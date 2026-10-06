@@ -191,10 +191,6 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def app_data_dir() -> Path:
-    return data_dir()
-
-
 def _db_core_executable_names(os_name: Optional[str] = None) -> List[str]:
     return ["tunnelforge-core.exe"] if (os_name or os.name) == "nt" else ["tunnelforge-core"]
 
@@ -275,7 +271,7 @@ def state_key_from_payload(payload: Dict[str, Any]) -> str:
 
 
 def cross_engine_state_dir(base_dir: Optional[Path] = None) -> Path:
-    state_dir = (base_dir or app_data_dir()) / "cross_engine_migration_state"
+    state_dir = (base_dir or data_dir()) / "cross_engine_migration_state"
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
 

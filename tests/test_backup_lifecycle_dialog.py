@@ -137,3 +137,103 @@ def test_import_dialog_backup_management_carries_registered_tls(monkeypatch):
         ct.clear_registered_tls()
     assert captured["endpoint"]["tls"]["mode"] == "verify_full"
     assert captured["endpoint"]["user"] == "u"
+
+
+def test_list_shows_korean_status_labels_with_raw_code_tooltips_and_empty_state():
+    dialog = _dialog()
+    try:
+        dialog._on_list(True, "", {"backups": [ENTRY]})
+        assert dialog.table.item(0, 1).text() == "전환 완료" and dialog.table.item(0, 1).toolTip() == "promoted"
+        assert dialog.table.item(0, 3).text() == "TunnelForge 소유 확인"
+        assert dialog.table.item(0, 5).text() == "전환됨"
+        assert dialog.label_state.text() == "보존된 백업 1건"
+        unknown = dict(ENTRY, journal_status="future_code")
+        dialog._on_list(True, "", {"backups": [unknown]})
+        assert dialog.table.item(0, 1).text() == "future_code", "unknown codes stay visible"
+        dialog._on_list(True, "", {"backups": []})
+        assert dialog.table.rowCount() == 0 and dialog.label_state.text() == "보존된 백업이 없습니다."
+    finally:
+        dialog.close()
+
+
+def test_destructive_actions_are_separated_and_need_a_selection():
+    from src.ui.styles import ButtonStyles
+
+    dialog = _dialog()
+    try:
+        for button in dialog._danger_buttons:
+            assert button.styleSheet() == ButtonStyles.DELETE
+            assert button.parent() is not dialog.btn_refresh.parent(), "own group, apart from read-only actions"
+        assert dialog.btn_refresh.isEnabled()
+        assert not dialog.btn_reconcile.isEnabled() and not any(b.isEnabled() for b in dialog._danger_buttons)
+        dialog._on_list(True, "", {"backups": [ENTRY]})
+        dialog.table.selectRow(0)
+        assert dialog.btn_reconcile.isEnabled() and all(b.isEnabled() for b in dialog._danger_buttons)
+    finally:
+        dialog.close()
+
+
+def test_request_shows_loading_disables_actions_and_delivers_after_the_thread_ends(monkeypatch):
+    from src.ui.dialogs import backup_lifecycle_dialog
+
+    class Signal:
+        def __init__(self):
+            self.slots = []
+
+        def connect(self, slot):
+            self.slots.append(slot)
+
+        def emit(self, *args):
+            for slot in self.slots:
+                slot(*args)
+
+    workers = []
+
+    class FakeWorker:
+        def __init__(self, payload):
+            self.payload = payload
+            self.finished_with_result = Signal()
+            self.finished = Signal()
+            workers.append(self)
+
+        def start(self):
+            pass
+
+        def wait(self):
+            return True
+
+    monkeypatch.setattr(backup_lifecycle_dialog, "BackupLifecycleWorker", FakeWorker)
+    dialog = _dialog()
+    try:
+        dialog.refresh()
+        assert dialog.label_state.text() == "조회 중…" and not dialog.btn_refresh.isEnabled()
+        dialog.refresh()
+        assert len(workers) == 1, "a second click while busy is ignored"
+        workers[0].finished_with_result.emit(True, "", {"backups": []})
+        assert dialog.label_state.text() == "조회 중…", "result is delivered only when the thread has ended"
+        workers[0].finished.emit()
+        assert dialog.btn_refresh.isEnabled() and dialog.label_state.text() == "보존된 백업이 없습니다."
+        dialog.refresh()
+        assert len(workers) == 2, "the next request (e.g. preview -> apply) is accepted right away"
+    finally:
+        dialog.close()
+
+
+def test_status_cells_are_translated_and_list_summary_survives_follow_up_requests():
+    from src.core import i18n
+
+    dialog = _dialog()
+    i18n.set_language("en")
+    try:
+        dialog._on_list(True, "", {"backups": [ENTRY]})
+        assert dialog.table.item(0, 1).text() == "Promoted"
+        assert dialog.table.item(0, 5).text() == "Promoted"
+        assert dialog.table.item(0, 2).text() == "tf_backup_1"  # names are never translated
+        summary = dialog.label_state.text()
+        assert summary
+        dialog._busy = True
+        dialog._on_worker_done(MagicMock(), [True, "", {"conclusion": "promoted"}], lambda *a: None)
+        assert dialog.label_state.text() == summary, "reconcile/preview must not wipe the backup count line"
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+        dialog.close()

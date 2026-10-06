@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QWidget, QAbstractItemView,
     QSplitter, QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices
 from typing import List, Optional
 from datetime import datetime
 import json
@@ -19,7 +20,6 @@ from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STA
 from src.core.db_connector import MySQLConnector
 from src.core.error_report_sanitizer import (
     sanitize_local_diagnostic,
-    sanitize_local_diagnostic_data,
 )
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
@@ -30,28 +30,15 @@ from src.exporters.rust_dump_exporter import (
     mysql_parallel_snapshot_denied_privilege
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
-from src.ui.workers.error_reporting_worker import ErrorReportingMixin
+from src.ui.workers.error_reporting_worker import (
+    ErrorReportingMixin,
+    report_operation_error,
+    sanitize_local_diagnostic_json,
+)
 from src.ui.dialogs.job_recording import begin_export_job, finish_export_job
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 logger = get_logger("db_dialogs")
-
-
-def _escape_local_diagnostic_text(value: object) -> str:
-    return sanitize_local_diagnostic(value)
-
-
-def _structured_local_diagnostic_text(value: object) -> str:
-    try:
-        serialized = json.dumps(
-            sanitize_local_diagnostic_data(value),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except BaseException:
-        serialized = "REDACTED"
-    return sanitize_local_diagnostic(serialized)
 
 
 _EXPORT_TELEMETRY_TYPES = {
@@ -486,9 +473,21 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         btn_layout.addStretch()
         table_layout.addLayout(btn_layout)
 
+        filter_layout = QHBoxLayout()
+        self.input_table_filter = QLineEdit()
+        self.input_table_filter.setPlaceholderText("테이블 이름 필터")
+        self.input_table_filter.setClearButtonEnabled(True)
+        self.input_table_filter.textChanged.connect(self._apply_table_filter)
+        self.label_table_count = QLabel("0/0 선택")
+        filter_layout.addWidget(self.input_table_filter, 1)
+        filter_layout.addWidget(self.label_table_count)
+        table_layout.addLayout(filter_layout)
+
         self.list_tables = QListWidget()
         self.list_tables.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.list_tables.setMaximumHeight(150)
+        self.list_tables.setMinimumHeight(100)  # 낮은 창에서는 눌리지 않고 설정 영역이 스크롤된다
+        self.list_tables.itemChanged.connect(self._update_table_count)
         table_layout.addWidget(self.list_tables)
 
         self.chk_include_fk = QCheckBox("FK 의존성 테이블 자동 포함")
@@ -920,6 +919,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def on_schema_changed(self, schema: str):
         self.list_tables.clear()
+        self._update_table_count()
         if not schema or not self.connector:
             return
         tables = self.connector.get_tables(schema)
@@ -927,17 +927,35 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             item = QListWidgetItem(table)
             item.setCheckState(Qt.CheckState.Checked)
             self.list_tables.addItem(item)
+        self._apply_table_filter(self.input_table_filter.text())
+        self._update_table_count()
 
         # 출력 폴더명 업데이트 (스키마 반영)
         self._update_output_dir_preview()
 
+    def _visible_table_items(self):
+        return [self.list_tables.item(i) for i in range(self.list_tables.count())
+                if not self.list_tables.item(i).isHidden()]
+
     def select_all_tables(self):
-        for i in range(self.list_tables.count()):
-            self.list_tables.item(i).setCheckState(Qt.CheckState.Checked)
+        """전체 선택/해제는 필터에 보이는 테이블에만 적용한다 (필터가 없으면 전체)."""
+        for item in self._visible_table_items():
+            item.setCheckState(Qt.CheckState.Checked)
 
     def deselect_all_tables(self):
+        for item in self._visible_table_items():
+            item.setCheckState(Qt.CheckState.Unchecked)
+
+    def _apply_table_filter(self, text: str = ""):
+        needle = (text or "").strip().lower()
         for i in range(self.list_tables.count()):
-            self.list_tables.item(i).setCheckState(Qt.CheckState.Unchecked)
+            item = self.list_tables.item(i)
+            item.setHidden(bool(needle) and needle not in item.text().lower())
+
+    def _update_table_count(self, *_):
+        total = self.list_tables.count()
+        checked = sum(1 for i in range(total) if self.list_tables.item(i).checkState() == Qt.CheckState.Checked)
+        self.label_table_count.setText(f"{checked}/{total} 선택")
 
     def get_selected_tables(self) -> List[str]:
         tables = []
@@ -1275,7 +1293,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용)"""
         timestamp = datetime.now().strftime('%H:%M:%S')
-        log_entry = f"[{timestamp}] {_escape_local_diagnostic_text(msg)}"
+        log_entry = f"[{timestamp}] {sanitize_local_diagnostic(msg)}"
         self.log_entries.append(log_entry)
         if len(self.log_entries) > MAX_LOG_ENTRIES:
             del self.log_entries[:-MAX_LOG_ENTRIES]
@@ -1283,7 +1301,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.btn_save_log.setEnabled(True)
 
     def on_progress(self, msg: str):
-        msg = _escape_local_diagnostic_text(msg)
+        msg = sanitize_local_diagnostic(msg)
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
         self._add_log(msg)
@@ -1300,13 +1318,17 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.label_tables.setText(
             f"📋 테이블: {self.export_completed_tables} / {self.export_total_tables} 완료"
         )
-        display_table = _escape_local_diagnostic_text(table_name)
+        display_table = sanitize_local_diagnostic(table_name)
         self._add_log(
             f"테이블 완료: {display_table} ({self.export_completed_tables}/{self.export_total_tables})"
         )
 
+    def _report_error_anonymously(self):
+        """Submit a privacy-allowlisted report in the background."""
+        report_operation_error(self, "export", "dump.run")
+
     def on_finished(self, success: bool, message: str):
-        message = _escape_local_diagnostic_text(message)
+        message = sanitize_local_diagnostic(message)
         handled_privilege_failure = False
         refusal = getattr(self.worker, "export_refusal", None)
         if (
@@ -1379,8 +1401,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             total_count = len(self.table_items)
             if total_count > 0:
                 self.label_tables.setText(f"📋 테이블: {done_count} / {total_count} 완료")
-            QMessageBox.information(
-                self, "Export 완료",
+            self._show_export_done(
                 f"✅ Export가 완료되었습니다.\n\n폴더: {self.input_output_dir.text()}"
                 + (
                     "\n\n⚠️ 테이블 데이터만 내보낸 불완전 Export입니다. "
@@ -1469,7 +1490,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         data_label, estimate_label = format_export_row_labels(overall_done, self.export_total_rows)
         self.label_data.setText(data_label)
         self.label_estimated_rows.setText(estimate_label)
-        display_speed = _escape_local_diagnostic_text(
+        display_speed = sanitize_local_diagnostic(
             info.get('speed', 'Rust DB Core')
         )
         self.label_speed.setText(f"⚡ 속도: {display_speed}")
@@ -1478,7 +1499,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             table_total = self.export_table_totals.get(table) or int(info.get("rows_total") or 0)
             self.label_status.setText(
                 format_export_table_status(
-                    _escape_local_diagnostic_text(table),
+                    sanitize_local_diagnostic(table),
                     self.export_table_done.get(table, 0),
                     table_total,
                 )
@@ -1486,8 +1507,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트"""
-        display_table = _escape_local_diagnostic_text(table_name)
-        display_message = _escape_local_diagnostic_text(message)
+        display_table = sanitize_local_diagnostic(table_name)
+        display_message = sanitize_local_diagnostic(message)
         now = datetime.now()
         self.export_table_status[table_name] = status
         if status == "loading":
@@ -1536,7 +1557,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             visible_summary = format_export_visible_telemetry(normalized_event)
 
         if visible_summary:
-            visible_summary = _escape_local_diagnostic_text(visible_summary)
+            visible_summary = sanitize_local_diagnostic(visible_summary)
             # 너무 많은 로그 방지
             if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
                 self.txt_log.takeItem(0)
@@ -1545,9 +1566,9 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self._add_log(visible_summary)
         elif not is_telemetry_event:
             visible_line = (
-                _structured_local_diagnostic_text(event)
+                sanitize_local_diagnostic_json(event)
                 if type(event) in {dict, list}
-                else _escape_local_diagnostic_text(line)
+                else sanitize_local_diagnostic(line)
             )
             # 너무 많은 로그 방지
             if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
@@ -1555,19 +1576,24 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.txt_log.addItem(visible_line)
             self.txt_log.scrollToBottom()
 
-    def _report_error_anonymously(self):
-        """Submit a privacy-allowlisted report in the background."""
-        if not self.config_manager:
-            return
-        report_args = {
-            "operation_kind": "export",
-            "db_engine": getattr(self.connector, "engine", ""),
-            "phase": "dump.run",
-        }
-        error_code = getattr(getattr(self, "worker", None), "error_code", None)
-        if error_code:
-            report_args["error_code"] = error_code
-        self._start_error_report_worker(**report_args)
+    def _show_export_done(self, text: str) -> QMessageBox:
+        """완료 안내 + '폴더 열기'(결과 폴더를 탐색기로 연다). open() 이라 호출부를 막지 않는다."""
+        box = QMessageBox(self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Export 완료")
+        box.setText(text)
+        open_button = box.addButton(translate_text("📂 폴더 열기"), QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.buttonClicked.connect(lambda button: self.open_output_folder() if button is open_button else None)
+        box.open()
+        return box
+
+    def open_output_folder(self) -> bool:
+        folder = self.input_output_dir.text()
+        if folder and os.path.isdir(folder):
+            return QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        return False
 
     def _export_table_duration_seconds(self, table_name: str) -> float:
         start = self.export_table_started_at.get(table_name)
@@ -1628,7 +1654,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             status = "running"
         else:
             status = "success" if self.export_success else "failed"
-        schema_name = safe_filename_component(_escape_local_diagnostic_text(self.export_schema or ""), "unknown")
+        schema_name = safe_filename_component(sanitize_local_diagnostic(self.export_schema or ""), "unknown")
         default_filename = f"export_log_{schema_name}_{status}_{timestamp}.txt"
 
         # 파일 저장 대화상자
@@ -1643,7 +1669,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             return
 
         try:
-            safe = _escape_local_diagnostic_text
+            safe = sanitize_local_diagnostic
             with open(file_path, 'w', encoding='utf-8') as f:
                 # 헤더 정보
                 f.write("=" * 70 + "\n")

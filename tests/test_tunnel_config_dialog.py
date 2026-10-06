@@ -11,7 +11,7 @@ from src.ui.dialogs.tunnel_config import (
     _RunningTestProgressDialog,
     _TempCredentials,
 )
-from src.ui.workers.connection_test_worker import ConnectionTestWorker, TestType
+from src.ui.workers.connection_test_worker import CANCELLED_MESSAGE, ConnectionTestWorker, TestType
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -435,5 +435,113 @@ def test_engine_change_switches_default_port_only():
         dialog.input_remote_port.setValue(13306)
         dialog.combo_db_engine.setCurrentIndex(dialog.combo_db_engine.findData("postgresql"))
         assert dialog.input_remote_port.value() == 13306
+    finally:
+        dialog.deleteLater()
+
+
+def test_progress_dialog_cancel_waits_for_worker_then_closes():
+    """연결 테스트 취소: 버튼은 취소만 요청하고, 다이얼로그는 worker 종료 후에만 닫힌다."""
+    parent = QWidget()
+    dialog = _RunningTestProgressDialog(parent, "테스트")
+    calls = []
+    try:
+        dialog.attach_cancel(lambda: calls.append("cancel"))
+        assert not dialog.btn_cancel.isHidden()
+
+        dialog._tick_elapsed()
+        assert "1" in dialog.elapsed_label.text()
+
+        dialog.btn_cancel.click()
+        dialog.reject()  # 실행 중 ESC도 취소 요청일 뿐, 중복 요청하지 않는다
+        assert calls == ["cancel"]
+        assert dialog.status_label.text() == "취소 중…"
+        assert not dialog.btn_cancel.isEnabled()
+
+        dialog.update_progress("🔗 다음 단계")  # 취소 중 표시는 덮어쓰지 않는다
+        assert dialog.status_label.text() == "취소 중…"
+
+        dialog.show_result(False, "⏹ 사용자가 테스트를 취소했습니다.")
+        assert dialog.btn_cancel.isHidden()
+        assert dialog.result() == QDialog.DialogCode.Rejected  # worker 종료 전에는 닫히지 않는다
+
+        dialog.allow_dismiss()
+        dialog.worker_stopped()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+    finally:
+        dialog.close()
+        parent.close()
+
+
+def test_start_connection_test_wires_cancel_to_worker(monkeypatch):
+    monkeypatch.setattr(ConnectionTestWorker, "start", lambda self: None)
+    cancelled = []
+    monkeypatch.setattr(ConnectionTestWorker, "cancel", lambda self: cancelled.append(self))
+
+    parent = ParentWithTunnels()
+    dialog = TunnelConfigDialog(parent, tunnel_data={"id": "current"}, tunnel_engine=object())
+    progress_dialog = None
+    try:
+        progress_dialog = dialog._start_connection_test(TestType.TUNNEL_ONLY, {"name": "t"}, None, "t")
+        worker = dialog._test_worker
+        progress_dialog.request_cancel()
+        assert cancelled == [worker]
+        assert dialog._test_worker is worker  # 취소해도 finished 전에는 참조 유지
+
+        worker.test_finished.emit(False, CANCELLED_MESSAGE)  # worker는 취소 시 결과를 먼저 보낸다
+        worker.finished.emit()
+        assert dialog._test_worker is None
+        assert progress_dialog.result() == QDialog.DialogCode.Accepted
+    finally:
+        if progress_dialog is not None:
+            progress_dialog.close()
+        dialog.close()
+        parent.close()
+
+
+class _PortEngine:
+    def __init__(self, busy=(), running=()):
+        self.busy = set(busy)
+        self.running = set(running)
+
+    def is_port_available(self, port):
+        return port not in self.busy
+
+    def is_running(self, tid):
+        return tid in self.running
+
+
+def test_local_port_warning_shows_when_port_busy_on_this_machine():
+    dialog = TunnelConfigDialog(
+        None,
+        tunnel_data={"id": "new", "connection_mode": "ssh_tunnel", "local_port": 3308},
+        tunnel_engine=_PortEngine(busy={3311}),
+    )
+    try:
+        warning = dialog.lbl_local_port_warning
+        assert warning.isHidden()
+
+        dialog.input_local_port.setValue(3311)
+        assert not warning.isHidden()
+        assert "3311" in warning.text()
+
+        dialog.radio_direct.setChecked(True)
+        assert warning.isHidden()  # 직접 연결은 Local 포트를 쓰지 않는다
+
+        dialog.radio_ssh_tunnel.setChecked(True)
+        assert not warning.isHidden()
+        dialog.input_local_port.setValue(3312)
+        assert warning.isHidden()
+    finally:
+        dialog.deleteLater()
+
+
+def test_local_port_warning_ignores_own_running_tunnel():
+    dialog = TunnelConfigDialog(
+        None,
+        tunnel_data={"id": "t1", "connection_mode": "ssh_tunnel", "local_port": 3308},
+        tunnel_engine=_PortEngine(busy={3308}, running={"t1"}),
+    )
+    try:
+        assert dialog.lbl_local_port_warning.isHidden()
     finally:
         dialog.deleteLater()

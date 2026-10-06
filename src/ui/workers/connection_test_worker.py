@@ -7,6 +7,9 @@ from typing import Optional, Tuple
 from PyQt6.QtCore import QThread, pyqtSignal
 
 
+CANCELLED_MESSAGE = "⏹ 사용자가 테스트를 취소했습니다."
+
+
 class TestType(Enum):
     """테스트 유형"""
     TUNNEL_ONLY = "tunnel"      # SSH 터널만 테스트
@@ -44,6 +47,15 @@ class ConnectionTestWorker(QThread):
         self.engine = tunnel_engine
         self.config_mgr = config_manager
 
+    def cancel(self):
+        """협조적 취소 요청. 단계 사이에서 확인하므로 진행 중인 네트워크 호출
+        (SSH 연결, 포트 도달 확인, DB 인증)은 자체 타임아웃까지 끝난 뒤에 반영된다."""
+        # ponytail: 단계 경계 취소만 지원. 즉시 끊으려면 engine/connector에 소켓 close 훅이 필요하다.
+        self.requestInterruption()
+
+    def _cancelled(self) -> bool:
+        return self.isInterruptionRequested()
+
     def run(self):
         try:
             if self.test_type == TestType.TUNNEL_ONLY:
@@ -59,6 +71,8 @@ class ConnectionTestWorker(QThread):
         """SSH 터널 연결만 테스트"""
         self.progress.emit("🔗 SSH 터널 연결 테스트 중...")
         success, msg = self.engine.test_connection(self.config)
+        if self._cancelled():
+            success, msg = False, CANCELLED_MESSAGE
         self.test_finished.emit(success, msg)
 
     def _test_db(self):
@@ -78,6 +92,9 @@ class ConnectionTestWorker(QThread):
                 return
 
             resolved, failure = self._resolve_connection(announce_connection=True)
+            if self._cancelled():
+                result_msg = CANCELLED_MESSAGE
+                return
             if failure:
                 result_success = False
                 if failure.kind == "target_unreachable":
@@ -144,6 +161,9 @@ class ConnectionTestWorker(QThread):
             if not is_direct:
                 self.progress.emit("🔗 [1/2] SSH 터널 연결 테스트 중...")
                 tunnel_success, tunnel_msg = self.engine.test_connection(self.config)
+                if self._cancelled():
+                    result_msg = CANCELLED_MESSAGE
+                    return
 
                 if tunnel_success:
                     results.append("✅ 1. SSH 터널 연결 성공")
@@ -165,6 +185,9 @@ class ConnectionTestWorker(QThread):
                 return
 
             resolved, failure = self._resolve_connection(announce_connection=False)
+            if self._cancelled():
+                result_msg = CANCELLED_MESSAGE
+                return
             if failure:
                 result_success = False
                 if failure.kind == "target_unreachable":
@@ -227,6 +250,8 @@ class ConnectionTestWorker(QThread):
         if not reachable:
             return None, _ConnectionFailure("target_unreachable", reach_msg)
         self.progress.emit(f"✅ {reach_msg}")
+        if self._cancelled():
+            return None, _ConnectionFailure("cancelled", CANCELLED_MESSAGE)
 
         if announce_connection:
             self.progress.emit("🔗 임시 SSH 터널 생성 중...")

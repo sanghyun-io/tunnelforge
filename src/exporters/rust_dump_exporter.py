@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from src.core.db_connector import MySQLConnector
 from src.core.db_core_service import (
     DbCoreFacade,
     DbCoreServiceError,

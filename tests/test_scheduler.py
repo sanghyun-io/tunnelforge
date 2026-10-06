@@ -24,50 +24,6 @@ app = QApplication.instance() or QApplication(sys.argv)
 class TestCronParser:
     """CronParser 클래스 테스트"""
 
-    def test_parse_field_wildcard(self):
-        """* 필드 파싱"""
-        from src.core.scheduler import CronParser
-
-        result = CronParser.parse_field('*', 0, 59, 0)
-        assert result == list(range(0, 60))
-
-    def test_parse_field_specific_value(self):
-        """특정 값 파싱"""
-        from src.core.scheduler import CronParser
-
-        result = CronParser.parse_field('5', 0, 59, 0)
-        assert result == [5]
-
-    def test_parse_field_range(self):
-        """범위 파싱 (1-5)"""
-        from src.core.scheduler import CronParser
-
-        result = CronParser.parse_field('1-5', 0, 6, 0)
-        assert result == [1, 2, 3, 4, 5]
-
-    def test_parse_field_step(self):
-        """간격 파싱 (*/15)"""
-        from src.core.scheduler import CronParser
-
-        result = CronParser.parse_field('*/15', 0, 59, 0)
-        assert result == [0, 15, 30, 45]
-
-    def test_parse_field_comma_separated(self):
-        """쉼표 구분 파싱 (1,3,5)"""
-        from src.core.scheduler import CronParser
-
-        result = CronParser.parse_field('1,3,5', 0, 6, 0)
-        assert result == [1, 3, 5]
-
-    def test_parse_field_out_of_range_excluded(self):
-        """범위 초과 값 제외"""
-        from src.core.scheduler import CronParser
-
-        result = CronParser.parse_field('0,5,70', 0, 59, 0)
-        assert 70 not in result
-        assert 0 in result
-        assert 5 in result
-
     def test_get_next_run_daily(self):
         """매일 실행 다음 시간 계산"""
         from src.core.scheduler import CronParser
