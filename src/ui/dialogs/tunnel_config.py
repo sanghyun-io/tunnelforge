@@ -41,6 +41,8 @@ class _RunningTestProgressDialog(TestProgressDialog):
 
     def reject(self):
         if not self._dismissable:
+            # 실행 중 ESC/닫기는 닫지 않고 취소 요청으로 바꾼다. 닫힘은 worker 종료 후.
+            self.request_cancel()
             return
         super().reject()
 
@@ -442,6 +444,13 @@ class TunnelConfigDialog(QDialog):
         self.lbl_local_port = QLabel("Local Bind Port:")
         form_layout.addRow(self.lbl_local_port, self.input_local_port)
 
+        # 이 컴퓨터에서 이미 사용 중인 포트면 바로 아래에 경고한다 (연결 시 바인드 실패 예방).
+        self.lbl_local_port_warning = QLabel()
+        self.lbl_local_port_warning.setWordWrap(True)
+        self.lbl_local_port_warning.setStyleSheet("color: #c0392b;")
+        form_layout.addRow("", self.lbl_local_port_warning)
+        self.input_local_port.valueChanged.connect(self._update_local_port_warning)
+
         # 터널 테스트 버튼 - 중앙화된 스타일 사용
         self.btn_tunnel_test = QPushButton("🔌 터널 테스트")
         self.btn_tunnel_test.setStyleSheet(ButtonStyles.TEST)
@@ -515,6 +524,27 @@ class TunnelConfigDialog(QDialog):
         for widget in ssh_only_rows:
             self._form_layout.setRowVisible(widget, is_ssh_mode)
         self.btn_copy_bastion.setEnabled(is_ssh_mode and bool(self.bastion_templates))
+        self._update_local_port_warning()
+
+    def _local_port_busy(self, port: int) -> bool:
+        """이 컴퓨터에서 port가 이미 점유됐는지. 이 연결 자신의 실행 중인 터널은 제외한다."""
+        check = getattr(self.engine, 'is_port_available', None)
+        if check is None:
+            return False
+        tid = self.tunnel_data.get('id')
+        if (tid and port == int(self.tunnel_data.get('local_port') or 0)
+                and getattr(self.engine, 'is_running', lambda _tid: False)(tid)):
+            return False
+        return not check(port)
+
+    def _update_local_port_warning(self, *_args):
+        port = self.input_local_port.value()
+        busy = self.radio_ssh_tunnel.isChecked() and self._local_port_busy(port)
+        if busy:
+            self.lbl_local_port_warning.setText(
+                f"⚠️ 포트 {port}은(는) 이 컴퓨터에서 이미 사용 중입니다. 다른 포트를 고르세요."
+            )
+        self._form_layout.setRowVisible(self.lbl_local_port_warning, busy)
 
     def _auto_check_save_credentials(self, text):
         if text and not self._credentials_choice_made and not self.chk_save_credentials.isChecked():
@@ -799,6 +829,7 @@ class TunnelConfigDialog(QDialog):
         self._test_worker = worker
 
         worker.progress.connect(dialog.update_progress)
+        dialog.attach_cancel(worker.cancel)
         worker.test_finished.connect(lambda s, m: self._on_test_result(dialog, s, m))
         # 내장 QThread.finished()(무인자) — 실제로 스레드가 정지한 뒤에만 발화.
         # 이 시점에야 dialog dismiss를 허용하고 worker 참조를 해제한다.
@@ -814,3 +845,4 @@ class TunnelConfigDialog(QDialog):
         """내장 QThread.finished() 핸들러. worker가 실제로 정지한 뒤 호출된다."""
         dialog.allow_dismiss()
         self._test_worker = None
+        dialog.worker_stopped()
