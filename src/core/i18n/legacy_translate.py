@@ -17,6 +17,14 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "⋯ 파일/히스토리": "⋯ File/History",
+    "SQL 파일 열기/저장, 쿼리 히스토리": "Open/save SQL files, query history",
+    "💾 다른 이름으로 저장 (Ctrl+Shift+S)": "💾 Save As (Ctrl+Shift+S)",
+    "테이블을 더블클릭하면 에디터 커서 위치에 이름을 삽입합니다": "Double-click a table to insert its name at the editor cursor",
+    "💾 결과 저장": "💾 Save Result",
+    "현재 결과 탭을 CSV/JSON 파일로 저장": "Save the current result tab to a CSV/JSON file",
+    "💾 전체 행 저장 (쿼리 재실행)...": "💾 Save all rows (re-run query)...",
+    "저장할 결과가 없습니다": "No result to save",
     "🔍 실행 계획": "🔍 Execution plan",
     "선택한 문장(없으면 커서 위치의 문장)의 실행 계획 보기 (Ctrl+E)\nANALYZE 는 대화상자에서 따로 선택해야 하며 쿼리를 실제로 실행합니다": "Show the execution plan of the selected statement (or the one at the cursor) (Ctrl+E)\nANALYZE is chosen separately in the dialog and really runs the query",
     "실행 계획을 볼 쿼리가 없습니다.": "There is no query to explain.",
@@ -1269,6 +1277,7 @@ _EN_REGEX_TRANSLATIONS = (
     (r"선택된 (?P<count>\{[^}]*\}|[0-9,]+)개 항목에 대해 정리 작업을 실행합니다\.\n\n이 작업은 되돌릴 수 없습니다\. 계속하시겠습니까\?", r"Cleanup will run for \g<count> selected items.\n\nThis operation cannot be undone. Do you want to continue?"),
     (r"이 SQL에 위험한 쿼리가 포함되어 있습니다\.\n\n(?P<sql>.*)\n\n정말 저장하시겠습니까\?", r"This SQL contains dangerous queries.\n\n\g<sql>\n\nDo you really want to save?"),
     (r"'(?P<name>[^']+)'의 변경사항을 저장하시겠습니까\?", r"Do you want to save changes to '\g<name>'?"),
+    (r"💾 표시된 (?P<count>\{[^}]*\}|[0-9,]+)행만 저장 \(CSV/JSON\)\.\.\.", r"💾 Save only the \g<count> displayed rows (CSV/JSON)..."),
     (r"(?P<count>\{[^}]*\}|[0-9,]+)초", r"\g<count>s"),
     (r"(?P<count>\{[^}]*\}|[0-9,]+)개 터널 연결됨", r"\g<count> tunnels connected"),
     (r"(?P<count>\{[^}]*\}|[0-9,]+)개 스킵", r"\g<count> skipped"),
