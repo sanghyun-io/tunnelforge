@@ -15,6 +15,10 @@
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?style=flat-square)](https://github.com/sanghyun-io/tunnelforge/releases)
 
+<img src="docs/images/sql_editor.gif" width="820" alt="SQL editor: autocomplete, run, results" />
+
+<sub>Open a database behind a bastion host, write SQL with table and column autocomplete, and see results — all in one window.</sub>
+
 </div>
 
 ---
@@ -85,6 +89,22 @@ Scheduled backups are available (backup tasks only: DST-aware times, at most one
 | 🌓 | **Light / Dark Theme** | Pick the theme that suits your setup. |
 | 🔄 | **Auto Update** | Checks for new versions on startup so you never miss an update. |
 | 🛡️ | **Anonymous Error Reporting** | Explicit opt-in sends a strict allowlisted report through a relay; no client GitHub credential is required. See [error reporting](docs/error_reporting.md). |
+
+---
+
+## Screenshots
+
+| Connections & groups | SQL editor |
+|:-:|:-:|
+| <img src="docs/images/main.png" width="420" alt="Connection list with groups and live tunnel status" /> | <img src="docs/images/sql_editor.png" width="420" alt="SQL editor with schema tree and results" /> |
+| Tunnels grouped by environment with live status (connected, reconnecting). | Schema tree, highlighting, validation, results and transaction controls. |
+
+| Connection settings | Safe import modes | MySQL ↔ PostgreSQL |
+|:-:|:-:|:-:|
+| <img src="docs/images/connection.png" width="270" alt="Connection dialog with SSH tunnel and TLS" /> | <img src="docs/images/import.png" width="270" alt="Import dialog with safe restore, overwrite and replace" /> | <img src="docs/images/migration.png" width="270" alt="Cross-engine migration wizard" /> |
+| SSH tunnel through a bastion, verified TLS, saved credentials. | Safe restore by default; overwrite swaps only after verification. | Step-by-step migration with pre-checks and verification. |
+
+<sub>Screenshots use demo data.</sub>
 
 ---
 
