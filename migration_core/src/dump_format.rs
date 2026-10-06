@@ -2384,7 +2384,7 @@ mod tests {
             columns: vec!["code".to_string()],
             column_prefixes: vec![prefix],
             unique,
-            visible: None,
+            visible: None, spatial: false,
         };
         let rows = vec![SurvivingFkColumn {
             referencing_table: "target_only_child".to_string(),
@@ -2402,7 +2402,7 @@ mod tests {
         assert_eq!(incompatible_surviving_fk_offenders(&rows, &parent(index(true, Some(10))), false).len(), 1);
         // A column that is only the second member of a composite UNIQUE key is flagged
         // `unique` at column level but cannot back the FK.
-        let mut composite = parent(NormalizedIndex { name: "uq_pair".to_string(), columns: vec!["tenant".to_string(), "code".to_string()], column_prefixes: vec![None, None], unique: true, visible: None });
+        let mut composite = parent(NormalizedIndex { name: "uq_pair".to_string(), columns: vec!["tenant".to_string(), "code".to_string()], column_prefixes: vec![None, None], unique: true, visible: None, spatial: false });
         composite.tables[0].columns[0].unique = true;
         assert_eq!(incompatible_surviving_fk_offenders(&rows, &composite, false).len(), 1);
         // lower_case_table_names folds target names; the mixed-case dump table still matches.

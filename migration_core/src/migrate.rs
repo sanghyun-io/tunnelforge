@@ -496,6 +496,18 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
                 return;
             }
         };
+        // Preflight blocks these too; migrate itself must not copy geometry it cannot keep.
+        if source_endpoint.engine != target_endpoint.engine {
+            let refused = schema.tables.iter()
+                .flat_map(|table| spatial_column_issues(table, &source_endpoint.engine))
+                .filter(|issue| issue.blocking)
+                .map(|issue| issue.message)
+                .collect::<Vec<_>>();
+            if !refused.is_empty() {
+                emit(json!({"event": "error", "request_id": request.request_id, "message": refused.join("; ")}));
+                return;
+            }
+        }
 
         match (
             connect_migration_endpoint(&source_endpoint),
@@ -908,6 +920,9 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
 
     if let Ok(schema) = parse_schema(&payload["schema"]) {
         for table in &schema.tables {
+            if source != target {
+                issues.extend(spatial_column_issues(table, &source));
+            }
             if let Err(message) = validate_target_foreign_key_actions(table, &target) {
                 issues.push(MigrationIssue {
                     issue_type: Some("unsupported_fk_action".to_string()),
@@ -950,6 +965,37 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
     }
 
     issues
+}
+
+/// Geometry has no lossless cross-engine mapping here (MySQL internal WKB vs PostGIS), so MySQL
+/// spatial and PostGIS columns block; PostgreSQL built-in geometric types move as their text.
+fn spatial_column_issues(table: &NormalizedTable, source: &str) -> Vec<MigrationIssue> {
+    table.columns.iter().filter_map(|column| {
+        let base = column.type_name.trim().to_ascii_lowercase();
+        let base = base.split([' ', '(']).next().unwrap_or("").to_string();
+        let (blocking, message, suggestion) = if source == "mysql" && is_mysql_spatial_type(&column.type_name) {
+            (true, format!("MySQL spatial column {}.{} ({}) cannot be migrated without losing its geometry", table.name, column.name, column.type_name),
+             "Exclude this table, or convert the column in MySQL (e.g. ST_AsText into a text column) before migrating.")
+        } else if source == "postgresql" && matches!(base.as_str(), "geometry" | "geography") {
+            (true, format!("PostGIS column {}.{} ({}) cannot be migrated to MySQL geometry", table.name, column.name, column.type_name),
+             "Exclude this table, or convert the column in PostgreSQL (e.g. ST_AsText into a text column) before migrating.")
+        } else if source == "postgresql" && matches!(base.as_str(), "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle") {
+            (false, format!("PostgreSQL geometric column {}.{} ({}) is copied as its text form into a MySQL text column", table.name, column.name, column.type_name),
+             "Convert the text into MySQL spatial values after the migration if geometry functions are needed.")
+        } else {
+            return None;
+        };
+        Some(MigrationIssue {
+            issue_type: Some("unsupported_spatial_type".to_string()),
+            severity: if blocking { "error" } else { "warning" }.to_string(),
+            location: format!("{}.{}", table.name, column.name),
+            message,
+            suggestion: suggestion.to_string(),
+            blocking,
+            table_name: Some(table.name.clone()),
+            column_name: Some(column.name.clone()),
+        })
+    }).collect()
 }
 
 pub(crate) fn live_preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
