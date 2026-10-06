@@ -162,3 +162,48 @@ def test_move_to_group_menu_moves_without_drag_and_drop():
         assert new_group == [tunnel["id"]]
     finally:
         tree.deleteLater()
+
+
+def _tree_with_signals(running=False):
+    tree = TunnelTreeWidget()
+    tunnel = sample_tunnel()
+    tree.load_data([tunnel], [], [])
+    tree.update_tunnel_status(tunnel["id"], running)
+    item = tree._tunnel_items[tunnel["id"]]
+    tree.setCurrentItem(item)
+    seen = []
+    for name in ("tunnel_sql_editor", "tunnel_start_requested", "tunnel_stop_requested",
+                 "tunnel_edit_requested", "tunnel_delete_requested"):
+        getattr(tree, name).connect(lambda data, n=name: seen.append(n))
+    return tree, item, seen
+
+
+def test_tree_keyboard_shortcuts_act_on_selected_connection():
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+
+    tree, item, seen = _tree_with_signals(running=False)
+    try:
+        for key in (Qt.Key.Key_Return, Qt.Key.Key_Space, Qt.Key.Key_F2, Qt.Key.Key_Delete):
+            QTest.keyClick(tree, key)
+        assert seen == ["tunnel_sql_editor", "tunnel_start_requested", "tunnel_edit_requested", "tunnel_delete_requested"]
+        tree.update_tunnel_status(sample_tunnel()["id"], True)
+        seen.clear()
+        QTest.keyClick(tree, Qt.Key.Key_Space)
+        assert seen == ["tunnel_stop_requested"]
+        seen.clear()
+        QTest.keyClick(tree, Qt.Key.Key_Delete, Qt.KeyboardModifier.ShiftModifier)  # 조합키는 가로채지 않는다
+        assert seen == []
+    finally:
+        tree.deleteLater()
+
+
+def test_double_click_always_opens_sql_editor():
+    tree, item, seen = _tree_with_signals(running=False)
+    try:
+        tree._on_item_double_clicked(item, 1)
+        tree.update_tunnel_status(sample_tunnel()["id"], True)
+        tree._on_item_double_clicked(item, 1)
+        assert seen == ["tunnel_sql_editor", "tunnel_sql_editor"]
+    finally:
+        tree.deleteLater()

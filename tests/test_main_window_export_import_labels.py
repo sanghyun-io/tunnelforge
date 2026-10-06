@@ -436,3 +436,55 @@ def test_update_balloon_click_opens_about_tab_once():
 def test_tray_message_click_is_wired():
     source = inspect.getsource(TrayController.init_tray)
     assert "messageClicked.connect(window._on_tray_message_clicked)" in source
+
+
+def test_row_more_button_opens_the_same_menu_as_right_click(monkeypatch):
+    from PyQt6.QtWidgets import QMenu, QToolButton, QWidget
+    from src.ui.widgets.tunnel_tree import TunnelTreeWidget
+
+    shown = []
+    monkeypatch.setattr(QMenu, "exec", lambda menu, *a: shown.append([act.text() for act in menu.actions()]))
+    window = QWidget()
+    window.tunnel_tree = TunnelTreeWidget()
+    window.edit_tunnel_dialog = lambda t: None
+    window._show_row_menu = lambda t, b: TunnelManagerUI._show_row_menu(window, t, b)
+    tunnel = {"id": "t1", "name": "운영"}
+    try:
+        container = TunnelManagerUI._build_manage_buttons(window, tunnel)
+        [more] = container.findChildren(QToolButton)
+        assert more.text() == "…" and more.toolTip()
+        more.click()
+        expected = QMenu()
+        window.tunnel_tree._build_tunnel_context_menu(expected, tunnel)
+        assert shown == [[act.text() for act in expected.actions()]]
+    finally:
+        window.deleteLater()
+
+
+def test_header_tool_labels_are_renamed():
+    from src.core.i18n import tr
+
+    assert tr("main.migration") == "MySQL 8.4 업그레이드 점검"
+    assert tr("main.db_transition") == "DB 전환 (MySQL ↔ PostgreSQL)"
+
+
+def test_main_window_shortcuts():
+    from PyQt6.QtGui import QAction
+    from PyQt6.QtWidgets import QMainWindow, QPushButton
+
+    win = QMainWindow()
+    calls = []
+    win.act_job_list = QAction(win)
+    win.btn_add_tunnel, win.btn_settings = QPushButton(), QPushButton()
+    win.add_tunnel_dialog = lambda: calls.append("add")
+    win.open_settings_dialog = lambda: calls.append("settings")
+    win.reload_config = lambda: calls.append("refresh")
+    try:
+        TunnelManagerUI._init_shortcuts(win)
+        keys = {a.shortcut().toString(): a for a in win.actions()}
+        assert set(keys) == {"Ctrl+N", "Ctrl+,", "Ctrl+J", "F5"}
+        for k in ("Ctrl+N", "Ctrl+,", "F5"):
+            keys[k].trigger()
+        assert calls == ["add", "settings", "refresh"]
+    finally:
+        win.deleteLater()

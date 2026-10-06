@@ -508,7 +508,7 @@ def test_launcher_passes_tunnel_and_rerun_to_the_wizard(monkeypatch):
 def test_main_window_has_the_job_list_button_and_startup_sweep():
     tree = ast.parse((ROOT / "src/ui/main_window.py").read_text(encoding="utf-8"))
     names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
-    assert {"btn_job_list", "open_job_list_dialog"} <= names
+    assert {"act_job_list", "open_job_list_dialog"} <= names
     source = (ROOT / "src/ui/main_window.py").read_text(encoding="utf-8")
     assert "sweep_interrupted()" in source
 
