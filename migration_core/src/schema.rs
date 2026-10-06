@@ -415,11 +415,7 @@ impl InspectAdapter for MysqlInspectAdapter {
 
 fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let schema_name = endpoint_schema(endpoint);
-    let opts = mysql_opts(endpoint);
-    let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
-    let mut conn = pool
-        .get_conn()
-        .map_err(|err| format!("mysql connection error: {err}"))?;
+    let mut conn = mysql_conn(endpoint)?;
     // Allocator values must be observed now, not served from MySQL's default
     // 24-hour information_schema statistics cache.
     conn.query_drop("SET SESSION information_schema_stats_expiry=0")
@@ -761,11 +757,7 @@ pub(crate) fn collect_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, 
 
 fn collect_mysql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, String> {
     let schema_name = endpoint_schema(endpoint);
-    let opts = mysql_opts(endpoint);
-    let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
-    let mut conn = pool
-        .get_conn()
-        .map_err(|err| format!("mysql connection error: {err}"))?;
+    let mut conn = mysql_conn(endpoint)?;
     let view_names: Vec<String> = conn
         .exec_map(
             "SELECT TABLE_NAME FROM information_schema.views WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
