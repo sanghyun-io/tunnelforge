@@ -6,7 +6,7 @@ from typing import Optional
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QMessageBox, QSystemTrayIcon,
                              QMenu, QApplication, QDialog)
-from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QTimer, Qt, QMetaObject, Q_ARG
+from PyQt6.QtCore import pyqtSlot, QTimer, Qt, QMetaObject, Q_ARG
 from PyQt6.QtGui import QAction, QIcon
 
 from src.ui.styles import ButtonStyles, LabelStyles, get_full_app_style
@@ -46,31 +46,11 @@ def _utc_now():
 
 
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
+from src.ui.dialogs.settings_update_helpers import UpdateCheckerThread
 from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
 from src.core.tunnel_monitor import TunnelMonitor, TunnelState
 from src.core.mysql_login_path import MysqlLoginPathManager
-
-
-class StartupUpdateCheckerThread(QThread):
-    """앱 시작 시 업데이트 확인 백그라운드 스레드"""
-    update_available = pyqtSignal(str, str)  # latest_version, download_url
-
-    def __init__(self, config_manager=None):
-        super().__init__()
-        self._config_manager = config_manager
-
-    def run(self):
-        try:
-            from src.core.update_checker import UpdateChecker
-            checker = UpdateChecker(config_manager=self._config_manager)
-            needs_update, latest_version, download_url, error_msg = checker.check_update()
-
-            if needs_update and latest_version and download_url:
-                self.update_available.emit(latest_version, download_url)
-        except Exception:
-            # 업데이트 확인 실패는 조용히 무시 (앱 실행에 영향 없음)
-            pass
 
 
 class TunnelManagerUI(QMainWindow):
@@ -1211,9 +1191,14 @@ class TunnelManagerUI(QMainWindow):
             return
 
         # 백그라운드 스레드에서 확인
-        self._update_checker_thread = StartupUpdateCheckerThread(config_manager=self.config_mgr)
-        self._update_checker_thread.update_available.connect(self._on_startup_update_available)
+        self._update_checker_thread = UpdateCheckerThread(config_manager=self.config_mgr)
+        self._update_checker_thread.update_checked.connect(self._on_startup_update_checked)
         self._update_checker_thread.start()
+
+    def _on_startup_update_checked(self, needs_update, latest_version, download_url, _error):
+        # 시작 시 확인 실패는 조용히 무시한다 (앱 실행에 영향 없음)
+        if needs_update and latest_version and download_url:
+            self._on_startup_update_available(latest_version, download_url)
 
     def _auto_connect_tunnels(self):
         """앱 시작 시 이전에 활성화되어 있던 터널 자동 연결"""

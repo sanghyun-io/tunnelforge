@@ -2,7 +2,7 @@
 간단한 Cron 표현식 파서
 """
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 from src.core.logger import get_logger
 from src.core.schedule_time import next_occurrence
@@ -20,36 +20,6 @@ class CronParser:
         "0 12 1 * *"  = 매월 1일 12:00
         "30 6 * * 1-5" = 평일 06:30
     """
-
-    @staticmethod
-    def parse_field(field: str, min_val: int, max_val: int, current: int, normalize_dow_7: bool = False) -> List[int]:
-        """크론 필드를 값 목록으로 파싱
-
-        Args:
-            normalize_dow_7: 요일 필드에서 7을 0(일요일)으로 취급 (cron 관용 표기 0/7=일요일 모두 허용)
-        """
-        if field == '*':
-            return list(range(min_val, max_val + 1))
-
-        def _normalize(v: int) -> int:
-            if normalize_dow_7 and v == 7:
-                return 0
-            return v
-
-        values = []
-        for part in field.split(','):
-            # 범위 (예: 1-5)
-            if '-' in part:
-                start, end = part.split('-')
-                values.extend(_normalize(v) for v in range(int(start), int(end) + 1))
-            # 간격 (예: */5)
-            elif part.startswith('*/'):
-                step = int(part[2:])
-                values.extend(range(min_val, max_val + 1, step))
-            else:
-                values.append(_normalize(int(part)))
-
-        return sorted(set(v for v in values if min_val <= v <= max_val))
 
     @staticmethod
     def get_next_run(expression: str, after: datetime = None) -> Optional[datetime]:

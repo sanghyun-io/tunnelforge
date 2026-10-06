@@ -394,11 +394,10 @@ class TestRustDumpExporter:
         self, tmp_path, monkeypatch
     ):
         """부분 export FK 부모 자동 포함은 Python MySQLConnector를 열지 않는다."""
+        import src.exporters.rust_dump_exporter as exporter_module
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
 
-        class FailingConnector:
-            def __init__(self, *args, **kwargs):
-                raise AssertionError("partial export must not instantiate MySQLConnector")
+        assert not hasattr(exporter_module, "MySQLConnector")
 
         class FakeFacade:
             def inspect_schema(self, endpoint):
@@ -421,7 +420,6 @@ class TestRustDumpExporter:
                 self.payload = payload
                 return {"success": True, "tables": 3, "rows_dumped": 0}
 
-        monkeypatch.setattr("src.exporters.rust_dump_exporter.MySQLConnector", FailingConnector)
         facade = FakeFacade()
         config = RustDumpConfig("localhost", 3306, "root", "password")
         exporter = RustDumpExporter(config, facade=facade)

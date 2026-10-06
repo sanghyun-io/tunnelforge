@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+from src.core.sql_statement_parser import literal_and_comment_mask
 from src.core.i18n import translate_text
 
 
@@ -294,15 +295,10 @@ class ProductionGuard:
         if not query:
             return False, None
 
-        # SQL 주석 제거
-        # 1. 한 줄 주석 (-- 또는 #)
-        clean_query = re.sub(r'--[^\n]*', '', query)
-        clean_query = re.sub(r'#[^\n]*', '', clean_query)
-        # 2. 블록 주석 (/* */)
-        clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL)
-
-        # 대문자로 변환하여 키워드 체크
-        upper_query = clean_query.upper()
+        # 주석과 문자열 리터럴을 공백으로 가린다. 정규식으로 지우면 문자열 안의 `--`가
+        # 같은 줄의 뒤쪽 문장(예: SELECT '--'; DROP TABLE t)까지 지워 위험 키워드를 놓친다.
+        mask = literal_and_comment_mask(query)
+        upper_query = "".join(" " if masked else char for char, masked in zip(query, mask)).upper()
 
         for keyword in ProductionGuard.DANGEROUS_KEYWORDS:
             # 단어 경계를 확인하여 정확한 키워드 매칭

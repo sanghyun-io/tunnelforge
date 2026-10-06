@@ -10,7 +10,11 @@ import uuid
 from src.core.error_report_codes import is_classified_error_code
 from src.core.error_report_environment import collect_environment
 from src.core.error_report_sanitizer import sanitize_error_text
-from src.core.error_report_schema import REPORT_SCHEMA_VERSION, validate_report_payload
+from src.core.error_report_schema import (
+    REPORT_SCHEMA_VERSION,
+    canonical_uuid_v4 as _canonical_uuid_v4,
+    validate_report_payload,
+)
 
 
 INSTALLATION_ID_SETTING = "error_reporting_installation_id"
@@ -20,7 +24,6 @@ _EXCEPTION_CLASS_PATTERN = re.compile(
 _ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 _FRAME_MODULE_PATTERN = re.compile(r"^src(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
 _FRAME_FUNCTION_PATTERN = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*|<module>)$")
-_EMPTY_UUID_V4 = "00000000-0000-4000-8000-000000000000"
 _INSTALLATION_ID_LOCK = threading.Lock()
 _BASE_EXCEPTION_DICT = BaseException.__dict__["__dict__"]
 _BASE_EXCEPTION_TRACEBACK = BaseException.__dict__["__traceback__"]
@@ -31,18 +34,6 @@ def _normalized_text(value):
         return unicodedata.normalize("NFKC", str(value or "")).strip()
     except BaseException:
         return ""
-
-
-def _canonical_uuid_v4(value):
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError):
-        return None
-    if parsed.version != 4 or str(parsed) != value or value == _EMPTY_UUID_V4:
-        return None
-    return value
 
 
 def _installation_id(config_manager):
