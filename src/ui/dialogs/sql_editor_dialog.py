@@ -457,12 +457,20 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         schema_layout = QVBoxLayout(schema_group)
         schema_layout.setContentsMargins(4, 8, 4, 4)
 
+        self.schema_filter = QLineEdit()
+        self.schema_filter.setPlaceholderText("테이블/컬럼 검색")
+        self.schema_filter.setClearButtonEnabled(True)
+        self.schema_filter.textChanged.connect(self._filter_schema_tree)
+        schema_layout.addWidget(self.schema_filter)
+
         self.schema_tree = QTreeWidget()
         self.schema_tree.setHeaderLabels(["이름"])
         self.schema_tree.setMinimumWidth(180)
         self.schema_tree.setStyleSheet(SCHEMA_TREE_QSS)
         self.schema_tree.setToolTip("테이블을 더블클릭하면 에디터 커서 위치에 이름을 삽입합니다")
         self.schema_tree.itemDoubleClicked.connect(self._on_schema_tree_item_clicked)
+        self.schema_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.schema_tree.customContextMenuRequested.connect(self._show_schema_tree_context_menu)
         schema_layout.addWidget(self.schema_tree)
         main_splitter.addWidget(schema_group)
 
@@ -482,17 +490,19 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self.editor_tabs.currentChanged.connect(self._on_editor_tab_changed)
 
         # 새 탭 버튼 (+)
-        self.new_tab_button = QPushButton("+")
-        self.new_tab_button.setFixedSize(24, 24)
+        self.new_tab_button = QToolButton()
+        self.new_tab_button.setText("+")
+        self.new_tab_button.setAutoRaise(True)
         self.new_tab_button.setToolTip("새 탭 (Ctrl+N)")
         self.new_tab_button.setStyleSheet("""
-            QPushButton {
+            QToolButton {
                 border: none;
                 background: transparent;
                 font-weight: bold;
                 font-size: 14px;
+                padding: 0px 6px;
             }
-            QPushButton:hover {
+            QToolButton:hover {
                 background: #e0e0e0;
                 border-radius: 4px;
             }
@@ -553,7 +563,12 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self.btn_save_result.setMenu(save_result_menu)
         self.result_tabs.setCornerWidget(self.btn_save_result, Qt.Corner.TopRightCorner)
 
+        self.result_empty_hint = QLabel("쿼리를 실행하면 결과가 여기에 표시됩니다\nCtrl+Enter 현재 쿼리 실행 · F5 전체 실행 · Ctrl+Space 자동완성")
+        self.result_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.result_empty_hint.setStyleSheet("color: #6c757d; border: 1px dashed #ced4da; border-radius: 4px; padding: 16px;")
+        result_layout.addWidget(self.result_empty_hint)
         result_layout.addWidget(self.result_tabs)
+        self._update_result_empty_state()
         result_layout.addWidget(self._build_transaction_panel())
         return result_group
 
@@ -1361,6 +1376,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         tab_name = f"결과 {self._result_counter} ({len(rows)}행)"
         self.result_tabs.addTab(table, tab_name)
         self.result_tabs.setCurrentWidget(table)
+        self._update_result_empty_state()
 
         # 편집 가능성 분석 + 설정
         if finalize:
@@ -1404,6 +1420,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         while self.result_tabs.count() > 0:
             self.result_tabs.removeTab(0)
         self._result_counter = 0
+        self._update_result_empty_state()
         return True
 
     def _set_message_panel_collapsed(self, collapsed: bool):
@@ -2295,6 +2312,13 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self.result_tabs.removeTab(index)
         if self.result_tabs.count() == 0:
             self._result_counter = 0
+        self._update_result_empty_state()
+
+    def _update_result_empty_state(self):
+        """결과 탭이 없으면 빈 표 대신 실행 안내를 보여준다."""
+        empty = self.result_tabs.count() == 0
+        self.result_empty_hint.setVisible(empty)
+        self.result_tabs.setVisible(not empty)
 
     def open_file(self):
         """SQL 파일 열기 (새 탭에서)"""
@@ -2572,6 +2596,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
 
         if selected_root:
             selected_root.setExpanded(True)
+        self._filter_schema_tree(self.schema_filter.text())
 
     def _on_schema_tree_item_clicked(self, item, _column):
         payload = item.data(0, Qt.ItemDataRole.UserRole) if item else None
@@ -2580,6 +2605,42 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         if not self.editor:
             return
         self.editor.insertPlainText(f"{self._quote_editor_identifier(payload.get('name') or '')} ")
+
+    def _filter_schema_tree(self, text):
+        """테이블/컬럼 이름 부분 일치 필터. 컬럼만 맞으면 그 테이블을 펼쳐 보여준다."""
+        needle = (text or "").strip().lower()
+        for i in range(self.schema_tree.topLevelItemCount()):
+            root = self.schema_tree.topLevelItem(i)
+            for t in range(root.childCount()):
+                table_item = root.child(t)
+                table_hit = needle in table_item.text(0).lower()
+                column_hit = False
+                for c in range(table_item.childCount()):
+                    column_item = table_item.child(c)
+                    hit = needle in column_item.text(0).lower()
+                    column_hit = column_hit or hit
+                    column_item.setHidden(not (table_hit or hit))
+                table_item.setHidden(not (table_hit or column_hit))
+                table_item.setExpanded(bool(needle) and column_hit and not table_hit)
+
+    def _build_schema_tree_menu(self, item):
+        """테이블 항목 우클릭 메뉴 (테이블이 아니면 None)"""
+        payload = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(payload, dict) or payload.get("kind") != "table":
+            return None
+        name = payload.get("name") or ""
+        quoted = self._quote_editor_identifier(name)
+        menu = QMenu(self)
+        menu.addAction("SELECT 문 삽입").triggered.connect(
+            lambda: self.editor and self.editor.insertPlainText(f"SELECT * FROM {quoted} LIMIT 100")
+        )
+        menu.addAction("이름 복사").triggered.connect(lambda: QApplication.clipboard().setText(name))
+        return menu
+
+    def _show_schema_tree_context_menu(self, position):
+        menu = self._build_schema_tree_menu(self.schema_tree.itemAt(position))
+        if menu:
+            menu.exec(self.schema_tree.viewport().mapToGlobal(position))
 
     def _quote_editor_identifier(self, name: str) -> str:
         return quote_editor_identifier(self._db_engine(), name)
