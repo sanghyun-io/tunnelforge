@@ -1093,3 +1093,33 @@ def test_metadata_connect_failure_surfaces_label(monkeypatch):
         assert "bad password" in dialog.validation_label.text()
     finally:
         close_dialog(dialog)
+
+
+def test_autocomplete_and_validation_find_tables_loaded_through_the_rust_connector(monkeypatch):
+    # The Rust connector has no `database` attribute, so metadata cached by connector key landed under
+    # None and Ctrl+Space never offered tables or columns for the selected schema.
+    from src.ui.dialogs.sql_editor_workers import create_sql_editor_connector
+
+    dialog = make_dialog(monkeypatch)
+    try:
+        dialog.db_combo.addItem("app")
+        dialog.db_combo.setCurrentText("app")
+        connector = create_sql_editor_connector("mysql", "127.0.0.1", 3306, "u", "p", "app", "")
+        dialog.metadata_provider.set_connector(connector)
+        metadata = SchemaMetadata()
+        metadata.tables = {"orders", "users"}
+        metadata.columns = {"users": {"id", "email"}, "orders": {"id", "user_id"}}
+        metadata.db_version = (8, 4, 0)
+        dialog._on_validation_requested = MagicMock()
+
+        dialog._on_metadata_loaded(metadata, "app")
+
+        sql = "SELECT * FROM "
+        labels = {item["label"] for item in dialog.sql_completer.get_completions(sql, len(sql), "app")}
+        assert {"orders", "users"} <= labels
+        sql = "SELECT  FROM users"
+        labels = {item["label"] for item in dialog.sql_completer.get_completions(sql, len("SELECT "), "app")}
+        assert {"id", "email"} <= labels
+        assert dialog.metadata_provider.get_metadata("app").tables == {"orders", "users"}
+    finally:
+        close_dialog(dialog)

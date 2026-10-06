@@ -2454,7 +2454,10 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
             self.metadata_provider.set_connector(connector)
             self.metadata_worker = MetadataLoadWorker(connector, target_schema)
             self.metadata_worker.progress.connect(self._on_metadata_progress)
-            self.metadata_worker.load_completed.connect(self._on_metadata_loaded)
+            # 로드한 스키마 이름으로 캐시한다: 자동완성/검증은 이 이름(db_combo)으로 조회한다.
+            self.metadata_worker.load_completed.connect(
+                lambda metadata, schema=target_schema: self._on_metadata_loaded(metadata, schema)
+            )
             self.metadata_worker.error_occurred.connect(self._on_metadata_error)
             self.metadata_worker.start()
 
@@ -2467,7 +2470,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         """메타데이터 로드 진행"""
         self.validation_label.setText(f"🔄 {msg}")
 
-    def _on_metadata_loaded(self, metadata):
+    def _on_metadata_loaded(self, metadata, schema=None):
         """메타데이터 로드 완료"""
         # 연결 정리 (메타데이터는 이미 메모리에 로드됨)
         if self._metadata_connector:
@@ -2477,8 +2480,13 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
                 pass
             self._metadata_connector = None
 
-        # 캐시된 메타데이터 업데이트
-        self.metadata_provider._metadata = metadata
+        # 캐시된 메타데이터 업데이트. Rust 커넥터에는 `database` 속성이 없어 `_metadata` 대입은
+        # 키 None 으로 저장됐고, 스키마 이름으로 조회하는 자동완성/검증이 테이블·컬럼을 못 찾았다.
+        schema = schema or self.db_combo.currentText().strip()
+        if schema:
+            self.metadata_provider.set_metadata(schema, metadata)
+        else:
+            self.metadata_provider._metadata = metadata
         self._populate_schema_tree(metadata)
 
         table_count = len(metadata.tables)
