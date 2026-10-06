@@ -310,3 +310,130 @@ def test_dialog_group_choice_defaults_to_current_group():
         assert plain.combo_group is None and plain.selected_group_id() == "g1"
     finally:
         plain.deleteLater()
+
+
+def _ssh_dialog(parent=None, **data):
+    tunnel = {
+        "id": "new", "name": "N", "connection_mode": "ssh_tunnel", "db_engine": "mysql",
+        "bastion_host": "b", "bastion_user": "u", "bastion_key": "k.pem", "remote_host": "db",
+    }
+    tunnel.update(data)
+    return TunnelConfigDialog(parent, tunnel_data=tunnel)
+
+
+def test_accept_rejects_missing_required_fields_and_marks_first(monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+    dialog = _ssh_dialog(name="", bastion_key="", local_port=3308)
+    try:
+        dialog.accept()
+        assert dialog.result() != QDialog.DialogCode.Accepted
+        assert "이름(별칭)" in warnings[0] and "SSH Key" in warnings[0]
+        assert "#c0392b" in dialog.input_name.styleSheet()
+        assert "#c0392b" in dialog.input_bastion_key.styleSheet()
+        assert dialog.input_bastion_host.styleSheet() == ""
+
+        # 직접 연결 모드에서는 Bastion/Endpoint가 필수가 아니다.
+        dialog.input_name.setText("ok")
+        dialog.radio_direct.setChecked(True)
+        dialog.input_remote_host.clear()
+        assert dialog._missing_required_fields() == []
+        dialog.accept()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+    finally:
+        dialog.deleteLater()
+
+
+def test_local_port_defaults_to_next_free_and_warns_on_collision(monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+
+    parent = ParentWithTunnels()
+    parent.tunnels[0]["local_port"] = 3308
+    parent.tunnels[1]["local_port"] = 3309
+    parent.tunnels[2]["local_port"] = 3310  # direct 연결은 포트를 쓰지 않는다
+    new_dialog = TunnelConfigDialog(parent)
+    assert new_dialog.input_local_port.value() == 3310
+    new_dialog.deleteLater()
+
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.No)
+    dialog = _ssh_dialog(parent, local_port=3309)
+    try:
+        dialog.accept()
+        assert asked and "3309" in asked[0]
+        assert dialog.result() != QDialog.DialogCode.Accepted
+    finally:
+        dialog.deleteLater()
+        parent.close()
+
+
+def test_credentials_usable_without_saving_and_uncheck_confirms(monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+
+    blank = TunnelConfigDialog(None, tunnel_data={"id": "t"})
+    try:
+        assert not blank.chk_save_credentials.isChecked()
+        assert blank.input_db_user.isEnabled() and blank.input_db_password.isEnabled()
+        assert blank.btn_db_test.isEnabled()
+    finally:
+        blank.deleteLater()
+
+    answers = [QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes]
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: answers.pop(0))
+    dialog = TunnelConfigDialog(None, tunnel_data={"id": "t", "db_user": "app",
+                                                   "db_password_encrypted": "enc"})
+    try:
+        dialog.chk_save_credentials.setChecked(False)  # No -> 되돌림
+        assert dialog.chk_save_credentials.isChecked()
+        assert dialog.get_data()["db_password_encrypted"] == "enc"
+        dialog.chk_save_credentials.setChecked(False)  # Yes -> 저장 시 삭제
+        assert not dialog.chk_save_credentials.isChecked()
+        assert dialog.input_db_user.text() == "app"  # 입력값은 지우지 않는다
+        assert "db_user" not in dialog.get_data()
+    finally:
+        dialog.deleteLater()
+
+
+def test_environment_is_near_name_with_description():
+    dialog = TunnelConfigDialog(None, tunnel_data={"id": "t", "environment": "production"})
+    try:
+        form = dialog._form_layout
+        env_row = form.getWidgetPosition(dialog.combo_environment)[0]
+        assert env_row == form.getWidgetPosition(dialog.input_name)[0] + 1
+        assert "스키마명 직접 입력" in dialog.lbl_environment_desc.text()
+        dialog.combo_environment.setCurrentIndex(dialog.combo_environment.findData("development"))
+        assert "확인 없이" in dialog.lbl_environment_desc.text()
+    finally:
+        dialog.deleteLater()
+
+
+def test_direct_mode_hides_ssh_only_rows():
+    dialog = TunnelConfigDialog(None, tunnel_data={"id": "t", "connection_mode": "direct"})
+    try:
+        form = dialog._form_layout
+        for widget in (dialog.input_bastion_host, dialog.key_layout_widget, dialog.input_local_port,
+                       dialog.btn_tunnel_test, dialog.btn_host_key, dialog.lbl_bastion):
+            assert not form.isRowVisible(widget)
+        dialog.radio_ssh_tunnel.setChecked(True)
+        assert form.isRowVisible(dialog.input_bastion_host)
+        assert form.isRowVisible(dialog.btn_tunnel_test)
+    finally:
+        dialog.deleteLater()
+
+
+def test_engine_change_switches_default_port_only():
+    dialog = TunnelConfigDialog(None, tunnel_data={"id": "t"})
+    try:
+        assert dialog.input_remote_port.value() == 3306
+        dialog.combo_db_engine.setCurrentIndex(dialog.combo_db_engine.findData("postgresql"))
+        assert dialog.input_remote_port.value() == 5432
+        dialog.combo_db_engine.setCurrentIndex(dialog.combo_db_engine.findData("mysql"))
+        assert dialog.input_remote_port.value() == 3306
+        dialog.input_remote_port.setValue(13306)
+        dialog.combo_db_engine.setCurrentIndex(dialog.combo_db_engine.findData("postgresql"))
+        assert dialog.input_remote_port.value() == 13306
+    finally:
+        dialog.deleteLater()

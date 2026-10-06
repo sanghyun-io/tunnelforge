@@ -1123,3 +1123,142 @@ def test_autocomplete_and_validation_find_tables_loaded_through_the_rust_connect
         assert dialog.metadata_provider.get_metadata("app").tables == {"orders", "users"}
     finally:
         close_dialog(dialog)
+
+
+# =====================================================================
+# UX 회귀: Esc 닫기 확인, 히스토리 삽입, 작은 화면, Enter 기본 버튼, 결과 저장 버튼, 스키마 트리 더블클릭
+# =====================================================================
+def test_escape_goes_through_close_confirmation(monkeypatch):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+
+    dialog = make_dialog(monkeypatch)
+    try:
+        dialog.show()
+        dialog.pending_queries = [{"query": "UPDATE users SET name = 'x'"}]
+        asked = []
+
+        def fake_question(parent, title, text, *args, **kwargs):
+            asked.append(text)
+            return QMessageBox.StandardButton.No
+
+        monkeypatch.setattr(QMessageBox, "question", fake_question)
+        dialog.editor.setFocus()
+        QTest.keyClick(dialog.editor, Qt.Key.Key_Escape)
+
+        assert asked and "미커밋" in asked[0]
+        assert dialog.isVisible()
+    finally:
+        dialog.pending_queries = []
+        close_dialog(dialog)
+
+
+def test_history_paste_inserts_at_cursor_and_is_undoable(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        dialog.editor.setPlainText("SELECT 1;\n")
+        dialog.editor.moveCursor(dialog.editor.textCursor().MoveOperation.End)
+
+        dialog._on_history_selected("SELECT 2;")
+
+        assert dialog.editor.toPlainText() == "SELECT 1;\nSELECT 2;"
+        dialog.editor.undo()
+        assert dialog.editor.toPlainText() == "SELECT 1;\n"
+    finally:
+        close_dialog(dialog)
+
+
+def test_small_screen_minimum_size_and_commit_rollback_shortcuts(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        assert dialog.minimumWidth() <= 900 and dialog.minimumHeight() <= 560
+        layout = dialog.layout()
+        assert max(layout.stretch(i) for i in range(layout.count())) == 1  # 에디터/결과가 남는 높이를 가져간다
+
+        assert dialog.shortcut_commit.key().toString() == "Ctrl+Shift+C"
+        assert dialog.shortcut_rollback.key().toString() == "Ctrl+Shift+R"
+        others = {
+            s.key().toString() for s in dialog.findChildren(type(dialog.shortcut_commit))
+            if s not in (dialog.shortcut_commit, dialog.shortcut_rollback)
+        }
+        assert not {"Ctrl+Shift+C", "Ctrl+Shift+R"} & others
+
+        called = []
+        dialog.btn_commit.clicked.disconnect()
+        dialog.btn_commit.clicked.connect(lambda: called.append("commit"))
+        dialog.shortcut_commit.activated.emit()
+        assert called == []  # 비활성 버튼이면 단축키도 무시
+        dialog.btn_commit.setEnabled(True)
+        dialog.shortcut_commit.activated.emit()
+        assert called == ["commit"]
+    finally:
+        close_dialog(dialog)
+
+
+def test_enter_in_limit_field_does_not_trigger_any_button(monkeypatch):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QPushButton
+
+    dialog = make_dialog(monkeypatch)
+    try:
+        buttons = dialog.findChildren(QPushButton)
+        assert all(not b.autoDefault() and not b.isDefault() for b in buttons)
+        clicked = []
+        for b in buttons:
+            b.clicked.connect(lambda _=False, t=b.text(): clicked.append(t))
+        dialog.show()
+        line_edit = dialog.limit_combo.lineEdit()
+        line_edit.setFocus()
+        QTest.keyClick(line_edit, Qt.Key.Key_Return)
+        assert clicked == []
+    finally:
+        close_dialog(dialog)
+
+
+def test_result_save_button_offers_shown_and_full_export(monkeypatch):
+    from PyQt6.QtWidgets import QMenu
+
+    dialog = make_dialog(monkeypatch)
+    try:
+        assert dialog.result_tabs.cornerWidget() is dialog.btn_save_result
+        menu = QMenu()
+        dialog._populate_result_save_menu(menu)
+        assert [a.isEnabled() for a in menu.actions()] == [False]  # 결과 없음
+
+        calls = []
+        monkeypatch.setattr(dialog, "_save_displayed_result", lambda t: calls.append(("shown", t)))
+        monkeypatch.setattr(dialog, "_export_result_full", lambda t: calls.append(("full", t)))
+        table = dialog._add_result_table(["id"], [[1], [2]], 0.01, "SELECT * FROM users")
+        dialog._populate_result_save_menu(menu)
+        shown, full = menu.actions()
+        assert "2행" in shown.text() and full.isEnabled()
+        shown.trigger()
+        full.trigger()
+        assert calls == [("shown", table), ("full", table)]
+
+        dialog._add_result_table(["id"], [[1]], 0.01, "DELETE FROM users RETURNING id")
+        dialog._populate_result_save_menu(menu)
+        assert not menu.actions()[1].isEnabled()
+    finally:
+        close_dialog(dialog)
+
+
+def test_schema_tree_inserts_on_double_click_not_single_click(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        metadata = SchemaMetadata()
+        metadata.tables = {"users"}
+        metadata.columns = {"users": {"id"}}
+        dialog._on_metadata_loaded(metadata)
+        dialog.editor.setPlainText("SELECT * FROM ")
+        dialog.editor.moveCursor(dialog.editor.textCursor().MoveOperation.End)
+        table_item = dialog.schema_tree.topLevelItem(0).child(0)
+
+        dialog.schema_tree.itemClicked.emit(table_item, 0)
+        assert dialog.editor.toPlainText() == "SELECT * FROM "
+
+        dialog.schema_tree.itemDoubleClicked.emit(table_item, 0)
+        assert dialog.editor.toPlainText() == "SELECT * FROM `users` "
+    finally:
+        close_dialog(dialog)

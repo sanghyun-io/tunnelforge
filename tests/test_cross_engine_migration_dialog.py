@@ -1858,3 +1858,123 @@ def test_save_report_writes_text_report(monkeypatch, tmp_path):
         assert "결과 저장 완료" in dialog.txt_verify_log.toPlainText()
     finally:
         dialog.close()
+
+
+def test_resume_button_disabled_while_target_cleanup_is_checked():
+    dialog = make_dialog()
+    try:
+        assert dialog.btn_resume.isEnabled()
+
+        dialog.chk_cleanup_before_migrate.setChecked(True)
+
+        assert not dialog.btn_resume.isEnabled()
+        assert "Target 정리" in dialog.btn_resume.toolTip()
+
+        dialog.chk_cleanup_before_migrate.setChecked(False)
+
+        assert dialog.btn_resume.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_resume_never_sends_target_cleanup(monkeypatch):
+    dialog = make_dialog()
+    started = []
+    infos = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.load_resume_state",
+        lambda _key: {"tables": [{"table": "users", "completed": True}]},
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.information",
+        lambda *args, **kwargs: infos.append(args),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda command, payload, workflow=False: started.append((command, payload)),
+    )
+    try:
+        dialog.input_approval_schema.setText("target_db")
+        dialog.chk_cleanup_before_migrate.setChecked(True)
+
+        dialog._resume_migration()
+
+        assert started[0][0] == "migrate"
+        assert started[0][1]["execution_options"]["cleanup_before_migrate"] is False
+        assert "state" in started[0][1]
+        assert infos, "사용자에게 정리 제외를 알려야 한다"
+    finally:
+        dialog.close()
+
+
+def test_step_indicator_highlights_current_step():
+    dialog = make_dialog()
+    try:
+        assert [label.text() for label in dialog.step_labels.values()] == dialog.step_titles
+
+        dialog._show_step("plan")
+
+        assert "#2563eb" in dialog.step_labels["plan"].styleSheet()
+        assert "#15803d" in dialog.step_labels["connections"].styleSheet()
+        assert "#98a2b3" in dialog.step_labels["verify"].styleSheet()
+    finally:
+        dialog.close()
+
+
+def test_execute_step_shows_summary_and_danger_run_button():
+    dialog = make_dialog()
+    try:
+        dialog.txt_schema.setPlainText('{"tables":[{"name":"a"},{"name":"b"}]}')
+        dialog._show_step("execute")
+
+        summary = dialog.lbl_execute_summary.text()
+        assert "MySQL source_db -&gt; PostgreSQL target_db" in summary
+        assert "테이블: 2개" in summary
+        assert "Target 정리: 꺼짐" in summary
+        assert dialog.btn_next.objectName() == "WizardDangerButton"
+
+        dialog.chk_cleanup_before_migrate.setChecked(True)
+        assert "#d92d20" in dialog.lbl_execute_summary.text()
+
+        dialog._show_step("plan")
+        assert dialog.btn_next.objectName() == "WizardNextButton"
+    finally:
+        dialog.close()
+
+
+def test_execution_options_use_korean_labels():
+    from PyQt6.QtWidgets import QLabel
+
+    dialog = make_dialog()
+    try:
+        labels = [label.text() for label in dialog.findChildren(QLabel)]
+        assert "create_only" not in dialog.chk_create_only.text()
+        assert "빈 Target에만 생성" in dialog.chk_create_only.text()
+        assert "배치 크기(행):" in labels
+        assert "가이드 예시 행 수:" in labels
+        assert not any(text in ("Chunk size:", "Guide rows:") for text in labels)
+    finally:
+        dialog.close()
+
+
+def test_tunnel_combo_does_not_grow_with_long_names_and_keeps_full_name_in_tooltip():
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QComboBox
+
+    tunnel_engine = FakeTunnelEngine()
+    tunnel_engine.tunnel_configs["source"]["name"] = "아주 긴 운영 데이터베이스 터널 이름 " * 4
+    dialog = CrossEngineMigrationDialog(
+        tunnel_engine=tunnel_engine,
+        config_manager=FakeConfigManager(tunnel_engine),
+    )
+    try:
+        combo = dialog.source_form.combo_tunnel
+        combo.setCurrentIndex(1)
+        assert combo.sizeAdjustPolicy() == QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        assert combo.minimumContentsLength() == 18
+        assert combo.itemData(1, Qt.ItemDataRole.ToolTipRole) == combo.itemText(1)
+        assert combo.toolTip() == combo.currentText()
+        assert dialog.minimumSizeHint().width() <= 1093
+    finally:
+        dialog.close()

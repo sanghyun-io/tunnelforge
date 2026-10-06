@@ -498,6 +498,13 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
                 return;
             }
         };
+        // A resume skips the tables its state marks completed; cleaning the target first would drop
+        // them and leave them empty while the run reports success.
+        if resume_state.is_some() && options.cleanup_before_migrate {
+            emit(json!({"event": "error", "request_id": request.request_id,
+                "message": "target cleanup cannot be combined with resume: it would drop tables the resume state skips as completed"}));
+            return;
+        }
         // Preflight blocks these too; migrate itself must not copy geometry it cannot keep.
         if source_endpoint.engine != target_endpoint.engine {
             let refused = schema.tables.iter()
@@ -2367,6 +2374,25 @@ mod tests {
         let mismatches = verify_with_adapters(&schema(), &mut source, &mut target, 2);
         assert!(mismatches.iter().any(|mismatch| mismatch["kind"] == "count"), "{mismatches:?}");
         assert!(mismatches.len() >= 3, "{mismatches:?}");
+    }
+
+    #[test]
+    fn migrate_refuses_target_cleanup_on_resume_before_connecting() {
+        let endpoint = |engine: &str| json!({"engine": engine, "host": "127.0.0.1", "port": 1, "user": "u", "password": "p", "database": "d"});
+        let events = handle_request(Request {
+            command: "migrate".to_string(),
+            request_id: None,
+            payload: json!({
+                "source_engine": "mysql", "target_engine": "postgresql",
+                "source": endpoint("mysql"), "target": endpoint("postgresql"),
+                "schema": schema(),
+                "execution_options": {"cleanup_before_migrate": true},
+                "state": {"current_phase": "copy", "direction": "mysql_to_postgresql",
+                    "tables": [{"table": "users", "completed": true, "last_key": null, "rows_copied": 1}]},
+            }),
+        });
+        let error = events.iter().find(|event| event["event"] == "error").expect("error event");
+        assert!(error["message"].as_str().unwrap().contains("cannot be combined with resume"), "{error}");
     }
 
     #[test]

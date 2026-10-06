@@ -306,7 +306,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def __init__(self, parent=None, connector: MySQLConnector = None,
                  config_manager=None, connection_info: str = "", job_context: dict = None):
         super().__init__(parent)
-        self.setWindowTitle("Rust DB Core Export (병렬 처리)")
+        self.setWindowTitle("데이터 Export")
         self.resize(600, 650)
         self.job_context = job_context or {}  # 작업 목록 기록용 프로필 정보 (id/name)
         self._job_id = None
@@ -402,7 +402,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         layout.addLayout(self._build_button_row())
 
     def _build_status_group(self):
-        status_group = QGroupBox("Rust DB Core 상태")
+        status_group = QGroupBox("Export 엔진 상태")
         status_layout = QVBoxLayout(status_group)
 
         if self.rust_dump_installed:

@@ -178,3 +178,19 @@ def test_the_rehearsal_option_is_disabled_when_no_profile_qualifies():
         assert not dialog.rehearsal_check.isEnabled()
     finally:
         dialog.close()
+
+
+def test_edit_dialog_fits_a_small_screen():
+    dialog = ScheduleEditDialog(None, [("t1", "Prod")])
+    try:
+        dialog.resize(1092, 560)
+        dialog.show()
+        _app.processEvents()
+        assert dialog.height() <= 560 and dialog.save_btn.isVisible()
+        assert dialog.save_btn.geometry().bottom() < dialog.height()
+        assert dialog.rehearsal_schema_edit.isHidden()
+        dialog.rehearsal_check.setEnabled(True)
+        dialog.rehearsal_check.setChecked(True)
+        assert not dialog.rehearsal_schema_edit.isHidden()
+    finally:
+        dialog.close()

@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
     QPushButton, QGroupBox, QRadioButton, QButtonGroup,
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox, QWidget, QTimeEdit, QTabWidget, QTextEdit,
+    QMessageBox, QWidget, QTimeEdit, QTabWidget, QTextEdit, QFrame, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTime, pyqtSignal
 
@@ -62,7 +62,16 @@ class ScheduleEditDialog(QDialog):
         self.setMinimumWidth(600)
         self.setMinimumHeight(550)
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        # 본문은 스크롤 영역에 넣고 저장/취소 행은 아래에 고정한다 (768px 화면에서도 버튼이 보이도록).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget()
+        scroll.setWidget(body)
+        outer_layout.addWidget(scroll, 1)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
         # 예약은 백업만 지원한다 (예약 SQL 실행 금지). 이전 버전의 SQL 일정은 삭제만 가능하다.
         self.unattended_note = QLabel(
             "예약 백업은 사람이 없는 상태로 실행됩니다. 처음 보는 SSH 호스트 키와 비밀번호가 필요한 SSH 개인키는 "
@@ -107,7 +116,7 @@ class ScheduleEditDialog(QDialog):
         self.save_btn.clicked.connect(self._save)
         btn_layout.addWidget(self.save_btn)
 
-        layout.addLayout(btn_layout)
+        outer_layout.addLayout(btn_layout)
 
     def _build_basic_info_group(self) -> QGroupBox:
         basic_group = QGroupBox("기본 정보")
@@ -166,6 +175,10 @@ class ScheduleEditDialog(QDialog):
         self.rehearsal_schema_edit = QLineEdit()
         self.rehearsal_schema_edit.setPlaceholderText("이미 존재하는 대상 스키마 (MySQL은 데이터베이스)")
         form.addRow("리허설 스키마:", self.rehearsal_schema_edit)
+        # 하위 필드는 체크했을 때만 펼친다.
+        for field in (self.rehearsal_tunnel_combo, self.rehearsal_database_edit, self.rehearsal_schema_edit):
+            form.setRowVisible(field, False)
+            self.rehearsal_check.toggled.connect(lambda checked, f=field: form.setRowVisible(f, checked))
         has_targets = self.rehearsal_tunnel_combo.count() > 0
         self.rehearsal_check.setEnabled(has_targets)
         if not has_targets:
@@ -694,7 +707,7 @@ class ScheduleListDialog(QDialog):
                 type_item.setToolTip("SQL 쿼리 실행")
             else:
                 type_item = QTableWidgetItem("🗄️ 백업")
-                type_item.setToolTip("Rust DB Core Export")
+                type_item.setToolTip("데이터 Export")
             self.table.setItem(row, 0, type_item)
 
             # 이름

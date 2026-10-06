@@ -219,8 +219,9 @@ class _DummyTunnelTree:
         self.updated = []
         self.buttons_set = []
 
-    def update_tunnel_status(self, tunnel_id, is_active):
+    def update_tunnel_status(self, tunnel_id, is_active, health=None, tooltip=""):
         self.updated.append((tunnel_id, is_active))
+        self.health = (health, tooltip)
 
     def set_power_button(self, tunnel_id, button):
         self.buttons_set.append((tunnel_id, button))
@@ -237,6 +238,9 @@ class _DummyHeartbeatWindow:
         self.engine = _DummyHeartbeatEngine()
         self.tunnel_tree = _DummyTunnelTree()
         self.repaint_calls = 0
+        self._last_tunnel_health = {}
+
+    _apply_tunnel_status = TunnelManagerUI._apply_tunnel_status
 
     def _build_power_button(self, tunnel, is_active):
         return f"button-{tunnel['id']}-{is_active}"
@@ -286,3 +290,149 @@ def test_dead_table_era_code_removed():
 def test_column_resize_signal_is_connected():
     source = (PROJECT_ROOT / "src" / "ui" / "main_window.py").read_text(encoding="utf-8")
     assert "header().sectionResized.connect(self._on_column_resized)" in source
+
+
+# --- 9. 연결 UX: 터널 상태(재연결/실패), 삭제 확인, 트레이 ---
+
+from types import SimpleNamespace
+
+from PyQt6.QtWidgets import QMessageBox, QSystemTrayIcon
+
+from src.core.tunnel_monitor import TunnelState, TunnelStatus
+from src.ui.controllers.tunnel_actions_controller import TunnelActionsController
+
+
+class _DummyMonitor:
+    def __init__(self, status):
+        self.status = status
+
+    def get_status(self, tunnel_id):
+        return self.status
+
+    def get_max_reconnect_attempts(self):
+        return 5
+
+
+class _Recorder:
+    def __init__(self):
+        self.messages = []
+
+    def showMessage(self, *args):
+        self.messages.append(args)
+
+
+def _health_window(status):
+    dummy = _DummyHeartbeatWindow()
+    dummy.tunnel_monitor = _DummyMonitor(status)
+    dummy._status_bar = _Recorder()
+    dummy.statusBar = lambda: dummy._status_bar
+    dummy.tray_icon = _Recorder()
+    return dummy
+
+
+def test_reconnecting_tunnel_shows_yellow_state_with_attempt_count():
+    status = TunnelStatus(tunnel_id="t2", state=TunnelState.RECONNECTING, reconnect_count=2)
+    dummy = _health_window(status)
+
+    TunnelManagerUI._update_tunnel_status_ui(dummy, "t2")
+
+    assert dummy.tunnel_tree.health == ("reconnecting", "재연결 중 (2/5)")
+    assert dummy.tray_icon.messages == []
+
+
+def test_tunnel_error_notifies_status_bar_and_tray_once():
+    status = TunnelStatus(tunnel_id="t2", state=TunnelState.ERROR, error_message="최대 재연결 시도 횟수 초과")
+    dummy = _health_window(status)
+
+    TunnelManagerUI._update_tunnel_status_ui(dummy, "t2")
+    TunnelManagerUI._update_tunnel_status_ui(dummy, "t2")
+
+    assert dummy.tunnel_tree.health[0] == "error"
+    assert "최대 재연결" in dummy.tunnel_tree.health[1]
+    assert len(dummy.tray_icon.messages) == 1
+    assert dummy.tray_icon.messages[0][2] == QSystemTrayIcon.MessageIcon.Warning
+    assert len(dummy._status_bar.messages) == 1
+
+
+def test_running_tunnel_ignores_stale_monitor_error():
+    status = TunnelStatus(tunnel_id="t1", state=TunnelState.ERROR, error_message="old")
+    dummy = _health_window(status)
+
+    TunnelManagerUI._update_tunnel_status_ui(dummy, "t1")
+
+    assert dummy.tunnel_tree.health == (None, "")
+
+
+def test_row_manage_buttons_have_no_delete_button():
+    source = inspect.getsource(TunnelManagerUI._build_manage_buttons)
+    assert "delete_tunnel" not in source
+    assert 'tr("common.delete")' not in source
+
+
+def _delete_window(schedules):
+    saved = []
+    window = SimpleNamespace(
+        engine=SimpleNamespace(is_running=lambda tid: False),
+        scheduler=SimpleNamespace(get_schedules=lambda: schedules),
+        tunnels=[{"id": "t1", "name": "운영"}],
+    )
+    controller = TunnelActionsController(window)
+    controller.save_and_refresh = lambda: saved.append(True)
+    return window, controller, saved
+
+
+def test_delete_confirm_defaults_to_no_and_mentions_schedules(monkeypatch):
+    calls = []
+
+    def fake_question(*args):
+        calls.append(args)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", fake_question)
+    schedules = [SimpleNamespace(tunnel_id="t1"), SimpleNamespace(tunnel_id="t1"), SimpleNamespace(tunnel_id="x")]
+    window, controller, saved = _delete_window(schedules)
+
+    controller.delete_tunnel(window.tunnels[0])
+
+    _, _, message, _, default_button = calls[0]
+    assert default_button == QMessageBox.StandardButton.No
+    assert "예약 백업이 2개" in message
+    assert saved == [] and len(window.tunnels) == 1
+
+
+def test_group_delete_confirm_defaults_to_no():
+    source = inspect.getsource(TunnelManagerUI._delete_group).replace("\r\n", "\n")
+    assert "QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,\n            QMessageBox.StandardButton.No," in source
+
+
+def test_tray_single_click_opens_window(monkeypatch):
+    opened = []
+    window = SimpleNamespace(bring_to_front=lambda: opened.append(True))
+    controller = TrayController(window, False)
+    monkeypatch.setattr("src.ui.controllers.tray_controller.sys.platform", "win32")
+
+    controller._on_tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
+    controller._on_tray_activated(QSystemTrayIcon.ActivationReason.Context)
+
+    assert opened == [True]
+
+
+def test_update_balloon_click_opens_about_tab_once():
+    calls = []
+    window = SimpleNamespace(
+        tray_icon=_Recorder(),
+        _pending_update_version=None,
+        bring_to_front=lambda: calls.append("front"),
+        open_settings_dialog=lambda about=False: calls.append(("settings", about)),
+    )
+
+    TunnelManagerUI._on_startup_update_available(window, "9.9.9", "https://example.invalid")
+    TunnelManagerUI._on_tray_message_clicked(window)
+    TunnelManagerUI._on_tray_message_clicked(window)
+
+    assert calls == ["front", ("settings", True), "front"]
+
+
+def test_tray_message_click_is_wired():
+    source = inspect.getsource(TrayController.init_tray)
+    assert "messageClicked.connect(window._on_tray_message_clicked)" in source

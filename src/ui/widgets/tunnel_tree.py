@@ -6,7 +6,7 @@
 
 from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView, QPushButton,
-    QHBoxLayout, QWidget, QAbstractItemView, QMenu
+    QHBoxLayout, QWidget, QAbstractItemView, QMenu, QLabel
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData
 from PyQt6.QtGui import QColor, QDrag
@@ -44,6 +44,14 @@ class TunnelTreeWidget(QTreeWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
+        # 연결이 하나도 없을 때 뷰포트 위에 띄우는 빈 상태 안내
+        self._empty_label = QLabel(self.viewport())
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setWordWrap(True)
+        self._empty_label.setStyleSheet("color: #888; font-size: 13px; padding: 24px;")
+        self._empty_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._empty_label.hide()
 
         # 컬럼 설정
         self.apply_language()
@@ -85,6 +93,11 @@ class TunnelTreeWidget(QTreeWidget):
             tr("main.status"), tr("main.name"), tr("main.local_port"), tr("main.target_host"),
             tr("main.default_schema"), tr("main.power"), tr("main.manage")
         ])
+        self._empty_label.setText(tr("tree.empty_hint"))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._empty_label.setGeometry(self.viewport().rect())
 
     def load_data(self, tunnels: list, groups: list, ungrouped_order: list):
         """데이터 로드 및 트리 구성
@@ -152,6 +165,9 @@ class TunnelTreeWidget(QTreeWidget):
                 self._tunnel_items[tunnel['id']] = tunnel_item
 
             self._ungrouped_header.setExpanded(True)
+
+        self._empty_label.setGeometry(self.viewport().rect())
+        self._empty_label.setVisible(self.topLevelItemCount() == 0)
 
     def _clear_item_widgets(self):
         """clear() 전에 setItemWidget으로 붙인 버튼 위젯을 명시적으로 제거."""
@@ -278,14 +294,22 @@ class TunnelTreeWidget(QTreeWidget):
 
         return item
 
-    def update_tunnel_status(self, tunnel_id: str, is_running: bool):
-        """터널 상태 업데이트"""
+    def update_tunnel_status(self, tunnel_id: str, is_running: bool, health=None, tooltip: str = ""):
+        """터널 상태 업데이트
+
+        health: 정지 상태일 때 모니터 상태 — 'reconnecting'(🟡) / 'error'(🔴) / None(⚪)
+        """
         if tunnel_id in self._tunnel_items:
             item = self._tunnel_items[tunnel_id]
             if is_running:
                 item.setText(0, "🟢")
+            elif health == "reconnecting":
+                item.setText(0, "🟡")
+            elif health == "error":
+                item.setText(0, "🔴")
             else:
                 item.setText(0, "⚪")
+            item.setToolTip(0, tooltip)
 
     def set_tunnel_buttons(self, tunnel_id: str, button_widget: QWidget):
         """터널 아이템에 버튼 위젯 설정"""

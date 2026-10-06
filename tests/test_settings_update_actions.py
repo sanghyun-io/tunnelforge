@@ -122,3 +122,46 @@ def test_restore_original_theme_if_unsaved_noop_when_saved(monkeypatch):
     SettingsDialog._restore_original_theme_if_unsaved(dialog)
 
     theme_mgr.set_theme.assert_not_called()
+
+
+def test_restore_backup_success_closes_dialog_so_save_cannot_overwrite(monkeypatch):
+    """백업 복원 성공 후에는 다이얼로그를 닫아, 이후 '저장'이 복원된 설정을 덮어쓰지 못하게 한다."""
+    dialog = MagicMock()
+    dialog.backup_list.currentItem.return_value.data.return_value = "backup.json"
+    dialog.config_mgr.restore_backup.return_value = (True, "복원됨")
+    monkeypatch.setattr(
+        settings.QMessageBox, "question", staticmethod(lambda *a, **k: settings.QMessageBox.StandardButton.Yes)
+    )
+    infos = []
+    monkeypatch.setattr(settings.QMessageBox, "information", staticmethod(lambda *a, **k: infos.append(a)))
+
+    SettingsDialog._restore_selected_backup(dialog)
+
+    dialog._close_after_config_replaced.assert_called_once_with()
+    dialog.save_settings.assert_not_called()
+    assert "재시작" in infos[0][2]
+
+
+def test_import_config_success_closes_dialog_so_save_cannot_overwrite(monkeypatch):
+    dialog = MagicMock()
+    dialog.config_mgr.import_config.return_value = (True, "가져옴")
+    monkeypatch.setattr(
+        settings.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: ("C:/x/config.json", ""))
+    )
+    monkeypatch.setattr(
+        settings.QMessageBox, "question", staticmethod(lambda *a, **k: settings.QMessageBox.StandardButton.Yes)
+    )
+    monkeypatch.setattr(settings.QMessageBox, "information", staticmethod(lambda *a, **k: None))
+
+    SettingsDialog._import_config(dialog)
+
+    dialog._close_after_config_replaced.assert_called_once_with()
+
+
+def test_close_after_config_replaced_reverts_theme_preview_and_accepts():
+    dialog = MagicMock()
+
+    SettingsDialog._close_after_config_replaced(dialog)
+
+    dialog._restore_original_theme_if_unsaved.assert_called_once_with()
+    dialog.accept.assert_called_once_with()

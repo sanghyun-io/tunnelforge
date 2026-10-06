@@ -1,5 +1,6 @@
 """MySQL <-> PostgreSQL migration dialog."""
 import copy
+import html
 import json
 from typing import Any, Dict, List, Optional, cast
 
@@ -131,7 +132,28 @@ _WIZARD_STYLESHEET = """
         color: #475467;
         font-weight: 600;
     }
+    QPushButton#WizardDangerButton {
+        background-color: #d92d20;
+        border: 1px solid #b42318;
+        color: #ffffff;
+        font-weight: 600;
+    }
+    QPushButton#WizardDangerButton:hover:enabled {
+        background-color: #b42318;
+    }
+    QPushButton#WizardDangerButton:disabled {
+        background-color: #fee4e2;
+        color: #f97066;
+        border: 1px solid #fecdca;
+        font-weight: 600;
+    }
 """
+
+_STEP_LABEL_STYLES = {
+    "done": "color: #15803d; padding: 2px 6px;",
+    "current": "color: #ffffff; background-color: #2563eb; border-radius: 3px; padding: 2px 6px; font-weight: 600;",
+    "todo": "color: #98a2b3; padding: 2px 6px;",
+}
 
 
 class CrossEngineMigrationDialog(QDialog):
@@ -196,6 +218,16 @@ class CrossEngineMigrationDialog(QDialog):
         layout = QVBoxLayout(self)
         self._apply_wizard_style()
 
+        # 단계 표시: 현재 위치와 전체 단계를 한 줄로 보여 준다
+        stepper_layout = QHBoxLayout()
+        self.step_labels: Dict[str, QLabel] = {}
+        for step_id, title in zip(self.step_ids, self.step_titles):
+            label = QLabel(title)
+            self.step_labels[step_id] = label
+            stepper_layout.addWidget(label)
+        stepper_layout.addStretch()
+        layout.addLayout(stepper_layout)
+
         endpoint_layout = QHBoxLayout()
         self.source_form = EndpointForm(
             "Source",
@@ -231,7 +263,10 @@ class CrossEngineMigrationDialog(QDialog):
 
         option_group = QGroupBox("실행 옵션")
         option_layout = QHBoxLayout(option_group)
-        self.chk_create_only = QCheckBox("create_only")
+        self.chk_create_only = QCheckBox("빈 Target에만 생성 (기존 데이터가 있으면 중단)")
+        self.chk_create_only.setToolTip(
+            "켜면 Target이 비어 있을 때만 테이블을 만들고 데이터를 넣습니다. 끄면 기존 Target 테이블에 이어서 추가합니다."
+        )
         self.chk_create_only.setChecked(True)
         self.spin_chunk_size = QSpinBox()
         self.spin_chunk_size.setRange(100, 100000)
@@ -240,10 +275,12 @@ class CrossEngineMigrationDialog(QDialog):
         self.spin_guide_row_limit = QSpinBox()
         self.spin_guide_row_limit.setRange(1, 1000)
         self.spin_guide_row_limit.setValue(20)
+        self.spin_chunk_size.setToolTip("한 번에 읽고 쓰는 행 수입니다. 메모리가 부족하면 줄이세요.")
+        self.spin_guide_row_limit.setToolTip("상세 가이드에서 테이블마다 보여 줄 예시 행 수입니다.")
         option_layout.addWidget(self.chk_create_only)
-        option_layout.addWidget(QLabel("Chunk size:"))
+        option_layout.addWidget(QLabel("배치 크기(행):"))
         option_layout.addWidget(self.spin_chunk_size)
-        option_layout.addWidget(QLabel("Guide rows:"))
+        option_layout.addWidget(QLabel("가이드 예시 행 수:"))
         option_layout.addWidget(self.spin_guide_row_limit)
         option_layout.addStretch()
 
@@ -300,6 +337,11 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_migration_result = QLabel("")
         self.lbl_migration_result.setWordWrap(True)
         self.lbl_migration_result.hide()
+        # 실행 직전 확인 요약: 무엇이 실행되는지 다시 보여 준다
+        self.lbl_execute_summary = QLabel("")
+        self.lbl_execute_summary.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_execute_summary.setWordWrap(True)
+        execution_layout.addWidget(self.lbl_execute_summary)
         execution_layout.addWidget(self.lbl_execution_warning)
         execution_layout.addWidget(self.input_approval_schema)
         execution_layout.addWidget(self.lbl_execution_phase)
@@ -720,6 +762,69 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_next.setEnabled(self._next_enabled_for_current_step())
         if hasattr(self, "lbl_next_hint"):
             self.lbl_next_hint.setText(self._next_hint_text())
+        if hasattr(self, "btn_resume"):
+            self._refresh_resume_button()
+        if hasattr(self, "lbl_execute_summary"):
+            self._update_execute_summary()
+        self._refresh_next_button_style()
+
+    def _refresh_next_button_style(self):
+        """DB를 바꾸는 실행 단계에서는 '다음' 버튼을 위험(빨강) 스타일로 바꾼다."""
+        if not hasattr(self, "btn_next"):
+            return
+        danger = self.current_step_id == "execute" and not self._step_completed.get("execute", False)
+        name = "WizardDangerButton" if danger else "WizardNextButton"
+        if self.btn_next.objectName() != name:
+            self.btn_next.setObjectName(name)
+            style = self.btn_next.style()
+            if style is not None:
+                style.unpolish(self.btn_next)
+                style.polish(self.btn_next)
+
+    def _refresh_resume_button(self):
+        """재개와 Target 정리는 함께 쓸 수 없다: 정리가 켜져 있으면 재개를 막는다."""
+        running = self._ui_running or bool(self.worker and self.worker.isRunning())
+        cleanup = self.chk_cleanup_before_migrate.isChecked()
+        self.btn_resume.setEnabled(not running and not cleanup)
+        if cleanup:
+            self.btn_target_advanced.setVisible(True)  # 정리를 끌 수 있는 곳을 항상 보이게
+            self.btn_resume.setToolTip(
+                "Target 정리가 켜져 있어 재개할 수 없습니다. 안전 점검 단계의 고급 설정에서 Target 정리를 끄면 재개할 수 있습니다."
+            )
+        else:
+            self.btn_resume.setToolTip("저장된 상태부터 대상 DB 변경 작업을 재개합니다.")
+
+    def _schema_table_count(self) -> int:
+        try:
+            schema = json.loads(self.txt_schema.toPlainText() or "{}")
+        except json.JSONDecodeError:
+            return 0
+        tables = schema.get("tables") if isinstance(schema, dict) else None
+        return len(tables) if isinstance(tables, list) else 0
+
+    def _update_execute_summary(self):
+        mode = "빈 Target에만 생성" if self.chk_create_only.isChecked() else "기존 Target에 추가"
+        lines = [
+            f"방향: {html.escape(self._direction_label())}",
+            f"테이블: {self._schema_table_count():,}개",
+            f"모드: {mode}",
+        ]
+        if self.chk_cleanup_before_migrate.isChecked():
+            lines.append(
+                '<span style="color:#d92d20; font-weight:600;">'
+                "Target 정리: 켜짐 - 실행 직전에 기존 Target 테이블을 삭제합니다</span>"
+            )
+        else:
+            lines.append("Target 정리: 꺼짐")
+        self.lbl_execute_summary.setText("<br>".join(lines))
+
+    def _refresh_step_indicator(self):
+        if not hasattr(self, "step_labels"):
+            return
+        current = self._current_step_index()
+        for index, step_id in enumerate(self.step_ids):
+            state = "done" if index < current else "current" if index == current else "todo"
+            self.step_labels[step_id].setStyleSheet(_STEP_LABEL_STYLES[state])
 
     def _next_hint_text(self) -> str:
         if self._ui_running or (self.worker and self.worker.isRunning()):
@@ -750,6 +855,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.current_step_id = step_id
         for page_id, page in self.step_pages.items():
             page.setVisible(page_id == step_id)
+        self._refresh_step_indicator()
         self._refresh_navigation_state()
         self._refresh_direction_summary()
 
@@ -1082,6 +1188,14 @@ class CrossEngineMigrationDialog(QDialog):
             return
         if not self._confirm_migration_execution():
             return
+        # 재개 시 Target 정리를 보내면 완료된 테이블이 삭제된 뒤 건너뛰어진다: 항상 끈다
+        if payload["execution_options"].get("cleanup_before_migrate"):
+            QMessageBox.information(
+                self,
+                "Target 정리 제외",
+                "중단 지점부터 재개할 때는 Target 정리를 실행하지 않습니다. 이미 완료된 테이블은 그대로 유지됩니다.",
+            )
+        payload["execution_options"]["cleanup_before_migrate"] = False
         payload["state"] = state
         self._start_command_with_payload("migrate", payload)
 
@@ -1134,7 +1248,6 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_run_safety,
             self.btn_guide,
             self.btn_plan,
-            self.btn_resume,
             self.btn_cleanup_failed,
             self.btn_verify,
             self.btn_close,

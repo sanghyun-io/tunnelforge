@@ -605,6 +605,45 @@ class TestTunnelMonitor:
         assert status.state == TunnelState.ERROR
         assert '최대' in status.error_message
 
+    def test_reconnect_states_notify_ui_and_keep_last_error(self):
+        """재연결 시작/최종 실패가 콜백으로 UI에 알려지고, 최종 실패에 마지막 오류가 남는다"""
+        from src.core.tunnel_monitor import TunnelStatus, TunnelState
+
+        seen = []
+        self.monitor.add_callback(lambda tid, st: seen.append(st.state))
+        status = TunnelStatus(tunnel_id='tunnel1')
+        self.monitor._statuses['tunnel1'] = status
+        self.monitor._max_reconnect_attempts = 1
+
+        with patch('threading.Thread'):
+            self.monitor._attempt_reconnect('tunnel1')
+        assert seen == [TunnelState.RECONNECTING]
+
+        status.error_message = "Connection refused"
+        self.monitor._attempt_reconnect('tunnel1')
+        assert seen[-1] == TunnelState.ERROR
+        assert "Connection refused" in status.error_message
+
+    def test_failed_attempt_with_retries_left_stays_reconnecting(self):
+        """재시도가 남은 중간 실패는 ERROR(최종 실패)로 표시하지 않는다"""
+        from src.core.tunnel_monitor import TunnelStatus, TunnelState
+
+        status = TunnelStatus(tunnel_id='tunnel1', state=TunnelState.RECONNECTING, reconnect_count=1)
+        self.monitor._statuses['tunnel1'] = status
+        self.monitor._running = True
+        self.monitor._auto_reconnect = True
+        self.mock_engine.tunnel_configs = {'tunnel1': {'id': 'tunnel1'}}
+        self.mock_engine.start_tunnel.return_value = (False, "timeout")
+
+        seen = []
+        self.monitor.add_callback(lambda tid, st: seen.append(st.state))
+        with patch('time.sleep'), patch.object(self.monitor, '_attempt_reconnect') as retry:
+            self.monitor._reconnect_after_delay('tunnel1', 0, status)
+
+        retry.assert_called_once_with('tunnel1')
+        assert seen == [TunnelState.RECONNECTING]
+        assert status.error_message == "timeout"
+
     def test_set_auto_reconnect_updates_config_manager(self):
         """자동 재연결 설정 변경 시 config_manager 업데이트"""
         mock_config = MagicMock()

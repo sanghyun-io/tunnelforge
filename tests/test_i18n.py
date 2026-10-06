@@ -131,6 +131,9 @@ def test_translate_text_handles_common_hardcoded_ui_phrases():
     assert i18n.translate_text("새로운 버전 v2.1.0이 사용 가능합니다.\n설정에서 다운로드할 수 있습니다.") == (
         "New version v2.1.0 is available.\nYou can download it in Settings."
     )
+    assert i18n.translate_text("새로운 버전 v2.1.0이 사용 가능합니다.\n이 알림을 클릭하면 다운로드 화면을 엽니다.") == (
+        "New version v2.1.0 is available.\nClick this notification to open the download page."
+    )
     assert i18n.translate_text("3개 테이블") == "3 tables"
     assert i18n.translate_text("선택: 3개") == "Select: 3"
     assert i18n.translate_text("DB 변경 실행을 사용할 수 있습니다.") == "Run DB Changes can be used."

@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
                              QWidget, QTextBrowser, QSizePolicy,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
-                             QSpinBox, QProgressBar, QApplication)
+                             QSpinBox, QProgressBar, QApplication, QScrollArea)
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont
 from src.ui.dialogs.workspace_settings_group import WorkspaceRecoverySettingsGroup
@@ -171,7 +171,12 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.workspace_group)
         layout.addStretch()
 
-        return tab
+        # 그룹이 많아 작은 화면에서 잘리지 않도록 스크롤로 감싼다
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(tab)
+        return scroll
 
     def _build_language_group(self) -> QGroupBox:
         language_group = QGroupBox(tr("settings.language"))
@@ -466,8 +471,11 @@ class SettingsDialog(QDialog):
         if reply == QMessageBox.StandardButton.Yes:
             success, msg = self.config_mgr.restore_backup(filename)
             if success:
-                QMessageBox.information(self, "복원 완료", msg + "\n\n앱을 재시작하면 변경사항이 적용됩니다.")
-                self._refresh_backup_list()
+                QMessageBox.information(
+                    self, "복원 완료",
+                    msg + "\n\n설정 창을 닫습니다. 앱을 재시작하면 변경사항이 적용됩니다."
+                )
+                self._close_after_config_replaced()
             else:
                 QMessageBox.warning(self, "복원 실패", msg)
 
@@ -505,10 +513,18 @@ class SettingsDialog(QDialog):
             if reply == QMessageBox.StandardButton.Yes:
                 success, msg = self.config_mgr.import_config(file_path)
                 if success:
-                    QMessageBox.information(self, "가져오기 완료", msg + "\n\n앱을 재시작하면 변경사항이 적용됩니다.")
-                    self._refresh_backup_list()
+                    QMessageBox.information(
+                        self, "가져오기 완료",
+                        msg + "\n\n설정 창을 닫습니다. 앱을 재시작하면 변경사항이 적용됩니다."
+                    )
+                    self._close_after_config_replaced()
                 else:
                     QMessageBox.warning(self, "가져오기 실패", msg)
+
+    def _close_after_config_replaced(self):
+        """설정 파일이 통째로 바뀌었으므로 열 당시 위젯 값으로 '저장'해 덮어쓰지 않게 바로 닫는다."""
+        self._restore_original_theme_if_unsaved()
+        self.accept()
 
     def _create_log_tab(self) -> QWidget:
         """로그 뷰어 탭 생성"""
