@@ -74,8 +74,7 @@ fn connect(endpoint: &Endpoint) -> Result<Db, String> {
     if endpoint.engine != "mysql" {
         return Err("safe promotion supports MySQL only".into());
     }
-    let pool = mysql::Pool::new(mysql_opts(endpoint)).map_err(|e| error("connect", e))?;
-    let mut conn = pool.get_conn().map_err(|e| error("connect", e))?;
+    let mut conn = mysql_conn(endpoint).map_err(|e| error("connect", e))?;
     for sql in ["SET SESSION lock_wait_timeout=2","SET SESSION innodb_lock_wait_timeout=2","SET SESSION information_schema_stats_expiry=0","SET SESSION autocommit=1","SET SESSION time_zone='+00:00'","SET SESSION sql_mode=CONCAT_WS(',', 'STRICT_ALL_TABLES','NO_AUTO_VALUE_ON_ZERO', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode,'NO_BACKSLASH_ESCAPES',''),'STRICT_TRANS_TABLES',''),'ANSI_QUOTES',''),'NO_ZERO_DATE',''),'NO_ZERO_IN_DATE',''))","SET SESSION max_error_count=65535"] {
         conn.query_drop(sql).map_err(|e|error("configure session",e))?;
     }

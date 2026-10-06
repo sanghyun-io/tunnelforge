@@ -1227,8 +1227,13 @@ fn split_tsv_line(line: &str) -> Vec<String> {
 }
 
 fn unescape_tsv_field(field: &str) -> Value {
+    unescape_tsv(field).map_or(Value::Null, Value::String)
+}
+
+/// TSV 필드의 이스케이프를 푼다. NULL 표기는 None.
+pub(crate) fn unescape_tsv(field: &str) -> Option<String> {
     if field == "\\N" {
-        return Value::Null;
+        return None;
     }
     let mut output = String::new();
     let mut chars = field.chars();
@@ -1249,7 +1254,7 @@ fn unescape_tsv_field(field: &str) -> Value {
             None => output.push('\\'),
         }
     }
-    Value::String(output)
+    Some(output)
 }
 
 fn read_jsonl_rows(path: &Path, compression: &str) -> Result<Vec<Value>, String> {
