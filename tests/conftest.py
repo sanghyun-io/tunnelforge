@@ -14,6 +14,16 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """TF_LIVE_REQUIRED=1 (CI live gate): a skipped live test is a failure, as in the Rust live tests."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.skipped and os.environ.get("TF_LIVE_REQUIRED") == "1":
+        report.outcome = "failed"
+        report.longrepr = f"skipped while TF_LIVE_REQUIRED=1: {report.longrepr}"
+
+
 @pytest.fixture(autouse=True)
 def reset_process_language():
     """Keep process-wide Qt translation state from leaking between tests."""
