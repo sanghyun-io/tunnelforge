@@ -508,7 +508,7 @@ def test_launcher_passes_tunnel_and_rerun_to_the_wizard(monkeypatch):
 def test_main_window_has_the_job_list_button_and_startup_sweep():
     tree = ast.parse((ROOT / "src/ui/main_window.py").read_text(encoding="utf-8"))
     names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
-    assert {"btn_job_list", "open_job_list_dialog"} <= names
+    assert {"act_job_list", "open_job_list_dialog"} <= names
     source = (ROOT / "src/ui/main_window.py").read_text(encoding="utf-8")
     assert "sweep_interrupted()" in source
 
@@ -543,3 +543,84 @@ def test_overwrite_import_is_recorded_as_overwrite_with_the_dialog_label(history
     finally:
         dialog._job_id = None
         dialog.close()
+
+
+# ------------------------------------------------------------------ backup management entry point (sprint 2)
+
+def test_backup_management_button_is_offered_for_import_records_with_a_report(history):
+    seed(history)
+    opened = []
+    dialog = JobListDialog(history, manage_backups=opened.append)
+    try:
+        assert not dialog.btn_backups.isHidden()
+        assert select(dialog, 1).kind == jh.KIND_EXPORT_FULL
+        assert dialog.btn_backups.isEnabled() is False
+        report = "C:/dumps/app/_tunnelforge_import_report.json"
+        direct_job = history.begin(jh.KIND_IMPORT, target="app", mode="전체 교체 Import · 스레드 4", report_path=report)
+        overwrite_job = history.begin(jh.KIND_IMPORT, target="app", mode="덮어쓰기: 검증 후 기존 이름으로 교체 · 스레드 4",
+                                      report_path=report)
+        import_job = history.begin(jh.KIND_IMPORT, target="app", mode="안전 복원: 새 대상에 복원·검증 · 스레드 4",
+                                   report_path=report)
+        dialog.reload()
+
+        def row_of(job_id):
+            return next(r for r in range(dialog.table.rowCount())
+                        if dialog.table.item(r, 0).data(Qt.ItemDataRole.UserRole) == job_id)
+        select(dialog, row_of(direct_job))
+        assert dialog.btn_backups.isEnabled() is False, "direct (non-safe) imports leave no restore journal"
+        dialog.manage_backups_selected()
+        assert opened == []
+        select(dialog, row_of(overwrite_job))
+        assert dialog.btn_backups.isEnabled() is True
+        select(dialog, row_of(import_job))
+        assert dialog.btn_backups.isEnabled() is True
+        dialog.manage_backups_selected()
+        assert [r.id for r in opened] == [import_job]
+    finally:
+        dialog.close()
+    plain = JobListDialog(history)
+    try:
+        assert plain.btn_backups.isHidden(), "no entry point without a handler"
+    finally:
+        plain.close()
+
+
+def test_main_window_opens_backup_management_from_the_report_and_profile_credentials(tmp_path, monkeypatch):
+    from src.ui.dialogs import backup_lifecycle_dialog
+    from src.ui.main_window import TunnelManagerUI
+
+    report = tmp_path / "_tunnelforge_import_report.json"
+    report.write_text(json.dumps({"original_target": {"engine": "mysql", "host": "127.0.0.1", "port": 13306,
+                                                      "database": "app", "password": "never-in-report"}}),
+                      encoding="utf-8")
+    captured = {}
+
+    class FakeDialog:
+        def __init__(self, endpoint, input_dirs, parent=None):
+            captured.update(endpoint=endpoint, input_dirs=input_dirs)
+
+        def refresh(self):
+            captured["refreshed"] = True
+
+        def exec(self):
+            pass
+
+    monkeypatch.setattr(backup_lifecycle_dialog, "BackupLifecycleDialog", FakeDialog)
+    ensured = []
+    window = SimpleNamespace(
+        config_mgr=MagicMock(load_config=lambda: {"tunnels": [{"id": "prof-1", "name": "Prod"}]},
+                             get_tunnel_credentials=lambda tid: ("u", "p")),
+        _ensure_tunnel_running=lambda tunnel, prompt: ensured.append(tunnel["id"]) or True,
+    )
+    record = jh.JobRecord(id="1", kind=jh.KIND_IMPORT, profile_id="prof-1", report_path=str(report))
+    TunnelManagerUI.open_job_backups(window, record)
+    assert ensured == ["prof-1"] and captured["refreshed"] is True
+    assert captured["input_dirs"] == [str(tmp_path)]
+    endpoint = captured["endpoint"]
+    assert (endpoint["host"], endpoint["port"], endpoint["database"]) == ("127.0.0.1", 13306, "app")
+    assert (endpoint["user"], endpoint["password"]) == ("u", "p")
+
+    captured.clear()
+    TunnelManagerUI.open_job_backups(window, jh.JobRecord(id="2", kind=jh.KIND_IMPORT, profile_id="prof-1",
+                                                          report_path=str(tmp_path / "missing.json")))
+    assert captured == {}, "no safe-restore report -> no dialog"

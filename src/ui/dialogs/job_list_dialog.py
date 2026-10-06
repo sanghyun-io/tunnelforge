@@ -48,6 +48,15 @@ STATUS_COLORS = {
 }
 # 새 사전 검증을 다시 거치는 종류만 "설정을 채워" 다시 연다.
 REOPEN_WITH_SETTINGS = (jh.KIND_EXPORT_FULL, jh.KIND_EXPORT_TABLES)
+# Import 보고서가 있는 Dump 폴더에 복원/전환 저널이 남는다 → 그 폴더로 백업 관리를 연다.
+BACKUP_KINDS = (jh.KIND_IMPORT,)
+# 저널은 안전 복원(덮어쓰기 포함) Import 에만 남는다. mode 는 Import 모드 표시 텍스트로 시작한다.
+BACKUP_MODE_PREFIXES = ("안전 복원", "덮어쓰기")
+
+
+def has_backup_journal(record: Optional[JobRecord]) -> bool:
+    return bool(record and record.kind in BACKUP_KINDS and record.report_path
+                and (record.mode or "").startswith(BACKUP_MODE_PREFIXES))
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -77,12 +86,14 @@ class _SortItem(QTableWidgetItem):
 
 
 class JobListDialog(QDialog):
-    def __init__(self, history: JobHistory, reopen: Optional[Callable[[JobRecord], None]] = None, parent=None):
+    def __init__(self, history: JobHistory, reopen: Optional[Callable[[JobRecord], None]] = None, parent=None,
+                 manage_backups: Optional[Callable[[JobRecord], None]] = None):
         super().__init__(parent)
         self.setWindowTitle("작업 목록")
         self.resize(1100, 560)
         self.history = history
         self._reopen = reopen
+        self._manage_backups = manage_backups
         self._records: List[JobRecord] = []
         self._shown: List[JobRecord] = []
 
@@ -129,14 +140,17 @@ class JobListDialog(QDialog):
         self.btn_report = QPushButton("보고서 열기")
         self.btn_error = QPushButton("실패 원인 보기")
         self.btn_reopen = QPushButton("다시 열기")
+        self.btn_backups = QPushButton("복원 백업 관리")
+        self.btn_backups.setToolTip("이 Import/안전 전환이 남긴 백업을 조회·대조·정리합니다 (앱을 다시 켠 뒤에도 사용 가능)")
         self.btn_delete = QPushButton("선택 기록 삭제")
         self.btn_clear = QPushButton("모든 기록 삭제")
         self.btn_refresh = QPushButton("새로고침")
-        for button in (self.btn_report, self.btn_error, self.btn_reopen, self.btn_delete, self.btn_clear, self.btn_refresh):
+        for button in (self.btn_report, self.btn_error, self.btn_reopen, self.btn_backups, self.btn_delete, self.btn_clear, self.btn_refresh):
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
         self.btn_reopen.setVisible(reopen is not None)
+        self.btn_backups.setVisible(manage_backups is not None)
 
         self.status_filter.currentIndexChanged.connect(self._apply_filters)
         self.kind_filter.currentIndexChanged.connect(self._apply_filters)
@@ -144,6 +158,7 @@ class JobListDialog(QDialog):
         self.btn_report.clicked.connect(self.open_report)
         self.btn_error.clicked.connect(self.show_error)
         self.btn_reopen.clicked.connect(self.reopen_selected)
+        self.btn_backups.clicked.connect(self.manage_backups_selected)
         self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_clear.clicked.connect(self.clear_all)
         self.btn_refresh.clicked.connect(self.reload)
@@ -243,6 +258,7 @@ class JobListDialog(QDialog):
         self.btn_error.setEnabled(bool(record and record.error_summary))
         self.btn_delete.setEnabled(bool(record and record.status != jh.STATUS_RUNNING))
         self.btn_reopen.setEnabled(record is not None)
+        self.btn_backups.setEnabled(has_backup_journal(record))
         if record is not None:
             self.btn_reopen.setText("같은 설정으로 다시 열기 (실행 때 새로 검증)" if record.kind in REOPEN_WITH_SETTINGS
                                     else "원래 대화상자 열기")
@@ -275,6 +291,11 @@ class JobListDialog(QDialog):
         record = self.selected_record()
         if record is not None and self._reopen is not None:
             self._reopen(record)
+
+    def manage_backups_selected(self) -> None:
+        record = self.selected_record()
+        if has_backup_journal(record) and self._manage_backups is not None:
+            self._manage_backups(record)
 
     def _confirm(self, title: str, text: str) -> bool:
         reply = QMessageBox.question(self, title, text,

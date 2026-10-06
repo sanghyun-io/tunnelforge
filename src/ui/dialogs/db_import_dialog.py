@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QWidget, QAbstractItemView,
     QSplitter, QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from typing import List, Optional
 from datetime import datetime
 import json
@@ -35,7 +35,7 @@ from src.ui.workers.error_reporting_worker import (
     report_operation_error,
     sanitize_local_diagnostic_json,
 )
-from src.ui.dialogs.job_recording import begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job
+from src.ui.dialogs.job_recording import IMPORT_REPORT_NAME, begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
@@ -752,6 +752,12 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.label_status.setStyleSheet("color: #27ae60; font-weight: bold;")
         progress_layout.addWidget(self.label_status)
 
+        # 종료(완료/실패/중지) 후 Core 보고서 파일로 가는 링크
+        self.label_report_link = QLabel()
+        self.label_report_link.setOpenExternalLinks(True)
+        self.label_report_link.setVisible(False)
+        progress_layout.addWidget(self.label_report_link)
+
         progress_main_layout.addWidget(self.progress_group)
 
         self.table_status_group = QGroupBox("테이블 Import 상태")
@@ -857,6 +863,19 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_manage_backups = QPushButton("복원 백업 관리")
         self.btn_manage_backups.clicked.connect(self.open_backup_lifecycle)
 
+        # 실행 중에만 보인다. 중지를 요청해도 창은 닫지 않고 최종 상태와 보고서를 보여 준다.
+        self.btn_stop = QPushButton("⏹ 중지")
+        self.btn_stop.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+            QPushButton:disabled { background-color: #f5b7b1; color: #f8f9f9; }
+        """)
+        self.btn_stop.setVisible(False)
+        self.btn_stop.clicked.connect(lambda: self.request_stop(close_after=False))
+
         btn_cancel = QPushButton("닫기")
         btn_cancel.setStyleSheet("""
             QPushButton {
@@ -873,6 +892,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         button_layout.addWidget(self.btn_manage_backups)
         button_layout.addStretch()
         button_layout.addWidget(self.btn_import)
+        button_layout.addWidget(self.btn_stop)
         button_layout.addWidget(btn_cancel)
         return button_layout
 
@@ -1072,6 +1092,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.radio_tz_utc.setEnabled(enabled)
         self.radio_tz_none.setEnabled(enabled)
         self.btn_import.setEnabled(enabled)
+        self.btn_stop.setVisible(not enabled)
+        if not enabled:
+            self.btn_stop.setEnabled(True)
+            self.btn_stop.setText("⏹ 중지")
         if enabled and self._is_valid_dump_dir(self.input_dir.text()):
             self._update_original_schema_option(self.input_dir.text())
 
@@ -1228,6 +1252,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         # UI 상태 변경 - 모든 입력 비활성화
         self.set_ui_enabled(False)
+        self.label_report_link.setVisible(False)
         self.btn_rerun.setVisible(False)
         self.label_rerun_hint.setVisible(False)
         self.btn_save_log.setEnabled(False)
@@ -1695,6 +1720,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # UI 상태 복구
         self.set_ui_enabled(True)
         self.btn_save_log.setEnabled(True)  # 로그 저장 버튼 활성화
+        self._show_report_link()
 
         safe_ready = (self.last_import_mode == "safe" and success
                       and self.import_audit.get("verified") is True
@@ -1728,7 +1754,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 if self._cancel_requested
                 else f"❌ Import 실패: {error_count}/{total_count} 테이블 오류"
             )
-            if self.last_import_mode == "safe":
+            if self.last_import_mode == "safe" and not self._cancel_requested:
                 self.label_status.setText(
                     "안전 복원 실패 · 원본 미변경"
                     if self.import_audit.get("original_unchanged") is True
@@ -1757,6 +1783,24 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
+
+    def _show_report_link(self):
+        """Core 가 남긴 Import 보고서가 있으면 링크로 보여 준다 (중지/실패 후에도 상태 확인용)."""
+        path = str(self.import_audit.get("report_path") or "")
+        if not path and self.last_input_dir and self.import_start_time:
+            # Core 가 경로를 알려 주지 않았으면 Dump 폴더의 보고서를 쓰되, 이번 실행 중에 쓰인 것만 쓴다
+            # (이전 실행의 보고서를 이번 결과로 오인하지 않도록).
+            # ponytail: 2초 여유는 파일시스템 타임스탬프 해상도용. 직전 실행이 2초 안에 끝났다면 구분 못 한다.
+            fallback = os.path.join(self.last_input_dir, IMPORT_REPORT_NAME)
+            if os.path.isfile(fallback) and os.path.getmtime(fallback) >= self.import_start_time.timestamp() - 2:
+                path = fallback
+        if path and os.path.isfile(path):
+            self.label_report_link.setText('<a href="{}">{}</a>'.format(
+                QUrl.fromLocalFile(path).toString(), translate_text("📄 Import 보고서 열기")))
+            self.label_report_link.setToolTip(path)
+            self.label_report_link.setVisible(True)
+        else:
+            self.label_report_link.setVisible(False)
 
     def copy_restore_target(self):
         candidate = restore_target_connection_info(self.import_audit.get("candidate_target"))
@@ -1800,6 +1844,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._cancel_requested = False
         self._promotion_action = payload["action"]
         self.set_ui_enabled(False)
+        if self._promotion_action == "plan":
+            self.btn_stop.setVisible(False)  # 읽기 전용 비교 단계: 중지할 변경이 없다
         self.btn_review_restore.setEnabled(False)
         if self._promotion_action == "confirm":
             self.import_success = None
@@ -1820,6 +1866,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             finish_promotion_job(self, success, message, result)
         self.set_ui_enabled(True)
         self.btn_save_log.setEnabled(True)
+        if action == "confirm":
+            self._show_report_link()
         if action == "confirm":
             sanitized = _sanitized_rust_event(result)
             self.import_audit["promotion_result"] = {key: sanitized.get(key) for key in (
@@ -1856,7 +1904,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 self.import_audit["restore_status"] = "promotion_failed_original_unchanged" if known_unchanged else "promotion_outcome_unknown"
                 self.import_audit["original_unchanged"] = True if known_unchanged else None
                 self.import_audit["cutover_pending"] = True if known_unchanged else None
-                self.label_status.setText("전환 차단 · 원본 미변경" if known_unchanged else "전환 결과 미확인 · 원본/백업/복원 대상의 상태를 확인하세요")
+                if self._cancel_requested:
+                    self.label_status.setText("⏹ 전환 중지됨 · 원본 미변경" if known_unchanged
+                                              else "⏹ 전환 중지됨 · 원본/백업/복원 대상의 상태를 보고서에서 확인하세요")
+                else:
+                    self.label_status.setText("전환 차단 · 원본 미변경" if known_unchanged else "전환 결과 미확인 · 원본/백업/복원 대상의 상태를 확인하세요")
                 self.btn_review_restore.setEnabled(known_unchanged)
             self._add_log(message or "Promotion result could not be verified")
             QMessageBox.warning(self, "전환 작업 확인 필요", sanitize_local_diagnostic(message) or self.label_status.text())
@@ -2100,32 +2152,51 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 f"❌ 로그 저장 중 오류가 발생했습니다.\n\n{str(e)}"
             )
 
+    def request_stop(self, close_after: bool = False) -> bool:
+        """실행 중인 Import/전환에 중지를 요청한다.
+
+        close_after=False(중지 버튼)면 창은 그대로 두고, 워커가 끝나면 최종 상태와 보고서 링크를 보여 준다.
+        """
+        if not (self.worker and self.worker.isRunning()):
+            return False
+        if self._cancel_requested:  # 이미 중지 요청됨: 닫기만 추가로 예약할 수 있다
+            self._close_after_cancel = self._close_after_cancel or close_after
+            return True
+        cancel_text = (
+            "대상 전환이 실행 중입니다. 취소하면 전환 결과를 확인하지 못할 수 있습니다. 원본·백업·복원 대상의 상태를 보고서와 DB에서 확인해야 합니다. 취소하시겠습니까?"
+            if getattr(self, "_promotion_action", "") == "confirm" else
+            "전환 검토(읽기 전용)가 실행 중입니다. 취소해도 기존 대상은 변경되지 않습니다. 취소하시겠습니까?"
+            if getattr(self, "_promotion_action", "") == "plan" else
+            "Import가 실행 중입니다.\n취소하면 전용 Rust DB Core 프로세스를 종료합니다.\n대상 스키마에 일부 데이터가 반영되었을 수 있습니다.\n\n취소하시겠습니까?"
+        )
+        reply = QMessageBox.question(
+            self,
+            translate_text("Import 실행 중"),
+            translate_text(cancel_text),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+        self._cancel_requested = True
+        self._close_after_cancel = close_after
+        self.import_audit = getattr(self, "import_audit", {})
+        self.import_audit["ui_cancel_requested"] = True
+        self.import_audit["ui_cancel_stage"] = (
+            "promotion_confirm" if getattr(self, "_promotion_action", "") == "confirm"
+            else "promotion_plan" if getattr(self, "_promotion_action", "") == "plan"
+            else "safe_restore" if getattr(self, "last_import_mode", "") == "safe" else "import"
+        )
+        self._add_log("Import 취소 요청: 전용 Rust DB Core 프로세스 종료를 요청했습니다.")
+        self.worker.cancel()
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("중지 중…")
+        self.label_status.setText(translate_text("⏹ 중지 중…"))
+        return True
+
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
             self.btn_save_log.setEnabled(True)
-            cancel_text = (
-                "대상 전환이 실행 중입니다. 취소하면 전환 결과를 확인하지 못할 수 있습니다. 원본·백업·복원 대상의 상태를 보고서와 DB에서 확인해야 합니다. 취소하시겠습니까?"
-                if getattr(self, "_promotion_action", "") == "confirm" else
-                "Import가 실행 중입니다.\n취소하면 전용 Rust DB Core 프로세스를 종료합니다.\n대상 스키마에 일부 데이터가 반영되었을 수 있습니다.\n\n취소하시겠습니까?"
-            )
-            reply = QMessageBox.question(
-                self,
-                translate_text("Import 실행 중"),
-                translate_text(cancel_text),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self._cancel_requested = True
-                self._close_after_cancel = True
-                self.import_audit = getattr(self, "import_audit", {})
-                self.import_audit["ui_cancel_requested"] = True
-                self.import_audit["ui_cancel_stage"] = (
-                    "promotion_confirm" if getattr(self, "_promotion_action", "") == "confirm"
-                    else "safe_restore" if getattr(self, "last_import_mode", "") == "safe" else "import"
-                )
-                self._add_log("Import 취소 요청: 전용 Rust DB Core 프로세스 종료를 요청했습니다.")
-                self.worker.cancel()
-                self.label_status.setText(translate_text("⏹ Import 취소 요청 중..."))
+            self.request_stop(close_after=True)
             event.ignore()
             return
         if self.connector:

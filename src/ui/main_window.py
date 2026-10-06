@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 from typing import Optional
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QMessageBox, QSystemTrayIcon,
-                             QMenu, QApplication, QDialog)
+                             QMenu, QApplication, QDialog, QToolButton)
 from PyQt6.QtCore import pyqtSlot, QTimer, Qt, QMetaObject, Q_ARG
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtGui import QAction, QIcon, QKeySequence
 
 from src.ui.styles import ButtonStyles, LabelStyles, get_full_app_style
 from src.ui.theme_manager import ThemeManager
@@ -128,6 +128,8 @@ class TunnelManagerUI(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("TunnelForge")
         self.setGeometry(100, 100, 950, 600)
+        # 1366x768@125%(논리 1092px)에서도 반쪽 스냅이 되도록 헤더를 줄였다 — 최소 폭은 800 으로 고정
+        self.setMinimumWidth(800)
 
         # 창 아이콘 설정
         icon_path = str(app_icon_path())
@@ -156,26 +158,33 @@ class TunnelManagerUI(QMainWindow):
         self.btn_add_tunnel.setStyleSheet(ButtonStyles.PRIMARY)
         self.btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
 
-        # [스키마 비교] 버튼 - Secondary 스타일
-        self.btn_schema_diff = QPushButton()
-        self.btn_schema_diff.setStyleSheet(ButtonStyles.SECONDARY)
-        self.btn_schema_diff.clicked.connect(self._open_schema_diff_dialog)
-
-        # [마이그레이션 분석] 버튼 - Secondary 스타일
-        self.btn_migration = QPushButton()
-        self.btn_migration.setStyleSheet(ButtonStyles.SECONDARY)
-        self.btn_migration.clicked.connect(self.open_migration_analyzer)
-
-        # [DB 전환] 버튼 - Secondary 스타일
-        self.btn_db_transition = QPushButton()
-        self.btn_db_transition.setStyleSheet(ButtonStyles.SECONDARY)
-        self.btn_db_transition.clicked.connect(self.open_cross_engine_migration)
-
-        # [스케줄] 버튼 - Secondary 스타일
-        self.btn_schedule = QPushButton()
-        self.btn_schedule.setStyleSheet(ButtonStyles.SECONDARY)
-        self.btn_schedule.clicked.connect(self._open_schedule_dialog)
-        self.btn_schedule.setVisible(SCHEDULE_FEATURE_ENABLED)
+        # [도구 ▾] 헤더 폭을 줄이기 위해 도구 실행 항목은 메뉴 하나로 모은다
+        self.btn_tools = QToolButton()
+        self.btn_tools.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_tools.setStyleSheet(
+            ButtonStyles.SECONDARY.replace("QPushButton", "QToolButton")
+            + "QToolButton { padding-right: 22px; }"  # 메뉴 화살표(▾ 표시) 자리를 비워 글자와 겹치지 않게 한다
+            + "QToolButton::menu-indicator { subcontrol-position: center right; right: 6px; }"
+        )
+        tools_menu = QMenu(self.btn_tools)
+        self.act_schema_diff = tools_menu.addAction("")
+        self.act_schema_diff.triggered.connect(self._open_schema_diff_dialog)
+        self.act_migration = tools_menu.addAction("")
+        self.act_migration.triggered.connect(self.open_migration_analyzer)
+        self.act_db_transition = tools_menu.addAction("")
+        self.act_db_transition.triggered.connect(self.open_cross_engine_migration)
+        tools_menu.addSeparator()
+        self.act_schedule = tools_menu.addAction("")
+        self.act_schedule.triggered.connect(self._open_schedule_dialog)
+        self.act_schedule.setVisible(SCHEDULE_FEATURE_ENABLED)
+        # [작업 목록] Export/Import/전환/이관 실행 기록
+        self.act_job_list = tools_menu.addAction("")
+        self.act_job_list.triggered.connect(self.open_job_list_dialog)
+        # [복구된 SQL] 삭제된 프로필에서 남은 작업 공간이 있을 때만 보인다 (읽기 전용 목록)
+        self.act_recovered_sql = tools_menu.addAction("")
+        self.act_recovered_sql.triggered.connect(self.open_recovered_sql_dialog)
+        self.act_recovered_sql.setVisible(False)
+        self.btn_tools.setMenu(tools_menu)
 
         # [설정] 버튼 - Secondary 스타일 (중앙화)
         self.btn_settings = QPushButton()
@@ -186,23 +195,11 @@ class TunnelManagerUI(QMainWindow):
         header_layout.addStretch()
         header_layout.addWidget(self.btn_add_group)
         header_layout.addWidget(self.btn_add_tunnel)
-        header_layout.addWidget(self.btn_schema_diff)
-        header_layout.addWidget(self.btn_migration)
-        header_layout.addWidget(self.btn_db_transition)
-        header_layout.addWidget(self.btn_schedule)
-        # [작업 목록] Export/Import/전환/이관 실행 기록
-        self.btn_job_list = QPushButton()
-        self.btn_job_list.setStyleSheet(ButtonStyles.SECONDARY)
-        self.btn_job_list.clicked.connect(self.open_job_list_dialog)
-        header_layout.addWidget(self.btn_job_list)
-        # [복구된 SQL] 삭제된 프로필에서 남은 작업 공간이 있을 때만 보인다 (읽기 전용 목록)
-        self.btn_recovered_sql = QPushButton()
-        self.btn_recovered_sql.setStyleSheet(ButtonStyles.SECONDARY)
-        self.btn_recovered_sql.clicked.connect(self.open_recovered_sql_dialog)
-        self.btn_recovered_sql.setVisible(False)
-        header_layout.addWidget(self.btn_recovered_sql)
+        header_layout.addWidget(self.btn_tools)
         header_layout.addWidget(self.btn_settings)
         layout.addLayout(header_layout)
+
+        self._init_shortcuts()
 
         # --- 트리 위젯 설정 (터널 그룹핑 지원) ---
         self.tunnel_tree = TunnelTreeWidget(self)
@@ -228,6 +225,28 @@ class TunnelManagerUI(QMainWindow):
         from src.core.job_history import sweep_interrupted
         sweep_interrupted()  # 이전 실행에서 작업 도중 종료된 기록을 '중단됨'으로 표시
 
+    def _init_shortcuts(self):
+        """창 전역 단축키. 메뉴 항목 QAction 도 창에 붙여 메뉴가 닫혀 있어도 동작한다.
+
+        모달 대화상자(SQL 에디터 등)는 별도 창이라 여기 단축키를 가로채지 않는다.
+        """
+        self.act_add_tunnel = QAction(self)
+        self.act_add_tunnel.triggered.connect(self.add_tunnel_dialog)
+        self.act_settings = QAction(self)
+        self.act_settings.triggered.connect(lambda: self.open_settings_dialog())
+        self.act_refresh = QAction(self)
+        self.act_refresh.triggered.connect(self._reload_and_refresh)
+        for action, key in (
+            (self.act_add_tunnel, "Ctrl+N"),
+            (self.act_settings, "Ctrl+,"),
+            (self.act_job_list, "Ctrl+J"),
+            (self.act_refresh, "F5"),
+        ):
+            action.setShortcut(QKeySequence(key))
+            self.addAction(action)
+        self.btn_add_tunnel.setToolTip("Ctrl+N")
+        self.btn_settings.setToolTip("Ctrl+,")
+
     def _icon_text(self, icon: str, key: str) -> str:
         return f"{icon} {tr(key)}" if icon else tr(key)
 
@@ -235,13 +254,14 @@ class TunnelManagerUI(QMainWindow):
         self.title_label.setText(self._icon_text("📡", "main.title"))
         self.btn_add_group.setText(self._icon_text("📁", "main.add_group"))
         self.btn_add_tunnel.setText(self._icon_text("➕", "main.add_tunnel"))
-        self.btn_schema_diff.setText(self._icon_text("🔀", "main.schema_diff"))
-        self.btn_migration.setText(self._icon_text("🔄", "main.migration"))
-        self.btn_db_transition.setText(tr("main.db_transition"))
-        self.btn_schedule.setText(self._icon_text("📅", "main.schedule"))
+        self.btn_tools.setText(self._icon_text("🧰", "main.tools"))
+        self.act_schema_diff.setText(self._icon_text("🔀", "main.schema_diff"))
+        self.act_migration.setText(self._icon_text("🔄", "main.migration"))
+        self.act_db_transition.setText(self._icon_text("🔁", "main.db_transition"))
+        self.act_schedule.setText(self._icon_text("📅", "main.schedule"))
         self.btn_settings.setText(self._icon_text("⚙️", "main.settings"))
-        self.btn_job_list.setText("📋 작업 목록")
-        self.btn_recovered_sql.setText("📝 복구된 SQL")
+        self.act_job_list.setText(self._icon_text("📋", "main.job_list"))
+        self.act_recovered_sql.setText(self._icon_text("📝", "main.recovered_sql"))
         self.statusBar().showMessage(tr("app.ready"))
         if hasattr(self, "tunnel_tree"):
             self.tunnel_tree.apply_language()
@@ -296,6 +316,8 @@ class TunnelManagerUI(QMainWindow):
 
     def _connect_tree_signals(self):
         """트리 위젯 시그널 연결"""
+        self.tunnel_tree.tunnel_start_requested.connect(self.start_tunnel)
+        self.tunnel_tree.tunnel_stop_requested.connect(self.stop_tunnel)
         self.tunnel_tree.tunnel_edit_requested.connect(self.edit_tunnel_dialog)
         self.tunnel_tree.tunnel_delete_requested.connect(self.delete_tunnel)
         self.tunnel_tree.tunnel_db_connect.connect(self._on_tree_db_connect)
@@ -337,9 +359,22 @@ class TunnelManagerUI(QMainWindow):
         btn_edit.setStyleSheet(ButtonStyles.EDIT)
         btn_edit.clicked.connect(lambda checked, t=tunnel: self.edit_tunnel_dialog(t))
         h_box.addWidget(btn_edit)
-        # 삭제는 오클릭 방지를 위해 우클릭 메뉴에만 둔다
+        # 삭제는 오클릭 방지를 위해 ⋯ 메뉴(= 우클릭 메뉴)에만 둔다
+        btn_more = QToolButton()
+        btn_more.setText("…")  # ⋯(U+22EF)는 맑은 고딕에 없어 폴백 글꼴 의존 → 어디서나 있는 …
+        btn_more.setStyleSheet(ButtonStyles.EDIT.replace("QPushButton", "QToolButton"))
+        btn_more.setToolTip(tr("main.more_actions"))
+        btn_more.setAccessibleName(tr("main.more_actions"))
+        btn_more.clicked.connect(lambda checked=False, t=tunnel, b=btn_more: self._show_row_menu(t, b))
+        h_box.addWidget(btn_more)
 
         return container
+
+    def _show_row_menu(self, tunnel: dict, anchor: QWidget):
+        """행의 ⋯ 버튼: 우클릭 컨텍스트 메뉴와 같은 메뉴를 버튼 아래에 띄운다."""
+        menu = QMenu(self)
+        self.tunnel_tree._build_tunnel_context_menu(menu, tunnel)
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
 
     def refresh_table(self):
         """설정 데이터와 현재 터널 상태를 기반으로 트리를 갱신합니다."""
@@ -611,7 +646,40 @@ class TunnelManagerUI(QMainWindow):
         """작업 목록 (TF-STATUS-132)"""
         from src.core.job_history import make_history
         from src.ui.dialogs.job_list_dialog import JobListDialog
-        JobListDialog(make_history(), reopen=self.reopen_job_dialog, parent=self).exec()
+        JobListDialog(make_history(), reopen=self.reopen_job_dialog, parent=self,
+                      manage_backups=self.open_job_backups).exec()
+
+    def open_job_backups(self, record):
+        """작업 목록의 Import 기록 → 복원 백업 관리. 앱을 다시 켠 뒤에도 그 Dump 폴더의 저널과
+        보고서의 원래 대상(자격 증명 없음) + 프로필에 저장된 자격 증명으로 연다."""
+        import json
+        from src.core.connection_trust import apply_registered_tls
+        from src.exporters.rust_dump_exporter import restore_target_connection_info
+        from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
+        try:
+            with open(record.report_path, encoding='utf-8') as f:
+                report = json.load(f)
+        except (OSError, ValueError):
+            report = {}
+        original = restore_target_connection_info(report.get('original_target') if isinstance(report, dict) else None)
+        if not original:
+            QMessageBox.information(self, "백업 관리", "이 기록의 Dump 폴더에서 안전 복원 보고서를 찾을 수 없습니다.")
+            return
+        tunnel = next((t for t in self.config_mgr.load_config().get('tunnels', [])
+                       if record.profile_id and t.get('id') == record.profile_id), None)
+        if tunnel is None:
+            QMessageBox.information(self, "백업 관리", "이 기록의 연결 프로필을 찾을 수 없습니다.")
+            return
+        if not self._ensure_tunnel_running(tunnel, prompt=True):
+            return
+        user, password = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(self, "백업 관리", "DB 자격 증명이 저장되어 있지 않습니다.")
+            return
+        original.update(user=user, password=password)
+        dialog = BackupLifecycleDialog(apply_registered_tls(original), [os.path.dirname(record.report_path)], self)
+        dialog.refresh()
+        dialog.exec()
 
     def reopen_job_dialog(self, record):
         """작업 목록에서 원래 대화상자를 연다. Export 만 이전 설정으로 화면을 채우고, 나머지는 설정 없이 연다
@@ -632,13 +700,13 @@ class TunnelManagerUI(QMainWindow):
         return [t.get('id') for t in self.config_mgr.load_config().get('tunnels', []) if t.get('id')]
 
     def _refresh_recovered_sql_button(self):
-        """고아 SQL 작업 공간(삭제된 프로필)이 있을 때만 '복구된 SQL' 버튼을 보인다."""
+        """고아 SQL 작업 공간(삭제된 프로필)이 있을 때만 도구 메뉴의 '복구된 SQL' 항목을 보인다."""
         try:
             from src.core.workspace_store import WorkspaceStore
             from src.ui.dialogs.recovered_sql_dialog import find_orphans
-            self.btn_recovered_sql.setVisible(bool(find_orphans(WorkspaceStore(), self._known_profile_ids())))
+            self.act_recovered_sql.setVisible(bool(find_orphans(WorkspaceStore(), self._known_profile_ids())))
         except Exception:
-            self.btn_recovered_sql.setVisible(False)
+            self.act_recovered_sql.setVisible(False)
 
     def open_recovered_sql_dialog(self):
         from src.core.workspace_store import WorkspaceStore
