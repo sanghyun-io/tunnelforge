@@ -378,4 +378,5 @@ class RustDbCursor:
 
 
 def quote_mysql_ident(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
+    """MySQL 식별자를 백틱으로 감싸고, 이름 안의 백틱은 두 번 써서 escape한다."""
+    return "`" + str(identifier).replace("`", "``") + "`"

@@ -14,6 +14,7 @@ from src.core.migration_fix_models import (
     DEFAULT_TARGET_COLLATION,
 )
 from src.core.migration_fk_graph import CollationFKGraphBuilder, build_fk_graph
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 
 class FKSafeCharsetChanger:
@@ -145,7 +146,7 @@ class FKSafeCharsetChanger:
         alter_tables = []
         for table in ordered_tables:
             alter_tables.append(
-                f"ALTER TABLE `{self.schema}`.`{table}` "
+                f"ALTER TABLE {quote_mysql_ident(self.schema)}.{quote_mysql_ident(table)} "
                 f"CONVERT TO CHARACTER SET {charset} COLLATE {collation};"
             )
 
