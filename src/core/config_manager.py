@@ -2,13 +2,11 @@ import copy
 import json
 import os
 import threading
-import uuid
 from datetime import datetime
 from typing import Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 from cryptography.fernet import Fernet
 
 from src.core.logger import get_logger
-from src.core.constants import DEFAULT_MYSQL_PORT
 from src.core.platform_paths import backups_dir, config_file, encryption_key_file, app_support_dir
 from src.core.group_manager import TunnelGroupManager
 from src.core.connection_trust import TLS_MODES
@@ -145,23 +143,8 @@ class ConfigManager:
         self._ensure_config_exists()
 
     def _default_config(self) -> dict:
-        """초기 실행 시 보여줄 더미 데이터"""
-        return {
-            "tunnels": [
-                {
-                    "id": str(uuid.uuid4()),
-                    "name": "테스트 서버 (예시)",
-                    "bastion_host": "1.2.3.4",
-                    "bastion_port": 22,
-                    "bastion_user": "ec2-user",
-                    "bastion_key": "", # 키 파일 경로 비어있음
-                    "remote_host": "rds-endpoint.amazonaws.com",
-                    "remote_port": DEFAULT_MYSQL_PORT,
-                    "db_engine": "mysql",
-                    "local_port": 3308
-                }
-            ]
-        }
+        """초기 실행 설정 — 가짜 예시 연결 없이 빈 목록으로 시작 (UI가 빈 상태 안내를 표시)"""
+        return {"tunnels": []}
 
     def _ensure_config_exists(self):
         """설정 폴더와 파일이 없으면 기본값을 생성합니다."""

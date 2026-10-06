@@ -1268,3 +1268,13 @@ def test_incomplete_choice_survives_snapshot_fallback_worker_rebuild(monkeypatch
         assert worker.kwargs["mysql_snapshot_mode"] == "single_connection"
     finally:
         dialog.close()
+
+
+def test_export_title_does_not_expose_the_engine_name(monkeypatch):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_export_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    dialog = RustDumpExportDialog()
+    try:
+        assert dialog.windowTitle() == "데이터 Export"
+    finally:
+        dialog.close()

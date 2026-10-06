@@ -53,7 +53,7 @@ from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
 from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
 from src.ui.dialogs.tunnel_status_dialog import TunnelStatusDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
-from src.core.tunnel_monitor import TunnelMonitor
+from src.core.tunnel_monitor import TunnelMonitor, TunnelState
 from src.core.mysql_login_path import MysqlLoginPathManager
 
 
@@ -95,6 +95,7 @@ class TunnelManagerUI(QMainWindow):
         self.tunnels = self.config_data.get('tunnels', [])
 
         self._update_checker_thread = None
+        self._pending_update_version = None  # 트레이 업데이트 알림 클릭 시 정보 탭을 열기 위함
         self._error_reporting_consent_policy = ConsentPolicy(self.config_mgr)
         self._init_error_reporting_prompt_lifecycle()
 
@@ -119,6 +120,7 @@ class TunnelManagerUI(QMainWindow):
                 self.scheduler.start()
 
         # TunnelMonitor 초기화
+        self._last_tunnel_health = {}  # tunnel_id -> None/'reconnecting'/'error' (실패 알림 중복 방지)
         self.tunnel_monitor = TunnelMonitor(tunnel_engine, config_manager)
         self.tunnel_monitor.add_callback(self._on_tunnel_status_changed)
         if self._start_background:
@@ -203,7 +205,7 @@ class TunnelManagerUI(QMainWindow):
         # [설정] 버튼 - Secondary 스타일 (중앙화)
         self.btn_settings = QPushButton()
         self.btn_settings.setStyleSheet(ButtonStyles.SECONDARY)
-        self.btn_settings.clicked.connect(self.open_settings_dialog)
+        self.btn_settings.clicked.connect(lambda: self.open_settings_dialog())
 
         header_layout.addWidget(self.title_label)
         header_layout.addStretch()
@@ -310,6 +312,13 @@ class TunnelManagerUI(QMainWindow):
         """트레이 아이콘 클릭 시"""
         self._tray_controller._on_tray_activated(reason)
 
+    def _on_tray_message_clicked(self):
+        """트레이 알림 클릭 시 창을 열고, 업데이트 알림이었다면 설정 > 정보 탭을 연다."""
+        self.bring_to_front()
+        if self._pending_update_version:
+            self._pending_update_version = None
+            self.open_settings_dialog(about=True)
+
     def _connect_tree_signals(self):
         """트리 위젯 시그널 연결"""
         self.tunnel_tree.tunnel_start_requested.connect(self.start_tunnel)
@@ -355,11 +364,7 @@ class TunnelManagerUI(QMainWindow):
         btn_edit.setStyleSheet(ButtonStyles.EDIT)
         btn_edit.clicked.connect(lambda checked, t=tunnel: self.edit_tunnel_dialog(t))
         h_box.addWidget(btn_edit)
-
-        btn_del = QPushButton(tr("common.delete"))
-        btn_del.setStyleSheet(ButtonStyles.DELETE)
-        btn_del.clicked.connect(lambda checked, t=tunnel: self.delete_tunnel(t))
-        h_box.addWidget(btn_del)
+        # 삭제는 오클릭 방지를 위해 우클릭 메뉴에만 둔다
 
         return container
 
@@ -381,7 +386,7 @@ class TunnelManagerUI(QMainWindow):
             is_active = self.engine.is_running(tid)
 
             # 상태 업데이트
-            self.tunnel_tree.update_tunnel_status(tid, is_active)
+            self._apply_tunnel_status(tid, is_active)
 
             # 전원 버튼 생성
             self.tunnel_tree.set_power_button(tid, self._build_power_button(tunnel, is_active))
@@ -582,7 +587,8 @@ class TunnelManagerUI(QMainWindow):
             self, "그룹 삭제",
             f"'{group['name']}' 그룹을 삭제하시겠습니까?\n\n"
             f"그룹에 속한 터널은 '그룹 없음'으로 이동됩니다.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
         if reply == QMessageBox.StandardButton.Yes:
@@ -618,9 +624,11 @@ class TunnelManagerUI(QMainWindow):
         """변경사항을 JSON 파일에 저장하고 테이블 새로고침 (기존 설정 보존)"""
         self._tunnel_actions_controller.save_and_refresh()
 
-    def open_settings_dialog(self):
-        """설정 다이얼로그 열기"""
+    def open_settings_dialog(self, about: bool = False):
+        """설정 다이얼로그 열기 (about=True면 정보 탭에서 시작)"""
         dialog = SettingsDialog(self, config_manager=self.config_mgr)
+        if about:
+            dialog.tabs.setCurrentIndex(dialog.tabs.count() - 1)  # 정보 탭은 마지막 탭
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._apply_language()
             self.refresh_table()
@@ -722,6 +730,7 @@ class TunnelManagerUI(QMainWindow):
                 logger.warning(f"Unverified DB TLS connection: {tunnel_config['name']}")
             else:
                 self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
+            self._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
             self.tray_icon.showMessage("TunnelForge", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
             self._register_login_path(tunnel_config)
         else:
@@ -1097,9 +1106,37 @@ class TunnelManagerUI(QMainWindow):
             return
 
         is_active = self.engine.is_running(tunnel_id)
-        self.tunnel_tree.update_tunnel_status(tunnel_id, is_active)
+        health = self._apply_tunnel_status(tunnel_id, is_active)
         self.tunnel_tree.set_power_button(tunnel_id, self._build_power_button(tunnel, is_active))
         self._schedule_repaint()
+
+        # 자동 재연결까지 실패해 ERROR로 끝난 순간 한 번만 알린다
+        previous = self._last_tunnel_health.get(tunnel_id)
+        self._last_tunnel_health[tunnel_id] = health
+        if health == "error" and previous != "error":
+            status = self.tunnel_monitor.get_status(tunnel_id)
+            message = f"❌ '{tunnel.get('name', tunnel_id)}' 터널 연결 실패: {status.error_message or ''}"
+            self.statusBar().showMessage(message, 10000)
+            if hasattr(self, 'tray_icon'):
+                self._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
+                self.tray_icon.showMessage(
+                    "터널 연결 실패", message, QSystemTrayIcon.MessageIcon.Warning, 5000
+                )
+
+    def _apply_tunnel_status(self, tunnel_id: str, is_active: bool):
+        """엔진 실행 여부 + 모니터 상태(재연결 중/실패)를 행 상태 아이콘에 반영한다."""
+        health, tooltip = None, ""
+        monitor = getattr(self, 'tunnel_monitor', None)
+        if not is_active and monitor:
+            status = monitor.get_status(tunnel_id)
+            if status.state == TunnelState.RECONNECTING:
+                health = "reconnecting"
+                tooltip = f"재연결 중 ({status.reconnect_count}/{monitor.get_max_reconnect_attempts()})"
+            elif status.state == TunnelState.ERROR:
+                health = "error"
+                tooltip = f"연결 실패: {status.error_message or ''}"
+        self.tunnel_tree.update_tunnel_status(tunnel_id, is_active, health, tooltip)
+        return health
 
     def open_tunnel_status_dialog(self, tunnel_id: str):
         """터널 상태 상세 다이얼로그 열기"""
@@ -1264,6 +1301,7 @@ class TunnelManagerUI(QMainWindow):
 
             # 트레이 알림 (연결된 터널이 있는 경우만)
             if connected:
+                self._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
                 self.tray_icon.showMessage(
                     "자동 연결 완료",
                     f"{len(connected)}개 터널 연결됨" + (f", {len(skipped)}개 스킵" if skipped else ""),
@@ -1272,11 +1310,11 @@ class TunnelManagerUI(QMainWindow):
                 )
 
     def _on_startup_update_available(self, latest_version: str, download_url: str):
-        """시작 시 업데이트 발견 시 트레이 알림"""
-        # 트레이 알림
+        """시작 시 업데이트 발견 시 트레이 알림 (클릭하면 설정 > 정보 탭)"""
+        self._pending_update_version = latest_version
         self.tray_icon.showMessage(
             "업데이트 사용 가능",
-            f"새로운 버전 {latest_version}이 사용 가능합니다.\n설정에서 다운로드할 수 있습니다.",
+            f"새로운 버전 {latest_version}이 사용 가능합니다.\n이 알림을 클릭하면 다운로드 화면을 엽니다.",
             QSystemTrayIcon.MessageIcon.Information,
             5000  # 5초 동안 표시
         )

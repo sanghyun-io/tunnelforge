@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QGroupBox, QRadioButton, QButtonGroup,
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
     QMessageBox, QWidget, QTimeEdit, QTabWidget, QTextEdit,
-    QPlainTextEdit, QStackedWidget, QSplitter, QFrame
+    QPlainTextEdit, QStackedWidget, QSplitter, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTime, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QColor, QTextCharFormat, QSyntaxHighlighter
@@ -163,7 +163,16 @@ class ScheduleEditDialog(QDialog):
         self.setMinimumWidth(600)
         self.setMinimumHeight(550)
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        # 본문은 스크롤 영역에 넣고 저장/취소 행은 아래에 고정한다 (768px 화면에서도 버튼이 보이도록).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget()
+        scroll.setWidget(body)
+        outer_layout.addWidget(scroll, 1)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
         # 예약은 백업만 지원한다: 작업 유형 선택은 숨기고 항상 백업으로 저장한다 (예약 SQL 실행 금지).
         self.task_type_box = self._build_task_type_group()
         self.task_type_box.setVisible(False)
@@ -186,7 +195,11 @@ class ScheduleEditDialog(QDialog):
 
         self.task_stack = QStackedWidget()
         self.task_stack.addWidget(self._build_backup_page())
-        self.task_stack.addWidget(self._build_sql_page())
+        # SQL 페이지는 레거시 SQL 일정을 열 때만 스택에 넣는다. QStackedWidget은 가장 큰 페이지에 맞춰
+        # 크기를 잡으므로, 항상 넣으면 백업 설정 그룹에 큰 빈 공간이 생긴다.
+        self._sql_page = self._build_sql_page()
+        if self.schedule is not None and self.schedule.is_sql_query_task():
+            self.task_stack.addWidget(self._sql_page)
         layout.addWidget(self.task_stack)
 
         layout.addWidget(self._build_schedule_group())
@@ -213,14 +226,14 @@ class ScheduleEditDialog(QDialog):
         self.save_btn.clicked.connect(self._save)
         btn_layout.addWidget(self.save_btn)
 
-        layout.addLayout(btn_layout)
+        outer_layout.addLayout(btn_layout)
 
     def _build_task_type_group(self) -> QGroupBox:
         type_group = QGroupBox("작업 유형")
         type_layout = QHBoxLayout(type_group)
 
         self.task_type_group = QButtonGroup(self)
-        self.backup_radio = QRadioButton("🗄️ 백업 (Rust DB Core Export)")
+        self.backup_radio = QRadioButton("🗄️ 백업 (데이터 Export)")
         self.sql_radio = QRadioButton("📝 SQL 쿼리 실행")
         self.backup_radio.setChecked(True)
 
@@ -290,6 +303,10 @@ class ScheduleEditDialog(QDialog):
         self.rehearsal_schema_edit = QLineEdit()
         self.rehearsal_schema_edit.setPlaceholderText("이미 존재하는 대상 스키마 (MySQL은 데이터베이스)")
         form.addRow("리허설 스키마:", self.rehearsal_schema_edit)
+        # 하위 필드는 체크했을 때만 펼친다.
+        for field in (self.rehearsal_tunnel_combo, self.rehearsal_database_edit, self.rehearsal_schema_edit):
+            form.setRowVisible(field, False)
+            self.rehearsal_check.toggled.connect(lambda checked, f=field: form.setRowVisible(f, checked))
         has_targets = self.rehearsal_tunnel_combo.count() > 0
         self.rehearsal_check.setEnabled(has_targets)
         if not has_targets:
@@ -986,7 +1003,7 @@ class ScheduleListDialog(QDialog):
                 type_item.setToolTip("SQL 쿼리 실행")
             else:
                 type_item = QTableWidgetItem("🗄️ 백업")
-                type_item.setToolTip("Rust DB Core Export")
+                type_item.setToolTip("데이터 Export")
             self.table.setItem(row, 0, type_item)
 
             # 이름
