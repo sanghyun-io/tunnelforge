@@ -276,3 +276,37 @@ def test_connection_test_flows_share_run_test_wrapper():
         source = inspect.getsource(method)
         assert "_run_test(" in source
         assert "dialog.exec()" not in source
+
+
+def test_dialog_scrolls_content_and_keeps_buttons_visible():
+    from PyQt6.QtWidgets import QDialogButtonBox, QScrollArea
+
+    dialog = TunnelConfigDialog(None, tunnel_data={"id": "t1", "name": "x", "db_engine": "mysql"})
+    try:
+        assert isinstance(dialog.scroll_area, QScrollArea)
+        buttons = dialog.findChild(QDialogButtonBox)
+        # 확인/취소와 통합 테스트는 스크롤 영역 밖(항상 보임)에 있다.
+        assert not dialog.scroll_area.isAncestorOf(buttons)
+        assert not dialog.scroll_area.isAncestorOf(dialog.btn_integrated_test)
+        assert dialog.scroll_area.isAncestorOf(dialog.input_db_password)
+        available = (dialog.screen() or app.primaryScreen()).availableGeometry()
+        assert dialog.height() <= int(available.height() * 0.85)
+    finally:
+        dialog.deleteLater()
+
+
+def test_dialog_group_choice_defaults_to_current_group():
+    groups = [{"id": "g1", "name": "운영"}, {"id": "g2", "name": "개발"}]
+    dialog = TunnelConfigDialog(None, tunnel_data={"id": "t1", "name": "x"}, groups=groups, current_group_id="g2")
+    try:
+        assert dialog.selected_group_id() == "g2"
+        dialog.combo_group.setCurrentIndex(dialog.combo_group.findData(None))
+        assert dialog.selected_group_id() is None
+    finally:
+        dialog.deleteLater()
+    # 그룹 목록을 주지 않으면 선택란이 없고 원래 그룹을 유지한다.
+    plain = TunnelConfigDialog(None, tunnel_data={"id": "t1"}, current_group_id="g1")
+    try:
+        assert plain.combo_group is None and plain.selected_group_id() == "g1"
+    finally:
+        plain.deleteLater()

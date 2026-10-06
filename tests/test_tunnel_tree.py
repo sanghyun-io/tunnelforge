@@ -97,3 +97,33 @@ def test_update_tunnel_status_toggles_icon_without_reload():
         assert item.text(0) == "⚪"
     finally:
         tree.close()
+
+
+def test_move_to_group_menu_moves_without_drag_and_drop():
+    from PyQt6.QtWidgets import QMenu
+
+    tree = TunnelTreeWidget()
+    try:
+        tunnel = sample_tunnel()
+        groups = [{"id": "g1", "name": "운영", "tunnel_ids": [tunnel["id"]]}, {"id": "g2", "name": "개발", "tunnel_ids": []}]
+        tree.load_data([tunnel], groups, [])
+        assert tree.tunnel_group_id(tunnel["id"]) == "g1"
+        moved, new_group = [], []
+        tree.tunnel_moved_to_group.connect(lambda tunnel_id, group_id: moved.append((tunnel_id, group_id)))
+        tree.tunnel_move_to_new_group.connect(new_group.append)
+
+        menu = QMenu()
+        tree._build_move_to_group_menu(menu, tunnel["id"])
+        submenu = menu.actions()[0].menu()
+        actions = {action.text(): action for action in submenu.actions() if action.text()}
+        assert actions["운영"].isChecked() and not actions["운영"].isEnabled()
+        actions["개발"].trigger()
+        [remove] = [action for text, action in actions.items() if "그룹에서 빼기" in text or "Remove" in text]
+        assert remove.isEnabled()
+        remove.trigger()
+        [create] = [action for text, action in actions.items() if text.startswith("➕")]
+        create.trigger()
+        assert moved == [(tunnel["id"], "g2"), (tunnel["id"], "")]
+        assert new_group == [tunnel["id"]]
+    finally:
+        tree.deleteLater()

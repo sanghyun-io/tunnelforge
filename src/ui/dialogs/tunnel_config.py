@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                              QDialogButtonBox, QFileDialog, QPushButton,
                              QHBoxLayout, QSpinBox, QLabel, QMessageBox, QApplication,
                              QRadioButton, QCheckBox, QButtonGroup, QGroupBox, QWidget,
-                             QComboBox, QMenu)
+                             QComboBox, QMenu, QScrollArea, QFrame)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
 import uuid
@@ -69,10 +69,13 @@ class _TempCredentials:
 
 
 class TunnelConfigDialog(QDialog):
-    def __init__(self, parent=None, tunnel_data=None, tunnel_engine=None):
+    def __init__(self, parent=None, tunnel_data=None, tunnel_engine=None, groups=None, current_group_id=None):
         super().__init__(parent)
         self.setWindowTitle("터널 연결 설정")
-        self.resize(500, 450)
+
+        # 그룹 선택 (None이면 그룹 선택란을 표시하지 않음)
+        self._groups = groups
+        self._current_group_id = current_group_id
 
         # 엔진 인스턴스 저장 (테스트 연결용)
         self.engine = tunnel_engine
@@ -88,7 +91,11 @@ class TunnelConfigDialog(QDialog):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        form_layout = QFormLayout()
+        # 입력 항목은 스크롤 영역에 두고, 테스트/확인 버튼은 항상 보이도록 아래에 고정한다.
+        # 섹션이 많아 화면이 작은 Windows 노트북에서 하단이 잘리던 문제.
+        content = QWidget()
+        form_layout = QFormLayout(content)
+        form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self._build_basic_info_section(form_layout)
         self._build_connection_mode_section(form_layout)
@@ -99,17 +106,54 @@ class TunnelConfigDialog(QDialog):
         self._build_local_section(form_layout)
         self._build_auth_section(form_layout)
 
-        layout.addLayout(form_layout)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setWidget(content)
+        layout.addWidget(self.scroll_area, 1)
 
         # 초기 모드에 따라 UI 상태 설정
         self.on_mode_changed()
 
         self._build_footer_section(layout)
+        self._fit_to_screen(content)
+
+    def _fit_to_screen(self, content: QWidget):
+        """내용이 다 보이면 그 크기로, 화면보다 크면 화면 높이의 85%로 열고 나머지는 스크롤한다."""
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else None
+        hint = content.sizeHint()
+        scrollbar = self.scroll_area.verticalScrollBar().sizeHint().width()
+        chrome = self.sizeHint().height() - self.scroll_area.sizeHint().height()
+        width = max(560, hint.width() + scrollbar + 32)
+        height = hint.height() + max(chrome, 0) + 24
+        if available is not None:
+            width = min(width, int(available.width() * 0.9))
+            height = min(height, int(available.height() * 0.85))
+        self.setMinimumHeight(min(360, height))
+        self.resize(width, height)
 
     def _build_basic_info_section(self, form_layout: QFormLayout):
         self.input_name = QLineEdit(self.tunnel_data.get('name', ''))
         self.input_name.setPlaceholderText("예: Project A (Master)")
         form_layout.addRow("이름(별칭):", self.input_name)
+
+        self.combo_group = None
+        if self._groups is not None:
+            self.combo_group = QComboBox()
+            self.combo_group.addItem("(그룹 없음)", None)
+            for group in self._groups:
+                self.combo_group.addItem(group.get('name', ''), group.get('id'))
+            index = self.combo_group.findData(self._current_group_id)
+            self.combo_group.setCurrentIndex(index if index >= 0 else 0)
+            form_layout.addRow("그룹:", self.combo_group)
+
+    def selected_group_id(self):
+        """선택한 그룹 ID (그룹 없음이면 None). 그룹 선택란이 없으면 원래 그룹을 유지한다."""
+        if self.combo_group is None:
+            return self._current_group_id
+        return self.combo_group.currentData()
 
     def _build_connection_mode_section(self, form_layout: QFormLayout):
         lbl_mode = QLabel("--- 연결 방식 ---")

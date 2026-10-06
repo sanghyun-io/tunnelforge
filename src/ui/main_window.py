@@ -328,6 +328,7 @@ class TunnelManagerUI(QMainWindow):
         self.tunnel_tree.group_edit_requested.connect(self._edit_group_dialog)
         self.tunnel_tree.group_delete_requested.connect(self._delete_group)
         self.tunnel_tree.tunnel_moved_to_group.connect(self._on_tunnel_moved)
+        self.tunnel_tree.tunnel_move_to_new_group.connect(self._move_tunnel_to_new_group)
         self.tunnel_tree.group_collapsed_changed.connect(
             lambda gid, collapsed: self.config_mgr.save_group_collapsed_state(gid, collapsed)
         )
@@ -527,6 +528,17 @@ class TunnelManagerUI(QMainWindow):
             self._reload_and_refresh()
         else:
             logger.warning(f"터널 이동 실패: {msg}")
+
+    def _move_tunnel_to_new_group(self, tunnel_id: str):
+        """새 그룹을 만들고 터널을 그 그룹으로 이동"""
+        accepted, result = create_group_dialog(self)
+        if not (accepted and result):
+            return
+        success, msg, group_id = self.config_mgr.add_group(result['name'], result['color'])
+        if not success:
+            QMessageBox.warning(self, "그룹 생성 실패", msg)
+            return
+        self._on_tunnel_moved(tunnel_id, group_id)
 
     # --- 그룹 관리 ---
     def add_group_dialog(self):

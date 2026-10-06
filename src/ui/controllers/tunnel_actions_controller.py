@@ -17,12 +17,13 @@ class TunnelActionsController:
     def add_tunnel_dialog(self):
         """연결 추가 팝업"""
         window = self._window
-        dialog = TunnelConfigDialog(window, tunnel_engine=window.engine)
+        dialog = TunnelConfigDialog(window, tunnel_engine=window.engine, groups=self._groups())
         if dialog.exec():
             new_data = dialog.get_data()
             new_data = self._process_credentials(new_data)
             window.tunnels.append(new_data)
             self.save_and_refresh()
+            self._apply_group(dialog, new_data["id"], None)
 
     def edit_tunnel_dialog(self, tunnel):
         """연결 수정 팝업"""
@@ -31,7 +32,9 @@ class TunnelActionsController:
             QMessageBox.warning(window, "수정 불가", "실행 중인 터널은 수정할 수 없습니다.\n먼저 연결을 중지해주세요.")
             return
 
-        dialog = TunnelConfigDialog(window, tunnel_data=tunnel, tunnel_engine=window.engine)
+        current_group = window.config_mgr.get_tunnel_group(tunnel["id"])
+        dialog = TunnelConfigDialog(window, tunnel_data=tunnel, tunnel_engine=window.engine,
+                                    groups=self._groups(), current_group_id=current_group)
         if dialog.exec():
             updated_data = dialog.get_data()
             updated_data = self._process_credentials(updated_data)
@@ -40,6 +43,7 @@ class TunnelActionsController:
                     window.tunnels[i] = updated_data
                     break
             self.save_and_refresh()
+            self._apply_group(dialog, updated_data["id"], current_group)
 
     def duplicate_tunnel(self, tunnel):
         """연결 설정 복사하여 새로 만들기"""
@@ -49,7 +53,10 @@ class TunnelActionsController:
         original_name = tunnel.get("name", "Unknown")
         new_data["name"] = f"{original_name} (복사)"
 
-        dialog = TunnelConfigDialog(window, tunnel_data=new_data, tunnel_engine=window.engine)
+        # 복사본은 원본과 같은 그룹을 기본값으로 둔다.
+        dialog = TunnelConfigDialog(window, tunnel_data=new_data, tunnel_engine=window.engine,
+                                    groups=self._groups(),
+                                    current_group_id=window.config_mgr.get_tunnel_group(tunnel["id"]))
         dialog.setWindowTitle("연결 복사 - 새 연결 만들기")
 
         if dialog.exec():
@@ -58,6 +65,7 @@ class TunnelActionsController:
             copied_data = self._process_credentials(copied_data)
             window.tunnels.append(copied_data)
             self.save_and_refresh()
+            self._apply_group(dialog, copied_data["id"], None)
             window.statusBar().showMessage(f"✅ '{copied_data['name']}' 연결이 생성되었습니다.", 3000)
 
     def delete_tunnel(self, tunnel):
@@ -77,6 +85,21 @@ class TunnelActionsController:
         if confirm == QMessageBox.StandardButton.Yes:
             window.tunnels = [existing for existing in window.tunnels if existing["id"] != tunnel["id"]]
             self.save_and_refresh()
+
+    def _groups(self):
+        return self._window.config_mgr.get_groups()
+
+    def _apply_group(self, dialog, tunnel_id, previous_group_id):
+        """다이얼로그에서 고른 그룹으로 이동 (바뀐 경우만)"""
+        window = self._window
+        chosen = dialog.selected_group_id()
+        if chosen == previous_group_id:
+            return
+        success, msg = window.config_mgr.move_tunnel_to_group(tunnel_id, chosen)
+        if success:
+            window._reload_and_refresh()
+        else:
+            QMessageBox.warning(window, "그룹 이동 실패", msg)
 
     def _process_credentials(self, tunnel_data: dict) -> dict:
         """비밀번호 암호화 처리"""

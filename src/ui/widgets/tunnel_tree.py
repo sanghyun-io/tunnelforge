@@ -36,6 +36,7 @@ class TunnelTreeWidget(QTreeWidget):
     group_edit_requested = pyqtSignal(str)       # 그룹 수정 요청
     group_delete_requested = pyqtSignal(str)     # 그룹 삭제 요청
     tunnel_moved_to_group = pyqtSignal(str, str) # (tunnel_id, group_id 또는 None)
+    tunnel_move_to_new_group = pyqtSignal(str)   # 새 그룹을 만들어 이동 (tunnel_id)
     group_collapsed_changed = pyqtSignal(str, bool)  # group_id, collapsed
 
     # 아이템 타입 상수
@@ -348,6 +349,8 @@ class TunnelTreeWidget(QTreeWidget):
         action_test = menu.addAction("🔍 " + tr("tree.test_connection"))
         action_test.triggered.connect(lambda: self.tunnel_test.emit(tunnel_data))
 
+        self._build_move_to_group_menu(menu, tunnel_data.get('id'))
+
         menu.addSeparator()
 
         action_db = menu.addAction("🔌 " + tr("tree.db_connect"))
@@ -371,6 +374,35 @@ class TunnelTreeWidget(QTreeWidget):
 
         action_delete = menu.addAction("🗑️ " + tr("common.delete"))
         action_delete.triggered.connect(lambda: self.tunnel_delete_requested.emit(tunnel_data))
+
+    def tunnel_group_id(self, tunnel_id):
+        """터널이 현재 속한 그룹 ID (그룹 없음이면 None)"""
+        item = self._tunnel_items.get(tunnel_id)
+        parent_data = item.parent().data(0, Qt.ItemDataRole.UserRole) if item and item.parent() else None
+        if parent_data and parent_data.get('type') == self.ITEM_TYPE_GROUP:
+            return parent_data.get('id')
+        return None
+
+    def _build_move_to_group_menu(self, menu, tunnel_id):
+        """드래그 앤 드롭 없이 그룹을 바꾸는 하위 메뉴"""
+        if not tunnel_id:
+            return
+        current = self.tunnel_group_id(tunnel_id)
+        submenu = menu.addMenu("📁 " + tr("tree.move_to_group"))
+        for group_id, group_item in self._group_items.items():
+            name = (group_item.data(0, Qt.ItemDataRole.UserRole) or {}).get('data', {}).get('name', group_id)
+            action = submenu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(group_id == current)
+            action.setEnabled(group_id != current)
+            action.triggered.connect(lambda _checked=False, gid=group_id: self.tunnel_moved_to_group.emit(tunnel_id, gid))
+        if self._group_items:
+            submenu.addSeparator()
+        action_remove = submenu.addAction(tr("tree.remove_from_group"))
+        action_remove.setEnabled(current is not None)
+        action_remove.triggered.connect(lambda: self.tunnel_moved_to_group.emit(tunnel_id, ""))
+        action_new = submenu.addAction("➕ " + tr("tree.new_group"))
+        action_new.triggered.connect(lambda: self.tunnel_move_to_new_group.emit(tunnel_id))
 
     def _on_item_double_clicked(self, item, column):
         """더블클릭 이벤트"""
