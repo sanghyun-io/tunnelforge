@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
     QStatusBar, QApplication, QAbstractItemView, QListWidget, QListWidgetItem, QProgressBar,
     QDialogButtonBox, QMenu, QCheckBox, QFrame, QToolTip, QLineEdit,
-    QTreeWidget, QTreeWidgetItem, QSpinBox
+    QTreeWidget, QTreeWidgetItem, QSpinBox, QToolButton
 )
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QThread, QTimer, QPoint
 from PyQt6.QtGui import (
@@ -257,7 +257,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self._metadata_connector = None  # 메타데이터 로드용 연결
 
         self.setWindowTitle(f"SQL 에디터 - {self.config.get('name', 'Unknown')}")
-        self.setMinimumSize(1000, 700)
+        self.setMinimumSize(900, 560)  # 1366x768 @125% 노트북 화면에서도 커밋/롤백·상태바가 보이도록
         self.init_ui()
         self.setup_shortcuts()
         self.refresh_databases()
@@ -330,8 +330,13 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         layout.addLayout(self._build_connection_bar())
         layout.addWidget(self._build_session_banner())
         layout.addLayout(self._build_toolbar())
-        layout.addWidget(self._build_editor_panel())
+        layout.addWidget(self._build_editor_panel(), 1)  # 남는 높이는 에디터/결과 영역이 차지
         self._build_status_bar(layout)
+
+        # LIMIT/제한시간 입력에서 Enter 가 🔄 새로고침 등 버튼을 암묵적으로 누르지 않도록
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
+            button.setDefault(False)
 
     def _build_connection_bar(self):
         conn_bar = QHBoxLayout()
@@ -402,20 +407,19 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self.query_timeout_spin.setToolTip("쿼리 제한시간 (0 = 사용 안 함). 초과하면 서버에서 취소됩니다")
         toolbar.addWidget(self.query_timeout_spin)
 
-        btn_open = QPushButton("📂 열기")
-        btn_open.setToolTip("SQL 파일 열기 (Ctrl+O)")
-        btn_open.clicked.connect(self.open_file)
-        toolbar.addWidget(btn_open)
-
-        btn_save = QPushButton("💾 저장")
-        btn_save.setToolTip("SQL 파일 저장 (Ctrl+S)")
-        btn_save.clicked.connect(self.save_file)
-        toolbar.addWidget(btn_save)
-
-        btn_history = QPushButton("📜 히스토리")
-        btn_history.setToolTip("쿼리 히스토리 보기")
-        btn_history.clicked.connect(self.show_history)
-        toolbar.addWidget(btn_history)
+        # 파일/히스토리는 작은 화면에서도 툴바가 넘치지 않도록 '⋯' 메뉴로 모은다
+        self.btn_more = QToolButton()
+        self.btn_more.setText("⋯ 파일/히스토리")
+        self.btn_more.setToolTip("SQL 파일 열기/저장, 쿼리 히스토리")
+        self.btn_more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more_menu = QMenu(self.btn_more)
+        more_menu.addAction("📂 열기 (Ctrl+O)", self.open_file)
+        more_menu.addAction("💾 저장 (Ctrl+S)", self.save_file)
+        more_menu.addAction("💾 다른 이름으로 저장 (Ctrl+Shift+S)", self.save_file_as)
+        more_menu.addSeparator()
+        more_menu.addAction("📜 히스토리", self.show_history)
+        self.btn_more.setMenu(more_menu)
+        toolbar.addWidget(self.btn_more)
 
         toolbar.addStretch()
 
@@ -457,7 +461,8 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self.schema_tree.setHeaderLabels(["이름"])
         self.schema_tree.setMinimumWidth(180)
         self.schema_tree.setStyleSheet(SCHEMA_TREE_QSS)
-        self.schema_tree.itemClicked.connect(self._on_schema_tree_item_clicked)
+        self.schema_tree.setToolTip("테이블을 더블클릭하면 에디터 커서 위치에 이름을 삽입합니다")
+        self.schema_tree.itemDoubleClicked.connect(self._on_schema_tree_item_clicked)
         schema_layout.addWidget(self.schema_tree)
         main_splitter.addWidget(schema_group)
 
@@ -538,6 +543,16 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         result_tab_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         result_tab_bar.customContextMenuRequested.connect(self._show_result_tab_context_menu)
 
+        self.btn_save_result = QToolButton()
+        self.btn_save_result.setText("💾 결과 저장")
+        self.btn_save_result.setToolTip("현재 결과 탭을 CSV/JSON 파일로 저장")
+        self.btn_save_result.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        save_result_menu = QMenu(self.btn_save_result)
+        save_result_menu.setToolTipsVisible(True)
+        save_result_menu.aboutToShow.connect(lambda m=save_result_menu: self._populate_result_save_menu(m))
+        self.btn_save_result.setMenu(save_result_menu)
+        self.result_tabs.setCornerWidget(self.btn_save_result, Qt.Corner.TopRightCorner)
+
         result_layout.addWidget(self.result_tabs)
         result_layout.addWidget(self._build_transaction_panel())
         return result_group
@@ -571,12 +586,14 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
 
         self.btn_commit = QPushButton("✅ 커밋")
         self.btn_commit.setStyleSheet(COMMIT_BUTTON_QSS)
+        self.btn_commit.setToolTip("트랜잭션 커밋 (Ctrl+Shift+C)")
         self.btn_commit.clicked.connect(self._do_commit)
         self.btn_commit.setEnabled(False)
         tx_header_layout.addWidget(self.btn_commit)
 
         self.btn_rollback = QPushButton("↩️ 롤백")
         self.btn_rollback.setStyleSheet(ROLLBACK_BUTTON_QSS)
+        self.btn_rollback.setToolTip("트랜잭션 롤백 (Ctrl+Shift+R)")
         self.btn_rollback.clicked.connect(self._do_rollback)
         self.btn_rollback.setEnabled(False)
         tx_header_layout.addWidget(self.btn_rollback)
@@ -648,6 +665,12 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         # Ctrl+Shift+Tab: 이전 탭
         self.shortcut_prev_tab = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
         self.shortcut_prev_tab.activated.connect(self._prev_tab)
+
+        # Ctrl+Shift+C / Ctrl+Shift+R: 커밋 / 롤백 (버튼이 비활성이면 click()이 무시됨)
+        self.shortcut_commit = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
+        self.shortcut_commit.activated.connect(self.btn_commit.click)
+        self.shortcut_rollback = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
+        self.shortcut_rollback.activated.connect(self.btn_rollback.click)
 
     # =====================================================================
     # 에디터 탭 관리
@@ -1885,15 +1908,8 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         copy_header_action.triggered.connect(lambda: self._copy_table_data(table, columns, True))
 
         menu.addSeparator()
-        save_shown_action = menu.addAction("💾 표시된 결과 저장 (CSV/JSON)...")
-        save_shown_action.setToolTip("화면에 받은 행만 저장합니다 (결과 상한이 적용된 행)")
-        save_shown_action.triggered.connect(lambda: self._save_displayed_result(table))
-        save_full_action = menu.addAction("💾 전체 결과를 파일로 (쿼리 재실행)...")
-        save_full_action.setToolTip("쿼리를 다시 실행해 모든 행을 파일로 직접 저장합니다 (행 상한 없음)")
-        save_full_action.triggered.connect(lambda: self._export_result_full(table))
-        if not is_export_safe_query(getattr(table, '_source_query', '')):
-            save_full_action.setEnabled(False)
-            save_full_action.setToolTip("데이터를 변경할 수 있는 쿼리는 재실행 저장을 지원하지 않습니다 (표시된 결과 저장 사용)")
+        menu.setToolTipsVisible(True)
+        self._add_result_save_actions(menu, table)
 
         # 편집 기능 메뉴
         ctx = getattr(table, '_edit_context', None)
@@ -1916,6 +1932,27 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
             info.setEnabled(False)
 
         menu.exec(table.mapToGlobal(position))
+
+    def _add_result_save_actions(self, menu, table):
+        """결과 저장 액션 2종 (표시된 행 / 쿼리 재실행 전체 행) — 컨텍스트 메뉴와 '결과 저장' 버튼 공용"""
+        save_shown_action = menu.addAction(f"💾 표시된 {table.rowCount()}행만 저장 (CSV/JSON)...")
+        save_shown_action.setToolTip("화면에 받은 행만 저장합니다 (결과 상한이 적용된 행)")
+        save_shown_action.triggered.connect(lambda: self._save_displayed_result(table))
+        save_full_action = menu.addAction("💾 전체 행 저장 (쿼리 재실행)...")
+        save_full_action.setToolTip("쿼리를 다시 실행해 모든 행을 파일로 직접 저장합니다 (행 상한 없음)")
+        save_full_action.triggered.connect(lambda: self._export_result_full(table))
+        if not is_export_safe_query(getattr(table, '_source_query', '')):
+            save_full_action.setEnabled(False)
+            save_full_action.setToolTip("데이터를 변경할 수 있는 쿼리는 재실행 저장을 지원하지 않습니다 (표시된 결과 저장 사용)")
+        return save_shown_action, save_full_action
+
+    def _populate_result_save_menu(self, menu):
+        menu.clear()
+        table = self.result_tabs.currentWidget()
+        if not isinstance(table, QTableWidget):
+            menu.addAction("저장할 결과가 없습니다").setEnabled(False)
+            return
+        self._add_result_save_actions(menu, table)
 
     def _copy_table_data(self, table, columns, include_header):
         """테이블 데이터를 탭 구분 형식으로 클립보드에 복사 (Excel 호환)
@@ -2319,7 +2356,9 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
 
     def _on_history_selected(self, query):
         """히스토리에서 쿼리 선택됨"""
-        self.editor.setPlainText(query)
+        if self.editor:
+            # 현재 탭을 덮어쓰지 않고 커서 위치에 삽입 (Ctrl+Z 로 되돌릴 수 있음)
+            self.editor.insertPlainText(query)
 
     # =====================================================================
     # SQL 검증 및 자동완성
@@ -2620,6 +2659,10 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
     def _on_autocomplete_ready(self, completions: list):
         """자동완성 목록 준비됨"""
         self.editor.show_autocomplete_popup(completions)
+
+    def reject(self):
+        """Esc 도 창 닫기 버튼과 같은 closeEvent 확인(미커밋/실행 중 쿼리) 경로를 거치게 한다."""
+        self.close()
 
     def closeEvent(self, event):
         """다이얼로그 닫기.
