@@ -730,6 +730,7 @@ class TunnelManagerUI(QMainWindow):
                 logger.warning(f"Unverified DB TLS connection: {tunnel_config['name']}")
             else:
                 self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
+            self._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
             self.tray_icon.showMessage("TunnelForge", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
             self._register_login_path(tunnel_config)
         else:
@@ -1117,6 +1118,7 @@ class TunnelManagerUI(QMainWindow):
             message = f"❌ '{tunnel.get('name', tunnel_id)}' 터널 연결 실패: {status.error_message or ''}"
             self.statusBar().showMessage(message, 10000)
             if hasattr(self, 'tray_icon'):
+                self._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
                 self.tray_icon.showMessage(
                     "터널 연결 실패", message, QSystemTrayIcon.MessageIcon.Warning, 5000
                 )
@@ -1299,6 +1301,7 @@ class TunnelManagerUI(QMainWindow):
 
             # 트레이 알림 (연결된 터널이 있는 경우만)
             if connected:
+                self._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
                 self.tray_icon.showMessage(
                     "자동 연결 완료",
                     f"{len(connected)}개 터널 연결됨" + (f", {len(skipped)}개 스킵" if skipped else ""),

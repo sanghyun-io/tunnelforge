@@ -787,8 +787,9 @@ class CrossEngineMigrationDialog(QDialog):
         cleanup = self.chk_cleanup_before_migrate.isChecked()
         self.btn_resume.setEnabled(not running and not cleanup)
         if cleanup:
+            self.btn_target_advanced.setVisible(True)  # 정리를 끌 수 있는 곳을 항상 보이게
             self.btn_resume.setToolTip(
-                "Target 정리가 켜져 있으면 재개할 수 없습니다. 재개하면 이미 완료된 테이블이 삭제된 뒤 건너뛰어집니다."
+                "Target 정리가 켜져 있어 재개할 수 없습니다. 안전 점검 단계의 고급 설정에서 Target 정리를 끄면 재개할 수 있습니다."
             )
         else:
             self.btn_resume.setToolTip("저장된 상태부터 대상 DB 변경 작업을 재개합니다.")

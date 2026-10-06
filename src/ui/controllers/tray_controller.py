@@ -118,6 +118,7 @@ class TrayController:
         failure_title: str,
     ):
         if success:
+            self._window._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
             self._window.tray_icon.showMessage(
                 success_title,
                 f"{schedule_name} 백업이 완료되었습니다.",
@@ -125,6 +126,7 @@ class TrayController:
                 3000,
             )
         else:
+            self._window._pending_update_version = None  # 업데이트 외 알림 클릭이 정보 탭을 열지 않도록
             self._window.tray_icon.showMessage(
                 failure_title,
                 f"{schedule_name}: {message}",

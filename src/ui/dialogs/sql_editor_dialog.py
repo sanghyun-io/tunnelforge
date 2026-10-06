@@ -1943,7 +1943,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         save_full_action.triggered.connect(lambda: self._export_result_full(table))
         if not is_export_safe_query(getattr(table, '_source_query', '')):
             save_full_action.setEnabled(False)
-            save_full_action.setToolTip("데이터를 변경할 수 있는 쿼리는 재실행 저장을 지원하지 않습니다 (표시된 결과 저장 사용)")
+            save_full_action.setToolTip("데이터를 변경할 수 있는 쿼리는 재실행 저장을 지원하지 않습니다 (표시된 행만 저장 사용)")
         return save_shown_action, save_full_action
 
     def _populate_result_save_menu(self, menu):
@@ -2358,6 +2358,9 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         """히스토리에서 쿼리 선택됨"""
         if self.editor:
             # 현재 탭을 덮어쓰지 않고 커서 위치에 삽입 (Ctrl+Z 로 되돌릴 수 있음)
+            cursor = self.editor.textCursor()
+            if not cursor.atBlockStart():
+                query = "\n" + query  # 기존 문장 뒤에 붙지 않도록 새 줄에서 시작
             self.editor.insertPlainText(query)
 
     # =====================================================================

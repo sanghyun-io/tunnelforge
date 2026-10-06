@@ -169,7 +169,7 @@ class TunnelTreeWidget(QTreeWidget):
             self._ungrouped_header.setExpanded(True)
 
         self._empty_label.setGeometry(self.viewport().rect())
-        self._empty_label.setVisible(not tunnels)
+        self._empty_label.setVisible(self.topLevelItemCount() == 0)
 
     def _clear_item_widgets(self):
         """clear() 전에 setItemWidget으로 붙인 버튼 위젯을 명시적으로 제거."""

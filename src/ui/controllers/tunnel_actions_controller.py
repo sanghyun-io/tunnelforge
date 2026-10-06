@@ -52,6 +52,7 @@ class TunnelActionsController:
         new_data["id"] = str(uuid.uuid4())
         original_name = tunnel.get("name", "Unknown")
         new_data["name"] = f"{original_name} (복사)"
+        new_data.pop("local_port", None)  # 복사본은 새 연결처럼 비어 있는 다음 포트를 받는다
 
         # 복사본은 원본과 같은 그룹을 기본값으로 둔다.
         dialog = TunnelConfigDialog(window, tunnel_data=new_data, tunnel_engine=window.engine,
@@ -78,7 +79,7 @@ class TunnelActionsController:
         message = f"'{tunnel['name']}' 연결 설정을 삭제하시겠습니까?"
         scheduler = getattr(window, "scheduler", None)
         if scheduler:
-            schedule_count = sum(1 for s in scheduler.get_schedules() if s.tunnel_id == tunnel["id"])
+            schedule_count = sum(1 for s in scheduler.get_schedules() if tunnel["id"] in (s.tunnel_id, getattr(s, "rehearsal_tunnel_id", None)))
             if schedule_count:
                 message += f"\n\n⚠️ 이 연결을 사용하는 예약 백업이 {schedule_count}개 있습니다."
 

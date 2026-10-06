@@ -455,10 +455,14 @@ class TunnelConfigDialog(QDialog):
 
         # 체크박스는 저장 여부만 정한다. 입력과 DB 인증 테스트는 항상 사용할 수 있다.
         self.chk_save_credentials = QCheckBox("DB 자격 증명 저장")
-        self.chk_save_credentials.setToolTip("암호화하여 저장합니다. 해제해도 입력한 값으로 테스트할 수 있습니다.")
+        self.chk_save_credentials.setToolTip("암호화하여 저장합니다. 체크하지 않아도 입력한 값으로 테스트할 수 있습니다.")
+        # 사용자가 체크박스를 직접 고르지 않았다면, 자격 증명을 입력하는 순간 저장을 켠다(입력값이 조용히 버려지지 않도록).
+        self._credentials_choice_made = False
+        self.chk_save_credentials.clicked.connect(lambda _checked: setattr(self, '_credentials_choice_made', True))
         form_layout.addRow(self.chk_save_credentials)
 
         self.input_db_user = QLineEdit(self.tunnel_data.get('db_user', ''))
+        self.input_db_user.textEdited.connect(self._auto_check_save_credentials)
         self.input_db_user.setPlaceholderText("DB 사용자명")
         form_layout.addRow("DB User:", self.input_db_user)
 
@@ -512,13 +516,17 @@ class TunnelConfigDialog(QDialog):
             self._form_layout.setRowVisible(widget, is_ssh_mode)
         self.btn_copy_bastion.setEnabled(is_ssh_mode and bool(self.bastion_templates))
 
+    def _auto_check_save_credentials(self, text):
+        if text and not self._credentials_choice_made and not self.chk_save_credentials.isChecked():
+            self.chk_save_credentials.setChecked(True)
+
     def _on_save_credentials_toggled(self, checked):
         """저장된 자격 증명이 있는데 저장을 해제하면, 저장 시 삭제된다는 것을 확인받는다."""
         if checked or not self.tunnel_data.get('db_user'):
             return
         answer = QMessageBox.question(
             self, "DB 자격 증명 저장 해제",
-            "저장된 DB 자격 증명이 저장 시 삭제됩니다.\n계속하시겠습니까?",
+            "연결을 저장하면 저장된 DB 자격 증명이 삭제됩니다.\n계속하시겠습니까?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

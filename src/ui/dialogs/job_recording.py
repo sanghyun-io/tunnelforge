@@ -29,7 +29,7 @@ def _profile(context: Optional[Dict[str, Any]], fallback_name: str = "") -> Dict
 _SNAPSHOT_LABELS = {
     "parallel_strict": "일관 스냅샷(병렬)",
     "single_connection": "일관 스냅샷(단일 연결)",
-    "parallel_no_backup_lock": "락 없는 단일 연결 스냅샷",
+    "parallel_no_backup_lock": "락 없는 스냅샷(단일 워커)",
 }
 _COMPRESSION_LABELS = {"none": "압축 안 함", "zstd": "zstd 압축"}
 
