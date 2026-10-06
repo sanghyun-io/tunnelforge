@@ -141,6 +141,10 @@ class TestConfigManager:
         assert 'tunnels' in config
         assert isinstance(config['tunnels'], list)
 
+    def test_first_run_has_no_fake_example_tunnel(self):
+        """첫 실행 시 가짜 예시 연결(1.2.3.4)을 넣지 않는다"""
+        assert self.config_mgr.load_config()['tunnels'] == []
+
     def test_save_config(self, sample_config_data):
         """설정 저장 테스트"""
         self.config_mgr.save_config(sample_config_data)
@@ -693,7 +697,8 @@ class TestConfigManager:
             'auto_update_check': True,
         }
 
-    def test_known_host_round_trip(self):
+    def test_known_host_round_trip(self, sample_config_data):
+        self.config_mgr.save_config(sample_config_data)
         assert self.config_mgr.get_known_host("Bastion", 22) is None
         entry = {"key_type": "ssh-ed25519", "key_b64": "AAAA", "fingerprint": "SHA256:x"}
         self.config_mgr.save_known_host("Bastion", 22, entry)

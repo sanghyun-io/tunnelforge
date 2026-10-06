@@ -380,11 +380,13 @@ class TunnelMonitor:
             # 최대 재연결 시도 횟수 체크
             if status.reconnect_count >= self._max_reconnect_attempts:
                 status.state = TunnelState.ERROR
-                status.error_message = "최대 재연결 시도 횟수 초과"
+                last_error = status.error_message
+                status.error_message = "최대 재연결 시도 횟수 초과" + (f" ({last_error})" if last_error else "")
                 self._add_event(
                     tunnel_id, "error",
                     f"재연결 실패 (시도 {status.reconnect_count}회)"
                 )
+                self._notify_callbacks(tunnel_id, status)
                 return
 
             # 백오프 딜레이: RECONNECT_BACKOFF_SECONDS 참조 (증가 정책은 모듈 상수 주석 참조)
@@ -397,6 +399,7 @@ class TunnelMonitor:
                 tunnel_id, "reconnecting",
                 f"재연결 시도 {status.reconnect_count}/{self._max_reconnect_attempts} ({delay}초 대기)"
             )
+            self._notify_callbacks(tunnel_id, status)
 
         # 별도 스레드에서 재연결 시도 (락을 점유하지 않은 상태로 예약)
         threading.Thread(
@@ -447,9 +450,11 @@ class TunnelMonitor:
                     status.error_message = None
                     self._add_event(tunnel_id, "reconnected", "자동 재연결 성공")
                 else:
-                    status.state = TunnelState.ERROR
                     status.error_message = msg
                     should_retry = self._auto_reconnect and self._running
+                    # 재시도가 남아 있으면 RECONNECTING 유지 — ERROR는 최종 실패에만 쓴다
+                    if not should_retry:
+                        status.state = TunnelState.ERROR
 
                 self._notify_callbacks(tunnel_id, status)
 
@@ -463,6 +468,7 @@ class TunnelMonitor:
             with self._lock:
                 status.state = TunnelState.ERROR
                 status.error_message = str(e)
+                self._notify_callbacks(tunnel_id, status)
 
     def _add_event(self, tunnel_id: str, event_type: str, message: str):
         """이벤트 추가"""

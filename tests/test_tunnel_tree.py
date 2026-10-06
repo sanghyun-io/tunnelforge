@@ -99,6 +99,41 @@ def test_update_tunnel_status_toggles_icon_without_reload():
         tree.close()
 
 
+def test_update_tunnel_status_shows_reconnecting_and_error_with_tooltip():
+    tree = TunnelTreeWidget()
+    try:
+        tunnel = sample_tunnel()
+        tree.load_data([tunnel], [], [])
+        item = tree._tunnel_items[tunnel["id"]]
+
+        tree.update_tunnel_status(tunnel["id"], False, "reconnecting", "재연결 중 (2/5)")
+        assert item.text(0) == "🟡"
+        assert item.toolTip(0) == "재연결 중 (2/5)"
+
+        tree.update_tunnel_status(tunnel["id"], False, "error", "연결 실패: timeout")
+        assert item.text(0) == "🔴"
+        assert item.toolTip(0) == "연결 실패: timeout"
+
+        tree.update_tunnel_status(tunnel["id"], True)
+        assert item.text(0) == "🟢"
+        assert item.toolTip(0) == ""
+    finally:
+        tree.close()
+
+
+def test_empty_state_hint_only_when_no_tunnels():
+    tree = TunnelTreeWidget()
+    try:
+        tree.load_data([], [], [])
+        assert not tree._empty_label.isHidden()
+        assert "연결 추가" in tree._empty_label.text() or "Add Connection" in tree._empty_label.text()
+
+        tree.load_data([sample_tunnel()], [], [])
+        assert tree._empty_label.isHidden()
+    finally:
+        tree.close()
+
+
 def test_move_to_group_menu_moves_without_drag_and_drop():
     from PyQt6.QtWidgets import QMenu
 
