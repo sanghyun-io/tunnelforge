@@ -194,7 +194,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
             return Err("unsupported dump manifest format".into());
         }
-        crate::import::check_mysql_spatial_import(&manifest, &original.engine)?;
+        crate::import::check_mysql_spatial_import(&manifest, &Default::default(), &original.engine)?;
         if manifest.format_version < 4 && manifest.source_engine == "mysql"
             && manifest.schema.tables.iter().any(|table| table.columns.iter().any(|column| mysql_bit_width(&column.type_name).is_some()))
         {

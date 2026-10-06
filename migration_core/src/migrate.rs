@@ -655,6 +655,7 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
             }
         };
         let options = parse_options(&request.payload);
+        let schema = without_mysql_spatial_names(schema, &source_endpoint.engine, &target_endpoint.engine);
         match (
             connect_migration_endpoint(&source_endpoint),
             connect_migration_endpoint(&target_endpoint),
@@ -965,6 +966,19 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
     }
 
     issues
+}
+
+/// PostgreSQL point/polygon share their names with MySQL spatial types, but their MySQL copy is text;
+/// verify must not read that text as geometry hex on the MySQL side.
+fn without_mysql_spatial_names(mut schema: NormalizedSchema, source: &str, target: &str) -> NormalizedSchema {
+    if source == "postgresql" && target == "mysql" {
+        for column in schema.tables.iter_mut().flat_map(|table| table.columns.iter_mut()) {
+            if is_mysql_spatial_type(&column.type_name) {
+                column.type_name = map_type(source, target, &column.type_name);
+            }
+        }
+    }
+    schema
 }
 
 /// Geometry has no lossless cross-engine mapping here (MySQL internal WKB vs PostGIS), so MySQL

@@ -397,9 +397,11 @@ fn projected_columns_sql(engine: &str, table: &NormalizedTable, exact_mysql_valu
                     quote_ident(engine, &column.name),
                     quote_ident(engine, &column.name)
                 )
-            } else if exact_mysql_values && engine == "mysql" && is_mysql_spatial_type(&column.type_name) {
+            } else if engine == "mysql" && is_mysql_spatial_type(&column.type_name) {
                 // The text protocol returns geometry as raw SRID+WKB bytes (lossy as UTF-8). Hex of the
                 // internal format round-trips through X'..' like mysqldump --hex-blob, SRID included.
+                // The legacy projection takes it too: its digests rejected raw geometry as invalid UTF-8,
+                // so no stored digest depends on the old form.
                 format!(
                     "HEX({}) AS {}",
                     quote_ident(engine, &column.name),
@@ -3751,8 +3753,8 @@ mod binary_keyset_tests {
         let mut geo = table(vec![column("id", "int"), column("pos", "point srid 4326")]);
         geo.columns[1].primary_key = false;
         assert!(projected_text_columns_sql("mysql", &geo).contains("HEX(`pos`) AS `pos`"));
-        // Safe-promotion digests keep the old projection; PostgreSQL point stays text.
-        assert!(!legacy_projected_text_columns_sql("mysql", &geo).contains("HEX(`pos`)"));
+        // Safe-promotion digests read geometry the same way; PostgreSQL point stays text.
+        assert!(legacy_projected_text_columns_sql("mysql", &geo).contains("HEX(`pos`) AS `pos`"));
         assert!(projected_text_columns_sql("postgresql", &geo).contains("\"pos\"::text"));
         let hex = Value::String("E6100000010100000000000000000000000000000000000000".into());
         assert_eq!(sql_literal_for_column("mysql", "point srid 4326", &hex), "X'E6100000010100000000000000000000000000000000000000'");

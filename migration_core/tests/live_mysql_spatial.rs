@@ -45,6 +45,7 @@ fn mysql_spatial_values_round_trip_exactly_when_configured() {
     };
     let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let table = format!("tf_geo_{suffix}");
+    let plain = format!("tf_geo_plain_{suffix}");
     let mut db = LiveAdapter::connect(&mysql).unwrap();
     db.execute_sql(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, g GEOMETRY NULL, p POINT NOT NULL SRID 4326, \
         poly POLYGON NULL, SPATIAL INDEX sp_p (p))")).unwrap();
@@ -52,12 +53,14 @@ fn mysql_spatial_values_round_trip_exactly_when_configured() {
         (1, ST_GeomFromText('POINT(1 2)'), ST_GeomFromText('POINT(37.5665 126.978)', 4326), ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 0))')), \
         (2, ST_GeomFromText('LINESTRING(0 0, 1.25 -3.5)', 3857), ST_GeomFromText('POINT(-33.8688 151.2093)', 4326), NULL), \
         (3, NULL, ST_GeomFromText('POINT(0 0)', 4326), NULL)")).unwrap();
+    db.execute_sql(&format!("CREATE TABLE {plain} (id INT PRIMARY KEY, v VARCHAR(8))")).unwrap();
+    db.execute_sql(&format!("INSERT INTO {plain} VALUES (1, 'a'), (2, 'b')")).unwrap();
     let expected = snapshot(&mysql, &table);
     let mut failures = Vec::new();
 
     for format in ["jsonl", "tsv"] {
         let dir = std::env::temp_dir().join(format!("tf-geo-{suffix}-{format}"));
-        let dumped = run("dump.run", json!({"source": &mysql, "tables": [&table], "output_dir": dir, "threads": 1,
+        let dumped = run("dump.run", json!({"source": &mysql, "tables": [&table, &plain], "output_dir": dir, "threads": 1,
             "chunk_size": 2, "data_format": format, "compression": "none"}));
         if let Err(error) = dumped {
             failures.push(format!("dump {format}: {error}"));
@@ -98,6 +101,12 @@ fn mysql_spatial_values_round_trip_exactly_when_configured() {
             }
             other => failures.push(format!("legacy spatial dump {format} was not refused: {other:?}")),
         }
+        // Leaving the spatial table out of the selection keeps the rest of the dump usable.
+        for target in [&mysql, &postgres] {
+            if let Err(error) = run("dump.import", json!({"target": target, "input_dir": dir, "mode": "replace", "threads": 1, "tables": [&plain]})) {
+                failures.push(format!("partial import {format} into {} without the spatial table: {error}", target.engine));
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -118,8 +127,26 @@ fn mysql_spatial_values_round_trip_exactly_when_configured() {
         failures.push("migrate created the PostgreSQL table despite the refusal".into());
     }
 
+    // PostgreSQL built-in point/polygon move as text and verify reads that text, not geometry hex.
     let mut pg = LiveAdapter::connect(&postgres).unwrap();
-    let _ = pg.execute_sql(&format!("DROP TABLE IF EXISTS {table}"));
-    db.execute_sql(&format!("DROP TABLE IF EXISTS {table}")).unwrap();
+    let shapes = format!("tf_geo_pg_{suffix}");
+    pg.execute_sql(&format!("CREATE TABLE {shapes} (id INT PRIMARY KEY, pos POINT, area POLYGON)")).unwrap();
+    pg.execute_sql(&format!("INSERT INTO {shapes} VALUES (1, '(1,2)', '((0,0),(1,1),(1,0))'), (2, NULL, NULL), (3, '(-1.5,2.25)', NULL)")).unwrap();
+    let payload = json!({"source_engine":"postgresql","target_engine":"mysql","source":&postgres,"target":&mysql,
+        "schema":{"tables":[{"name": &shapes, "columns": [{"name":"id","type":"integer","nullable":false,"primary_key":true},
+            {"name":"pos","type":"point","nullable":true},{"name":"area","type":"polygon","nullable":true}]}]},
+        "execution_options":{"mode":"create_only","chunk_size":2}});
+    match run("migrate", payload.clone()) {
+        Ok(result) if result["success"] == true => match run("verify", payload) {
+            Ok(result) if result["success"] == true => {}
+            other => failures.push(format!("verify PostgreSQL point -> MySQL: {other:?}")),
+        },
+        other => failures.push(format!("migrate PostgreSQL point -> MySQL: {other:?}")),
+    }
+
+    for name in [&table, &plain, &shapes] {
+        let _ = pg.execute_sql(&format!("DROP TABLE IF EXISTS {name}"));
+        let _ = db.execute_sql(&format!("DROP TABLE IF EXISTS {name}"));
+    }
     assert!(failures.is_empty(), "MySQL spatial regressions:\n{}", failures.join("\n"));
 }
