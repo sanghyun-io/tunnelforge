@@ -1,6 +1,6 @@
 """SQL statement splitting helpers shared by execution entry points."""
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 
 @dataclass
@@ -32,11 +32,25 @@ def find_sql_statement_at_position(sql_text: str, cursor_pos: int, dialect: str 
     return statements[-1].text
 
 
-def parse_sql_statement_ranges(sql_text: str, dialect: str = "mysql") -> list[SqlStatement]:
+def literal_and_comment_mask(sql_text: str, dialect: str = "mysql") -> List[bool]:
+    """Mark every character that sits inside a comment or a string literal.
+
+    Identifier quotes (MySQL backticks, PostgreSQL double quotes) are not marked,
+    so keyword/table scans can run on the original text and skip masked positions.
+    """
+    mask = [False] * len(sql_text or "")
+    parse_sql_statement_ranges(sql_text, dialect, mask=mask)
+    return mask
+
+
+def parse_sql_statement_ranges(
+    sql_text: str, dialect: str = "mysql", *, mask: Optional[List[bool]] = None
+) -> list[SqlStatement]:
     """Split SQL and retain source ranges using the engine's default string rules.
 
     PostgreSQL assumes standard_conforming_strings=on; MySQL assumes default
     SQL mode. Session changes to those lexical modes are not interpreted here.
+    When ``mask`` is given, positions inside comments and string literals are set to True.
     """
     if not sql_text or not sql_text.strip():
         return []
@@ -52,7 +66,12 @@ def parse_sql_statement_ranges(sql_text: str, dialect: str = "mysql") -> list[Sq
     block_comment = 0
     backslash_escapes = False
     escape_next = False
+    quote_is_literal = False
     i = 0
+
+    def mark(start: int, end: int) -> None:
+        if mask is not None:
+            mask[start:end] = [True] * (end - start)
 
     def append_text(text: str, source_pos: int) -> None:
         nonlocal current_start
@@ -90,21 +109,30 @@ def parse_sql_statement_ranges(sql_text: str, dialect: str = "mysql") -> list[Sq
                     continue
 
         if line_comment:
+            start = i
             i, line_comment = _consume_line_comment(sql_text, i, append_text)
+            mark(start, i)
             continue
 
         if block_comment:
+            start = i
             i, block_comment = _consume_block_comment(sql_text, i, append_text, block_comment, postgresql)
+            mark(start, i)
             continue
 
         if dollar_quote:
+            start = i
             i, dollar_quote = _consume_dollar_quote(sql_text, i, dollar_quote, append_text)
+            mark(start, i)
             continue
 
         if quote:
+            start = i
             i, quote, escape_next = _consume_quoted_string(
                 sql_text, i, quote, escape_next, append_text, backslash_escapes
             )
+            if quote_is_literal:
+                mark(start, i)
             continue
 
         if delimiter != ";" and delimiter and sql_text.startswith(delimiter, i):
@@ -117,11 +145,15 @@ def parse_sql_statement_ranges(sql_text: str, dialect: str = "mysql") -> list[Sq
             if marker:
                 dollar_quote = marker
                 append_text(marker, i)
+                mark(i, i + len(marker))
                 i += len(marker)
                 continue
 
         if char in (("'", '"') if postgresql else ("'", '"', "`")):
             quote = char
+            quote_is_literal = char == "'" or (char == '"' and not postgresql)
+            if quote_is_literal:
+                mark(i, i + 1)
             backslash_escapes = (not postgresql and char != "`") or (
                 postgresql and char == "'" and i > 0 and sql_text[i - 1] in "eE"
                 and (i < 2 or not _is_identifier_char(sql_text[i - 2]))
@@ -136,18 +168,21 @@ def parse_sql_statement_ranges(sql_text: str, dialect: str = "mysql") -> list[Sq
         ):
             line_comment = True
             append_text(char + next_char, i)
+            mark(i, i + 2)
             i += 2
             continue
 
         if char == "#" and not postgresql:
             line_comment = True
             append_text(char, i)
+            mark(i, i + 1)
             i += 1
             continue
 
         if char == "/" and next_char == "*":
             block_comment = 1
             append_text(char + next_char, i)
+            mark(i, i + 2)
             i += 2
             continue
 

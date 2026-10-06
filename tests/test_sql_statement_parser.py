@@ -131,3 +131,23 @@ def test_dollar_quote_reader_fails_closed_for_out_of_range_starts():
 def test_dollar_quote_reader_fails_closed_for_none_sql_text():
     assert read_dollar_quote(None, 0) == ""
     assert read_dollar_quote(None, 0) == ""
+
+
+def test_literal_and_comment_mask_marks_strings_and_comments_but_not_identifiers():
+    from src.core.sql_statement_parser import literal_and_comment_mask
+
+    sql = "SELECT `t`.a, 'x -- y' FROM t -- c\n/* b */ WHERE z = \"q\""
+    masked = "".join("#" if m else ch for ch, m in zip(sql, literal_and_comment_mask(sql)))
+    assert masked.startswith("SELECT `t`.a, ######## FROM t ")
+    assert "WHERE z = ###" in masked and "/* b */" not in masked
+
+    pg = "SELECT \"Drop\", $f$ DROP $f$"
+    pg_masked = "".join("#" if m else ch for ch, m in zip(pg, literal_and_comment_mask(pg, "postgresql")))
+    assert pg_masked.startswith('SELECT "Drop", ') and "DROP" not in pg_masked.split(",", 1)[1]
+
+
+def test_dangerous_query_check_is_not_hidden_by_comment_markers_inside_strings():
+    from src.core.production_guard import ProductionGuard
+
+    assert ProductionGuard.is_dangerous_query("SELECT '--'; DROP TABLE t") == (True, "DROP")
+    assert ProductionGuard.is_dangerous_query("SELECT 'drop table' -- DELETE") == (False, None)

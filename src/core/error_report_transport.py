@@ -2,7 +2,6 @@
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -10,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 from PyQt6.QtCore import QThread
 
+from src.core.error_report_schema import canonical_uuid_v4
 from src.core.error_reporting_config import ERROR_REPORT_RELAY_URL
 from src.core.logger import get_logger
 
@@ -310,24 +310,10 @@ class ErrorReportTransport:
         if needs_receipt:
             if set(parsed_body) != {"status", "receipt"}:
                 return None
-            if not _is_canonical_uuid_v4(parsed_body["receipt"]):
+            if canonical_uuid_v4(parsed_body["receipt"]) is None:
                 return None
             return RelayResult(True, message, "", status_code)
         return None
-
-
-def _is_canonical_uuid_v4(value):
-    if type(value) is not str:
-        return False
-    try:
-        parsed = uuid.UUID(value)
-    except (AttributeError, ValueError):
-        return False
-    return (
-        parsed.version == 4
-        and parsed.variant == uuid.RFC_4122
-        and str(parsed) == value
-    )
 
 
 def _is_canonical_issue_url(url):
