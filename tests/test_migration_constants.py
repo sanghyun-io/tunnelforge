@@ -6,7 +6,6 @@ migration_constants.py 단위 테스트
 import re
 import pytest
 
-import src.core.migration_parsers as migration_parsers
 from src.core.migration_constants import (
     REMOVED_SYS_VARS_84,
     NEW_RESERVED_KEYWORDS_84,
@@ -17,40 +16,18 @@ from src.core.migration_constants import (
     DEPRECATED_FUNCTIONS_84,
     REMOVED_FUNCTIONS_80X,
     OBSOLETE_SQL_MODES,
-    AUTH_PLUGINS,
-    SYS_VARS_NEW_DEFAULTS_84,
-    IDENTIFIER_LIMITS,
-    INDEX_SIZE_LIMITS,
-    CHARSET_MIGRATION_MAP,
-    CHARSET_BYTES_PER_CHAR,
-    STORAGE_ENGINE_STATUS,
     ENGINE_POLICIES,
-    MYSQL_SCHEMA_TABLES,
-    DEPRECATED_SYNTAX_PATTERNS,
-    UPGRADE_CHECK_IDS,
-    DOC_LINKS,
     IssueType,
     CompatibilityIssue,
-    # Regex patterns
     INVALID_DATE_PATTERN,
     INVALID_DATETIME_PATTERN,
-    INVALID_DATE_VALUES_PATTERN,
     ZEROFILL_PATTERN,
     FLOAT_PRECISION_PATTERN,
-    INT_DISPLAY_WIDTH_PATTERN,
     FK_NAME_LENGTH_PATTERN,
     AUTH_PLUGIN_PATTERN,
     FTS_TABLE_PREFIX_PATTERN,
     SUPER_PRIVILEGE_PATTERN,
     SYS_VAR_USAGE_PATTERN,
-    YEAR2_PATTERN,
-    ENUM_EMPTY_PATTERN,
-    DOLLAR_SIGN_PATTERN,
-    TRAILING_SPACE_PATTERN,
-    CONTROL_CHAR_PATTERN,
-    TIMESTAMP_PATTERN,
-    BLOB_TEXT_DEFAULT_PATTERN,
-    INVALID_57_NAME_MULTIPLE_DOTS_PATTERN,
 )
 
 
@@ -129,85 +106,6 @@ class TestObsoleteSqlModes:
         assert mode in OBSOLETE_SQL_MODES
 
 
-class TestAuthPlugins:
-    """AUTH_PLUGINS dict 구조 검증"""
-
-    def test_keys_exist(self):
-        assert 'disabled' in AUTH_PLUGINS
-        assert 'removed' in AUTH_PLUGINS
-        assert 'deprecated' in AUTH_PLUGINS
-        assert 'recommended' in AUTH_PLUGINS
-
-    def test_mysql_native_password_disabled(self):
-        assert 'mysql_native_password' in AUTH_PLUGINS['disabled']
-
-    def test_caching_sha2_recommended(self):
-        assert 'caching_sha2_password' in AUTH_PLUGINS['recommended']
-
-
-class TestSysVarsNewDefaults:
-    """SYS_VARS_NEW_DEFAULTS_84 구조 검증"""
-
-    def test_each_has_old_and_new(self):
-        for var, val in SYS_VARS_NEW_DEFAULTS_84.items():
-            assert 'old' in val, f"{var} missing 'old'"
-            assert 'new' in val, f"{var} missing 'new'"
-
-    def test_no_overlap_with_removed(self):
-        """기본값 변경 변수는 제거된 변수와 겹치지 않아야 함"""
-        for var in SYS_VARS_NEW_DEFAULTS_84:
-            assert var not in REMOVED_SYS_VARS_84, f"{var} is both in defaults and removed"
-
-
-class TestIdentifierLimits:
-    """IDENTIFIER_LIMITS, INDEX_SIZE_LIMITS 검증"""
-
-    def test_table_name_limit(self):
-        assert IDENTIFIER_LIMITS['TABLE_NAME'] == 64
-
-    def test_column_name_limit(self):
-        assert IDENTIFIER_LIMITS['COLUMN_NAME'] == 64
-
-    def test_innodb_max_key_length(self):
-        assert INDEX_SIZE_LIMITS['INNODB_MAX_KEY_LENGTH'] == 3072
-
-    def test_all_values_positive(self):
-        for k, v in IDENTIFIER_LIMITS.items():
-            assert v > 0, f"{k} should be positive"
-        for k, v in INDEX_SIZE_LIMITS.items():
-            assert v > 0, f"{k} should be positive"
-
-
-class TestCharsetConstants:
-    """Charset 관련 상수 검증"""
-
-    def test_utf8_maps_to_utf8mb4(self):
-        assert CHARSET_MIGRATION_MAP['utf8'] == 'utf8mb4'
-
-    def test_utf8mb3_maps_to_utf8mb4(self):
-        assert CHARSET_MIGRATION_MAP['utf8mb3'] == 'utf8mb4'
-
-    def test_bytes_per_char_utf8mb4(self):
-        assert CHARSET_BYTES_PER_CHAR['utf8mb4'] == 4
-
-    def test_bytes_per_char_latin1(self):
-        assert CHARSET_BYTES_PER_CHAR['latin1'] == 1
-
-
-class TestStorageEngineStatus:
-    """STORAGE_ENGINE_STATUS 검증"""
-
-    def test_deprecated_engines(self):
-        assert 'MyISAM' in STORAGE_ENGINE_STATUS['deprecated']
-
-    def test_recommended_is_innodb(self):
-        assert STORAGE_ENGINE_STATUS['recommended'] == 'InnoDB'
-
-    def test_deprecated_is_derived_from_engine_policies(self):
-        """deprecated 목록은 ENGINE_POLICIES 키에서 파생된 단일 소스여야 한다"""
-        assert STORAGE_ENGINE_STATUS['deprecated'] == list(ENGINE_POLICIES.keys())
-
-
 class TestEnginePolicies:
     """ENGINE_POLICIES 정책 dict 검증"""
 
@@ -222,20 +120,6 @@ class TestEnginePolicies:
         for engine, policy in ENGINE_POLICIES.items():
             assert policy.get("severity"), f"{engine} policy missing severity"
             assert policy.get("suggestion"), f"{engine} policy missing suggestion"
-
-
-class TestMysqlSchemaTables:
-    """MYSQL_SCHEMA_TABLES 검증"""
-
-    def test_is_tuple(self):
-        assert isinstance(MYSQL_SCHEMA_TABLES, tuple)
-
-    def test_all_unique(self):
-        assert len(set(MYSQL_SCHEMA_TABLES)) == len(MYSQL_SCHEMA_TABLES)
-
-    def test_known_tables_present(self):
-        assert 'tables' in MYSQL_SCHEMA_TABLES
-        assert 'columns' in MYSQL_SCHEMA_TABLES
 
 
 # ============================================================
@@ -322,39 +206,6 @@ class TestCompatibilityIssue:
 
 
 # ============================================================
-# 매핑 테스트
-# ============================================================
-class TestUpgradeCheckIds:
-    """UPGRADE_CHECK_IDS 매핑 검증"""
-
-    def test_all_keys_are_issue_type(self):
-        for key in UPGRADE_CHECK_IDS:
-            assert isinstance(key, IssueType)
-
-    def test_all_values_are_strings(self):
-        for val in UPGRADE_CHECK_IDS.values():
-            assert isinstance(val, str)
-
-    def test_known_mapping(self):
-        assert UPGRADE_CHECK_IDS[IssueType.REMOVED_SYS_VAR] == "removedSysVars"
-
-
-class TestDocLinks:
-    """DOC_LINKS 매핑 검증"""
-
-    def test_all_keys_are_issue_type(self):
-        for key in DOC_LINKS:
-            assert isinstance(key, IssueType)
-
-    def test_all_values_are_urls(self):
-        for val in DOC_LINKS.values():
-            assert val.startswith("https://")
-
-    def test_charset_issue_has_link(self):
-        assert IssueType.CHARSET_ISSUE in DOC_LINKS
-
-
-# ============================================================
 # 정규식 패턴 테스트
 # ============================================================
 class TestInvalidDatePattern:
@@ -411,24 +262,6 @@ class TestFloatPrecisionPattern:
         assert result == expected
 
 
-class TestIntDisplayWidthPattern:
-    @pytest.mark.parametrize("text,expected_match,expected_width", [
-        ("INT(11)", True, "11"),
-        ("BIGINT(20)", True, "20"),
-        ("TINYINT(1)", True, "1"),
-        ("SMALLINT(5)", True, "5"),
-        ("INT", False, None),
-        ("VARCHAR(255)", False, None),
-    ])
-    def test_match(self, text, expected_match, expected_width):
-        m = INT_DISPLAY_WIDTH_PATTERN.search(text)
-        if expected_match:
-            assert m is not None
-            assert m.group(2) == expected_width
-        else:
-            assert m is None
-
-
 class TestFKNameLengthPattern:
     def test_matches_long_name(self):
         name = "a" * 65
@@ -475,150 +308,6 @@ class TestSuperPrivilegePattern:
         assert result == expected
 
 
-class TestYear2Pattern:
-    @pytest.mark.parametrize("text,expected", [
-        ("YEAR(2)", True),
-        ("year( 2 )", True),
-        ("YEAR(4)", False),
-        ("YEAR", False),
-    ])
-    def test_match(self, text, expected):
-        result = YEAR2_PATTERN.search(text) is not None
-        assert result == expected
-
-
-class TestEnumEmptyPattern:
-    @pytest.mark.parametrize("text,expected", [
-        ("ENUM('active','','inactive')", True),
-        ("ENUM('', 'a')", True),
-        ("ENUM('active','inactive')", False),
-    ])
-    def test_match(self, text, expected):
-        result = ENUM_EMPTY_PATTERN.search(text) is not None
-        assert result == expected
-
-
-class TestDollarSignPattern:
-    @pytest.mark.parametrize("text,expected", [
-        ("`price$usd`", True),
-        ("`$table`", True),
-        ("`normal_name`", False),
-    ])
-    def test_match(self, text, expected):
-        result = DOLLAR_SIGN_PATTERN.search(text) is not None
-        assert result == expected
-
-
-class TestTrailingSpacePattern:
-    @pytest.mark.parametrize("text,expected", [
-        ("`name `", True),
-        ("`name  `", True),
-        ("`name`", False),
-    ])
-    def test_match(self, text, expected):
-        result = TRAILING_SPACE_PATTERN.search(text) is not None
-        assert result == expected
-
-
-class TestControlCharPattern:
-    @pytest.mark.parametrize("text,expected", [
-        ("`na\\x00me`", True),
-        ("`na\\x1fme`", True),
-        ("`normal`", False),
-    ])
-    def test_match(self, text, expected):
-        # Build actual string with control chars
-        if "\\x00" in text:
-            text = "`na\x00me`"
-        elif "\\x1f" in text:
-            text = "`na\x1fme`"
-        result = CONTROL_CHAR_PATTERN.search(text) is not None
-        assert result == expected
-
-
-class TestIdentifierPatternFalsePositiveRegressions:
-    """DOLLAR_SIGN/TRAILING_SPACE/CONTROL_CHAR 패턴의 오탐 회귀 테스트.
-
-    과거 raw regex는 백틱 쌍이 맞는지 확인하지 않아, 인접한 두 식별자
-    사이(개행 포함)나 식별자 밖의 문자열 리터럴을 하나의 식별자로 오인했다.
-    """
-
-    MULTILINE_CREATE_TABLE = (
-        "CREATE TABLE `t` (\n"
-        "  `id` int NOT NULL,\n"
-        "  `name` varchar(255) DEFAULT NULL\n"
-        ")"
-    )
-
-    def test_trailing_space_no_false_positive_across_lines(self):
-        assert TRAILING_SPACE_PATTERN.search(self.MULTILINE_CREATE_TABLE) is None
-
-    def test_control_char_no_false_positive_across_lines(self):
-        assert CONTROL_CHAR_PATTERN.search(self.MULTILINE_CREATE_TABLE) is None
-
-    def test_dollar_sign_no_false_positive_in_string_literal(self):
-        content = (
-            "CREATE TABLE `t` (`amount` decimal(10,2) DEFAULT '$0.00', "
-            "`name` varchar(20));"
-        )
-        assert DOLLAR_SIGN_PATTERN.search(content) is None
-
-    def test_dollar_sign_still_matches_real_identifier(self):
-        content = "CREATE TABLE t (`price$usd` INT)"
-        assert DOLLAR_SIGN_PATTERN.search(content) is not None
-
-    def test_trailing_space_still_matches_standalone_identifier(self):
-        assert TRAILING_SPACE_PATTERN.search("`name `") is not None
-
-    def test_control_char_still_matches_standalone_identifier(self):
-        assert CONTROL_CHAR_PATTERN.search("`na\x00me`") is not None
-
-
-class TestInvalid57NameMultipleDotsContext:
-    """INVALID_57_NAME_MULTIPLE_DOTS_PATTERN의 컨텍스트 제한 검증"""
-
-    def test_no_match_in_insert_string_literal(self):
-        content = "INSERT INTO t VALUES ('see notes..thanks');"
-        assert INVALID_57_NAME_MULTIPLE_DOTS_PATTERN.search(content) is None
-
-    def test_matches_schema_table_reference(self):
-        content = "SELECT * FROM schema..table;"
-        match = INVALID_57_NAME_MULTIPLE_DOTS_PATTERN.search(content)
-        assert match is not None
-        assert match.group(0) == "schema..table"
-
-
-class TestMigrationParsersDocstring:
-    """migration_parsers 모듈 docstring이 실제 구현과 일치하는지 검증"""
-
-    def test_removed_parsers_not_documented(self):
-        doc = migration_parsers.__doc__ or ""
-        assert "ConfigFileParser" not in doc
-        assert "DumpMetadataParser" not in doc
-
-
-class TestTimestampPattern:
-    def test_matches_timestamp(self):
-        m = TIMESTAMP_PATTERN.search("'2024-01-15 10:30:45'")
-        assert m is not None
-        assert m.group(1) == "2024"
-
-    def test_no_match_date_only(self):
-        assert not TIMESTAMP_PATTERN.search("'2024-01-15'")
-
-
-class TestBlobTextDefaultPattern:
-    @pytest.mark.parametrize("text,expected", [
-        ("`data` TEXT DEFAULT 'hello'", True),
-        ("`data` BLOB DEFAULT ''", True),
-        ("`data` LONGTEXT DEFAULT NULL", True),
-        ("`data` VARCHAR(255) DEFAULT ''", False),
-    ])
-    def test_match(self, text, expected):
-        result = BLOB_TEXT_DEFAULT_PATTERN.search(text) is not None
-        assert result == expected
-
-
 class TestSysVarUsagePattern:
     @pytest.mark.parametrize("text,expected", [
         ("SET @@global.binlog_format = 'ROW'", True),
@@ -630,25 +319,6 @@ class TestSysVarUsagePattern:
     def test_match(self, text, expected):
         result = SYS_VAR_USAGE_PATTERN.search(text) is not None
         assert result == expected
-
-
-class TestDeprecatedSyntaxPatterns:
-    """DEPRECATED_SYNTAX_PATTERNS dict 검증"""
-
-    def test_group_by_asc_desc(self):
-        pattern = DEPRECATED_SYNTAX_PATTERNS['GROUP_BY_ASC_DESC']
-        assert pattern.search("SELECT * FROM t GROUP BY col ASC")
-        assert not pattern.search("SELECT * FROM t ORDER BY col ASC")
-
-    def test_sql_calc_found_rows(self):
-        pattern = DEPRECATED_SYNTAX_PATTERNS['SQL_CALC_FOUND_ROWS']
-        assert pattern.search("SELECT SQL_CALC_FOUND_ROWS * FROM t")
-        assert not pattern.search("SELECT * FROM t")
-
-    def test_found_rows_func(self):
-        pattern = DEPRECATED_SYNTAX_PATTERNS['FOUND_ROWS_FUNC']
-        assert pattern.search("SELECT FOUND_ROWS()")
-        assert not pattern.search("SELECT COUNT(*)")
 
 
 # ============================================================

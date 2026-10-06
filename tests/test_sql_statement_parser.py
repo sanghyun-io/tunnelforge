@@ -4,6 +4,7 @@ from src.core.sql_statement_parser import (
     find_sql_statement_at_position,
     parse_sql_statement_ranges,
     parse_sql_statements,
+    read_dollar_quote,
 )
 
 
@@ -33,3 +34,100 @@ def test_mysql_default_preserves_hash_comments_and_backslash_strings():
 
 def test_mysql_double_dash_requires_whitespace():
     assert parse_sql_statements("SELECT 1--2; SELECT 3;") == ["SELECT 1--2", "SELECT 3"]
+
+
+def test_sql_statement_parser_preserves_semicolons_in_literals_and_comments():
+    sql = """
+    -- comment; ignored
+    SELECT 'a;b';
+    /* block; comment */
+    UPDATE logs SET message = "x;y";
+    """
+
+    assert parse_sql_statements(sql) == [
+        "-- comment; ignored\n    SELECT 'a;b'",
+        '/* block; comment */\n    UPDATE logs SET message = "x;y"',
+    ]
+
+
+def test_sql_statement_parser_supports_client_delimiters():
+    sql = """
+    DELIMITER //
+    CREATE PROCEDURE p()
+    BEGIN
+        SELECT 'a;b';
+    END//
+    DELIMITER ;
+    SELECT 1;
+    """
+
+    assert parse_sql_statements(sql) == [
+        "CREATE PROCEDURE p()\n    BEGIN\n        SELECT 'a;b';\n    END",
+        "SELECT 1",
+    ]
+
+
+def test_sql_statement_parser_supports_mysql_dollar_delimiter():
+    sql = """
+    DELIMITER $$
+    CREATE PROCEDURE p()
+    BEGIN
+        SELECT 'a;b';
+    END$$
+    DELIMITER ;
+    SELECT 1;
+    """
+
+    assert parse_sql_statements(sql) == [
+        "CREATE PROCEDURE p()\n    BEGIN\n        SELECT 'a;b';\n    END",
+        "SELECT 1",
+    ]
+
+
+def test_find_sql_statement_at_position_supports_mysql_dollar_delimiter():
+    sql = """
+    DELIMITER $$
+    CREATE PROCEDURE p()
+    BEGIN
+        SELECT 'a;b';
+    END$$
+    DELIMITER ;
+    SELECT 1;
+    """
+
+    procedure = "CREATE PROCEDURE p()\n    BEGIN\n        SELECT 'a;b';\n    END"
+
+    assert find_sql_statement_at_position(sql, sql.index("SELECT 'a;b'")) == procedure
+    assert find_sql_statement_at_position(sql, sql.rindex("SELECT 1")) == "SELECT 1"
+
+
+def test_sql_statement_parser_supports_postgresql_dollar_quotes():
+    sql = """
+    CREATE FUNCTION f() RETURNS void AS $body$
+    BEGIN
+        RAISE NOTICE 'a;b';
+    END
+    $body$ LANGUAGE plpgsql;
+    SELECT 1;
+    """
+
+    assert parse_sql_statements(sql) == [
+        "CREATE FUNCTION f() RETURNS void AS $body$\n    BEGIN\n        RAISE NOTICE 'a;b';\n    END\n    $body$ LANGUAGE plpgsql",
+        "SELECT 1",
+    ]
+
+
+def test_dollar_quote_reader_fails_closed_for_out_of_range_starts():
+    sql = "$body$"
+
+    assert read_dollar_quote("", 0) == ""
+    assert read_dollar_quote(sql, -1) == ""
+    assert read_dollar_quote(sql, len(sql)) == ""
+    assert read_dollar_quote("", 0) == ""
+    assert read_dollar_quote(sql, -1) == ""
+    assert read_dollar_quote(sql, len(sql)) == ""
+
+
+def test_dollar_quote_reader_fails_closed_for_none_sql_text():
+    assert read_dollar_quote(None, 0) == ""
+    assert read_dollar_quote(None, 0) == ""

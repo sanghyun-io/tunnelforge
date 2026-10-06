@@ -7,14 +7,8 @@ MySQL 8.0.x → 8.4.x 업그레이드 호환성 검사에 사용.
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-from src.core.migration_identifier_matchers import (
-    DOLLAR_SIGN_PATTERN,
-    TRAILING_SPACE_PATTERN,
-    CONTROL_CHAR_PATTERN,
-    INVALID_57_NAME_MULTIPLE_DOTS_PATTERN,
-)
 
 # ============================================================
 # MySQL 8.4에서 제거된 시스템 변수 (47개)
@@ -124,31 +118,6 @@ ALL_REMOVED_FUNCTIONS: Tuple[str, ...] = tuple(dict.fromkeys(
     REMOVED_FUNCTIONS_84 + REMOVED_FUNCTIONS_80X + DEPRECATED_FUNCTIONS_84
 ))
 
-# MySQL 8.4에서 generated column 내 동작이 변경된 함수
-# (mysql-upgrade-checker의 CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS 참조)
-# 이 함수들은 generated column 표현식에서 사용 시 8.4 업그레이드 후 결과가 달라질 수 있음
-CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS: Tuple[str, ...] = (
-    'IF',
-    'IFNULL',
-    'NULLIF',
-    'CASE',
-    'COALESCE',
-    'GREATEST',
-    'LEAST',
-    'BIT_AND',
-    'BIT_OR',
-    'BIT_XOR',
-)
-
-# ============================================================
-# 인증 플러그인 상태
-# ============================================================
-AUTH_PLUGINS: Dict[str, List[str]] = {
-    'disabled': ['mysql_native_password'],  # 8.4에서 기본 비활성화
-    'removed': ['authentication_fido', 'authentication_fido_client'],  # 8.4에서 제거
-    'deprecated': ['sha256_password'],  # deprecated, caching_sha2_password 권장
-    'recommended': ['caching_sha2_password'],  # 권장
-}
 
 # ============================================================
 # 제거된/deprecated SQL 모드 (11개)
@@ -160,113 +129,10 @@ OBSOLETE_SQL_MODES: Tuple[str, ...] = (
 )
 
 # ============================================================
-# 기본값이 변경된 시스템 변수
-# ============================================================
-SYS_VARS_NEW_DEFAULTS_84: Dict[str, Dict[str, str]] = {
-    # Note: binlog_transaction_dependency_tracking은 REMOVED_SYS_VARS_84에 포함 (제거됨)
-    'replica_parallel_workers': {
-        'old': '0', 'new': '4',
-    },
-    'innodb_adaptive_hash_index': {
-        'old': 'ON', 'new': 'OFF',
-    },
-    'innodb_doublewrite_pages': {
-        'old': '(innodb_write_io_threads)', 'new': '128',
-    },
-    'innodb_flush_method': {
-        'old': 'fsync (Unix)', 'new': 'O_DIRECT (Linux)',
-    },
-    'innodb_io_capacity': {
-        'old': '200', 'new': '10000',
-    },
-    'innodb_io_capacity_max': {
-        'old': '2000', 'new': '20000',
-    },
-    'innodb_log_buffer_size': {
-        'old': '16M', 'new': '64M',
-    },
-    'innodb_redo_log_capacity': {
-        'old': '100M (innodb_log_file_size * innodb_log_files_in_group)', 'new': '100M',
-    },
-    'group_replication_consistency': {
-        'old': 'EVENTUAL', 'new': 'BEFORE_ON_PRIMARY_FAILOVER',
-    },
-    'innodb_change_buffering': {
-        'old': 'all', 'new': 'none',
-    },
-    # Note: log_error_verbosity는 8.4에서도 기본값 2 유지 (변경 없음, 삭제)
-    'explicit_defaults_for_timestamp': {
-        'old': 'OFF', 'new': 'ON',
-    },
-}
-
-# ============================================================
-# 식별자 길이 제한
-# ============================================================
-IDENTIFIER_LIMITS: Dict[str, int] = {
-    'TABLE_NAME': 64,
-    'COLUMN_NAME': 64,
-    'INDEX_NAME': 64,
-    'FOREIGN_KEY_NAME': 64,
-    'CONSTRAINT_NAME': 64,
-    'DATABASE_NAME': 64,
-    'VIEW_NAME': 64,
-    'TRIGGER_NAME': 64,
-    'ALIAS': 256,
-    'ENUM_ELEMENT': 255,
-    'SET_ELEMENT': 255,
-}
-
-# ============================================================
-# 인덱스 크기 제한 (바이트)
-# ============================================================
-INDEX_SIZE_LIMITS: Dict[str, int] = {
-    'INNODB_MAX_KEY_LENGTH': 3072,
-    'MYISAM_MAX_KEY_LENGTH': 1000,
-    'DEFAULT_PREFIX_LENGTH': 767,
-}
-
-# ============================================================
-# Deprecated 구문 패턴
-# ============================================================
-DEPRECATED_SYNTAX_PATTERNS: Dict[str, re.Pattern] = {
-    'GROUP_BY_ASC_DESC': re.compile(
-        r'\bGROUP\s+BY\b[^;]*\b(ASC|DESC)\b',
-        re.IGNORECASE | re.DOTALL
-    ),
-    'SQL_CALC_FOUND_ROWS': re.compile(
-        r'\bSQL_CALC_FOUND_ROWS\b',
-        re.IGNORECASE
-    ),
-    'FOUND_ROWS_FUNC': re.compile(
-        r'\bFOUND_ROWS\s*\(\s*\)',
-        re.IGNORECASE
-    ),
-}
-
-# ============================================================
-# MySQL 스키마 내부 테이블 (충돌 방지)
-# ============================================================
-MYSQL_SCHEMA_TABLES: Tuple[str, ...] = (
-    'catalogs', 'check_constraints', 'collations', 'columns',
-    'column_statistics', 'dd_properties', 'events',
-    'foreign_key_column_usage', 'foreign_keys', 'index_column_usage',
-    'index_partitions', 'indexes', 'innodb_ddl_log',
-    'innodb_dynamic_metadata', 'parameter_type_elements', 'parameters',
-    'resource_groups', 'routines', 'schemata',
-    'st_spatial_reference_systems', 'table_partition_values',
-    'table_partitions', 'table_stats', 'tables', 'tablespace_files',
-    'tablespaces', 'triggers', 'view_routine_usage',
-    'view_table_usage', 'column_type_elements',
-)
-
-# ============================================================
 # 스토리지 엔진 상태
 # ============================================================
 # 엔진별 상세 정책 (severity, suggestion)
-# migration_analyzer.py의 check_deprecated_engines와 storage_rules.py가 공유하는 단일 소스.
-# STORAGE_ENGINE_STATUS['deprecated']는 이 dict의 키에서 파생되므로,
-# 새 엔진을 deprecated로 취급하려면 반드시 이 dict에 항목을 추가해야 한다.
+# migration_compat_checker.py의 check_deprecated_engines가 사용하는 단일 소스.
 ENGINE_POLICIES: Dict[str, Dict[str, str]] = {
     'MyISAM': {
         'severity': 'warning',
@@ -306,34 +172,6 @@ ENGINE_POLICIES: Dict[str, Dict[str, str]] = {
     },
 }
 
-STORAGE_ENGINE_STATUS: Dict[str, Any] = {
-    # ENGINE_POLICIES에 정의된 엔진 = deprecated 취급 대상 (단일 소스에서 파생)
-    'deprecated': list(ENGINE_POLICIES.keys()),
-    'recommended': 'InnoDB',
-    # 호환성 유지용 메타데이터. 규칙 스캔의 독립적인 소스로는 사용하지 않는다.
-    'warning_engines': ['MEMORY', 'CSV'],
-}
-
-# ============================================================
-# 문자셋 관련 상수
-# ============================================================
-CHARSET_MIGRATION_MAP: Dict[str, str] = {
-    'utf8': 'utf8mb4',
-    'utf8mb3': 'utf8mb4',
-    'latin1': 'utf8mb4',  # 권장
-}
-
-CHARSET_BYTES_PER_CHAR: Dict[str, int] = {
-    'utf8mb4': 4,
-    'utf8mb3': 3,
-    'utf8': 3,
-    'latin1': 1,
-    'ascii': 1,
-    'binary': 1,
-    'ucs2': 2,
-    'utf16': 4,
-    'utf32': 4,
-}
 
 # ============================================================
 # IssueType Enum (확장)
@@ -427,15 +265,6 @@ class CompatibilityIssue:
 
 
 # ============================================================
-# 식별자 이슈 탐지용 컨텍스트 제한 매처
-# ============================================================
-# _IdentifierIssuePattern / _ContextualDotPattern과 이에 의존하는 인스턴스
-# (DOLLAR_SIGN_PATTERN, TRAILING_SPACE_PATTERN, CONTROL_CHAR_PATTERN,
-# INVALID_57_NAME_MULTIPLE_DOTS_PATTERN)는 src/core/migration_identifier_matchers.py로
-# 이동했다. 하위 호환을 위해 모듈 상단에서 재노출(re-export)한다.
-
-
-# ============================================================
 # 덤프 파일 분석용 정규식 패턴
 # ============================================================
 
@@ -443,11 +272,6 @@ class CompatibilityIssue:
 INVALID_DATE_PATTERN = re.compile(r"['\"]0000-00-00['\"]|^0000-00-00$", re.MULTILINE)
 INVALID_DATETIME_PATTERN = re.compile(r"['\"]0000-00-00 00:00:00['\"]|^0000-00-00 00:00:00$", re.MULTILINE)
 
-# 추가적인 잘못된 날짜 패턴 (년/월/일 = 00)
-INVALID_DATE_VALUES_PATTERN = re.compile(
-    r"'(?:0000-\d{2}-\d{2}|\d{4}-00-\d{2}|\d{4}-\d{2}-00)'",
-    re.IGNORECASE
-)
 
 # ZEROFILL 속성
 ZEROFILL_PATTERN = re.compile(r'\bZEROFILL\b', re.IGNORECASE)
@@ -458,11 +282,6 @@ FLOAT_PRECISION_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# INT 표시 너비 (deprecated, TINYINT(1) 제외)
-INT_DISPLAY_WIDTH_PATTERN = re.compile(
-    r'\b(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)\s*\(\s*(\d+)\s*\)',
-    re.IGNORECASE
-)
 
 # FK 이름 길이 (64자 초과)
 FK_NAME_LENGTH_PATTERN = re.compile(
@@ -489,136 +308,11 @@ SYS_VAR_USAGE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# YEAR(2) 타입 패턴
-YEAR2_PATTERN = re.compile(r'\bYEAR\s*\(\s*2\s*\)', re.IGNORECASE)
 
-# ENUM 빈 값 정의 패턴
-ENUM_EMPTY_PATTERN = re.compile(
-    r"ENUM\s*\([^)]*''\s*[,)]",
-    re.IGNORECASE
-)
 
-# SET 빈 값 정의 패턴
-SET_EMPTY_PATTERN = re.compile(
-    r"SET\s*\([^)]*''\s*[,)]",
-    re.IGNORECASE
-)
 
-# TIMESTAMP 패턴 (범위 확인용)
-TIMESTAMP_PATTERN = re.compile(
-    r"'(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})'"
-)
 
-# BLOB/TEXT DEFAULT 패턴
-BLOB_TEXT_DEFAULT_PATTERN = re.compile(
-    r'`\w+`\s+(BLOB|TEXT|TINYBLOB|MEDIUMBLOB|LONGBLOB|TINYTEXT|MEDIUMTEXT|LONGTEXT)\s+DEFAULT\s+',
-    re.IGNORECASE
-)
 
-# GENERATED COLUMN 패턴
-GENERATED_COLUMN_PATTERN = re.compile(
-    r'GENERATED\s+ALWAYS\s+AS\s*\(([^)]+)\)',
-    re.IGNORECASE
-)
-
-# ============================================================
-# 신규 패턴 (이슈 #63)
-# ============================================================
-
-# PARTITION BY KEY/RANGE/LIST with prefix index 패턴
-# PARTITION BY KEY (prefix_col(N)) 또는 KEY (col(N)) 형태 감지
-PARTITION_PREFIX_KEY_PATTERN = re.compile(
-    r'PARTITION\s+BY\s+(?:LINEAR\s+)?KEY\s*\([^)]*\w+\s*\(\s*\d+\s*\)[^)]*\)',
-    re.IGNORECASE
-)
-
-# 스키마 생략 dot 구문 패턴 (`.tableName` 형태)
-# FROM 또는 JOIN 뒤에 오는 .table_name 참조 (스키마 없이 점으로 시작)
-EMPTY_DOT_TABLE_SYNTAX_PATTERN = re.compile(
-    r'(?:FROM|JOIN)\s+\.\s*`?\w+`?',
-    re.IGNORECASE
-)
-
-# INNODB ROW_FORMAT REDUNDANT/COMPACT 패턴
-INNODB_ROW_FORMAT_PATTERN = re.compile(
-    r'\bROW_FORMAT\s*=\s*(REDUNDANT|COMPACT)\b',
-    re.IGNORECASE
-)
-
-# deprecated 날짜 구분자 패턴 (@ 또는 / 또는 ! 등 비표준 구분자 사용)
-# MySQL은 일반적으로 - 또는 / 허용하나 @ ! # 등은 비표준
-DEPRECATED_TEMPORAL_DELIMITER_PATTERN = re.compile(
-    r"'(\d{4})\s*[@!#]\s*(\d{1,2})\s*[@!#]\s*(\d{1,2})'",
-    re.IGNORECASE
-)
-
-# 비InnoDB 엔진 테이블에 FOREIGN KEY 정의 패턴
-# CREATE TABLE ... ENGINE=MyISAM/MEMORY/ARCHIVE ... FOREIGN KEY
-INVALID_ENGINE_FK_PATTERN = re.compile(
-    r'CREATE\s+TABLE\s+[^;]+?FOREIGN\s+KEY[^;]+?ENGINE\s*=\s*(MyISAM|MEMORY|ARCHIVE|CSV)\b'
-    r'|CREATE\s+TABLE\s+[^;]+?ENGINE\s*=\s*(MyISAM|MEMORY|ARCHIVE|CSV)\b[^;]+?FOREIGN\s+KEY',
-    re.IGNORECASE | re.DOTALL
-)
-
-# 저장 프로시저/함수/이벤트/트리거 이름이 예약어와 충돌하는 패턴
-# CREATE PROCEDURE/FUNCTION `keyword` 또는 CREATE PROCEDURE/FUNCTION keyword
-ROUTINE_SYNTAX_KEYWORD_PATTERN = re.compile(
-    r'CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|EVENT|TRIGGER)\s+`?(\w+)`?',
-    re.IGNORECASE
-)
-
-# INVALID_57_NAME_MULTIPLE_DOTS_PATTERN은 migration_identifier_matchers.py로
-# 이동했고 모듈 상단에서 재노출된다.
-
-# ============================================================
-# Upgrade check ID 매핑
-# ============================================================
-UPGRADE_CHECK_IDS: Dict[IssueType, str] = {
-    IssueType.REMOVED_SYS_VAR: "removedSysVars",
-    IssueType.AUTH_PLUGIN_ISSUE: "authMethodUsage",
-    IssueType.CHARSET_ISSUE: "utf8mb3",
-    IssueType.RESERVED_KEYWORD: "reservedKeywords",
-    IssueType.INVALID_DATE: "zeroDates",
-    IssueType.ZEROFILL_USAGE: "zerofillWidth",
-    IssueType.FLOAT_PRECISION: "floatAutoToDouble",
-    IssueType.INT_DISPLAY_WIDTH: "displayWidth",
-    IssueType.DEPRECATED_FUNCTION: "removedFunctions",
-    IssueType.SUPER_PRIVILEGE: "superPrivilege",
-    IssueType.FK_NAME_LENGTH: "maxIdentifierLength",
-    IssueType.DEPRECATED_ENGINE: "deprecatedStorage",
-    IssueType.YEAR2_TYPE: "year2Type",
-    IssueType.INDEX_TOO_LARGE: "indexKeyLength",
-    IssueType.GROUPBY_ASC_DESC: "groupByAscDesc",
-    IssueType.SQL_CALC_FOUND_ROWS_USAGE: "sqlCalcFoundRows",
-    IssueType.FK_NON_UNIQUE_REF: "fkNonUniqueRef",
-    IssueType.FK_REF_NOT_FOUND: "fkRefNotFound",
-    IssueType.PARTITION_PREFIX_KEY: "partitionPrefixKey",
-    IssueType.EMPTY_DOT_TABLE_SYNTAX: "emptyDotTableSyntax",
-    IssueType.INNODB_ROW_FORMAT: "innodbRowFormat",
-    IssueType.DEPRECATED_TEMPORAL_DELIMITER: "deprecatedTemporalDelimiter",
-    IssueType.INVALID_ENGINE_FK: "invalidEngineFk",
-    IssueType.ROUTINE_SYNTAX_KEYWORD: "routineSyntaxKeyword",
-    IssueType.INVALID_57_NAME_MULTIPLE_DOTS: "invalid57NameMultipleDots",
-}
-
-# ============================================================
-# 문서 링크 매핑
-# ============================================================
-DOC_LINKS: Dict[IssueType, str] = {
-    IssueType.AUTH_PLUGIN_ISSUE: "https://dev.mysql.com/doc/refman/8.4/en/caching-sha2-password.html",
-    IssueType.CHARSET_ISSUE: "https://dev.mysql.com/doc/refman/8.4/en/charset-unicode-utf8mb4.html",
-    IssueType.REMOVED_SYS_VAR: "https://dev.mysql.com/doc/refman/8.4/en/added-deprecated-removed.html",
-    IssueType.ZEROFILL_USAGE: "https://dev.mysql.com/doc/refman/8.4/en/numeric-type-attributes.html",
-    IssueType.FLOAT_PRECISION: "https://dev.mysql.com/doc/refman/8.4/en/floating-point-types.html",
-    IssueType.RESERVED_KEYWORD: "https://dev.mysql.com/doc/refman/8.4/en/keywords.html",
-    IssueType.INVALID_DATE: "https://dev.mysql.com/doc/refman/8.4/en/sql-mode.html#sqlmode_no_zero_date",
-    IssueType.DEPRECATED_ENGINE: "https://dev.mysql.com/doc/refman/8.4/en/storage-engines.html",
-    IssueType.SUPER_PRIVILEGE: "https://dev.mysql.com/doc/refman/8.4/en/privileges-provided.html",
-    IssueType.YEAR2_TYPE: "https://dev.mysql.com/doc/refman/8.4/en/year.html",
-    IssueType.INDEX_TOO_LARGE: "https://dev.mysql.com/doc/refman/8.4/en/innodb-limits.html",
-    IssueType.GROUPBY_ASC_DESC: "https://dev.mysql.com/doc/refman/8.4/en/select.html",
-    IssueType.SQL_CALC_FOUND_ROWS_USAGE: "https://dev.mysql.com/doc/refman/8.4/en/information-functions.html#function_found-rows",
-}
 
 # ============================================================
 # 자동 수정 가능 이슈 타입 (UI 공용 단일 소스)

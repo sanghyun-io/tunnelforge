@@ -987,10 +987,6 @@ class MigrationAnalyzerDialog(QDialog):
         """모든 고아 레코드 선택"""
         self.table_orphans.selectAll()
 
-    def _generate_orphan_select_query(self, orphan: OrphanRecord, schema: str) -> str:
-        """고아 레코드 조회 쿼리 생성"""
-        return build_orphan_select_sql(orphan, schema)
-
     def copy_orphan_query(self):
         """선택된 고아 레코드 조회 쿼리 복사"""
         if not self.analysis_result:

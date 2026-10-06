@@ -116,14 +116,6 @@ class DbCoreFacade:
         tables = result.get("tables")
         return [str(table) for table in tables] if isinstance(tables, list) else []
 
-    def schema_diff(self, source_schema: Dict[str, Any], target_schema: Dict[str, Any]) -> List[Dict[str, Any]]:
-        result = self.client.request(
-            "schema.diff",
-            {"source_schema": source_schema, "target_schema": target_schema},
-        )
-        differences = result.get("differences")
-        return [item for item in differences if isinstance(item, dict)] if isinstance(differences, list) else []
-
     def execute_query(
         self,
         endpoint: DbEndpoint,
@@ -257,16 +249,6 @@ class DbCoreFacade:
         result = self.client.request("query.execute", payload, on_event=handle_event)
         _raise_if_query_failed(result)
         return result
-
-    def run_migration(
-        self,
-        payload: Dict[str, Any],
-        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ) -> Dict[str, Any]:
-        return self.client.request("migration.run", payload, on_event=on_event)
-
-    def verify_migration(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self.client.request("migration.verify", payload)
 
     def run_dump(
         self,

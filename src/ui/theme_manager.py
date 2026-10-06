@@ -8,7 +8,6 @@ Windows 시스템 테마 감지 기능 제공
 import sys
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from src.core.i18n import tr
 from src.ui.themes import ThemeType, ThemeColors, get_theme_colors, LIGHT_THEME
 
 
@@ -32,11 +31,6 @@ class ThemeManager(QObject):
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
-
-    @classmethod
-    def reset_instance(cls):
-        """테스트용: 싱글톤 인스턴스 초기화"""
-        cls._instance = None
 
     def set_config_manager(self, config_manager):
         """ConfigManager 설정 (설정 저장/로드용)"""
@@ -74,11 +68,6 @@ class ThemeManager(QObject):
         """현재 적용된 테마 색상"""
         return self._current_colors
 
-    @property
-    def is_dark(self) -> bool:
-        """다크 테마 여부"""
-        return self._current_colors == get_theme_colors(ThemeType.DARK)
-
     def set_theme(self, theme_type: ThemeType, save: bool = True):
         """테마 설정 및 적용
 
@@ -112,19 +101,3 @@ class ThemeManager(QObject):
         else:
             # ConfigManager 없으면 시스템 테마 사용
             self.set_theme(ThemeType.SYSTEM, save=False)
-
-    def refresh_system_theme(self):
-        """시스템 테마 재감지 (시스템 설정 변경 시 호출)"""
-        if self._current_theme_type == ThemeType.SYSTEM:
-            system_theme = self.detect_system_theme()
-            self._current_colors = get_theme_colors(ThemeType.SYSTEM, system_theme)
-            self.theme_changed.emit(self._current_colors)
-
-    def get_theme_display_name(self, theme_type: ThemeType) -> str:
-        """테마 타입의 표시 이름 반환"""
-        names = {
-            ThemeType.SYSTEM: tr("settings.system_theme"),
-            ThemeType.LIGHT: tr("settings.light_mode"),
-            ThemeType.DARK: tr("settings.dark_mode"),
-        }
-        return names.get(theme_type, tr("common.unknown"))

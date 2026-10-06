@@ -18,17 +18,18 @@ from src.core.db_core_service import normalize_db_engine
 from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
-from src.ui.workers.test_worker import ConnectionTestWorker, TestType
+from src.ui.workers.connection_test_worker import ConnectionTestWorker, TestType
 from src.ui.workers.db_connection_worker import has_active_connection_workers
-from src.ui.dialogs.test_dialogs import TestProgressDialog
+from src.ui.dialogs.progress_dialog import TestProgressDialog
 from src.ui.controllers import TrayController, TunnelActionsController, WizardLauncher
 from src.ui.dialogs.migration_dialogs import has_active_detached_migration_workers
 from src.ui.dialogs.oneclick_migration_dialog import (
     has_active_detached_oneclick_workers,
 )
+from src.ui.dialogs.explain_plan_dialog import has_active_explain_workers
 from src.core.logger import get_logger
 from src.core.platform_integration import restore_window_to_front
-from src.core.resources import app_icon_path, resource_path
+from src.core.resources import app_icon_path
 from src.core.i18n import tr
 from src.core.error_report_consent import ConsentPolicy
 from src.ui.dialogs.error_reporting_consent_dialog import ErrorReportingConsentDialog
@@ -44,14 +45,8 @@ def _utc_now():
     return datetime.now(timezone.utc)
 
 
-def get_resource_path(relative_path):
-    """PyInstaller 빌드 환경에서 리소스 경로를 올바르게 반환"""
-    return str(resource_path(relative_path))
-
-
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
 from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
-from src.ui.dialogs.tunnel_status_dialog import TunnelStatusDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
 from src.core.tunnel_monitor import TunnelMonitor
 from src.core.mysql_login_path import MysqlLoginPathManager
@@ -312,8 +307,6 @@ class TunnelManagerUI(QMainWindow):
 
     def _connect_tree_signals(self):
         """트리 위젯 시그널 연결"""
-        self.tunnel_tree.tunnel_start_requested.connect(self.start_tunnel)
-        self.tunnel_tree.tunnel_stop_requested.connect(self.stop_tunnel)
         self.tunnel_tree.tunnel_edit_requested.connect(self.edit_tunnel_dialog)
         self.tunnel_tree.tunnel_delete_requested.connect(self.delete_tunnel)
         self.tunnel_tree.tunnel_db_connect.connect(self._on_tree_db_connect)
@@ -852,6 +845,7 @@ class TunnelManagerUI(QMainWindow):
             QApplication.activeModalWidget() is not None
             or has_active_detached_migration_workers()
             or has_active_detached_oneclick_workers()
+            or has_active_explain_workers()
         )
 
     def _maybe_show_error_reporting_consent(self):
@@ -1100,37 +1094,6 @@ class TunnelManagerUI(QMainWindow):
         self.tunnel_tree.update_tunnel_status(tunnel_id, is_active)
         self.tunnel_tree.set_power_button(tunnel_id, self._build_power_button(tunnel, is_active))
         self._schedule_repaint()
-
-    def open_tunnel_status_dialog(self, tunnel_id: str):
-        """터널 상태 상세 다이얼로그 열기"""
-        # 터널 이름 찾기
-        tunnel_name = tunnel_id
-        for tunnel in self.tunnels:
-            if tunnel.get('id') == tunnel_id:
-                tunnel_name = tunnel.get('name', tunnel_id)
-                break
-
-        dialog = TunnelStatusDialog(
-            self,
-            self.tunnel_monitor,
-            tunnel_id,
-            tunnel_name
-        )
-        dialog.exec()
-
-    def get_tunnel_status_info(self, tunnel_id: str) -> dict:
-        """터널 상태 정보 반환 (트리 위젯용)"""
-        if not hasattr(self, 'tunnel_monitor') or not self.tunnel_monitor:
-            return {}
-
-        status = self.tunnel_monitor.get_status(tunnel_id)
-
-        return {
-            'state': status.state,
-            'duration': status.format_duration(),
-            'latency': f"{status.latency_ms:.0f}ms" if status.latency_ms and status.latency_ms >= 0 else "-",
-            'reconnect_count': status.reconnect_count
-        }
 
     # =========================================================================
     # 스키마 비교 관련 메서드

@@ -15,8 +15,8 @@ from src.core.connection_trust import (
 )
 from src.ui import trust_prompts
 from src.ui.styles import ButtonStyles, LabelStyles
-from src.ui.workers.test_worker import ConnectionTestWorker, TestType
-from src.ui.dialogs.test_dialogs import TestProgressDialog
+from src.ui.workers.connection_test_worker import ConnectionTestWorker, TestType
+from src.ui.dialogs.progress_dialog import TestProgressDialog
 
 logger = get_logger(__name__)
 

@@ -62,10 +62,8 @@ def test_sql_schedules_are_rejected_and_never_executed(env):
     env.settings["schedules"] = [sql.to_dict() | {"next_run": (datetime.now() - timedelta(minutes=1)).isoformat()}]
     legacy = env.reload()
     assert legacy._snapshot_due_jobs(datetime.now()) == []
-    executed = MagicMock()
-    legacy._sql_executor.execute = executed
     ok, message = legacy._execute_task(legacy.get_schedules()[0])
-    assert (ok, message) == (False, SQL_TASK_UNSUPPORTED_MESSAGE) and not executed.called
+    assert (ok, message) == (False, SQL_TASK_UNSUPPORTED_MESSAGE)
 
 
 @pytest.mark.parametrize("cron, fragment", [

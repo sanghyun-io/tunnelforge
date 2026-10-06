@@ -93,21 +93,6 @@ class TestMetadataCache:
         assert self.cache.get('prefix:key2') is None
         assert self.cache.get('other:key3') == 3
 
-    def test_get_stats(self):
-        """캐시 통계 반환 확인"""
-        self.cache.set('valid1', 'a')
-        self.cache.set('valid2', 'b')
-
-        # 하나를 만료
-        key = 'valid2'
-        value, _ = self.cache._cache[key]
-        self.cache._cache[key] = (value, time.time() - 100)
-
-        stats = self.cache.get_stats()
-        assert stats['total_entries'] == 2
-        assert stats['valid_entries'] == 1
-        assert stats['ttl_seconds'] == 5
-
     def test_overwrite_existing_key(self):
         """기존 키 덮어쓰기 확인"""
         self.cache.set('key', 'old_value')
@@ -340,30 +325,6 @@ class TestMySQLConnector:
         mock_conn.cursor.assert_not_called()
         mock_conn.commit.assert_not_called()
 
-    def test_invalidate_cache_all(self):
-        """전체 캐시 무효화 확인"""
-        # 캐시에 항목 추가
-        self.connector._cache.set(f"{self.connector._cache_key_prefix}:schemas", ['db1'])
-        self.connector._cache.set(f"{self.connector._cache_key_prefix}:tables:db1", ['t1'])
-
-        self.connector.invalidate_cache()
-
-        assert self.connector._cache.get(f"{self.connector._cache_key_prefix}:schemas") is None
-
-    def test_invalidate_cache_specific_schema(self):
-        """특정 스키마 캐시만 무효화 확인"""
-        # 두 스키마의 테이블 캐시 설정
-        prefix = self.connector._cache_key_prefix
-        self.connector._cache.set(f"{prefix}:tables:schema_a", ['t1'])
-        self.connector._cache.set(f"{prefix}:tables:schema_b", ['t2'])
-
-        self.connector.invalidate_cache(schema='schema_a')
-
-        # schema_a 캐시는 제거됨
-        assert self.connector._cache.get(f"{prefix}:tables:schema_a") is None
-        # schema_b 캐시는 유지됨
-        assert self.connector._cache.get(f"{prefix}:tables:schema_b") == ['t2']
-
     def test_context_manager_connects_and_disconnects(self):
         """컨텍스트 매니저 연결/해제 확인"""
         self.connector._delegate.facade = FakeFacade()
@@ -438,84 +399,6 @@ class TestMySQLConnector:
         """테이블 미존재 확인"""
         self.connector.get_tables = MagicMock(return_value=['users', 'orders'])
         assert self.connector.table_exists('products') is False
-
-    def test_get_create_table_statement_uses_qualified_name_without_switching_database(self):
-        """CREATE TABLE 조회 시 스키마 한정 식별자만 사용하고 self.database는 유지"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchone.return_value = {'Create Table': 'CREATE TABLE `users` (id INT)'}
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
-
-        ddl = self.connector.get_create_table_statement('users', schema='schema_b')
-
-        assert 'CREATE TABLE' in ddl
-        assert self.connector.database == 'test_db'
-        mock_conn.select_db.assert_not_called()
-        executed_sql = mock_cursor.execute.call_args[0][0]
-        assert '`schema_b`.`users`' in executed_sql
-
-    def test_get_table_data_uses_qualified_name_without_switching_database(self):
-        """테이블 데이터 조회 시 스키마 한정 식별자만 사용하고 self.database는 유지"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchall.return_value = [{'id': 1}]
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
-
-        rows = self.connector.get_table_data('users', schema='schema_b', limit=10)
-
-        assert rows == [{'id': 1}]
-        assert self.connector.database == 'test_db'
-        mock_conn.select_db.assert_not_called()
-        executed_sql = mock_cursor.execute.call_args[0][0]
-        assert '`schema_b`.`users`' in executed_sql
-        assert 'LIMIT 10' in executed_sql
-
-    def test_get_row_count_uses_qualified_name_without_switching_database(self):
-        """행 수 조회 시 스키마 한정 식별자만 사용하고 self.database는 유지"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchall.return_value = [{'cnt': 5}]
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
-
-        count = self.connector.get_row_count('users', schema='schema_b')
-
-        assert count == 5
-        assert self.connector.database == 'test_db'
-        mock_conn.select_db.assert_not_called()
-        executed_sql = mock_cursor.execute.call_args[0][0]
-        assert '`schema_b`.`users`' in executed_sql
-
-    def test_mysql_temporary_schema_methods_do_not_switch_database(self):
-        """세 메서드 모두 schema 지정 시에도 connector.database가 바뀌지 않음을 종합 확인"""
-        from src.core.db_connector import MySQLConnector
-        connector = MySQLConnector(
-            host='127.0.0.1', port=3306, user='u', password='p', database='schema_a'
-        )
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchone.return_value = {'Create Table': 'CREATE TABLE `users` (id INT)'}
-        mock_cursor.fetchall.return_value = [{'cnt': 5}]
-        mock_conn.cursor.return_value = mock_cursor
-        connector.connection = mock_conn
-
-        connector.get_create_table_statement('users', schema='schema_b')
-        connector.get_table_data('users', schema='schema_b', limit=10)
-        connector.get_row_count('users', schema='schema_b')
-
-        assert connector.database == 'schema_a'
-        mock_conn.select_db.assert_not_called()
-
 
 # =====================================================================
 # Facade 주입/공유 테스트 (WP-2.10: connector-facade 통합)

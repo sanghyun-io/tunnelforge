@@ -28,10 +28,10 @@ def filled_dialog(**kwargs):
     return dialog
 
 
-def test_task_type_choice_is_hidden_and_the_unattended_limits_are_explained():
+def test_the_unattended_limits_are_explained():
     dialog = ScheduleEditDialog(None, [("t1", "Prod")])
     try:
-        assert dialog.task_type_box.isHidden()
+        assert not hasattr(dialog, "sql_radio")  # SQL 작업 유형 선택 UI 자체가 없다
         assert "호스트 키" in dialog.unattended_note.text() and "개인키" in dialog.unattended_note.text()
         assert dialog.catch_up_check.isChecked()
     finally:
@@ -41,7 +41,6 @@ def test_task_type_choice_is_hidden_and_the_unattended_limits_are_explained():
 def test_saving_always_creates_a_backup_schedule_with_the_catch_up_choice():
     dialog = filled_dialog()
     try:
-        dialog.sql_radio.setChecked(True)  # even a forced radio state cannot create a SQL schedule
         dialog.catch_up_check.setChecked(False)
         dialog._save()
         config = dialog.result_config
@@ -71,6 +70,7 @@ def test_a_legacy_sql_schedule_can_not_be_saved_again(warnings):
     dialog = ScheduleEditDialog(None, [("t1", "Prod")], schedule=legacy)
     try:
         assert not dialog.unsupported_label.isHidden() and not dialog.save_btn.isEnabled()
+        assert dialog.backup_page.isHidden()
         dialog._save()
         assert dialog.result_config is None and "지원되지 않습니다" in warnings[-1]
     finally:

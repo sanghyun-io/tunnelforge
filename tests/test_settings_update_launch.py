@@ -516,7 +516,7 @@ def test_settings_ignores_queued_success_from_cancelled_generation(
             self.progress.emit(4, 4)
             self.finished.emit(True, str(installer))
 
-    import src.ui.workers as worker_package
+    import src.ui.workers.update_worker as worker_package
 
     monkeypatch.setattr(worker_package, "UpdateDownloadWorker", LateSuccessWorker)
     dialog = _MinimalDownloadDialog()
@@ -570,7 +570,7 @@ def test_settings_queued_old_success_cannot_override_restarted_download(
             self.progress.emit(self.file_size, self.file_size)
             self.finished.emit(True, self.installer)
 
-    import src.ui.workers as worker_package
+    import src.ui.workers.update_worker as worker_package
 
     monkeypatch.setattr(worker_package, "UpdateDownloadWorker", QueuedSuccessWorker)
     dialog = _MinimalDownloadDialog()
@@ -631,7 +631,7 @@ def test_settings_stale_success_cleanup_is_best_effort(monkeypatch, tmp_path):
         def run(self):
             self.finished.emit(True, str(installer))
 
-    import src.ui.workers as worker_package
+    import src.ui.workers.update_worker as worker_package
 
     monkeypatch.setattr(worker_package, "UpdateDownloadWorker", LateSuccessWorker)
     dialog = _MinimalDownloadDialog()
@@ -669,7 +669,7 @@ def test_settings_reject_invalidates_queued_success_before_dialog_closes(
             self.progress.emit(4, 4)
             self.finished.emit(True, str(installer))
 
-    import src.ui.workers as worker_package
+    import src.ui.workers.update_worker as worker_package
 
     monkeypatch.setattr(worker_package, "UpdateDownloadWorker", LateSuccessWorker)
     dialog = _MinimalDownloadDialog()
@@ -711,7 +711,7 @@ def test_settings_accept_invalidates_queued_success_before_dialog_closes(
             self.progress.emit(4, 4)
             self.finished.emit(True, str(installer))
 
-    import src.ui.workers as worker_package
+    import src.ui.workers.update_worker as worker_package
 
     monkeypatch.setattr(worker_package, "UpdateDownloadWorker", LateSuccessWorker)
     dialog = _MinimalDownloadDialog()
@@ -759,7 +759,7 @@ def test_settings_close_cancels_inflight_worker_without_waiting_in_ui_thread(
             progress_emitted.set()
             self.cancel_requested.wait(5000)
 
-    import src.ui.workers as worker_package
+    import src.ui.workers.update_worker as worker_package
 
     monkeypatch.setattr(worker_package, "UpdateDownloadWorker", InFlightWorker)
     dialog = _MinimalDownloadDialog()
