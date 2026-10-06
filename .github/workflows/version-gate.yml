@@ -9,9 +9,12 @@ on:
   pull_request:
     types: [labeled, unlabeled, opened, synchronize, reopened]
 
+# 새 이벤트가 오면 이전 실행을 취소한다. version-bump 의 push 는 HEAD_SHA 위의
+# fast-forward 이고 멱등이라, push 전에 취소돼도 새 실행이 같은 bump 를 다시 만든다.
+# (bump push 자체가 synchronize 를 일으켜 옛 head 의 macOS/live 잡을 끊어 준다.)
 concurrency:
   group: version-gate-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read

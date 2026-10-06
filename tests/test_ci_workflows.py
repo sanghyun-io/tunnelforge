@@ -613,3 +613,16 @@ def test_frozen_smoke_times_out_a_hung_app(smoke_runner, tmp_path):
     app.write_text('import time\ntime.sleep(10)\n', encoding='utf-8')
     with pytest.raises(subprocess.TimeoutExpired):
         smoke_runner([sys.executable, str(app)], timeout=0.2)
+
+
+def test_pr_workflows_cancel_superseded_runs():
+    # 버전 bump 커밋이 들어오면 옛 head 검증(macOS 러너 포함)이 대기열을 막지 않게 한다.
+    gate = yaml.safe_load(VERSION_GATE_PATH.read_text(encoding="utf-8"))["concurrency"]
+    assert gate["group"] == "version-gate-${{ github.event.pull_request.number }}"
+    assert gate["cancel-in-progress"] is True
+
+    macos_path = PROJECT_ROOT / ".github" / "workflows" / "macos-app.yml"
+    macos = yaml.safe_load(macos_path.read_text(encoding="utf-8"))["concurrency"]
+    # 수동 서명/공증 실행(workflow_dispatch)은 run_id 그룹이라 서로 취소하지 않는다.
+    assert macos["group"] == "macos-app-${{ github.event.pull_request.number || github.run_id }}"
+    assert macos["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
