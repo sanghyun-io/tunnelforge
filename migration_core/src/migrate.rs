@@ -1686,6 +1686,9 @@ fn verify_table_by_digest<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
 /// key column이 있는 테이블을 keyset 페이지네이션으로 행 단위 비교한다. 청크마다 양측을
 /// 읽어 typed 비교하고 row_progress를 emit하며, 마지막에 table_progress(completed)를 emit한다.
 /// 읽기 오류가 나면 그 오류를 담고 루프를 종료한다(완료 이벤트는 그대로 emit).
+/// Keys per target lookup statement (an OR of key equalities); bounds the SQL size.
+const VERIFY_KEY_LOOKUP_BATCH: usize = 500;
+
 fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
     source: &mut S,
     target: &mut T,
@@ -1716,24 +1719,31 @@ fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
                 break;
             }
         };
-        let target_rows = match target.read_rows_after_key(
-            table,
-            key_columns,
-            last_key.as_deref(),
-            chunk_size,
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                mismatches.push(json!({
-                    "table": table.name,
-                    "kind": "error",
-                    "side": "target",
-                    "message": err
-                }));
-                break;
+        if source_rows.is_empty() {
+            // Rows only the target has are reported by the count check above.
+            break;
+        }
+        // Look the target rows up by this page's keys instead of paging the target in its own
+        // order: across engines (or collations) the two sides sort text keys differently, which
+        // misaligned the pages and reported correct rows as missing/extra.
+        let keys = source_rows.iter()
+            .filter_map(|row| row_key_token(row, key_columns).and_then(|token| decode_key_token(&token)))
+            .collect::<Vec<_>>();
+        let mut target_rows = Vec::new();
+        let mut lookup_error = None;
+        for batch in keys.chunks(VERIFY_KEY_LOOKUP_BATCH) {
+            match target.read_rows_by_keys(table, key_columns, batch) {
+                Ok(rows) => target_rows.extend(rows),
+                Err(err) => { lookup_error = Some(err); break; }
             }
-        };
-        if source_rows.is_empty() && target_rows.is_empty() {
+        }
+        if let Some(err) = lookup_error {
+            mismatches.push(json!({
+                "table": table.name,
+                "kind": "error",
+                "side": "target",
+                "message": err
+            }));
             break;
         }
         mismatches.extend(compare_typed_keyed_rows(
@@ -1749,10 +1759,7 @@ fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
             "rows": verified_rows.min(total_rows),
             "total": total_rows
         }));
-        let next_key = source_rows
-            .last()
-            .or_else(|| target_rows.last())
-            .and_then(|row| row_key_token(row, key_columns));
+        let next_key = source_rows.last().and_then(|row| row_key_token(row, key_columns));
         match advance_keyset_cursor(table, key_columns, last_key.as_deref(), next_key) {
             Ok(token) => last_key = Some(token),
             Err(err) => {
@@ -2328,9 +2335,32 @@ mod tests {
         assert!(target.read_limits.is_empty());
         assert!(source.read_after_limits.len() > 2);
         assert!(source.read_after_limits.iter().all(|limit| *limit == 2));
-        assert!(target.read_after_limits.iter().all(|limit| *limit == 2));
+        // The target is looked up by each source page's keys, never paged in its own order.
+        assert!(target.read_after_limits.is_empty());
+        assert_eq!(target.key_lookups, vec![2, 2, 1]);
         assert!(source.max_returned <= 2);
         assert!(target.max_returned <= 2);
+    }
+
+    #[test]
+    fn verify_does_not_depend_on_the_target_sort_order() {
+        // A target that sorts keys differently (another engine's collation) used to misalign pages.
+        let rows: Vec<Value> = ["a", "B", "c", "D", "e"].iter()
+            .map(|id| json!({"id": id, "name": format!("user-{id}")}))
+            .collect();
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        let mut source = TrackingAdapter { rows, ..Default::default() };
+        let mut target = TrackingAdapter { rows: reversed, ..Default::default() };
+        let mismatches = verify_with_adapters(&schema(), &mut source, &mut target, 2);
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+
+        // A changed value or a missing row is still reported.
+        let mut target = TrackingAdapter { rows: vec![json!({"id": "a", "name": "user-a"}), json!({"id": "B", "name": "changed"})], ..Default::default() };
+        let mut source = TrackingAdapter { rows: vec![json!({"id": "a", "name": "user-a"}), json!({"id": "B", "name": "user-B"}), json!({"id": "c", "name": "user-c"})], ..Default::default() };
+        let mismatches = verify_with_adapters(&schema(), &mut source, &mut target, 2);
+        assert!(mismatches.iter().any(|mismatch| mismatch["kind"] == "count"), "{mismatches:?}");
+        assert!(mismatches.len() >= 3, "{mismatches:?}");
     }
 
     #[test]

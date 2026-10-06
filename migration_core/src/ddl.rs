@@ -470,6 +470,21 @@ pub fn select_chunk_text_sql(
     )
 }
 
+/// Rows whose key equals one of `keys`, with no ORDER BY: verify looks target rows up by the source
+/// page's keys, so the two engines' collation orders never have to agree.
+pub fn select_chunk_text_by_keys_sql(engine: &str, table: &NormalizedTable, key_columns: &[String], keys: &[Vec<String>]) -> String {
+    let terms = keys.iter().map(|values| {
+        let parts = key_columns.iter().zip(values).map(|(column, value)| keyset_term(engine, table, column, value, false)).collect::<Vec<_>>();
+        format!("({})", parts.join(" AND "))
+    }).collect::<Vec<_>>();
+    format!(
+        "SELECT {} FROM {} WHERE {}",
+        projected_text_columns_sql(engine, table),
+        quote_ident(engine, &table.name),
+        if terms.is_empty() { "1 = 0".to_string() } else { terms.join(" OR ") }
+    )
+}
+
 pub fn select_chunk_text_after_key_sql(
     engine: &str,
     table: &NormalizedTable,
@@ -588,7 +603,7 @@ fn keyset_term(engine: &str, table: &NormalizedTable, column: &str, value: &str,
                 }
             }
         }
-        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => {
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "character" => {
             return format!("{column_ref} {op} {}", mysql_text_literal(value));
         }
         "bit" => {

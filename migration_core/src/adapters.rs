@@ -404,6 +404,15 @@ pub trait MigrationAdapter {
         }
         Err("keyset reads require adapter support".to_string())
     }
+    /// Rows whose key equals one of `keys` (verify looks target rows up by the source keys).
+    fn read_rows_by_keys(
+        &mut self,
+        _table: &NormalizedTable,
+        _key_columns: &[String],
+        _keys: &[Vec<String>],
+    ) -> Result<Vec<Value>, String> {
+        Err("key lookups require adapter support".to_string())
+    }
     fn insert_rows(&mut self, table: &NormalizedTable, rows: Vec<Value>) -> Result<(), String>;
     fn execute_sql(&mut self, sql: &str) -> Result<(), String>;
 }
@@ -484,6 +493,19 @@ impl MigrationAdapter for MemoryAdapter {
         let rows = self.rows.get(&table.name).cloned().unwrap_or_default();
         let start = keyset_start_index(&rows, key_columns, last_key);
         Ok(rows.into_iter().skip(start).take(limit).collect())
+    }
+
+    fn read_rows_by_keys(
+        &mut self,
+        table: &NormalizedTable,
+        key_columns: &[String],
+        keys: &[Vec<String>],
+    ) -> Result<Vec<Value>, String> {
+        let wanted = keys.iter().map(|values| serde_json::to_string(values).unwrap_or_default()).collect::<std::collections::BTreeSet<_>>();
+        Ok(self.rows.get(&table.name).into_iter().flatten()
+            .filter(|row| row_key_token(row, key_columns).is_some_and(|token| wanted.contains(&token)))
+            .cloned()
+            .collect())
     }
 
     fn insert_rows(&mut self, table: &NormalizedTable, rows: Vec<Value>) -> Result<(), String> {
@@ -708,6 +730,27 @@ impl MigrationAdapter for LiveAdapter {
                     .into_iter()
                     .map(|row| postgres_row_to_json(&columns, &row))
                     .collect())
+            }
+        }
+    }
+
+    fn read_rows_by_keys(
+        &mut self,
+        table: &NormalizedTable,
+        key_columns: &[String],
+        keys: &[Vec<String>],
+    ) -> Result<Vec<Value>, String> {
+        let columns = column_names(table);
+        let engine = self.engine();
+        let sql = select_chunk_text_by_keys_sql(engine, table, key_columns, keys);
+        match self {
+            Self::MySql(conn) => {
+                let rows: Vec<mysql::Row> = conn.query(sql).map_err(|err| format!("mysql key lookup error: {err}"))?;
+                Ok(rows.into_iter().map(|row| mysql_row_to_json(&columns, row)).collect())
+            }
+            Self::PostgreSql(client) => {
+                let rows = client.query(&sql, &[]).map_err(|err| format_postgres_error("postgresql key lookup error", &err))?;
+                Ok(rows.into_iter().map(|row| postgres_row_to_json(&columns, &row)).collect())
             }
         }
     }
@@ -1027,6 +1070,7 @@ pub(crate) mod test_support {
         pub(crate) rows: Vec<Value>,
         pub(crate) read_limits: Vec<usize>,
         pub(crate) read_after_limits: Vec<usize>,
+        pub(crate) key_lookups: Vec<usize>,
         pub(crate) max_returned: usize,
     }
 
@@ -1061,6 +1105,22 @@ pub(crate) mod test_support {
             self.read_after_limits.push(limit);
             let start = keyset_start_index(&self.rows, key_columns, last_key);
             let chunk: Vec<Value> = self.rows.iter().skip(start).take(limit).cloned().collect();
+            self.max_returned = self.max_returned.max(chunk.len());
+            Ok(chunk)
+        }
+
+        fn read_rows_by_keys(
+            &mut self,
+            _table: &NormalizedTable,
+            key_columns: &[String],
+            keys: &[Vec<String>],
+        ) -> Result<Vec<Value>, String> {
+            self.key_lookups.push(keys.len());
+            let wanted = keys.iter().map(|values| serde_json::to_string(values).unwrap_or_default()).collect::<Vec<_>>();
+            let chunk: Vec<Value> = self.rows.iter()
+                .filter(|row| row_key_token(row, key_columns).is_some_and(|token| wanted.contains(&token)))
+                .cloned()
+                .collect();
             self.max_returned = self.max_returned.max(chunk.len());
             Ok(chunk)
         }
