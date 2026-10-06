@@ -1,6 +1,7 @@
 """Best-effort background delivery for anonymous error reports."""
 
 from datetime import datetime, timezone
+import json
 import weakref
 from typing import Optional
 
@@ -9,6 +10,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
 from src.core.error_report_builder import build_error_report
 from src.core.error_report_consent import ConsentPolicy
+from src.core.error_report_sanitizer import sanitize_local_diagnostic, sanitize_local_diagnostic_data
 from src.core.error_report_transport import (
     ERROR_REPORT_RELAY_URL,
     ErrorReportTransport,
@@ -137,6 +139,35 @@ def _record_last_report_attempt(config_manager, submitted, issue_url):
         config_manager.mutate_app_settings(record)
     except Exception:
         logger.warning("Anonymous error report attempt status could not be saved")
+
+
+def sanitize_local_diagnostic_json(value: object) -> str:
+    """Sanitized compact JSON of a structured value for local logs; "REDACTED" if it cannot be encoded."""
+    try:
+        serialized = json.dumps(
+            sanitize_local_diagnostic_data(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except BaseException:
+        serialized = "REDACTED"
+    return sanitize_local_diagnostic(serialized)
+
+
+def report_operation_error(dialog, operation_kind: str, phase: str):
+    """Submit a privacy-allowlisted report for a dialog's failed worker operation."""
+    if not dialog.config_manager:
+        return
+    report_args = {
+        "operation_kind": operation_kind,
+        "db_engine": getattr(dialog.connector, "engine", ""),
+        "phase": phase,
+    }
+    error_code = getattr(getattr(dialog, "worker", None), "error_code", None)
+    if error_code:
+        report_args["error_code"] = error_code
+    dialog._start_error_report_worker(**report_args)
 
 
 class ErrorReportingMixin:
