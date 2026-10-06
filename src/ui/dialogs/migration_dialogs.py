@@ -21,6 +21,7 @@ from PyQt6.QtGui import QColor
 from typing import Iterator, List, Optional, Dict
 from datetime import datetime
 
+from src.ui.workers.cancellable_worker import has_running_worker, worker_is_running
 from src.core.db_connector import MySQLConnector
 from src.core.migration_analyzer import (
     MigrationAnalyzer, AnalysisResult, OrphanRecord,
@@ -49,23 +50,9 @@ LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP = (
 _DETACHED_MIGRATION_WORKERS = set()
 
 
-def _worker_is_running(worker) -> bool:
-    try:
-        is_running = getattr(worker, "isRunning")
-        return bool(is_running()) if callable(is_running) else False
-    except (AttributeError, RuntimeError, TypeError):
-        return False
-
-
 def has_active_detached_migration_workers() -> bool:
     """Return whether a detached migration DB worker is still running."""
-    active = False
-    for worker in list(_DETACHED_MIGRATION_WORKERS):
-        if _worker_is_running(worker):
-            active = True
-        else:
-            _DETACHED_MIGRATION_WORKERS.discard(worker)
-    return active
+    return has_running_worker(_DETACHED_MIGRATION_WORKERS)
 
 
 def _disconnect_connector_in_background(connector) -> None:
@@ -119,12 +106,12 @@ def _detach_workers_until_finished(workers, connector) -> None:
             on_finished()
             continue
 
-        if not _worker_is_running(worker):
+        if not worker_is_running(worker):
             on_finished()
             continue
 
         _DETACHED_MIGRATION_WORKERS.add(worker)
-        if not _worker_is_running(worker):
+        if not worker_is_running(worker):
             on_finished()
 
 

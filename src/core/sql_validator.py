@@ -9,6 +9,7 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import List, Set, Optional, Tuple
 
+from src.core.sql_statement_parser import literal_and_comment_mask
 from src.core import constants
 from src.core.sql_identifier_utils import (
     ALIAS_STOP_WORDS, _normalize_identifier, _read_identifier, _skip_balanced_parentheses,
@@ -148,10 +149,8 @@ class SQLValidator:
         """테이블명 검증"""
         issues = []
 
-        # 문자열 리터럴 및 주석 영역 찾기 (검증에서 제외)
-        string_regions = self._find_string_regions(sql)
-        comment_regions = self._find_comment_regions(sql)
-        excluded_regions = string_regions + comment_regions
+        # 문자열 리터럴 및 주석 영역 (검증에서 제외)
+        masked = literal_and_comment_mask(sql)
 
         # CTE 이름 / 파생 테이블(서브쿼리) 별칭은 실제 테이블이 아니므로 존재 검증에서 제외
         virtual_tables = extract_cte_names(sql) | extract_derived_table_aliases(sql)
@@ -185,7 +184,7 @@ class SQLValidator:
                 validated_positions.add(table_start)
 
                 # 문자열/주석 내부인지 확인
-                if self._is_in_regions(table_start, excluded_regions):
+                if masked[table_start]:
                     continue
 
                 # CTE/파생 테이블 별칭이면 존재하지 않는 테이블로 오탐하지 않도록 스킵
@@ -213,8 +212,8 @@ class SQLValidator:
         """컬럼명 검증"""
         issues = []
 
-        # 문자열 리터럴 영역
-        string_regions = self._find_string_regions(sql)
+        # 문자열 리터럴 및 주석 영역
+        masked = literal_and_comment_mask(sql)
 
         # FROM 절에서 테이블/별칭 매핑 추출 (Validator/AutoCompleter 공용 파서)
         table_aliases = extract_table_aliases(sql, metadata)
@@ -227,7 +226,7 @@ class SQLValidator:
             column = match.group(2)
 
             # 문자열 내부 체크
-            if self._is_in_string(match.start(), string_regions):
+            if masked[match.start()]:
                 continue
 
             # 별칭 → 실제 테이블명 변환
@@ -255,7 +254,7 @@ class SQLValidator:
         return issues
 
     def _flag_unsupported_items(self, sql: str, items: Set[str], pattern_template: str,
-                                message_template: str, string_regions: List[Tuple[int, int]],
+                                message_template: str, masked: List[bool],
                                 line_offsets: List[int], major: int, minor: int) -> List[ValidationIssue]:
         """MYSQL8_KEYWORDS/MYSQL8_FUNCTIONS 스캔 공통 로직
 
@@ -268,7 +267,7 @@ class SQLValidator:
         for item in items:
             pattern = pattern_template.format(item=item)
             for match in re.finditer(pattern, sql, re.IGNORECASE):
-                if self._is_in_string(match.start(), string_regions):
+                if masked[match.start()]:
                     continue
 
                 line, col = self._offset_to_line_col(match.start(), line_offsets)
@@ -290,78 +289,20 @@ class SQLValidator:
 
         # MySQL 5.x에서 8.0+ 기능 사용 체크
         if major > 0 and major < 8:
-            string_regions = self._find_string_regions(sql)
+            masked = literal_and_comment_mask(sql)
 
             # 키워드 체크
             issues.extend(self._flag_unsupported_items(
                 sql, self.MYSQL8_KEYWORDS, r'\b{item}\b',
                 "'{item}'은(는) MySQL 8.0 이상에서만 지원됩니다 (현재: {major}.{minor})",
-                string_regions, line_offsets, major, minor
+                masked, line_offsets, major, minor
             ))
 
             # 함수 체크
             issues.extend(self._flag_unsupported_items(
                 sql, self.MYSQL8_FUNCTIONS, r'\b{item}\s*\(',
                 "함수 '{item}'은(는) MySQL 8.0 이상에서만 지원됩니다 (현재: {major}.{minor})",
-                string_regions, line_offsets, major, minor
+                masked, line_offsets, major, minor
             ))
 
         return issues
-
-    def _find_string_regions(self, sql: str) -> List[Tuple[int, int]]:
-        """문자열 리터럴 영역 찾기 (시작, 끝)"""
-        regions = []
-        in_string = False
-        string_char = None
-        start = 0
-
-        i = 0
-        while i < len(sql):
-            char = sql[i]
-
-            if not in_string:
-                if char in ("'", '"'):
-                    in_string = True
-                    string_char = char
-                    start = i
-            else:
-                if char == string_char:
-                    # 이스케이프 체크 (\' 또는 '')
-                    if i + 1 < len(sql) and sql[i + 1] == string_char:
-                        i += 1  # 이스케이프된 따옴표 스킵
-                    else:
-                        regions.append((start, i + 1))
-                        in_string = False
-                        string_char = None
-
-            i += 1
-
-        return regions
-
-    def _is_in_string(self, pos: int, string_regions: List[Tuple[int, int]]) -> bool:
-        """위치가 문자열 내부인지 확인"""
-        for start, end in string_regions:
-            if start <= pos < end:
-                return True
-        return False
-
-    def _find_comment_regions(self, sql: str) -> List[Tuple[int, int]]:
-        """주석 영역 찾기 (시작, 끝)"""
-        regions = []
-
-        # 단일 행 주석: -- 또는 #
-        for match in re.finditer(r'(--|#)[^\n]*', sql):
-            regions.append((match.start(), match.end()))
-
-        # 멀티라인 주석: /* */
-        for match in re.finditer(r'/\*.*?\*/', sql, re.DOTALL):
-            regions.append((match.start(), match.end()))
-
-        return regions
-
-    def _is_in_regions(self, pos: int, regions: List[Tuple[int, int]]) -> bool:
-        """위치가 특정 영역들 내부인지 확인"""
-        for start, end in regions:
-            if start <= pos < end:
-                return True
-        return False

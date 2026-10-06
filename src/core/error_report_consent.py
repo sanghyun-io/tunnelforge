@@ -6,6 +6,8 @@ import threading
 from typing import Optional
 import uuid
 
+from src.core.error_report_schema import canonical_uuid_v4 as _canonical_uuid_v4
+
 
 CONSENT_VERSION = 1
 _DEFER_DAYS = 30
@@ -17,7 +19,6 @@ _DEFERRED_UNTIL_SETTING = 'error_reporting_deferred_until'
 _INSTALLATION_ID_SETTING = 'error_reporting_installation_id'
 _PROMPT_CLAIM_ID_SETTING = 'error_reporting_prompt_claim_id'
 _CONSENT_GENERATION_SETTING = 'error_reporting_consent_generation'
-_EMPTY_UUID_V4 = '00000000-0000-4000-8000-000000000000'
 _MISSING = object()
 _SUBMISSION_LEASE_LOCK = threading.RLock()
 
@@ -452,23 +453,6 @@ def _new_consent_generation(settings):
         if generation != installation_id:
             return generation
     raise RuntimeError('Unable to create consent generation')
-
-
-def _canonical_uuid_v4(value):
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = uuid.UUID(value)
-    except ValueError:
-        return None
-    if (
-        parsed.version == 4
-        and parsed.variant == uuid.RFC_4122
-        and str(parsed) == value
-        and value != _EMPTY_UUID_V4
-    ):
-        return value
-    return None
 
 
 def _outcome(value):
