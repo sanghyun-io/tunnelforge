@@ -3,6 +3,7 @@ DB 스키마 구조 추출기
 """
 from typing import Callable, List, Dict, Optional, Tuple
 
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 from src.core.logger import get_logger
 from src.core.schema_diff_models import (
     ColumnInfo, ForeignKeyInfo, IndexInfo, TableSchema, _normalize_column_extra
@@ -245,7 +246,7 @@ class SchemaExtractor:
 
     def _get_row_count(self, schema: str, table: str) -> int:
         """테이블 행 수 조회"""
-        query = f"SELECT COUNT(*) as cnt FROM `{schema}`.`{table}`"
+        query = f"SELECT COUNT(*) as cnt FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(table)}"
         outcome = {}
 
         def _fetch():

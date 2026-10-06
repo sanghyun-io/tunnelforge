@@ -35,6 +35,7 @@ from src.ui.workers.migration_worker import (
 from src.core.logger import get_logger
 from src.ui.dialogs.migration_manual_guide_dialog import ManualGuideDialog
 from src.ui.dialogs.migration_result_store import MigrationResultStore
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 logger = get_logger('migration_dialogs')
 ONE_CLICK_MIGRATION_FEATURE_ENABLED = True
@@ -214,11 +215,11 @@ def build_orphan_select_sql(orphan: OrphanRecord, schema: str) -> str:
     return f"""-- {orphan.child_table}.{orphan.child_column} → {orphan.parent_table}.{orphan.parent_column}
 -- 고아 레코드 수: {orphan.orphan_count:,}개
 SELECT c.*
-FROM `{schema}`.`{orphan.child_table}` c
-LEFT JOIN `{schema}`.`{orphan.parent_table}` p
-    ON c.`{orphan.child_column}` = p.`{orphan.parent_column}`
-WHERE c.`{orphan.child_column}` IS NOT NULL
-  AND p.`{orphan.parent_column}` IS NULL;"""
+FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(orphan.child_table)} c
+LEFT JOIN {quote_mysql_ident(schema)}.{quote_mysql_ident(orphan.parent_table)} p
+    ON c.{quote_mysql_ident(orphan.child_column)} = p.{quote_mysql_ident(orphan.parent_column)}
+WHERE c.{quote_mysql_ident(orphan.child_column)} IS NOT NULL
+  AND p.{quote_mysql_ident(orphan.parent_column)} IS NULL;"""
 
 
 def _format_fk_tree_text(fk_tree: Dict[str, List[str]]) -> str:
