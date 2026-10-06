@@ -1462,6 +1462,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         clear_action.triggered.connect(self._clear_result_tabs)
 
         menu.exec(tab_bar.mapToGlobal(position))
+        menu.deleteLater()
 
     def _update_tx_status(self):
         """트랜잭션 상태 UI 업데이트.
@@ -1949,6 +1950,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
             info.setEnabled(False)
 
         menu.exec(table.mapToGlobal(position))
+        menu.deleteLater()
 
     def _add_result_save_actions(self, menu, table):
         """결과 저장 액션 2종 (표시된 행 / 쿼리 재실행 전체 행) — 컨텍스트 메뉴와 '결과 저장' 버튼 공용"""
@@ -2621,7 +2623,8 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
                     column_hit = column_hit or hit
                     column_item.setHidden(not (table_hit or hit))
                 table_item.setHidden(not (table_hit or column_hit))
-                table_item.setExpanded(bool(needle) and column_hit and not table_hit)
+                if needle:  # 필터 해제 시 사용자가 펼친 상태는 그대로 둔다
+                    table_item.setExpanded(column_hit and not table_hit)
 
     def _build_schema_tree_menu(self, item):
         """테이블 항목 우클릭 메뉴 (테이블이 아니면 None)"""
@@ -2641,6 +2644,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         menu = self._build_schema_tree_menu(self.schema_tree.itemAt(position))
         if menu:
             menu.exec(self.schema_tree.viewport().mapToGlobal(position))
+            menu.deleteLater()
 
     def _quote_editor_identifier(self, name: str) -> str:
         return quote_editor_identifier(self._db_engine(), name)

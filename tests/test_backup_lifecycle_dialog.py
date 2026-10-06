@@ -217,3 +217,23 @@ def test_request_shows_loading_disables_actions_and_delivers_after_the_thread_en
         assert len(workers) == 2, "the next request (e.g. preview -> apply) is accepted right away"
     finally:
         dialog.close()
+
+
+def test_status_cells_are_translated_and_list_summary_survives_follow_up_requests():
+    from src.core import i18n
+
+    dialog = _dialog()
+    i18n.set_language("en")
+    try:
+        dialog._on_list(True, "", {"backups": [ENTRY]})
+        assert dialog.table.item(0, 1).text() == "Promoted"
+        assert dialog.table.item(0, 5).text() == "Promoted"
+        assert dialog.table.item(0, 2).text() == "tf_backup_1"  # names are never translated
+        summary = dialog.label_state.text()
+        assert summary
+        dialog._busy = True
+        dialog._on_worker_done(MagicMock(), [True, "", {"conclusion": "promoted"}], lambda *a: None)
+        assert dialog.label_state.text() == summary, "reconcile/preview must not wipe the backup count line"
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+        dialog.close()

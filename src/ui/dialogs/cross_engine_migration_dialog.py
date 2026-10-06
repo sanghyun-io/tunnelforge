@@ -1522,6 +1522,8 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_safety_summary.setText("실행 모드가 바뀌어 전환 가능 여부를 다시 점검해야 합니다.")
         self.lbl_target_safety.setText("Target 상태를 아직 확인하지 않았습니다.")
         self.btn_target_advanced.hide()
+        self.target_advanced_panel.hide()
+        self.btn_target_advanced.setText("고급 설정 열기")
         self._populate_safety_issue_table([])
         self._refresh_navigation_state()
 

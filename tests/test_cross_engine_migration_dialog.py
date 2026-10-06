@@ -1612,6 +1612,37 @@ def test_target_advanced_button_expands_inline_without_leaving_safety_step():
         dialog.close()
 
 
+def test_create_only_toggle_collapses_open_target_advanced_panel():
+    dialog = make_dialog()
+    try:
+        dialog.show()
+        app.processEvents()
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "location": "target.public",
+                    "issue_type": "target_not_empty",
+                    "message": "target schema is not empty",
+                    "blocking": True,
+                }
+            ],
+        })
+        dialog.btn_target_advanced.click()
+        assert dialog.target_advanced_panel.isVisible()
+
+        dialog.chk_create_only.setChecked(not dialog.chk_create_only.isChecked())
+
+        assert not dialog.btn_target_advanced.isVisible()
+        assert not dialog.target_advanced_panel.isVisible()
+        assert dialog.btn_target_advanced.text() == "고급 설정 열기"
+    finally:
+        dialog.close()
+
+
 def test_safety_advanced_cleanup_is_planned_not_executed(monkeypatch):
     dialog = make_dialog()
     started = []

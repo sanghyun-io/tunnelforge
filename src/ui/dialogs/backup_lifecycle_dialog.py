@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
+from src.core.i18n import translate_text
 from src.ui.styles import ButtonStyles
 from src.ui.workers.backup_lifecycle_worker import BackupLifecycleWorker
 
@@ -65,6 +66,7 @@ class BackupLifecycleDialog(QDialog):
         self.entries: list = []
         self._worker: Optional[BackupLifecycleWorker] = None
         self._busy = False
+        self._list_summary = ""  # 마지막 목록 결과 줄: 대조/미리보기 뒤에도 유지한다
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -150,7 +152,7 @@ class BackupLifecycleDialog(QDialog):
     def _on_worker_done(self, worker, result: list, on_done: Callable[[bool, str, dict], None]) -> None:
         worker.wait()
         self._busy = False
-        self.label_state.setText("")
+        self.label_state.setText(self._list_summary)
         self._update_buttons()
         on_done(*(result or [False, "응답 없이 종료되었습니다.", {}]))
 
@@ -164,7 +166,8 @@ class BackupLifecycleDialog(QDialog):
             QMessageBox.warning(self, "백업 목록 조회 실패", message)
             return
         self.entries = list(result.get("backups") or [])
-        self.label_state.setText(f"보존된 백업 {len(self.entries)}건" if self.entries else "보존된 백업이 없습니다.")
+        self._list_summary = f"보존된 백업 {len(self.entries)}건" if self.entries else "보존된 백업이 없습니다."
+        self.label_state.setText(self._list_summary)
         self.table.setRowCount(len(self.entries))
         for row, entry in enumerate(self.entries):
             backup = entry.get("backup") or {}
@@ -179,7 +182,8 @@ class BackupLifecycleDialog(QDialog):
                 ((candidate.get("namespace") or "-") + ("" if candidate.get("exists", True) else " (없음)"), None),
             ]
             for column, (text, code) in enumerate(cells):
-                item = QTableWidgetItem(str(text))
+                # 상태 코드 열(code 있음)은 화면 라벨이므로 번역하고, 이름 열은 그대로 둔다.
+                item = QTableWidgetItem(translate_text(str(text)) if code else str(text))
                 if code:
                     item.setToolTip(str(code))
                 self.table.setItem(row, column, item)

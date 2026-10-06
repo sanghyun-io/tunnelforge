@@ -11,7 +11,7 @@ from src.ui.dialogs.tunnel_config import (
     _RunningTestProgressDialog,
     _TempCredentials,
 )
-from src.ui.workers.connection_test_worker import ConnectionTestWorker, TestType
+from src.ui.workers.connection_test_worker import CANCELLED_MESSAGE, ConnectionTestWorker, TestType
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -487,6 +487,7 @@ def test_start_connection_test_wires_cancel_to_worker(monkeypatch):
         assert cancelled == [worker]
         assert dialog._test_worker is worker  # 취소해도 finished 전에는 참조 유지
 
+        worker.test_finished.emit(False, CANCELLED_MESSAGE)  # worker는 취소 시 결과를 먼저 보낸다
         worker.finished.emit()
         assert dialog._test_worker is None
         assert progress_dialog.result() == QDialog.DialogCode.Accepted

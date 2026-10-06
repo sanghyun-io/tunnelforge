@@ -1299,6 +1299,38 @@ def test_schema_filter_matches_tables_and_columns(monkeypatch):
         close_dialog(dialog)
 
 
+def test_schema_filter_clear_keeps_user_expanded_tables(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        tables = _load_schema(dialog)
+        tables["users"].setExpanded(True)
+        dialog._filter_schema_tree("")
+        assert tables["users"].isExpanded()
+        assert not tables["orders"].isExpanded()
+    finally:
+        close_dialog(dialog)
+
+
+def test_context_menus_are_deleted_after_exec(monkeypatch):
+    from PyQt6 import sip
+    from PyQt6.QtCore import QEvent, QPoint
+    from PyQt6.QtWidgets import QMenu
+
+    shown = []
+    monkeypatch.setattr(QMenu, "exec", lambda self, *a: shown.append(self))
+    dialog = make_dialog(monkeypatch)
+    try:
+        tables = _load_schema(dialog)
+        monkeypatch.setattr(dialog.schema_tree, "itemAt", lambda pos: tables["users"])
+        dialog._show_schema_tree_context_menu(QPoint(0, 0))
+        dialog._show_result_tab_context_menu(QPoint(0, 0))
+        assert len(shown) == 2
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+        assert all(sip.isdeleted(m) for m in shown)
+    finally:
+        close_dialog(dialog)
+
+
 def test_schema_tree_context_menu_inserts_select_and_copies_name(monkeypatch):
     dialog = make_dialog(monkeypatch)
     try:

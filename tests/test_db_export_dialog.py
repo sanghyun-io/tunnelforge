@@ -1325,3 +1325,17 @@ def test_export_done_offers_open_folder(monkeypatch, tmp_path):
         assert dialog.open_output_folder() is False
     finally:
         dialog.close()
+
+
+def test_export_done_open_folder_button_is_translated(tmp_path):
+    from src.core import i18n
+
+    dialog = _export_with_tables(["a"])
+    i18n.set_language("en")
+    try:
+        dialog.input_output_dir.setText(str(tmp_path))
+        box = dialog._show_export_done("done")
+        assert "📂 Open folder" in [b.text() for b in box.buttons()]
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+        dialog.close()

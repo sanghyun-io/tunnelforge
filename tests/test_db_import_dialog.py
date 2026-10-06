@@ -1781,6 +1781,8 @@ def test_import_stop_button_cancels_without_closing_and_shows_final_status_and_r
         assert dialog.btn_stop.text() == "중지 중…" and not dialog.btn_stop.isEnabled()
         assert dialog.label_status.text() == "⏹ 중지 중…"
 
+        from datetime import datetime
+        dialog.import_start_time = datetime.now()
         report = tmp_path / "_tunnelforge_import_report.json"
         report.write_text("{}", encoding="utf-8")
         dialog.last_input_dir = str(tmp_path)
@@ -1815,6 +1817,89 @@ def test_import_close_while_running_still_stops_and_closes_after_finish(monkeypa
         dialog.close()  # stop already requested: closing only schedules close-after-finish, no second prompt
         assert asked == [1] and dialog._close_after_cancel is True
         dialog.worker.cancel.assert_called_once_with()
+    finally:
+        dialog.worker = None
+        type(dialog).close(dialog)
+
+
+def _stop_test_dialog(monkeypatch):
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    for name in ("warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, lambda *a, **k: None)
+    return RustDumpImportDialog()
+
+
+def test_stopped_safe_import_shows_stopped_status_not_safe_restore_failure(monkeypatch):
+    from datetime import datetime as _dt
+    dialog = _stop_test_dialog(monkeypatch)
+    try:
+        dialog.import_start_time = _dt.now()
+        dialog.last_import_mode = "safe"  # overwrite also runs as safe
+        dialog.import_audit = {"original_unchanged": True}
+        dialog.import_results = {"a": {"status": "done"}, "b": {"status": "blocked"}}
+        dialog._cancel_requested = True
+        dialog.on_finished(False, "cancelled")
+        assert dialog.label_status.text().startswith("⏹ Import 취소됨")
+    finally:
+        dialog.worker = None
+        type(dialog).close(dialog)
+
+
+def test_report_link_ignores_a_stale_report_from_an_earlier_run(monkeypatch, tmp_path):
+    from datetime import datetime as _dt
+    dialog = _stop_test_dialog(monkeypatch)
+    try:
+        report = tmp_path / "_tunnelforge_import_report.json"
+        report.write_text("{}", encoding="utf-8")
+        old = report.stat().st_mtime - 3600
+        os.utime(report, (old, old))
+        dialog.last_input_dir = str(tmp_path)
+        dialog.import_audit = {}
+        dialog.import_start_time = _dt.now()
+        dialog._show_report_link()
+        assert dialog.label_report_link.isHidden(), "a report older than this run is not this run's report"
+        report.write_text("{}", encoding="utf-8")  # rewritten during this run
+        dialog._show_report_link()
+        assert not dialog.label_report_link.isHidden()
+    finally:
+        type(dialog).close(dialog)
+
+
+def test_promotion_plan_step_has_no_stop_button_and_cutover_stop_shows_stopped_status(monkeypatch, tmp_path):
+    from datetime import datetime as _dt
+    dialog = _stop_test_dialog(monkeypatch)
+
+    class FakeWorker:
+        def __init__(self, *a, **k):
+            self.raw_output = MagicMock()
+            self.promotion_finished = MagicMock()
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.begin_promotion_job", lambda *a: None)
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.finish_promotion_job", lambda *a: None)
+    try:
+        dialog._start_promotion({"action": "plan"})
+        assert dialog.btn_stop.isHidden(), "the read-only plan step changes nothing, so there is nothing to stop"
+        dialog._start_promotion({"action": "confirm"})
+        assert not dialog.btn_stop.isHidden()
+
+        dialog.import_start_time = _dt.now()
+        report = tmp_path / "_tunnelforge_import_report.json"
+        report.write_text("{}", encoding="utf-8")
+        dialog.import_audit["report_path"] = str(report)
+        dialog._cancel_requested = True
+        dialog._on_promotion_finished(False, "cancelled", {"original_unchanged": False})
+        assert dialog.label_status.text().startswith("⏹ 전환 중지됨")
+        assert not dialog.label_report_link.isHidden()
+        dialog._on_promotion_finished(False, "cancelled", {"original_unchanged": True})
+        assert dialog.label_status.text() == "⏹ 전환 중지됨 · 원본 미변경"
     finally:
         dialog.worker = None
         type(dialog).close(dialog)

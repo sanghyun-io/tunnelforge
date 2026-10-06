@@ -478,7 +478,8 @@ def test_main_window_shortcuts():
     win.btn_add_tunnel, win.btn_settings = QPushButton(), QPushButton()
     win.add_tunnel_dialog = lambda: calls.append("add")
     win.open_settings_dialog = lambda: calls.append("settings")
-    win.reload_config = lambda: calls.append("refresh")
+    win._reload_and_refresh = lambda: calls.append("refresh")
+    win.reload_config = lambda: calls.append("modal")  # F5는 모달 알림을 띄우면 안 된다
     try:
         TunnelManagerUI._init_shortcuts(win)
         keys = {a.shortcut().toString(): a for a in win.actions()}
@@ -488,3 +489,20 @@ def test_main_window_shortcuts():
         assert calls == ["add", "settings", "refresh"]
     finally:
         win.deleteLater()
+
+
+def test_tools_menu_job_list_and_recovered_sql_are_translated():
+    from src.core.i18n import current_language, set_language, tr
+
+    previous = current_language()
+    try:
+        set_language("en")
+        assert tr("main.job_list") == "Job List"
+        assert tr("main.recovered_sql") == "Recovered SQL"
+        set_language("ko")
+        assert tr("main.job_list") == "작업 목록"
+        assert tr("main.recovered_sql") == "복구된 SQL"
+    finally:
+        set_language(previous)
+    source = inspect.getsource(TunnelManagerUI._apply_language)
+    assert '"main.job_list"' in source and '"main.recovered_sql"' in source

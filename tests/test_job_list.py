@@ -555,11 +555,24 @@ def test_backup_management_button_is_offered_for_import_records_with_a_report(hi
         assert not dialog.btn_backups.isHidden()
         assert select(dialog, 1).kind == jh.KIND_EXPORT_FULL
         assert dialog.btn_backups.isEnabled() is False
-        import_job = history.begin(jh.KIND_IMPORT, target="app", report_path="C:/dumps/app/_tunnelforge_import_report.json")
+        report = "C:/dumps/app/_tunnelforge_import_report.json"
+        direct_job = history.begin(jh.KIND_IMPORT, target="app", mode="전체 교체 Import · 스레드 4", report_path=report)
+        overwrite_job = history.begin(jh.KIND_IMPORT, target="app", mode="덮어쓰기: 검증 후 기존 이름으로 교체 · 스레드 4",
+                                      report_path=report)
+        import_job = history.begin(jh.KIND_IMPORT, target="app", mode="안전 복원: 새 대상에 복원·검증 · 스레드 4",
+                                   report_path=report)
         dialog.reload()
-        row = next(r for r in range(dialog.table.rowCount())
-                   if dialog.table.item(r, 0).data(Qt.ItemDataRole.UserRole) == import_job)
-        select(dialog, row)
+
+        def row_of(job_id):
+            return next(r for r in range(dialog.table.rowCount())
+                        if dialog.table.item(r, 0).data(Qt.ItemDataRole.UserRole) == job_id)
+        select(dialog, row_of(direct_job))
+        assert dialog.btn_backups.isEnabled() is False, "direct (non-safe) imports leave no restore journal"
+        dialog.manage_backups_selected()
+        assert opened == []
+        select(dialog, row_of(overwrite_job))
+        assert dialog.btn_backups.isEnabled() is True
+        select(dialog, row_of(import_job))
         assert dialog.btn_backups.isEnabled() is True
         dialog.manage_backups_selected()
         assert [r.id for r in opened] == [import_job]

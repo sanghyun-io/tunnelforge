@@ -1593,7 +1593,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         box.setIcon(QMessageBox.Icon.Information)
         box.setWindowTitle("Export 완료")
         box.setText(text)
-        open_button = box.addButton("📂 폴더 열기", QMessageBox.ButtonRole.ActionRole)
+        open_button = box.addButton(translate_text("📂 폴더 열기"), QMessageBox.ButtonRole.ActionRole)
         box.addButton(QMessageBox.StandardButton.Ok)
         box.buttonClicked.connect(lambda button: self.open_output_folder() if button is open_button else None)
         box.open()

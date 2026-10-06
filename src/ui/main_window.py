@@ -255,7 +255,7 @@ class TunnelManagerUI(QMainWindow):
         self.act_settings = QAction(self)
         self.act_settings.triggered.connect(lambda: self.open_settings_dialog())
         self.act_refresh = QAction(self)
-        self.act_refresh.triggered.connect(self.reload_config)
+        self.act_refresh.triggered.connect(self._reload_and_refresh)
         for action, key in (
             (self.act_add_tunnel, "Ctrl+N"),
             (self.act_settings, "Ctrl+,"),
@@ -277,11 +277,11 @@ class TunnelManagerUI(QMainWindow):
         self.btn_tools.setText(self._icon_text("🧰", "main.tools"))
         self.act_schema_diff.setText(self._icon_text("🔀", "main.schema_diff"))
         self.act_migration.setText(self._icon_text("🔄", "main.migration"))
-        self.act_db_transition.setText(tr("main.db_transition"))
+        self.act_db_transition.setText(self._icon_text("🔁", "main.db_transition"))
         self.act_schedule.setText(self._icon_text("📅", "main.schedule"))
         self.btn_settings.setText(self._icon_text("⚙️", "main.settings"))
-        self.act_job_list.setText("📋 작업 목록")
-        self.act_recovered_sql.setText("📝 복구된 SQL")
+        self.act_job_list.setText(self._icon_text("📋", "main.job_list"))
+        self.act_recovered_sql.setText(self._icon_text("📝", "main.recovered_sql"))
         self.statusBar().showMessage(tr("app.ready"))
         if hasattr(self, "tunnel_tree"):
             self.tunnel_tree.apply_language()
@@ -336,6 +336,8 @@ class TunnelManagerUI(QMainWindow):
 
     def _connect_tree_signals(self):
         """트리 위젯 시그널 연결"""
+        self.tunnel_tree.tunnel_start_requested.connect(self.start_tunnel)
+        self.tunnel_tree.tunnel_stop_requested.connect(self.stop_tunnel)
         self.tunnel_tree.tunnel_edit_requested.connect(self.edit_tunnel_dialog)
         self.tunnel_tree.tunnel_delete_requested.connect(self.delete_tunnel)
         self.tunnel_tree.tunnel_db_connect.connect(self._on_tree_db_connect)

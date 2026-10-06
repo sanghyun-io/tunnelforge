@@ -225,7 +225,7 @@ def _run_cancelled_mid_tunnel(test_type, config_manager=None):
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
-    from src.ui.workers.test_worker import CANCELLED_MESSAGE
+    from src.ui.workers.connection_test_worker import CANCELLED_MESSAGE
 
     app = QApplication.instance() or QApplication(sys.argv)
     entered, release = threading.Event(), threading.Event()
