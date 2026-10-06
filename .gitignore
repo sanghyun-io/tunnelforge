@@ -67,3 +67,7 @@ services/issue-relay/.dev.vars*
 !services/issue-relay/.dev.vars.example
 services/issue-relay/node_modules/
 services/issue-relay/.wrangler/
+
+# 임시 검증 산출물
+tmp-screenshots/
+tmp-debug/
