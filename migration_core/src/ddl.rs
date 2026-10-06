@@ -155,7 +155,7 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
             // MySQL must expose referenced unique keys at CREATE TABLE time,
             // even while foreign_key_checks=0 and target-only children survive.
             if target == "mysql" && index.unique { continue; }
-            let unique = if index.unique { "UNIQUE " } else { "" };
+            let unique = if index.unique { "UNIQUE " } else if index.spatial && target == "mysql" { "SPATIAL " } else { "" };
             let columns = index
                 .columns
                 .iter()
@@ -165,8 +165,9 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
                     // MySQL prefix 인덱스(col(255))는 prefix 길이를 보존한다. postgresql은 prefix
                     // 인덱스 개념이 없어 full 컬럼으로 둔다. 구 덤프(column_prefixes 없음)는
                     // get(i)=None으로 full 처리되어 기존 동작과 동일하다.
+                    // MySQL reports SUB_PART 32 for SPATIAL keys, but they take no prefix.
                     match index.column_prefixes.get(i).copied().flatten() {
-                        Some(prefix) if target == "mysql" => format!("{}({})", ident, prefix),
+                        Some(prefix) if target == "mysql" && !index.spatial => format!("{}({})", ident, prefix),
                         _ => ident,
                     }
                 })
@@ -393,6 +394,16 @@ fn projected_columns_sql(engine: &str, table: &NormalizedTable, exact_mysql_valu
             } else if engine == "postgresql" {
                 format!(
                     "{}::text AS {}",
+                    quote_ident(engine, &column.name),
+                    quote_ident(engine, &column.name)
+                )
+            } else if engine == "mysql" && is_mysql_spatial_type(&column.type_name) {
+                // The text protocol returns geometry as raw SRID+WKB bytes (lossy as UTF-8). Hex of the
+                // internal format round-trips through X'..' like mysqldump --hex-blob, SRID included.
+                // The legacy projection takes it too: its digests rejected raw geometry as invalid UTF-8,
+                // so no stored digest depends on the old form.
+                format!(
+                    "HEX({}) AS {}",
                     quote_ident(engine, &column.name),
                     quote_ident(engine, &column.name)
                 )
@@ -859,6 +870,15 @@ pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Va
         {
             return format!("b'{text}'");
         }
+        if target_engine == "mysql"
+            && is_mysql_spatial_type(source_type)
+            && !text.is_empty()
+            && text.len() % 2 == 0
+            && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            // PostgreSQL point/polygon text is never bare hex, so only MySQL geometry hex lands here.
+            return format!("X'{text}'");
+        }
         let source_type = source_type.to_ascii_lowercase();
         if is_binary_type(&source_type) {
             let hex = text.trim();
@@ -915,11 +935,22 @@ pub fn is_binary_type(type_name: &str) -> bool {
 }
 
 pub(crate) fn has_binary_columns(table: &NormalizedTable) -> bool {
-    // BIT digits must be written as bit literals, not loaded as text, so BIT tables take the literal path too.
-    table
-        .columns
-        .iter()
-        .any(|column| is_binary_type(&column.type_name) || mysql_bit_width(&column.type_name).is_some())
+    // BIT digits and geometry hex must be written as literals, not loaded as text, so those tables
+    // take the literal path too.
+    table.columns.iter().any(|column| {
+        is_binary_type(&column.type_name)
+            || mysql_bit_width(&column.type_name).is_some()
+            || is_mysql_spatial_type(&column.type_name)
+    })
+}
+
+/// MySQL spatial column types; `point srid 4326` carries the column SRID attribute. PostgreSQL has
+/// its own `point`/`polygon`, so callers apply this to MySQL data only.
+pub(crate) fn is_mysql_spatial_type(type_name: &str) -> bool {
+    let lowered = type_name.trim().to_ascii_lowercase();
+    let base = lowered.split([' ', '(']).next().unwrap_or("");
+    matches!(base, "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring"
+        | "multipolygon" | "geometrycollection" | "geomcollection")
 }
 
 /// Width of a `bit` / `bit(n)` column (both engines report this spelling); `None` for other types,
@@ -1110,7 +1141,7 @@ pub(crate) fn group_indexes(
                 columns: Vec::new(),
                 column_prefixes: Vec::new(),
                 unique,
-                visible: None,
+                visible: None, spatial: false,
             });
         index.unique = index.unique || unique;
         index.columns.push(column);
@@ -1404,6 +1435,17 @@ fn parse_modifier_word(s: &str, bytes: &[u8], i: usize) -> Option<usize> {
         // `timestamp/time with|without time zone`. same-engine PostgreSQL에서는 map_type이
         // 원문 type_name을 그대로 반환하므로, 이 타입들을 거부하면 정상 import가 깨진다(fidelity).
         "unsigned" | "zerofill" | "precision" => Some(i),
+        "srid" => {
+            // MySQL 8 column SRID attribute: `point srid 4326`.
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let digits_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            (i > digits_start).then_some(i)
+        }
         "varying" => {
             // character varying(255) / bit varying(8) — 선택적 길이 인자를 허용한다.
             while i < bytes.len() && bytes[i] == b' ' {
@@ -2254,7 +2296,7 @@ mod tests {
                         columns: vec!["user_id".to_string()],
                         column_prefixes: vec![None],
                         unique: false,
-                        visible: None,
+                        visible: None, spatial: false,
                     }],
                     foreign_keys: vec![NormalizedForeignKey {
                         name: "fk_orders_users".to_string(),
@@ -2333,7 +2375,7 @@ mod tests {
                         columns: vec!["slug".to_string()],
                         column_prefixes: vec![None],
                         unique: true,
-                        visible: None,
+                        visible: None, spatial: false,
                     }],
                     foreign_keys: Vec::new(),
                     table_collation: None,
@@ -2373,7 +2415,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None,
+                    visible: None, spatial: false,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -2497,7 +2539,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None,
+                    visible: None, spatial: false,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -2547,7 +2589,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None,
+                    visible: None, spatial: false,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -2610,7 +2652,7 @@ mod tests {
                         columns: vec!["audit_category_code".to_string()],
                         column_prefixes: vec![None],
                         unique: false,
-                        visible: None,
+                        visible: None, spatial: false,
                     }],
                     foreign_keys: vec![NormalizedForeignKey {
                         name: "df_evaluation_results_ibfk_3".to_string(),
@@ -2656,7 +2698,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None,
+                    visible: None, spatial: false,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -3433,7 +3475,7 @@ mod tests {
                     columns: vec!["filename".to_string()],
                     column_prefixes: vec![Some(255)],
                     unique: false,
-                    visible: None,
+                    visible: None, spatial: false,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -3689,7 +3731,7 @@ mod binary_keyset_tests {
         // Key columns cannot be TEXT/BLOB in MySQL (ERROR 1170).
         let mut keyed = table(vec![column("code", "text"), column("blob_key", "bytea")]);
         keyed.columns[1].primary_key = false;
-        keyed.indexes.push(NormalizedIndex { name: "uq_blob".into(), columns: vec!["blob_key".into()], column_prefixes: vec![None], unique: true, visible: None });
+        keyed.indexes.push(NormalizedIndex { name: "uq_blob".into(), columns: vec!["blob_key".into()], column_prefixes: vec![None], unique: true, visible: None, spatial: false });
         let ddl = generate_table_ddl(&keyed, "postgresql", "mysql").unwrap();
         assert!(ddl.contains("`code` VARCHAR(255) NOT NULL"), "{ddl}");
         assert!(ddl.contains("`blob_key` VARBINARY(255)"), "{ddl}");
@@ -3704,6 +3746,28 @@ mod binary_keyset_tests {
         assert_eq!(map_type("mysql", "postgresql", "char(0)"), "VARCHAR(1)");
         assert_eq!(copy_csv_field_for_column("postgresql", "tinyint(1)", &Value::String("2".into())), "\"true\"");
         assert_eq!(sql_literal_for_column("postgresql", "tinyint(1)", &Value::String("-1".into())), "TRUE");
+    }
+
+    #[test]
+    fn mysql_spatial_values_round_trip_as_hex_of_the_internal_format() {
+        let mut geo = table(vec![column("id", "int"), column("pos", "point srid 4326")]);
+        geo.columns[1].primary_key = false;
+        assert!(projected_text_columns_sql("mysql", &geo).contains("HEX(`pos`) AS `pos`"));
+        // Safe-promotion digests read geometry the same way; PostgreSQL point stays text.
+        assert!(legacy_projected_text_columns_sql("mysql", &geo).contains("HEX(`pos`) AS `pos`"));
+        assert!(projected_text_columns_sql("postgresql", &geo).contains("\"pos\"::text"));
+        let hex = Value::String("E6100000010100000000000000000000000000000000000000".into());
+        assert_eq!(sql_literal_for_column("mysql", "point srid 4326", &hex), "X'E6100000010100000000000000000000000000000000000000'");
+        // PostgreSQL point text into a MySQL text column stays a string.
+        assert_eq!(sql_literal_for_column("mysql", "point", &Value::String("(1,2)".into())), "'(1,2)'");
+        assert!(has_binary_columns(&geo));
+        assert!(is_safe_column_type("point srid 4326") && is_safe_column_type("geometry"));
+        assert!(!is_safe_column_type("point srid") && !is_safe_column_type("point srid x"));
+        let ddl = generate_table_ddl(&geo, "mysql", "mysql").unwrap();
+        assert!(ddl.contains("`pos` point srid 4326 NOT NULL"), "{ddl}");
+        geo.indexes.push(NormalizedIndex { name: "sp_pos".into(), columns: vec!["pos".into()], column_prefixes: vec![Some(32)], unique: false, visible: None, spatial: true });
+        let post = generate_post_data_ddl(&NormalizedSchema { tables: vec![geo] }, "mysql");
+        assert!(post.iter().any(|sql| sql == "CREATE SPATIAL INDEX `sp_pos` ON `events` (`pos`);"), "{post:?}");
     }
 
     #[test]

@@ -728,11 +728,15 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     // text into BIT columns, so only dumps that contain BIT columns carry it.
     let has_bit_columns = endpoint.engine == "mysql"
         && schema.tables.iter().any(|table| table.columns.iter().any(|column| mysql_bit_width(&column.type_name).is_some()));
+    // Version 5 marks MySQL geometry cells written as hex of the internal SRID+WKB bytes; earlier
+    // versions stored those bytes as lossy text.
+    let has_spatial_columns = endpoint.engine == "mysql"
+        && schema.tables.iter().any(|table| table.columns.iter().any(|column| is_mysql_spatial_type(&column.type_name)));
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
         // Older readers ignore namespace, timezone and ON UPDATE metadata. Fail
         // their version gate instead of silently restoring different semantics.
-        format_version: if has_bit_columns { 4 } else { 3 },
+        format_version: if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
         data_format: options.data_format.clone(),
         compression: options.compression.clone(),
         source_engine: endpoint.engine.clone(),

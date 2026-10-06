@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-09-29
 
-Current shipping version: `v2.12.3` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
+Current shipping version: `v2.12.4` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -2880,6 +2880,7 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-152 | High | fixed_pending_full_verify | MySQL spatial data fidelity | The text protocol returned geometry as raw SRID+WKB bytes, which dumps and migrations stored as lossy text: same-engine dumps succeeded but could not be restored, MySQL -> PostgreSQL migrate and dump.import wrote mojibake that verify still passed, column SRID attributes were dropped and tables with a SPATIAL index could not be dumped. Geometry is now read as hex of the internal format and written back as `X'..'` (format version 5 marks such dumps), `SRID n` and `CREATE SPATIAL INDEX` are preserved, pre-v5 spatial dumps are refused with a re-export message before anything changes, and MySQL spatial / PostGIS columns are refused across engines (preflight, migrate and dump.import) while PostgreSQL built-in geometric types move as text with a warning. Live `live_mysql_spatial` | Merge and publish |
 | TF-STATUS-151 | High | closed | Versioned release | v2.12.3 published stable/latest via PR #300 and approved workflows; 10 asset digests, four macOS sidecars and live updater (2.12.2/2.12.1 -> 2.12.3) verified; release notes explain the cross-engine type mapping fix (148) | Preserve exact-head checks and immutable tag |
 | TF-STATUS-150 | High | closed | Versioned release | v2.12.2 published stable/latest via PR #299 and approved workflows; 10 asset digests, four macOS sidecars and live updater (2.12.1/2.12.0 -> 2.12.2) verified; release notes explain the MySQL BIT fix and format version 4 (147) | Preserve exact-head checks and immutable tag |
 | TF-STATUS-149 | High | closed | Versioned release | v2.12.1 published stable/latest via PR #298 and approved workflows; 10 asset digests, four macOS sidecars and live updater (2.12.0/2.11.3 -> 2.12.1) verified; release notes ask users to re-export MySQL ENUM-key and backslash-composite-key tables (146) | Preserve exact-head checks and immutable tag |
@@ -3040,8 +3041,10 @@ codes in automatic reports (140, v2.11.3), (3) TLS/query-control/read-only live 
 the required CI gate (144), (4) "overwrite" backed by safe restore + automatic swap with
 `replace` kept as an always-visible advanced option (143, v2.12.0). Then the PK-type keyset
 matrix (146) found and fixed silent row loss; its findings opened 147 (BIT data) and 148
-(cross-engine type mapping), which are next, followed by Python live tests in CI and README/doc
-alignment.
+(cross-engine type mapping), both shipped (v2.12.2, v2.12.3). Next agenda (2026-10-06), in order:
+(1) MySQL spatial data fidelity (152, silent loss), (2) temporal values the other engine cannot
+hold plus keyless verify reads, (3) cross-engine verify of text keys under different collations,
+(4) Python live tests in CI, (5) README/doc alignment.
 v2.11.1 (TF-STATUS-138) fixed silent export corruption for binary primary keys (137);
 affected backups taken with <= 2.11.0 must be re-taken.
 Real Mac and managed-provider validation stay deferred by user decision.

@@ -2103,6 +2103,29 @@ mod tests {
     use super::*;
     use std::sync::{mpsc, Mutex};
     static LIVE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn promotion_digest_reads_geometry_values() {
+        let Some(host) = std::env::var("TF_PROMOTE_MYSQL_HOST").ok() else { return };
+        let endpoint = Endpoint { engine: "mysql".into(), host, port: 3306, user: "root".into(), password: "tf_local_test".into(),
+            database: "tf_test".into(), schema: None, tls: Default::default() };
+        let mut conn = connect(&endpoint).unwrap();
+        let name = format!("tf_promote_geo_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        conn.query_drop(format!("CREATE TABLE {} (id INT PRIMARY KEY, g GEOMETRY)", qualified("tf_test", &name))).unwrap();
+        // 1.0 encodes as ...F03F, which is not UTF-8 when read raw.
+        conn.query_drop(format!("INSERT INTO {} VALUES (1, ST_GeomFromText('POINT(1 1.5)'))", qualified("tf_test", &name))).unwrap();
+        let table = NormalizedTable {
+            name: name.clone(),
+            columns: vec![
+                NormalizedColumn { name: "id".into(), type_name: "int".into(), default_value: None, nullable: false, primary_key: true, unique: false, comment: None, default_is_expression: false, on_update: None },
+                NormalizedColumn { name: "g".into(), type_name: "geometry".into(), default_value: None, nullable: true, primary_key: false, unique: false, comment: None, default_is_expression: false, on_update: None },
+            ],
+            indexes: Vec::new(), foreign_keys: Vec::new(), table_collation: None, auto_increment: None, comment: None, checks: Vec::new(),
+        };
+        let digest = content_digest(&mut conn, "tf_test", &table);
+        conn.query_drop(format!("DROP TABLE {}", qualified("tf_test", &name))).unwrap();
+        assert!(digest.is_ok(), "{digest:?}");
+    }
     fn fixture() -> Option<(Endpoint, Endpoint, Db, std::path::PathBuf)> {
         let host = std::env::var("TF_PROMOTE_MYSQL_HOST").ok()?;
         let mut original = Endpoint {

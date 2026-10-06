@@ -276,11 +276,25 @@ impl InspectAdapter for MysqlInspectAdapter {
             (schema,&table.name)
         ).map_err(|err| format!("mysql CHECK inspect error: {err}"))?;
         table.checks = checks.into_iter().map(|(name,expression,enforced)| NormalizedCheck {name,expression,enforced:enforced=="YES"}).collect();
-        let visibility: Vec<(String,String)> = self.conn.exec(
-            "SELECT DISTINCT INDEX_NAME,IS_VISIBLE FROM information_schema.statistics WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", (schema,&table.name)
+        let visibility: Vec<(String,String,String)> = self.conn.exec(
+            "SELECT DISTINCT INDEX_NAME,IS_VISIBLE,INDEX_TYPE FROM information_schema.statistics WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", (schema,&table.name)
         ).map_err(|err| format!("mysql index visibility inspect error: {err}"))?;
         for index in &mut table.indexes {
-            index.visible = visibility.iter().find(|(name,_)| name==&index.name).map(|(_,value)| value=="YES");
+            let found = visibility.iter().find(|(name,_,_)| name==&index.name);
+            index.visible = found.map(|(_,value,_)| value=="YES");
+            index.spatial = found.is_some_and(|(_,_,kind)| kind=="SPATIAL");
+        }
+        if table.columns.iter().any(|column| is_mysql_spatial_type(&column.type_name)) {
+            // COLUMN_TYPE omits the SRID attribute; without it a restored column accepts any SRID and
+            // a SPATIAL index on it is ignored by the optimizer.
+            let srids: Vec<(String,u32)> = self.conn.exec(
+                "SELECT COLUMN_NAME,SRS_ID FROM information_schema.columns WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND SRS_ID IS NOT NULL", (schema,&table.name)
+            ).map_err(|err| format!("mysql spatial SRID inspect error: {err}"))?;
+            for column in &mut table.columns {
+                if let Some((_, srid)) = srids.iter().find(|(name,_)| name==&column.name) {
+                    column.type_name = format!("{} srid {srid}", column.type_name);
+                }
+            }
         }
         Ok(())
     }
@@ -481,7 +495,7 @@ fn inspect_mysql_unsupported_objects(
     ).map_err(|err| format!("mysql check inspect error: {err}"))?;
     objects.extend(checks.into_iter().filter(|(_,_,expression)| !is_safe_check_expression(expression)).map(|(table, name,_)| format!("check_constraint:{table}:{name}")));
     let indexes: Vec<(String, String)> = conn.exec(
-        "SELECT DISTINCT TABLE_NAME, INDEX_NAME FROM information_schema.statistics WHERE TABLE_SCHEMA=? AND (COLUMN_NAME IS NULL OR COLLATION='D' OR INDEX_TYPE NOT IN ('BTREE','HASH'))",
+        "SELECT DISTINCT TABLE_NAME, INDEX_NAME FROM information_schema.statistics WHERE TABLE_SCHEMA=? AND (COLUMN_NAME IS NULL OR COLLATION='D' OR INDEX_TYPE NOT IN ('BTREE','HASH','SPATIAL'))",
         (database,),
     ).map_err(|err| format!("mysql advanced index inspect error: {err}"))?;
     objects.extend(indexes.into_iter().map(|(table, name)| format!("unsupported_index:{table}:{name}")));

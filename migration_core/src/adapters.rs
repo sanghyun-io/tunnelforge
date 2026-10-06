@@ -133,6 +133,9 @@ pub struct NormalizedIndex {
     pub unique: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible: Option<bool>,
+    /// MySQL SPATIAL key (recreated as `CREATE SPATIAL INDEX`, without the reported prefix).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spatial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

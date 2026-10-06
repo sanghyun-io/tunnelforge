@@ -248,7 +248,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
-    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4) {
+    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
         return Err("unsupported dump manifest format".to_string());
     }
     let legacy_bit_text = manifest.format_version < 4 && manifest.source_engine == "mysql";
@@ -272,6 +272,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         .max(1);
     let mysql_local_infile_policy = mysql_local_infile_policy_from_payload(&request.payload)?;
     let timezone_sql = import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), &endpoint.engine)?;
+    check_mysql_spatial_import(&manifest, &selected, &endpoint.engine)?;
     let table_ddls = validate_import_metadata(&manifest, &selected, &endpoint.engine)?;
     let tables: Vec<DumpTableManifest> = manifest
         .tables
@@ -715,6 +716,28 @@ fn convert_legacy_bit_cells(table: &NormalizedTable, rows: &mut [Value]) -> Resu
 /// Strict MySQL session: out-of-range, too-long or invalid values fail instead of being clamped,
 /// truncated or zeroed. Shared by dump.import and migrate.
 pub(crate) const MYSQL_STRICT_SQL_MODE: &str = "SET SESSION sql_mode = CONCAT_WS(',', 'STRICT_ALL_TABLES', 'NO_AUTO_VALUE_ON_ZERO', TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ',')))";
+
+/// MySQL geometry restores only into MySQL, and only from dumps that stored its exact bytes
+/// (format version 5). Checked before anything is dropped; an empty selection means every table.
+pub(crate) fn check_mysql_spatial_import(manifest: &DumpManifest, selected: &BTreeSet<String>, target_engine: &str) -> Result<(), String> {
+    if manifest.source_engine != "mysql" {
+        return Ok(());
+    }
+    let spatial = manifest.schema.tables.iter()
+        .filter(|table| selected.is_empty() || selected.contains(&table.name))
+        .flat_map(|table| table.columns.iter().filter(|column| is_mysql_spatial_type(&column.type_name)).map(move |column| format!("{}.{}", table.name, column.name)))
+        .collect::<Vec<_>>();
+    if spatial.is_empty() {
+        return Ok(());
+    }
+    if target_engine != "mysql" {
+        return Err(format!("MySQL spatial columns cannot be imported into {target_engine} without losing their geometry: {}; exclude these tables or convert them in MySQL first", spatial.join(", ")));
+    }
+    if manifest.format_version < 5 {
+        return Err(format!("this dump was written before format version 5 and stored MySQL spatial values as text, which corrupted them: {}; re-export the database with this version", spatial.join(", ")));
+    }
+    Ok(())
+}
 
 fn import_table_rows<F: FnMut(Value)>(
     endpoint: &Endpoint,
