@@ -20,6 +20,7 @@ pub(crate) fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: 
     ));
     emit(phase_event(request, "preflight", "checking target state"));
     issues.extend(live_preflight_issues(&request.payload));
+    issues.extend(source_value_issues(&request.payload));
     emit(phase_event(
         request,
         "preflight",

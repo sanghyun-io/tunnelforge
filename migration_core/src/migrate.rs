@@ -101,6 +101,7 @@ fn direction_readiness(payload: &Value, source: &Endpoint, target: &Endpoint) ->
             });
             let mut issues = preflight_issues(&check_payload);
             issues.extend(live_preflight_issues(&check_payload));
+            issues.extend(source_value_issues(&check_payload));
             json!({
                 "direction": direction,
                 "source_engine": source.engine,
@@ -205,6 +206,7 @@ fn direction_guide(payload: &Value, source: &Endpoint, target: &Endpoint) -> Val
             });
             let mut issues = preflight_issues(&check_payload);
             issues.extend(live_preflight_issues(&check_payload));
+            issues.extend(source_value_issues(&check_payload));
             let row_limit = guide_row_limit(payload);
             let mut table_guides = Vec::new();
             match LiveAdapter::connect(source) {
@@ -509,6 +511,15 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             }
         }
 
+        // Preflight blocks these too; check again on a fresh run in case rows changed since.
+        if resume_state.is_none() {
+            let refused = source_value_issues(&request.payload).into_iter().filter(|issue| issue.blocking)
+                .map(|issue| format!("{} ({})", issue.message, issue.suggestion)).collect::<Vec<_>>();
+            if !refused.is_empty() {
+                emit(json!({"event": "error", "request_id": request.request_id, "message": refused.join("; ")}));
+                return;
+            }
+        }
         match (
             connect_migration_endpoint(&source_endpoint),
             connect_migration_endpoint(&target_endpoint),
@@ -923,6 +934,20 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
         for table in &schema.tables {
             if source != target {
                 issues.extend(spatial_column_issues(table, &source));
+                for column in &table.columns {
+                    if let Some((blocking, problem)) = temporal_type_problem(&source, &column.type_name) {
+                        issues.push(MigrationIssue {
+                            issue_type: Some("unsupported_temporal_type".to_string()),
+                            severity: if blocking { "error" } else { "warning" }.to_string(),
+                            location: format!("{}.{}", table.name, column.name),
+                            message: format!("{}.{}: {problem}", table.name, column.name),
+                            suggestion: if blocking { "Exclude this table, or convert the column in the source before migrating." } else { "Recreate the interval semantics in MySQL after the migration if needed." }.to_string(),
+                            blocking,
+                            table_name: Some(table.name.clone()),
+                            column_name: Some(column.name.clone()),
+                        });
+                    }
+                }
             }
             if let Err(message) = validate_target_foreign_key_actions(table, &target) {
                 issues.push(MigrationIssue {
@@ -1010,6 +1035,78 @@ fn spatial_column_issues(table: &NormalizedTable, source: &str) -> Vec<Migration
             column_name: Some(column.name.clone()),
         })
     }).collect()
+}
+
+/// Source rows holding temporal values the target engine cannot store (MySQL zero dates and TIME
+/// past 24:00, PostgreSQL infinity/BC/year > 9999) block the migration before anything is
+/// created, instead of failing mid-copy after earlier tables were committed.
+pub(crate) fn source_value_issues(payload: &Value) -> Vec<MigrationIssue> {
+    let source_engine = read_engine(payload, "source_engine");
+    if source_engine == read_engine(payload, "target_engine") {
+        return Vec::new();
+    }
+    let (Ok(schema), Some(Ok(endpoint))) = (parse_schema(&payload["schema"]), payload.get("source").map(endpoint_from_value)) else {
+        return Vec::new();
+    };
+    let scans = schema.tables.iter().filter_map(|table| {
+        let checks = table.columns.iter().filter_map(|column| {
+            temporal_scan_condition(&source_engine, &column.type_name, &quote_ident(&source_engine, &column.name)).map(|condition| (column, condition))
+        }).collect::<Vec<_>>();
+        (!checks.is_empty()).then_some((table, checks))
+    }).collect::<Vec<_>>();
+    if scans.is_empty() {
+        return Vec::new();
+    }
+    let mut source = match connect_migration_endpoint(&endpoint) {
+        Ok(source) => source,
+        Err(message) => return vec![MigrationIssue {
+            issue_type: None, severity: "error".to_string(), location: "source".to_string(), message,
+            suggestion: "Check the source database connection.".to_string(), blocking: true, table_name: None, column_name: None,
+        }],
+    };
+    let text_cast = if source_engine == "mysql" { "CHAR" } else { "TEXT" };
+    let mut issues = Vec::new();
+    for (table, checks) in scans {
+        // ponytail: one full scan per table with temporal columns; sample or index if preflight gets slow.
+        let sums = checks.iter().map(|(_, condition)| format!("CAST(SUM(CASE WHEN {condition} THEN 1 ELSE 0 END) AS {text_cast})")).collect::<Vec<_>>();
+        let sql = format!("SELECT {} FROM {}", sums.join(", "), quote_ident(&source_engine, &table.name));
+        let counts = match source.query_text_row(&sql) {
+            Ok(counts) => counts,
+            Err(err) => {
+                issues.push(MigrationIssue {
+                    issue_type: Some("temporal_scan_failed".to_string()), severity: "error".to_string(), location: table.name.clone(),
+                    message: format!("could not check the dates and times in {}: {err}", table.name),
+                    suggestion: "Check SELECT permission on the table, or leave it out of the migration.".to_string(),
+                    blocking: true, table_name: Some(table.name.clone()), column_name: None,
+                });
+                continue;
+            }
+        };
+        for ((column, condition), count) in checks.iter().zip(counts) {
+            let count = count.and_then(|text| text.parse::<u64>().ok()).unwrap_or(0);
+            if count == 0 {
+                continue;
+            }
+            let target = if source_engine == "mysql" { "PostgreSQL" } else { "MySQL" };
+            issues.push(MigrationIssue {
+                issue_type: Some("unsupported_temporal_value".to_string()),
+                severity: "error".to_string(),
+                location: format!("{}.{}", table.name, column.name),
+                message: format!("{count} row(s) in {}.{} ({}) hold dates or times {target} cannot store", table.name, column.name, column.type_name),
+                suggestion: if column.nullable {
+                    format!("Fix or clear them in the source first, e.g. UPDATE {} SET {} = NULL WHERE {condition}; then run the check again.",
+                        quote_ident(&source_engine, &table.name), quote_ident(&source_engine, &column.name))
+                } else {
+                    format!("The column is NOT NULL: replace them with real values in the source (find them with SELECT * FROM {} WHERE {condition}), then run the check again.",
+                        quote_ident(&source_engine, &table.name))
+                },
+                blocking: true,
+                table_name: Some(table.name.clone()),
+                column_name: Some(column.name.clone()),
+            });
+        }
+    }
+    issues
 }
 
 pub(crate) fn live_preflight_issues(payload: &Value) -> Vec<MigrationIssue> {

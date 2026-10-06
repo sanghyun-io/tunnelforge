@@ -986,6 +986,78 @@ pub(crate) fn legacy_mysql_bit_digits(text: &str, width: u32) -> Result<String, 
     Ok(format!("{value:0width$b}", width = width as usize))
 }
 
+fn temporal_base(type_name: &str) -> String {
+    let lowered = type_name.trim().to_ascii_lowercase();
+    if lowered.ends_with("[]") {
+        // Arrays move as their text form (LONGTEXT); their elements are not checked here.
+        return String::new();
+    }
+    if lowered.starts_with("time") && lowered.contains("with time zone") && !lowered.starts_with("timestamp") {
+        return "timetz".to_string();
+    }
+    lowered.split([' ', '(']).next().unwrap_or("").to_string()
+}
+
+/// Why a temporal value cannot be stored by the other engine, or `None` when it can. MySQL keeps
+/// zero/partial dates and TIME up to 838:59:59; PostgreSQL keeps infinity, BC dates and years past
+/// 9999. Nothing converts these silently: callers refuse before writing.
+pub(crate) fn temporal_value_problem(source_engine: &str, source_type: &str, text: &str) -> Option<&'static str> {
+    let base = temporal_base(source_type);
+    let text = text.trim();
+    if source_engine == "mysql" {
+        if matches!(base.as_str(), "date" | "datetime" | "timestamp") {
+            let mut parts = text.get(..10)?.split('-').map(|part| part.parse::<u32>().ok());
+            let (year, month, day) = (parts.next()??, parts.next()??, parts.next()??);
+            if year == 0 || month == 0 || day == 0 {
+                return Some("a zero or partial date (year, month or day 0)");
+            }
+            // ALLOW_INVALID_DATES keeps days such as 2024-02-30.
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let days = match month { 2 if leap => 29, 2 => 28, 4 | 6 | 9 | 11 => 30, _ => 31 };
+            return (month > 12 || day > days).then_some("an invalid date (day past the end of the month)");
+        }
+        if base == "time" {
+            if text.starts_with('-') {
+                return Some("a negative TIME");
+            }
+            let (hours, rest) = text.split_once(':')?;
+            let hours = hours.parse::<u32>().ok()?;
+            let past_midnight = hours == 24 && rest.bytes().any(|byte| matches!(byte, b'1'..=b'9'));
+            return (hours > 24 || past_midnight).then_some("a TIME beyond 24:00:00");
+        }
+    } else if source_engine == "postgresql" && matches!(base.as_str(), "date" | "timestamp") {
+        if text.contains("infinity") {
+            return Some("an infinite date");
+        }
+        if text.ends_with(" BC") {
+            return Some("a BC date");
+        }
+        let year = text.split('-').next().unwrap_or("");
+        return (year.len() > 4).then_some("a year after 9999");
+    }
+    None
+}
+
+/// SQL condition (on the source) matching the values `temporal_value_problem` refuses.
+pub(crate) fn temporal_scan_condition(source_engine: &str, source_type: &str, column_ref: &str) -> Option<String> {
+    match (source_engine, temporal_base(source_type).as_str()) {
+        ("mysql", "date" | "datetime" | "timestamp") => Some(format!("(YEAR({column_ref}) = 0 OR MONTH({column_ref}) = 0 OR DAY({column_ref}) = 0 OR DAY({column_ref}) > DAY(LAST_DAY({column_ref})))")),
+        ("mysql", "time") => Some(format!("({column_ref} < '00:00:00' OR {column_ref} > '24:00:00')")),
+        ("postgresql", "date" | "timestamp") => Some(format!("(NOT isfinite({column_ref}) OR extract(year from {column_ref}) NOT BETWEEN 1 AND 9999)")),
+        _ => None,
+    }
+}
+
+/// Column types the other engine has no column for: blocking (no lossless mapping) or a warning
+/// (the value moves as text). PostgreSQL `time with time zone` would lose its offset in MySQL TIME.
+pub(crate) fn temporal_type_problem(source_engine: &str, source_type: &str) -> Option<(bool, &'static str)> {
+    match (source_engine, temporal_base(source_type).as_str()) {
+        ("postgresql", "timetz") => Some((true, "time with time zone has no MySQL type that keeps the offset")),
+        ("postgresql", "interval") => Some((false, "interval is copied as its text form into a MySQL text column")),
+        _ => None,
+    }
+}
+
 pub fn is_decimal_type(type_name: &str) -> bool {
     let type_name = type_name.trim().to_ascii_lowercase();
     type_name.starts_with("decimal") || type_name.starts_with("numeric")
@@ -3775,6 +3847,31 @@ mod binary_keyset_tests {
         let utc = Value::String("2026-11-01 05:30:00.123+00".into());
         assert_eq!(sql_literal_for_column("mysql", "timestamp with time zone", &utc), "'2026-11-01 05:30:00.123'");
         assert_eq!(sql_literal_for_column("postgresql", "timestamp with time zone", &utc), "'2026-11-01 05:30:00.123+00'");
+    }
+
+    #[test]
+    fn temporal_values_the_other_engine_cannot_store_are_named() {
+        for (engine, ty, text, refused) in [
+            ("mysql", "date", "0000-00-00", true), ("mysql", "datetime(6)", "2024-00-15 10:00:00", true),
+            ("mysql", "timestamp", "2024-01-15 00:00:00", false), ("mysql", "date", "0000-01-01", true),
+            ("mysql", "time", "838:59:59", true), ("mysql", "time(3)", "-01:00:00.000", true),
+            ("mysql", "time", "24:00:00", false), ("mysql", "time", "24:00:00.5", true), ("mysql", "time", "23:59:59", false),
+            ("postgresql", "date", "infinity", true), ("postgresql", "timestamp(3) with time zone", "-infinity", true),
+            ("postgresql", "date", "0044-03-15 BC", true), ("postgresql", "timestamp without time zone", "12000-01-01 00:00:00", true),
+            ("postgresql", "date", "2024-02-29", false), ("postgresql", "time without time zone", "24:00:00", false),
+            ("mysql", "varchar(10)", "0000-00-00", false), ("mysql", "date", "2024-02-30", true),
+            ("mysql", "date", "2024-02-29", false), ("mysql", "date", "2023-02-29", true),
+            ("postgresql", "timestamp without time zone[]", "{infinity}", false),
+        ] {
+            assert_eq!(temporal_value_problem(engine, ty, text).is_some(), refused, "{engine} {ty} {text}");
+        }
+        assert!(temporal_scan_condition("mysql", "datetime(3)", "`d`").unwrap().contains("MONTH(`d`) = 0"));
+        assert!(temporal_scan_condition("postgresql", "timestamp(3) with time zone", "\"d\"").unwrap().contains("isfinite"));
+        assert!(temporal_scan_condition("postgresql", "time without time zone", "\"t\"").is_none());
+        assert!(temporal_scan_condition("postgresql", "timestamp(3) with time zone[]", "\"a\"").is_none());
+        assert_eq!(temporal_type_problem("postgresql", "time with time zone"), Some((true, "time with time zone has no MySQL type that keeps the offset")));
+        assert!(temporal_type_problem("postgresql", "interval").is_some_and(|(blocking, _)| !blocking));
+        assert!(temporal_type_problem("postgresql", "timestamp with time zone").is_none());
     }
 
     #[test]
