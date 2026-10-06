@@ -1683,11 +1683,13 @@ fn verify_table_by_digest<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
     mismatches
 }
 
-/// key column이 있는 테이블을 keyset 페이지네이션으로 행 단위 비교한다. 청크마다 양측을
-/// 읽어 typed 비교하고 row_progress를 emit하며, 마지막에 table_progress(completed)를 emit한다.
-/// 읽기 오류가 나면 그 오류를 담고 루프를 종료한다(완료 이벤트는 그대로 emit).
 /// Keys per target lookup statement (an OR of key equalities); bounds the SQL size.
 const VERIFY_KEY_LOOKUP_BATCH: usize = 500;
+
+/// key column이 있는 테이블을 행 단위 비교한다. 원본은 keyset으로 청크를 읽고, 대상은 그 청크의
+/// 키로 직접 조회해(엔진별 정렬 순서 무관) typed 비교하며 row_progress를 emit한다. 대상에만 있는
+/// 행은 상위의 행 수 비교가 잡는다. 마지막에 table_progress(completed)를 emit하고, 읽기 오류가 나면
+/// 그 오류를 담고 루프를 종료한다(완료 이벤트는 그대로 emit).
 
 fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
     source: &mut S,

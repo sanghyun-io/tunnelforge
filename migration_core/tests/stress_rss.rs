@@ -101,6 +101,19 @@ impl MigrationAdapter for SyntheticStressAdapter {
         self.read_rows(table, offset, limit)
     }
 
+    fn read_rows_by_keys(
+        &mut self,
+        _table: &NormalizedTable,
+        _key_columns: &[String],
+        keys: &[Vec<String>],
+    ) -> Result<Vec<Value>, String> {
+        Ok(keys.iter()
+            .filter_map(|values| values.first().and_then(|id| id.parse::<usize>().ok()))
+            .filter(|id| (1..=self.rows).contains(id))
+            .map(Self::row)
+            .collect())
+    }
+
     fn insert_rows(&mut self, _table: &NormalizedTable, _rows: Vec<Value>) -> Result<(), String> {
         Ok(())
     }

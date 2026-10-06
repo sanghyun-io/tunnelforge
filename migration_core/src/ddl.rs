@@ -571,7 +571,9 @@ fn keyset_term(engine: &str, table: &NormalizedTable, column: &str, value: &str,
         return format!("{column_ref} {op} {}", sql_literal_for_column(engine, &found.type_name, &text));
     }
     if engine != "mysql" {
-        return format!("{column_ref} {op} {}", sql_literal(&text));
+        // Same value conversion as the copy (tinyint(1) -> boolean, NUL stripped), so a key
+        // lookup on the target matches the stored row.
+        return format!("{column_ref} {op} {}", sql_literal_for_column(engine, &found.type_name, &text));
     }
     let lowered = found.type_name.trim().to_ascii_lowercase();
     let base = lowered.split(['(', ' ']).next().unwrap_or("");
@@ -606,11 +608,13 @@ fn keyset_term(engine: &str, table: &NormalizedTable, column: &str, value: &str,
         "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "character" => {
             return format!("{column_ref} {op} {}", mysql_text_literal(value));
         }
-        "bit" => {
+        // PostgreSQL `bit varying` lands in a MySQL text column; only real BIT compares as an integer.
+        "bit" if mysql_bit_width(&found.type_name).is_some() => {
             if let Ok(number) = u64::from_str_radix(value, 2) {
                 return format!("{column_ref} {op} {number}");
             }
         }
+        "bit" => return format!("{column_ref} {op} {}", mysql_text_literal(value)),
         _ => {}
     }
     // A PostgreSQL timestamptz cursor compared on a MySQL DATETIME (cross-engine verify) drops the
@@ -3893,5 +3897,20 @@ mod binary_keyset_tests {
     fn a_key_column_missing_from_the_table_falls_back_to_a_text_literal() {
         let ints = table(vec![column("id", "bigint")]);
         assert!(after_key("mysql", &ints, &["other"], &["1"]).contains("`events`.`other` > '1'"));
+    }
+
+    #[test]
+    fn key_lookups_use_the_literal_the_copy_stored() {
+        let keys = vec![vec!["0101".to_string()]];
+        // PostgreSQL bit varying is text in MySQL: compare as text, not as the integer 5.
+        let varbit = table(vec![column("k", "bit varying(8)")]);
+        assert!(select_chunk_text_by_keys_sql("mysql", &varbit, &["k".to_string()], &keys).contains("`events`.`k` = "));
+        assert!(!select_chunk_text_by_keys_sql("mysql", &varbit, &["k".to_string()], &keys).contains("= 5"));
+        let bit = table(vec![column("k", "bit(8)")]);
+        assert!(select_chunk_text_by_keys_sql("mysql", &bit, &["k".to_string()], &keys).contains("`events`.`k` = 5"));
+        // MySQL tinyint(1) 2 was copied to PostgreSQL BOOLEAN as TRUE.
+        let flag = table(vec![column("k", "tinyint(1)")]);
+        assert!(select_chunk_text_by_keys_sql("postgresql", &flag, &["k".to_string()], &[vec!["2".to_string()]]).contains("= TRUE"));
+        assert!(select_chunk_text_by_keys_sql("mysql", &flag, &["k".to_string()], &[]).ends_with("WHERE 1 = 0"));
     }
 }
