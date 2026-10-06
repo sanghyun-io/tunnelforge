@@ -15,6 +15,10 @@
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?style=flat-square)](https://github.com/sanghyun-io/tunnelforge/releases)
 
+<img src="docs/images/sql_editor.gif" width="820" alt="SQL 에디터: 자동완성, 실행, 결과" />
+
+<sub>Bastion 뒤에 있는 DB를 열고, 테이블·컬럼 자동완성으로 SQL을 작성해 결과까지 한 창에서 확인합니다.</sub>
+
 </div>
 
 ---
@@ -85,6 +89,22 @@
 | 🌓 | **라이트 / 다크 테마** | 환경에 맞는 테마 선택. |
 | 🔄 | **자동 업데이트 확인** | 시작 시 새 버전을 확인하여 항상 최신 상태 유지. |
 | 🛡️ | **익명 오류 보고** | 명시적 동의 후 엄격한 허용 목록의 보고서만 릴레이로 전송하며, 클라이언트 GitHub 자격 증명이 필요하지 않습니다. [오류 보고 안내](docs/error_reporting.md) |
+
+---
+
+## 스크린샷
+
+| 연결 목록과 그룹 | SQL 에디터 |
+|:-:|:-:|
+| <img src="docs/images/main.png" width="420" alt="그룹과 실시간 터널 상태가 보이는 연결 목록" /> | <img src="docs/images/sql_editor.png" width="420" alt="스키마 트리와 결과가 보이는 SQL 에디터" /> |
+| 환경별로 묶인 터널과 실시간 상태(연결됨, 재연결 중). | 스키마 트리, 구문 강조, 검증, 결과, 트랜잭션 제어. |
+
+| 연결 설정 | 안전한 Import 방식 | MySQL ↔ PostgreSQL |
+|:-:|:-:|:-:|
+| <img src="docs/images/connection.png" width="270" alt="SSH 터널과 TLS가 보이는 연결 설정 창" /> | <img src="docs/images/import.png" width="270" alt="안전 복원, 덮어쓰기, 전체 교체가 보이는 Import 창" /> | <img src="docs/images/migration.png" width="270" alt="DB 전환 마법사" /> |
+| Bastion 경유 SSH 터널, TLS 검증, 자격 증명 저장. | 기본은 안전 복원, 덮어쓰기는 검증을 마친 뒤에만 교체. | 사전 점검과 검증이 포함된 단계별 전환. |
+
+<sub>스크린샷은 데모 데이터입니다.</sub>
 
 ---
 
