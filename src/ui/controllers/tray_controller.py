@@ -1,6 +1,7 @@
 """System tray behavior for the main window."""
 
 import os
+import sys
 
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import QMenu, QSystemTrayIcon
@@ -51,11 +52,18 @@ class TrayController:
 
         window.tray_icon.setContextMenu(tray_menu)
         window.tray_icon.activated.connect(window._on_tray_activated)
+        window.tray_icon.messageClicked.connect(window._on_tray_message_clicked)
         window.tray_icon.show()
 
     def _on_tray_activated(self, reason):
-        """트레이 아이콘 클릭 시"""
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+        """트레이 아이콘 클릭 시 — Windows 관례대로 한 번 클릭(Trigger)도 창을 연다.
+
+        macOS는 클릭이 컨텍스트 메뉴를 여는 동작이라 더블클릭만 창을 연다.
+        """
+        open_reasons = {QSystemTrayIcon.ActivationReason.DoubleClick}
+        if sys.platform != "darwin":
+            open_reasons.add(QSystemTrayIcon.ActivationReason.Trigger)
+        if reason in open_reasons:
             self._window.bring_to_front()
 
     def _update_schedule_run_menu(self):

@@ -1247,6 +1247,7 @@ _EN_REGEX_TRANSLATIONS = (
     (r"(?P<name>.+) 연결되었습니다\.", r"\g<name> connected."),
     (r"(?P<name>.+) 백업이 완료되었습니다\.", r"Backup completed for \g<name>."),
     (r"새로운 버전 (?P<version>.+)이 사용 가능합니다\.\n설정에서 다운로드할 수 있습니다\.", r"New version \g<version> is available.\nYou can download it in Settings."),
+    (r"새로운 버전 (?P<version>.+)이 사용 가능합니다\.\n이 알림을 클릭하면 다운로드 화면을 엽니다\.", r"New version \g<version> is available.\nClick this notification to open the download page."),
     (r"자동 연결 완료", r"Auto-Connect Complete"),
     (r"선택한 (?P<count>\{[^}]*\}|[0-9,]+)개 테이블을 재시도하시겠습니까\?\n\n테이블: (?P<tables>.*)", r"Do you want to retry \g<count> selected tables?\n\nTables: \g<tables>"),
     (r"⚠️ (?P<relations>\{[^}]*\}|[0-9,]+)개 관계에서 총 (?P<records>\{[^}]*\}|[0-9,]+)개 고아 레코드 발견", r"⚠️ Found \g<records> orphan records across \g<relations> relationships"),
