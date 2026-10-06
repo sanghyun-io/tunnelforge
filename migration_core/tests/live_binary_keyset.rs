@@ -189,7 +189,7 @@ fn binary_primary_keys_advance_every_keyset_cursor_when_configured() {
                 source_db.execute_sql(&format!("DROP TABLE IF EXISTS {name}")).unwrap();
                 continue;
             }
-            // migrate (copy through read_rows_after_key) + verify (digest through read_rows_after_key on both sides)
+            // migrate (copy through read_rows_after_key) + verify (source keyset pages, target looked up by those keys)
             let payload = json!({
                 "source_engine": source.engine, "target_engine": other.engine,
                 "source": source, "target": other,
