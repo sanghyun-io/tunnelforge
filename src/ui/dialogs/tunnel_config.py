@@ -97,12 +97,15 @@ class TunnelConfigDialog(QDialog):
         form_layout = QFormLayout(content)
         form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
+        self._form_layout = form_layout
+
         self._build_basic_info_section(form_layout)
+        # 환경(Production 등)은 위험 작업 확인 방식을 정하는 식별 속성이라 이름 바로 아래에 둔다.
+        self._build_environment_section(form_layout)
         self._build_connection_mode_section(form_layout)
         self._build_bastion_section(form_layout)
         self._build_target_db_section(form_layout)
         self._build_tls_section(form_layout)
-        self._build_environment_section(form_layout)
         self._build_local_section(form_layout)
         self._build_auth_section(form_layout)
 
@@ -249,6 +252,7 @@ class TunnelConfigDialog(QDialog):
         self.combo_db_engine.addItem("PostgreSQL", "postgresql")
         engine_index = self.combo_db_engine.findData(self.tunnel_data.get('db_engine'))
         self.combo_db_engine.setCurrentIndex(engine_index if engine_index >= 0 else 0)
+        self.combo_db_engine.currentIndexChanged.connect(self._sync_port_to_engine)
         form_layout.addRow("DB Engine:", self.combo_db_engine)
 
         # 기본 스키마 (선택사항)
@@ -259,6 +263,14 @@ class TunnelConfigDialog(QDialog):
         self.input_default_schema = QLineEdit(self.tunnel_data.get('default_schema', ''))
         self.input_default_schema.setPlaceholderText("(선택사항) MySQL DB명 또는 PostgreSQL schema명")
         form_layout.addRow("기본 스키마:", self.input_default_schema)
+
+    _ENGINE_DEFAULT_PORTS = {"mysql": 3306, "postgresql": 5432}
+
+    def _sync_port_to_engine(self, *_args):
+        """포트가 아직 다른 엔진의 기본값이면 선택한 엔진의 기본 포트로 바꾼다 (사용자 지정 포트는 유지)."""
+        target = self._ENGINE_DEFAULT_PORTS.get(self.combo_db_engine.currentData())
+        if target and self.input_remote_port.value() in self._ENGINE_DEFAULT_PORTS.values():
+            self.input_remote_port.setValue(target)
 
     def _initial_tls_mode(self) -> str:
         saved = self.tunnel_data.get('db_tls_mode')
@@ -376,11 +388,14 @@ class TunnelConfigDialog(QDialog):
             self.engine.refresh_host_key(host, port)
             QMessageBox.information(self, "SSH 호스트 키", "호스트 키를 저장했습니다.")
 
-    def _build_environment_section(self, form_layout: QFormLayout):
-        lbl_env = QLabel("--- 환경 설정 ---")
-        lbl_env.setStyleSheet(LabelStyles.SECTION_HEADER)
-        form_layout.addRow(lbl_env)
+    _ENVIRONMENT_DESCRIPTIONS = {
+        None: "위험 작업 시 확인 필요 (기본값 No)",
+        "production": "위험 작업 시 스키마명 직접 입력 필요",
+        "staging": "위험 작업 시 확인 다이얼로그 표시",
+        "development": "확인 없이 바로 실행",
+    }
 
+    def _build_environment_section(self, form_layout: QFormLayout):
         self.combo_environment = QComboBox()
         self.combo_environment.addItem("(미설정)", None)
         self.combo_environment.addItem("🔴 Production", "production")
@@ -398,6 +413,17 @@ class TunnelConfigDialog(QDialog):
         self.combo_environment.setCurrentIndex(env_index if env_index >= 0 else 0)
         form_layout.addRow("환경:", self.combo_environment)
 
+        # 선택한 환경의 동작을 툴팁이 아니라 바로 아래 한 줄로 보여준다.
+        self.lbl_environment_desc = QLabel()
+        self.lbl_environment_desc.setStyleSheet("color: #7f8c8d;")
+        form_layout.addRow("", self.lbl_environment_desc)
+        self.combo_environment.currentIndexChanged.connect(self._update_environment_desc)
+        self._update_environment_desc()
+
+    def _update_environment_desc(self, *_args):
+        desc = self._ENVIRONMENT_DESCRIPTIONS.get(self.combo_environment.currentData(), "")
+        self.lbl_environment_desc.setText(translate_text(desc))
+
     def _build_local_section(self, form_layout: QFormLayout):
         self.lbl_local = QLabel("--- Local (내 컴퓨터) ---")
         self.lbl_local.setStyleSheet(LabelStyles.SECTION_HEADER)
@@ -405,7 +431,14 @@ class TunnelConfigDialog(QDialog):
 
         self.input_local_port = QSpinBox()
         self.input_local_port.setRange(1, 65535)
-        self.input_local_port.setValue(int(self.tunnel_data.get('local_port', 3308)))
+        local_port = self.tunnel_data.get('local_port')
+        if local_port is None:
+            # 새 연결은 다른 연결과 겹치지 않는 다음 빈 포트를 기본값으로 쓴다.
+            used = self._other_local_ports()
+            local_port = 3308
+            while local_port in used and local_port < 65535:
+                local_port += 1
+        self.input_local_port.setValue(int(local_port))
         self.lbl_local_port = QLabel("Local Bind Port:")
         form_layout.addRow(self.lbl_local_port, self.input_local_port)
 
@@ -420,26 +453,23 @@ class TunnelConfigDialog(QDialog):
         lbl_mysql.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_mysql)
 
+        # 체크박스는 저장 여부만 정한다. 입력과 DB 인증 테스트는 항상 사용할 수 있다.
         self.chk_save_credentials = QCheckBox("DB 자격 증명 저장")
-        self.chk_save_credentials.setToolTip("암호화하여 저장합니다")
-        self.chk_save_credentials.toggled.connect(self._on_save_credentials_toggled)
+        self.chk_save_credentials.setToolTip("암호화하여 저장합니다. 해제해도 입력한 값으로 테스트할 수 있습니다.")
         form_layout.addRow(self.chk_save_credentials)
 
         self.input_db_user = QLineEdit(self.tunnel_data.get('db_user', ''))
         self.input_db_user.setPlaceholderText("DB 사용자명")
-        self.input_db_user.setEnabled(False)
         form_layout.addRow("DB User:", self.input_db_user)
 
         self.input_db_password = QLineEdit()
         self.input_db_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.input_db_password.setPlaceholderText("DB 비밀번호")
-        self.input_db_password.setEnabled(False)
         form_layout.addRow("DB Password:", self.input_db_password)
 
         # DB 인증 테스트 버튼 - 중앙화된 스타일 사용
         self.btn_db_test = QPushButton("🔐 DB 인증 테스트")
         self.btn_db_test.setStyleSheet(ButtonStyles.TEST)
-        self.btn_db_test.setEnabled(False)  # 체크박스 연동
         self.btn_db_test.clicked.connect(self._test_db_only)
         form_layout.addRow("", self.btn_db_test)
 
@@ -448,6 +478,7 @@ class TunnelConfigDialog(QDialog):
             self.chk_save_credentials.setChecked(True)
             if self.tunnel_data.get('db_password_encrypted'):
                 self.input_db_password.setPlaceholderText("(저장됨 - 변경시 새로 입력)")
+        self.chk_save_credentials.toggled.connect(self._on_save_credentials_toggled)
 
     def _build_footer_section(self, layout: QVBoxLayout):
         self.btn_integrated_test = QPushButton("🚀 통합 테스트")
@@ -471,31 +502,30 @@ class TunnelConfigDialog(QDialog):
         """연결 모드 변경 시 UI 업데이트"""
         is_ssh_mode = self.radio_ssh_tunnel.isChecked()
 
-        # Bastion 관련 필드 토글
-        bastion_widgets = [
-            self.lbl_bastion, self.lbl_bastion_host, self.input_bastion_host,
-            self.lbl_bastion_port, self.input_bastion_port,
-            self.lbl_bastion_user, self.input_bastion_user,
-            self.lbl_bastion_key, self.key_layout_widget,
-            self.btn_copy_bastion, self.btn_host_key
+        # SSH 전용 행(Bastion, Local, 호스트 키, 터널 테스트)은 직접 연결 모드에서 숨긴다.
+        ssh_only_rows = [
+            self.lbl_bastion, self.input_bastion_host, self.input_bastion_port,
+            self.input_bastion_user, self.key_layout_widget, self.btn_copy_bastion,
+            self.btn_host_key, self.lbl_local, self.input_local_port, self.btn_tunnel_test,
         ]
-        for widget in bastion_widgets:
-            widget.setEnabled(is_ssh_mode)
+        for widget in ssh_only_rows:
+            self._form_layout.setRowVisible(widget, is_ssh_mode)
         self.btn_copy_bastion.setEnabled(is_ssh_mode and bool(self.bastion_templates))
 
-        # Local Port 토글
-        local_widgets = [self.lbl_local, self.lbl_local_port, self.input_local_port]
-        for widget in local_widgets:
-            widget.setEnabled(is_ssh_mode)
-
     def _on_save_credentials_toggled(self, checked):
-        """MySQL 자격 증명 저장 체크박스 토글"""
-        self.input_db_user.setEnabled(checked)
-        self.input_db_password.setEnabled(checked)
-        self.btn_db_test.setEnabled(checked)
-        if not checked:
-            self.input_db_user.clear()
-            self.input_db_password.clear()
+        """저장된 자격 증명이 있는데 저장을 해제하면, 저장 시 삭제된다는 것을 확인받는다."""
+        if checked or not self.tunnel_data.get('db_user'):
+            return
+        answer = QMessageBox.question(
+            self, "DB 자격 증명 저장 해제",
+            "저장된 DB 자격 증명이 저장 시 삭제됩니다.\n계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.chk_save_credentials.blockSignals(True)
+            self.chk_save_credentials.setChecked(True)
+            self.chk_save_credentials.blockSignals(False)
 
     def _load_bastion_templates(self):
         current_id = self.tunnel_data.get('id')
@@ -582,10 +612,60 @@ class TunnelConfigDialog(QDialog):
 
         return data
 
+    def _other_local_ports(self):
+        """현재 연결을 제외한 SSH 터널 연결들이 쓰는 local_port 집합."""
+        current_id = self.tunnel_data.get('id')
+        return {
+            int(t['local_port']) for t in self._available_tunnels()
+            if t.get('id') != current_id and t.get('local_port')
+            and t.get('connection_mode', 'ssh_tunnel') != 'direct'
+        }
+
+    def _missing_required_fields(self):
+        """모드별 필수 입력 중 비어 있는 (이름, 위젯) 목록 (폼 순서)."""
+        required = [("이름(별칭)", self.input_name)]
+        if self.radio_ssh_tunnel.isChecked():
+            required += [
+                ("SSH 호스트", self.input_bastion_host),
+                ("SSH 사용자", self.input_bastion_user),
+                ("SSH Key", self.input_bastion_key),
+                ("Target DB (Endpoint)", self.input_remote_host),
+            ]
+        return [(label, widget) for label, widget in required if not widget.text().strip()]
+
     def accept(self):
+        missing = self._missing_required_fields()
+        for widget in (self.input_name, self.input_bastion_host, self.input_bastion_user,
+                       self.input_bastion_key, self.input_remote_host):
+            widget.setStyleSheet("")
+        if missing:
+            for _label, widget in missing:
+                widget.setStyleSheet("border: 1px solid #c0392b;")
+            first = missing[0][1]
+            self.scroll_area.ensureWidgetVisible(first)
+            first.setFocus()
+            QMessageBox.warning(
+                self, "필수 항목 누락",
+                "다음 필드를 입력해주세요:\n\n• " + "\n• ".join(label for label, _w in missing)
+            )
+            return
         if not self.combo_db_engine.currentData():
             QMessageBox.warning(self, "필수 항목 누락", "DB Engine을 선택해주세요.\nMySQL 또는 PostgreSQL을 명시해야 합니다.")
+            self.combo_db_engine.setFocus()
             return
+        port = self.input_local_port.value()
+        if self.radio_ssh_tunnel.isChecked() and port in self._other_local_ports():
+            answer = QMessageBox.question(
+                self, "Local 포트 중복",
+                f"Local Bind Port {port}을(를) 다른 연결이 이미 사용 중입니다.\n"
+                "두 연결을 동시에 켜면 포트 충돌이 납니다. 그대로 저장하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.scroll_area.ensureWidgetVisible(self.input_local_port)
+                self.input_local_port.setFocus()
+                return
         super().accept()
 
     def _test_tunnel_only(self):
@@ -673,9 +753,9 @@ class TunnelConfigDialog(QDialog):
             QMessageBox.warning(self, "필수 항목 누락", "DB Engine을 먼저 선택해주세요.")
             return
 
-        # DB 자격 증명 확인 (선택 사항)
-        db_user = self.input_db_user.text() if self.chk_save_credentials.isChecked() else None
-        db_password = self.input_db_password.text() if self.chk_save_credentials.isChecked() else None
+        # DB 자격 증명 확인 (선택 사항) - 저장 체크 여부와 무관하게 입력값으로 테스트한다.
+        db_user = self.input_db_user.text() or None
+        db_password = self.input_db_password.text() or None
 
         temp_config_mgr = _TempCredentials(
             db_user, db_password,

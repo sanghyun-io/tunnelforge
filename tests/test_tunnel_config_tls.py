@@ -86,9 +86,9 @@ def test_get_data_includes_tls_fields_and_ca_follows_mode():
 
 def test_host_key_button_only_in_ssh_mode():
     dialog = _dialog()
-    assert dialog.btn_host_key.isEnabled()
+    assert dialog._form_layout.isRowVisible(dialog.btn_host_key)
     dialog.radio_direct.setChecked(True)
-    assert not dialog.btn_host_key.isEnabled()
+    assert not dialog._form_layout.isRowVisible(dialog.btn_host_key)
 
 
 class _Store:
