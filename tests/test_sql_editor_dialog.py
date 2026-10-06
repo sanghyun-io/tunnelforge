@@ -1262,3 +1262,90 @@ def test_schema_tree_inserts_on_double_click_not_single_click(monkeypatch):
         assert dialog.editor.toPlainText() == "SELECT * FROM `users` "
     finally:
         close_dialog(dialog)
+
+
+def _load_schema(dialog):
+    metadata = SchemaMetadata()
+    metadata.tables = {"orders", "users", "user_roles"}
+    metadata.columns = {"users": {"id", "email"}, "orders": {"id", "customer_email"}, "user_roles": {"role"}}
+    dialog._on_metadata_loaded(metadata)
+    root = dialog.schema_tree.topLevelItem(0)
+    return {root.child(i).text(0): root.child(i) for i in range(root.childCount())}
+
+
+def test_schema_filter_matches_tables_and_columns(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        tables = _load_schema(dialog)
+
+        dialog.schema_filter.setText("USER")
+        assert [n for n, t in tables.items() if not t.isHidden()] == ["user_roles", "users"]
+        assert not tables["users"].child(0).isHidden()  # 테이블이 맞으면 컬럼 전부 표시
+
+        dialog.schema_filter.setText("email")
+        orders = tables["orders"]
+        assert not orders.isHidden() and orders.isExpanded()
+        assert [orders.child(i).isHidden() for i in range(orders.childCount())] == [False, True]
+        assert tables["user_roles"].isHidden()
+
+        dialog.schema_filter.clear()
+        assert not any(t.isHidden() for t in tables.values())
+
+        # 메타데이터를 다시 로드해도 입력된 필터가 유지된다
+        dialog.schema_filter.setText("roles")
+        tables = _load_schema(dialog)
+        assert [n for n, t in tables.items() if not t.isHidden()] == ["user_roles"]
+    finally:
+        close_dialog(dialog)
+
+
+def test_schema_tree_context_menu_inserts_select_and_copies_name(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        tables = _load_schema(dialog)
+        assert dialog._build_schema_tree_menu(dialog.schema_tree.topLevelItem(0)) is None
+        assert dialog._build_schema_tree_menu(tables["users"].child(0)) is None
+
+        dialog.editor.setPlainText("")
+        insert, copy = dialog._build_schema_tree_menu(tables["users"]).actions()
+        assert (insert.text(), copy.text()) == ("SELECT 문 삽입", "이름 복사")
+        insert.trigger()
+        assert dialog.editor.toPlainText() == "SELECT * FROM `users` LIMIT 100"
+        copy.trigger()
+        assert QApplication.clipboard().text() == "users"
+    finally:
+        close_dialog(dialog)
+
+
+def test_new_tab_corner_button_fits_inside_tab_bar(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        dialog.resize(1092, 560)
+        dialog.show()
+        app.processEvents()
+        button = dialog.new_tab_button
+        assert dialog.editor_tabs.cornerWidget() is button
+        assert button.geometry().bottom() <= dialog.editor_tabs.tabBar().geometry().bottom()
+        assert button.height() >= button.sizeHint().height()
+    finally:
+        close_dialog(dialog)
+
+
+def test_result_area_shows_hint_until_a_result_exists(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        assert not dialog.result_empty_hint.isHidden()
+        assert "Ctrl+Enter" in dialog.result_empty_hint.text()
+        assert dialog.result_tabs.isHidden()
+
+        dialog._add_result_table(["id"], [[1]], 0.01, "SELECT 1")
+        assert dialog.result_empty_hint.isHidden() and not dialog.result_tabs.isHidden()
+
+        dialog.close_result_tab(0)
+        assert not dialog.result_empty_hint.isHidden() and dialog.result_tabs.isHidden()
+
+        dialog._add_result_table(["id"], [[1]], 0.01, "SELECT 1")
+        assert dialog._clear_result_tabs()
+        assert not dialog.result_empty_hint.isHidden()
+    finally:
+        close_dialog(dialog)
