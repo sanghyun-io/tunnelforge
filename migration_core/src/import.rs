@@ -303,7 +303,23 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         "message": "Import 데이터 검증 중: 대상 테이블 변경 전에 청크 무결성과 행 데이터를 확인합니다.",
         "tables": tables.len(),
     }));
-    validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression, &manifest.schema)?;
+    // Cross-engine imports refuse temporal types and values the target cannot store before anything changes.
+    if manifest.source_engine != endpoint.engine {
+        let source_engine = manifest.source_engine.as_str();
+        let refused = manifest.schema.tables.iter().filter(|table| tables.iter().any(|selected| selected.name == table.name))
+            .flat_map(|table| table.columns.iter().filter_map(move |column| match temporal_type_problem(source_engine, &column.type_name) {
+                Some((true, problem)) => Some(format!("{}.{}: {problem}", table.name, column.name)),
+                _ => None,
+            }))
+            .collect::<Vec<_>>();
+        if !refused.is_empty() {
+            return Err(format!("{}; leave these tables out or convert the columns in the source and export again", refused.join("; ")));
+        }
+    }
+    let source_engine = manifest.source_engine.clone();
+    let temporal_check = move |column: &NormalizedColumn, text: &str| temporal_value_problem(&source_engine, &column.type_name, text);
+    let cell_check: Option<DumpCellCheck> = (manifest.source_engine != endpoint.engine).then_some(&temporal_check);
+    validate_dump_manifest_chunks_with(input_path, &tables, &data_format, &compression, &manifest.schema, cell_check)?;
     for warning in &manifest_warnings {
         emit(json!({
             "event": "warning",

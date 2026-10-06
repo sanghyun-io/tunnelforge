@@ -58,6 +58,17 @@ fn migrate_tables(source: &Endpoint, target: &Endpoint, table: &str, tables: Val
     failures
 }
 
+/// Locations of the blocking issues `preflight` reports for one table.
+fn preflight_refusals(source: &Endpoint, target: &Endpoint, table: &str, columns: Value) -> Vec<String> {
+    let payload = json!({"source_engine": source.engine, "target_engine": target.engine, "source": source, "target": target,
+        "schema": {"tables": [{"name": table, "columns": columns}]}, "execution_options": {"mode": "create_only", "chunk_size": 2}});
+    let result = run("preflight", payload).unwrap_or(Value::Null);
+    result["issues"].as_array().into_iter().flatten()
+        .filter(|issue| issue["blocking"] == true)
+        .filter_map(|issue| issue["location"].as_str().map(str::to_string))
+        .collect()
+}
+
 #[test]
 fn cross_engine_migration_keeps_types_when_configured() {
     let (Some(mysql), Some(postgres)) = (endpoint("TF_MYSQL", "mysql", 3306), endpoint("TF_POSTGRES", "postgresql", 5432)) else {
@@ -147,7 +158,65 @@ fn cross_engine_migration_keeps_types_when_configured() {
         failures.push(format!("PostgreSQL NaN reached MySQL: {}", first_row(&mysql, &format!("SELECT v FROM {nan}"))));
     }
 
-    for (adapter, tables) in [(&mut my, [&child, &m, &p, &ai, &wide, &nan]), (&mut pg, [&child, &m, &p, &ai, &wide, &nan])] {
+    // Temporal values the other engine cannot store are refused by preflight, before any DDL.
+    let zero = format!("tf_xtypes_zero_{suffix}");
+    my.execute_sql("SET SESSION sql_mode = 'ALLOW_INVALID_DATES'").unwrap();
+    my.execute_sql(&format!("CREATE TABLE {zero} (id INT PRIMARY KEY, d DATE, dt DATETIME, t TIME, inv DATE)")).unwrap();
+    my.execute_sql(&format!("INSERT INTO {zero} VALUES (1, '0000-00-00', '2024-00-15 00:00:00', '100:00:00', NULL), (2, '2024-01-15', '2024-01-15 00:00:00', '12:34:56', '2024-02-30')")).unwrap();
+    let zero_columns = json!([col("id", "int", true), col("d", "date", false), col("dt", "datetime", false), col("t", "time", false), col("inv", "date", false)]);
+    let refused = preflight_refusals(&mysql, &postgres, &zero, zero_columns.clone());
+    for column in ["d", "dt", "t", "inv"] {
+        if !refused.iter().any(|location| location == &format!("{zero}.{column}")) {
+            failures.push(format!("MySQL {zero}.{column} with an unstorable value was not refused: {refused:?}"));
+        }
+    }
+    // A cross-engine dump.import refuses the same values before the target changes.
+    let dir = std::env::temp_dir().join(format!("tf-xtypes-zero-{suffix}"));
+    if let Err(error) = run("dump.run", json!({"source": &mysql, "tables": [&zero], "output_dir": dir, "threads": 1, "data_format": "tsv", "compression": "none"})) {
+        failures.push(format!("dump of zero dates: {error}"));
+    } else {
+        match run("dump.import", json!({"target": &postgres, "input_dir": dir, "mode": "replace", "threads": 1})) {
+            Err(error) if error.contains("cannot store") => {
+                if first_row(&postgres, &format!("SELECT to_regclass('{zero}') IS NOT NULL AS present"))["present"] == true {
+                    failures.push("dump.import created the table before refusing zero dates".into());
+                }
+            }
+            other => failures.push(format!("dump.import of zero dates into PostgreSQL was not refused: {other:?}")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // Keyless tables read through the text protocol: ordinary TIME and midnight DATETIME verify.
+    let keyless = format!("tf_xtypes_keyless_{suffix}");
+    my.execute_sql(&format!("CREATE TABLE {keyless} (d DATE, dt DATETIME(3), t TIME(3))")).unwrap();
+    my.execute_sql(&format!("INSERT INTO {keyless} VALUES ('2024-01-15', '2024-01-15 00:00:00', '12:34:56.500'), ('2024-01-16', '2024-01-16 10:00:00.250', '00:00:00'), (NULL, NULL, '23:59:59')")).unwrap();
+    failures.extend(migrate_and_verify(&mysql, &postgres, &keyless, json!([col("d", "date", false), col("dt", "datetime(3)", false), col("t", "time(3)", false)]), json!({})));
+
+    let inf = format!("tf_xtypes_inf_{suffix}");
+    pg.execute_sql(&format!("CREATE TABLE {inf} (id INT PRIMARY KEY, ts TIMESTAMPTZ, d DATE, tz TIMETZ, iv INTERVAL)")).unwrap();
+    pg.execute_sql(&format!("INSERT INTO {inf} VALUES (1, 'infinity', '0044-03-15 BC', '12:00:00+09', '1 day'), (2, '2024-01-15 00:00:00+00', '2024-01-15', NULL, NULL)")).unwrap();
+    let refused = preflight_refusals(&postgres, &mysql, &inf, json!([col("id", "integer", true), col("ts", "timestamp with time zone", false),
+        col("d", "date", false), col("tz", "time with time zone", false), col("iv", "interval", false)]));
+    for column in ["ts", "d", "tz"] {
+        if !refused.iter().any(|location| location == &format!("{inf}.{column}")) {
+            failures.push(format!("PostgreSQL {inf}.{column} was not refused: {refused:?}"));
+        }
+    }
+    if refused.iter().any(|location| location == &format!("{inf}.iv")) {
+        failures.push("PostgreSQL interval was refused instead of warned".into());
+    }
+    // dump.import refuses the timetz column type too, before the target changes.
+    let dir = std::env::temp_dir().join(format!("tf-xtypes-inf-{suffix}"));
+    if let Err(error) = run("dump.run", json!({"source": &postgres, "tables": [&inf], "output_dir": dir, "threads": 1, "data_format": "jsonl", "compression": "none"})) {
+        failures.push(format!("dump of timetz table: {error}"));
+    } else {
+        match run("dump.import", json!({"target": &mysql, "input_dir": dir, "mode": "replace", "threads": 1})) {
+            Err(error) if error.contains("time with time zone") => {}
+            other => failures.push(format!("dump.import of timetz into MySQL was not refused: {other:?}")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    for (adapter, tables) in [(&mut my, [&child, &m, &p, &ai, &wide, &nan, &zero, &keyless, &inf]), (&mut pg, [&child, &m, &p, &ai, &wide, &nan, &zero, &keyless, &inf])] {
         for table in tables {
             let _ = adapter.execute_sql(&format!("DROP TABLE IF EXISTS {table}"));
         }

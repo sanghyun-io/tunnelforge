@@ -73,8 +73,8 @@ struct Case {
     columns: Value,
     values: Vec<String>,
     migrate: bool,
-    /// Cross-engine verify pages both sides with the source cursor; text keys under different
-    /// collations misalign the pages (false mismatches, follow-up), so those cases skip verify.
+    /// Cross-engine verify looks target rows up by the source keys, so text keys under different
+    /// collations verify too.
     verify: bool,
 }
 
@@ -90,7 +90,7 @@ fn mysql_cases() -> Vec<Case> {
             // backslashes, a quote, case/accents and trailing space under a NO PAD collation
             values: ["'a'", "'B '", "'\\u{00e1}x'", "'a\\\\b'", "'x\\\\'", "'\\\\''z'", "'it''s'", "'zz'"]
                 .iter().enumerate().map(|(i, k)| format!("({}, {})", k.replace("\\u{00e1}", "\u{00e1}"), label(i))).collect(),
-            migrate: true, verify: false },
+            migrate: true, verify: true },
         Case { name: "text_general_ci", ddl: "k VARCHAR(32) COLLATE utf8mb4_general_ci PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "varchar(32)", true), col("v", "varchar(8)", false)]),
             values: ["'apple'", "'Banana'", "'cherry'", "'Date'", "'egg'", "'Fig'", "'grape'"]
@@ -162,7 +162,7 @@ fn mysql_cases() -> Vec<Case> {
         Case { name: "composite_text_decimal", ddl: "a VARCHAR(16) COLLATE utf8mb4_0900_ai_ci NOT NULL, b DECIMAL(30,20) NOT NULL, v VARCHAR(8), PRIMARY KEY (a, b)",
             columns: json!([col("a", "varchar(16)", true), col("b", "decimal(30,20)", true), col("v", "varchar(8)", false)]),
             values: (0..7).map(|i| format!("('{}', 1.0000000000000000000{}, {})", if i < 4 { "g\\\\1" } else { "G2" }, i, label(i))).collect(),
-            migrate: true, verify: false },
+            migrate: true, verify: true },
         Case { name: "nullable_unique", ddl: "k VARCHAR(16) NULL UNIQUE, v VARCHAR(8)",
             columns: json!([{"name": "k", "type": "varchar(16)", "nullable": true, "unique": true}, col("v", "varchar(8)", false)]),
             values: ["NULL", "NULL", "NULL", "'a'", "'b'", "'c'", "'d'"].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
@@ -176,7 +176,7 @@ fn postgres_cases() -> Vec<Case> {
         Case { name: "text_icu", ddl: "k TEXT COLLATE \"en-US-x-icu\" PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "text", true), col("v", "varchar(8)", false)]),
             values: ["'a'", "'B'", "'\u{00e1}x'", "'a\\b'", "'x\\'", "'it''s'", "'_z'", "'Zz'"].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
-            migrate: true, verify: false },
+            migrate: true, verify: true },
         Case { name: "numeric_wide", ddl: "k NUMERIC(38,0) PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "numeric(38,0)", true), col("v", "varchar(8)", false)]),
             values: (1..=7).map(|i| format!("(1000000000000000000000000000000{i}, {})", label(i))).collect(),
@@ -200,7 +200,7 @@ fn postgres_cases() -> Vec<Case> {
         Case { name: "composite_text_numeric", ddl: "a TEXT COLLATE \"en-US-x-icu\" NOT NULL, b NUMERIC(30,20) NOT NULL, v VARCHAR(8), PRIMARY KEY (a, b)",
             columns: json!([col("a", "text", true), col("b", "numeric(30,20)", true), col("v", "varchar(8)", false)]),
             values: (0..7).map(|i| format!("('{}', 1.0000000000000000000{}, {})", if i < 4 { "g\\1" } else { "G2" }, i, label(i))).collect(),
-            migrate: true, verify: false },
+            migrate: true, verify: true },
         Case { name: "nullable_unique", ddl: "k VARCHAR(16) NULL UNIQUE, v VARCHAR(8)",
             columns: json!([{"name": "k", "type": "varchar(16)", "nullable": true, "unique": true}, col("v", "varchar(8)", false)]),
             values: ["NULL", "NULL", "NULL", "'a'", "'b'", "'c'", "'d'"].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
