@@ -25,12 +25,23 @@ def _profile(context: Optional[Dict[str, Any]], fallback_name: str = "") -> Dict
 
 # ------------------------------------------------------------------ export
 
+# 작업 목록에 보이는 실행 모드는 사람이 읽는 라벨로 남긴다 (원래 코드값은 rerun에 그대로 보존).
+_SNAPSHOT_LABELS = {
+    "parallel_strict": "일관 스냅샷(병렬)",
+    "single_connection": "일관 스냅샷(단일 연결)",
+    "parallel_no_backup_lock": "락 없는 단일 연결 스냅샷",
+}
+_COMPRESSION_LABELS = {"none": "압축 안 함", "zstd": "zstd 압축"}
+
+
 def begin_export_job(dialog) -> Optional[str]:
     try:
         full = dialog.radio_full.isChecked()
         tables = [] if full else list(dialog.get_selected_tables())
-        mode = (f"{'전체' if full else f'테이블 {len(tables)}개'} · snapshot={dialog._snapshot_mode}"
-                f" · {dialog.combo_compression.currentText()} · 스레드 {dialog.spin_threads.value()}"
+        compression = dialog.combo_compression.currentText()
+        mode = (f"{'전체' if full else f'테이블 {len(tables)}개'}"
+                f" · {_SNAPSHOT_LABELS.get(dialog._snapshot_mode, dialog._snapshot_mode)}"
+                f" · {_COMPRESSION_LABELS.get(compression, compression)} · 스레드 {dialog.spin_threads.value()}"
                 + (" · 불완전 Export(테이블 데이터만)" if dialog._allow_incomplete else ""))
         return job_begin(
             KIND_EXPORT_FULL if full else KIND_EXPORT_TABLES,

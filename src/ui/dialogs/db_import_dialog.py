@@ -424,7 +424,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None,
                  tunnel_config: dict = None):
         super().__init__(parent)
-        self.setWindowTitle("Rust DB Core Import (병렬 처리)")
+        self.setWindowTitle("데이터 Import")
         self.resize(600, 700)
 
         self.connector = connector
@@ -522,7 +522,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         layout.addLayout(self._build_button_row())
 
     def _build_status_group(self):
-        status_group = QGroupBox("Rust DB Core 상태")
+        status_group = QGroupBox("Import 엔진 상태")
         status_layout = QVBoxLayout(status_group)
 
         if self.rust_dump_installed:
@@ -774,7 +774,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.table_list = QListWidget()
         self.table_list.setMinimumHeight(150)
         self.table_list.setMaximumHeight(200)
-        self.table_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        # 일부 테이블 재시도는 지원하지 않으므로 선택할 수 있다는 오해를 주지 않는다.
+        self.table_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table_list.setStyleSheet("""
             QListWidget {
                 border: 1px solid #bdc3c7;
@@ -792,30 +793,17 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         table_status_layout.addWidget(self.table_list)
 
         retry_layout = QHBoxLayout()
-        self.btn_retry = QPushButton("🔄 선택한 테이블 재시도")
-        self.btn_retry.setVisible(False)
-        self.btn_retry.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
-        self.btn_retry.clicked.connect(self.do_retry)
+        # 일부 테이블만 재시도하면 인덱스/FK 복원이 누락되므로, 원래 범위 전체를 같은 설정으로 다시 실행한다.
+        self.btn_rerun = QPushButton("🔄 같은 설정으로 다시 Import")
+        self.btn_rerun.setVisible(False)
+        self.btn_rerun.setToolTip("대상 데이터 상태를 확인한 뒤 원래 범위 전체를 같은 설정으로 다시 Import합니다.")
+        self.btn_rerun.clicked.connect(lambda: self.do_import())
+        self.label_rerun_hint = QLabel("대상 데이터 상태를 확인한 뒤 다시 실행하세요.")
+        self.label_rerun_hint.setStyleSheet("color: gray; font-size: 11px;")
+        self.label_rerun_hint.setVisible(False)
 
-        self.btn_select_failed = QPushButton("실패한 테이블 모두 선택")
-        self.btn_select_failed.setVisible(False)
-        self.btn_select_failed.setStyleSheet("""
-            QPushButton {
-                background-color: #95a5a6; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #7f8c8d; }
-        """)
-        self.btn_select_failed.clicked.connect(self.select_failed_tables)
-
-        retry_layout.addWidget(self.btn_select_failed)
-        retry_layout.addWidget(self.btn_retry)
+        retry_layout.addWidget(self.btn_rerun)
+        retry_layout.addWidget(self.label_rerun_hint)
         retry_layout.addStretch()
         table_status_layout.addLayout(retry_layout)
 
@@ -1253,8 +1241,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         # UI 상태 변경 - 모든 입력 비활성화
         self.set_ui_enabled(False)
-        self.btn_retry.setVisible(False)
-        self.btn_select_failed.setVisible(False)
+        self.btn_rerun.setVisible(False)
+        self.label_rerun_hint.setVisible(False)
         self.btn_save_log.setEnabled(False)
 
         # 설정 섹션 접기
@@ -1345,7 +1333,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.txt_log.addItem(f"🔄 재시도 모드: {len(retry_tables)}개 테이블")
 
         # 작업 스레드 시작
-        self._job_id = begin_import_job(self, input_dir, namespace or target_schema, import_mode, self.spin_threads.value())
+        self._job_id = begin_import_job(self, input_dir, namespace or target_schema,
+                                        self._get_import_mode_text(selected_mode), self.spin_threads.value())
         self.worker = RustDumpWorker(
             "import", config,
             input_dir=input_dir,
@@ -1638,7 +1627,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                     self.table_items[table_name] = item
 
     def on_import_finished(self, success: bool, message: str, results: dict):
-        """Import 완료 처리 (결과 저장 및 재시도 버튼 표시)"""
+        """Import 완료 처리 (결과 저장 및 다시 Import 버튼 표시)"""
         self.import_results = results
 
         failed_tables = [
@@ -1647,8 +1636,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         ]
 
         if failed_tables:
-            self.btn_retry.setVisible(False)
-            self.btn_select_failed.setVisible(True)
+            self.btn_rerun.setVisible(True)
+            self.label_rerun_hint.setVisible(True)
             self.txt_log.addItem(f"⚠️ {len(failed_tables)}개 테이블 Import 실패")
 
     def on_finished(self, success: bool, message: str):
@@ -1791,13 +1780,6 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if error_code:
             report_args["error_code"] = error_code
         self._start_error_report_worker(**report_args)
-
-    def select_failed_tables(self):
-        """실패한 테이블 모두 선택"""
-        for table_name, result in self._table_results().items():
-            if result.get('status') in ('error', 'blocked'):
-                if table_name in self.table_items:
-                    self.table_items[table_name].setSelected(True)
 
     def copy_restore_target(self):
         candidate = restore_target_connection_info(self.import_audit.get("candidate_target"))
