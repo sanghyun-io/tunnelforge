@@ -19,7 +19,6 @@ from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STA
 from src.core.db_connector import MySQLConnector
 from src.core.error_report_sanitizer import (
     sanitize_local_diagnostic,
-    sanitize_local_diagnostic_data,
 )
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
@@ -30,28 +29,15 @@ from src.exporters.rust_dump_exporter import (
     mysql_parallel_snapshot_denied_privilege
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
-from src.ui.workers.error_reporting_worker import ErrorReportingMixin
+from src.ui.workers.error_reporting_worker import (
+    ErrorReportingMixin,
+    report_operation_error,
+    sanitize_local_diagnostic_json,
+)
 from src.ui.dialogs.job_recording import begin_export_job, finish_export_job
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 logger = get_logger("db_dialogs")
-
-
-def _escape_local_diagnostic_text(value: object) -> str:
-    return sanitize_local_diagnostic(value)
-
-
-def _structured_local_diagnostic_text(value: object) -> str:
-    try:
-        serialized = json.dumps(
-            sanitize_local_diagnostic_data(value),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except BaseException:
-        serialized = "REDACTED"
-    return sanitize_local_diagnostic(serialized)
 
 
 _EXPORT_TELEMETRY_TYPES = {
@@ -1275,7 +1261,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용)"""
         timestamp = datetime.now().strftime('%H:%M:%S')
-        log_entry = f"[{timestamp}] {_escape_local_diagnostic_text(msg)}"
+        log_entry = f"[{timestamp}] {sanitize_local_diagnostic(msg)}"
         self.log_entries.append(log_entry)
         if len(self.log_entries) > MAX_LOG_ENTRIES:
             del self.log_entries[:-MAX_LOG_ENTRIES]
@@ -1283,7 +1269,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.btn_save_log.setEnabled(True)
 
     def on_progress(self, msg: str):
-        msg = _escape_local_diagnostic_text(msg)
+        msg = sanitize_local_diagnostic(msg)
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
         self._add_log(msg)
@@ -1300,13 +1286,17 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.label_tables.setText(
             f"📋 테이블: {self.export_completed_tables} / {self.export_total_tables} 완료"
         )
-        display_table = _escape_local_diagnostic_text(table_name)
+        display_table = sanitize_local_diagnostic(table_name)
         self._add_log(
             f"테이블 완료: {display_table} ({self.export_completed_tables}/{self.export_total_tables})"
         )
 
+    def _report_error_anonymously(self):
+        """Submit a privacy-allowlisted report in the background."""
+        report_operation_error(self, "export", "dump.run")
+
     def on_finished(self, success: bool, message: str):
-        message = _escape_local_diagnostic_text(message)
+        message = sanitize_local_diagnostic(message)
         handled_privilege_failure = False
         refusal = getattr(self.worker, "export_refusal", None)
         if (
@@ -1469,7 +1459,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         data_label, estimate_label = format_export_row_labels(overall_done, self.export_total_rows)
         self.label_data.setText(data_label)
         self.label_estimated_rows.setText(estimate_label)
-        display_speed = _escape_local_diagnostic_text(
+        display_speed = sanitize_local_diagnostic(
             info.get('speed', 'Rust DB Core')
         )
         self.label_speed.setText(f"⚡ 속도: {display_speed}")
@@ -1478,7 +1468,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             table_total = self.export_table_totals.get(table) or int(info.get("rows_total") or 0)
             self.label_status.setText(
                 format_export_table_status(
-                    _escape_local_diagnostic_text(table),
+                    sanitize_local_diagnostic(table),
                     self.export_table_done.get(table, 0),
                     table_total,
                 )
@@ -1486,8 +1476,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트"""
-        display_table = _escape_local_diagnostic_text(table_name)
-        display_message = _escape_local_diagnostic_text(message)
+        display_table = sanitize_local_diagnostic(table_name)
+        display_message = sanitize_local_diagnostic(message)
         now = datetime.now()
         self.export_table_status[table_name] = status
         if status == "loading":
@@ -1536,7 +1526,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             visible_summary = format_export_visible_telemetry(normalized_event)
 
         if visible_summary:
-            visible_summary = _escape_local_diagnostic_text(visible_summary)
+            visible_summary = sanitize_local_diagnostic(visible_summary)
             # 너무 많은 로그 방지
             if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
                 self.txt_log.takeItem(0)
@@ -1545,29 +1535,15 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self._add_log(visible_summary)
         elif not is_telemetry_event:
             visible_line = (
-                _structured_local_diagnostic_text(event)
+                sanitize_local_diagnostic_json(event)
                 if type(event) in {dict, list}
-                else _escape_local_diagnostic_text(line)
+                else sanitize_local_diagnostic(line)
             )
             # 너무 많은 로그 방지
             if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
                 self.txt_log.takeItem(0)
             self.txt_log.addItem(visible_line)
             self.txt_log.scrollToBottom()
-
-    def _report_error_anonymously(self):
-        """Submit a privacy-allowlisted report in the background."""
-        if not self.config_manager:
-            return
-        report_args = {
-            "operation_kind": "export",
-            "db_engine": getattr(self.connector, "engine", ""),
-            "phase": "dump.run",
-        }
-        error_code = getattr(getattr(self, "worker", None), "error_code", None)
-        if error_code:
-            report_args["error_code"] = error_code
-        self._start_error_report_worker(**report_args)
 
     def _export_table_duration_seconds(self, table_name: str) -> float:
         start = self.export_table_started_at.get(table_name)
@@ -1628,7 +1604,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             status = "running"
         else:
             status = "success" if self.export_success else "failed"
-        schema_name = safe_filename_component(_escape_local_diagnostic_text(self.export_schema or ""), "unknown")
+        schema_name = safe_filename_component(sanitize_local_diagnostic(self.export_schema or ""), "unknown")
         default_filename = f"export_log_{schema_name}_{status}_{timestamp}.txt"
 
         # 파일 저장 대화상자
@@ -1643,7 +1619,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             return
 
         try:
-            safe = _escape_local_diagnostic_text
+            safe = sanitize_local_diagnostic
             with open(file_path, 'w', encoding='utf-8') as f:
                 # 헤더 정보
                 f.write("=" * 70 + "\n")
