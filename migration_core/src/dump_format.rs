@@ -905,6 +905,20 @@ pub(crate) fn validate_dump_manifest_chunks(
     compression: &str,
     schema: &NormalizedSchema,
 ) -> Result<(), String> {
+    validate_dump_manifest_chunks_with(input_path, tables, data_format, compression, schema, None)
+}
+
+/// Cell check run on every non-NULL cell before the target changes: `(column, text) -> problem`.
+pub(crate) type DumpCellCheck<'a> = &'a dyn Fn(&NormalizedColumn, &str) -> Option<&'static str>;
+
+pub(crate) fn validate_dump_manifest_chunks_with(
+    input_path: &Path,
+    tables: &[DumpTableManifest],
+    data_format: &str,
+    compression: &str,
+    schema: &NormalizedSchema,
+    cell_check: Option<DumpCellCheck>,
+) -> Result<(), String> {
     for table in tables {
         let invalid = |message: &str| classified_import_error("export_invalid", message, Some(&table.name));
         let definition = schema.tables.iter().find(|item| item.name == table.name)
@@ -937,9 +951,18 @@ pub(crate) fn validate_dump_manifest_chunks(
             for (line_index, line) in reader.lines().enumerate() {
                 let row_error = |message: &str| invalid(&format!("{chunk_name} line {}: {message}", line_index + 1));
                 let line = line.map_err(|err| row_error(&format!("failed to decode dump row: {err}")))?;
+                let check_cell = |column: &NormalizedColumn, text: &str| match cell_check.and_then(|check| check(column, text)) {
+                    Some(problem) => Err(invalid(&format!("{chunk_name} line {}: column {} holds {problem} ('{text}'), which the target engine cannot store; fix it in the source (or leave the table out) and export again", line_index + 1, column.name))),
+                    None => Ok(()),
+                };
                 if data_format == "tsv" {
                     if line.split('\t').count() != definition.columns.len() {
                         return Err(row_error("TSV field count does not match schema"));
+                    }
+                    if cell_check.is_some() {
+                        for (column, field) in definition.columns.iter().zip(line.split('\t')) {
+                            if field != "\\N" { check_cell(column, field)?; }
+                        }
                     }
                 } else {
                     if line.trim().is_empty() {
@@ -952,6 +975,11 @@ pub(crate) fn validate_dump_manifest_chunks(
                         || definition.columns.iter().any(|column| !object.contains_key(&column.name))
                     {
                         return Err(row_error("JSON row columns do not match schema"));
+                    }
+                    if cell_check.is_some() {
+                        for column in &definition.columns {
+                            if let Some(Value::String(text)) = object.get(&column.name) { check_cell(column, text)?; }
+                        }
                     }
                 }
                 row_count = row_count.checked_add(1).ok_or_else(|| row_error("row count overflow"))?;

@@ -538,6 +538,24 @@ impl LiveAdapter {
             Self::PostgreSql(_) => "postgresql",
         }
     }
+
+    /// First row of `sql` as text cells (the SQL casts what it selects to text).
+    pub(crate) fn query_text_row(&mut self, sql: &str) -> Result<Vec<Option<String>>, String> {
+        match self {
+            Self::MySql(conn) => {
+                let row: Option<mysql::Row> = conn.query_first(sql).map_err(|err| format!("mysql query error: {err}"))?;
+                Ok(row.map(|row| row.unwrap().into_iter().map(|value| match value {
+                    mysql::Value::NULL => None,
+                    mysql::Value::Bytes(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
+                    other => Some(other.as_sql(true).trim_matches('\'').to_string()),
+                }).collect()).unwrap_or_default())
+            }
+            Self::PostgreSql(client) => {
+                let rows = client.query(sql, &[]).map_err(|err| format_postgres_error("postgresql query error", &err))?;
+                Ok(rows.first().map(|row| (0..row.len()).map(|index| row.get::<_, Option<String>>(index)).collect()).unwrap_or_default())
+            }
+        }
+    }
 }
 
 impl MigrationAdapter for LiveAdapter {
@@ -611,9 +629,14 @@ impl MigrationAdapter for LiveAdapter {
         let key_columns = cursor_key_columns(table);
         match self {
             Self::MySql(conn) => {
+                // Text protocol, like the keyset path and dumps: the binary protocol renders TIME as
+                // `0 12:34:56.000000` and a midnight DATETIME as a bare date, so verify of keyless
+                // tables compared different text for the same value.
                 let sql = select_chunk_text_sql("mysql", table, &key_columns);
+                let sql = sql.strip_suffix("LIMIT ? OFFSET ?").map(|head| format!("{head}LIMIT {limit} OFFSET {offset}"))
+                    .ok_or("mysql select chunk SQL has no LIMIT/OFFSET placeholders")?;
                 let rows: Vec<mysql::Row> = conn
-                    .exec(sql, (limit as u64, offset as u64))
+                    .query(sql)
                     .map_err(|err| format!("mysql select chunk error: {err}"))?;
                 Ok(rows
                     .into_iter()
