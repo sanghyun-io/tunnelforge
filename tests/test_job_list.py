@@ -93,7 +93,8 @@ def test_export_run_is_recorded_with_profile_target_and_actual_mode(history):
         running = only(history)
         assert running.status == jh.STATUS_RUNNING and running.kind == jh.KIND_EXPORT_FULL
         assert (running.profile_id, running.profile_name, running.target) == ("prof-1", "Prod", "app")
-        assert "snapshot=parallel_strict" in running.mode and "스레드 3" in running.mode and "none" in running.mode
+        assert "일관 스냅샷(병렬)" in running.mode and "스레드 3" in running.mode and "압축 안 함" in running.mode
+        assert "snapshot=" not in running.mode and running.rerun["snapshot_mode"] == "parallel_strict"
         dialog.export_total_tables = 3
         dialog.export_table_done = {"a": 10, "b": 5}
         dialog.input_output_dir.setText("C:/exports/app_1")
@@ -516,3 +517,29 @@ def test_job_history_is_isolated_from_the_real_application_directory(tmp_path):
     real = jh.job_history_file()
     jh.job_begin(jh.KIND_IMPORT, target="isolation-check")
     assert not real.exists() or "isolation-check" not in real.read_text(encoding="utf-8")
+
+
+def test_overwrite_import_is_recorded_as_overwrite_with_the_dialog_label(history, monkeypatch, tmp_path):
+    started = {}
+
+    def fake_worker(task_type, config, **kwargs):
+        started.update(kwargs)
+        return idle_worker()
+
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", fake_worker)
+    monkeypatch.setattr(RustDumpImportDialog, "_confirm_production_guard", lambda *a: True)
+    connector = MagicMock(host="127.0.0.1", port=3306, user="root", password="pw", engine="mysql")
+    connector.get_schemas.return_value = ["app"]
+    dialog = RustDumpImportDialog(connector=connector, tunnel_config={"id": "prof-1", "name": "Prod"})
+    try:
+        dialog.input_dir.setText(str(tmp_path))
+        dialog.chk_use_original.setChecked(False)
+        dialog.combo_target_schema.setEditable(True)
+        dialog.combo_target_schema.setCurrentText("app")
+        dialog.radio_overwrite.setChecked(True)
+        dialog.do_import()
+        assert started["import_mode"] == "safe"  # the core still runs a safe restore first
+        assert only(history).mode.startswith(dialog._get_import_mode_text("overwrite"))
+    finally:
+        dialog._job_id = None
+        dialog.close()

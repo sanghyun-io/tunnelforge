@@ -1727,3 +1727,31 @@ def test_import_table_result_helpers_ignore_fk_restore_and_non_dict_entries():
     }
     assert RustDumpImportDialog._count_by_status(dialog, table_results, "done") == 1
     assert RustDumpImportDialog._count_by_status(dialog, table_results, "error") == 1
+
+
+def test_failed_import_offers_a_full_rerun_instead_of_a_dead_end_table_selection(monkeypatch):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    dialog = RustDumpImportDialog()
+    try:
+        from PyQt6.QtWidgets import QAbstractItemView
+        assert not hasattr(dialog, "btn_select_failed") and not hasattr(dialog, "btn_retry")
+        assert dialog.table_list.selectionMode() == QAbstractItemView.SelectionMode.NoSelection
+        assert dialog.btn_rerun.isHidden()
+        dialog.on_import_finished(False, "x", {"a": {"status": "done"}, "b": {"status": "error"}})
+        assert not dialog.btn_rerun.isHidden() and not dialog.label_rerun_hint.isHidden()
+        dialog.do_import = MagicMock()
+        dialog.btn_rerun.click()
+        dialog.do_import.assert_called_once_with()  # full rerun with the same settings, never a table subset
+    finally:
+        dialog.close()
+
+
+def test_import_and_export_titles_do_not_expose_the_engine_name(monkeypatch):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    dialog = RustDumpImportDialog()
+    try:
+        assert dialog.windowTitle() == "데이터 Import"
+    finally:
+        dialog.close()

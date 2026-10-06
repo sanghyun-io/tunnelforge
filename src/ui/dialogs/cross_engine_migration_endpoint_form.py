@@ -2,6 +2,7 @@
 Cross-Engine 마이그레이션 소스/타겟 엔드포인트 입력 폼
 """
 from typing import Dict, Optional
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QWidget,
 )
@@ -19,6 +20,20 @@ from src.core.cross_engine_migration import (
     DatabaseEngine,
     make_connection_payload,
 )
+
+
+def _make_compact_combo(combo: QComboBox) -> QComboBox:
+    """가장 긴 항목에 맞춰 폭이 늘어나지 않게 하고, 전체 이름은 툴팁으로 보여 준다."""
+    combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(18)
+    combo.currentIndexChanged.connect(lambda _index: combo.setToolTip(combo.currentText()))
+    return combo
+
+
+def _sync_item_tooltips(combo: QComboBox):
+    for index in range(combo.count()):
+        combo.setItemData(index, combo.itemText(index), Qt.ItemDataRole.ToolTipRole)
+    combo.setToolTip(combo.currentText())
 
 
 class EndpointForm(QGroupBox):
@@ -40,7 +55,7 @@ class EndpointForm(QGroupBox):
     def _setup_ui(self, default_engine: DatabaseEngine):
         layout = QFormLayout(self)
 
-        self.combo_tunnel = QComboBox()
+        self.combo_tunnel = _make_compact_combo(QComboBox())
         self._load_tunnels()
 
         self.combo_engine = QComboBox()
@@ -83,9 +98,10 @@ class EndpointForm(QGroupBox):
         self._tls_touched = False
         self._tls_name_from_tunnel = False  # 인증서 이름이 터널 프로필에서 온 값이면 True (호스트를 직접 고치면 폐기)
         self._tls_connection_mode = "direct"
-        self.combo_tls = QComboBox()
+        self.combo_tls = _make_compact_combo(QComboBox())
         for mode in (TLS_MODES[2], TLS_MODES[1], TLS_MODES[0]):
             self.combo_tls.addItem(TLS_MODE_LABELS[mode], mode)
+        _sync_item_tooltips(self.combo_tls)
         self.combo_tls.activated.connect(self._on_tls_chosen)
         self.combo_tls.currentIndexChanged.connect(self._update_tls_state)
         layout.addRow("TLS 검증:", self.combo_tls)
@@ -209,6 +225,7 @@ class EndpointForm(QGroupBox):
                 if isinstance(data, dict) and data.get("tunnel_id") == selected_id:
                     self.combo_tunnel.setCurrentIndex(index)
                     break
+        _sync_item_tooltips(self.combo_tunnel)
 
     def set_engine_filter(self, allowed_engines):
         self.engine_filter = set(allowed_engines) if allowed_engines else None

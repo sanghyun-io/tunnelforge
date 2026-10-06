@@ -178,3 +178,28 @@ def test_the_rehearsal_option_is_disabled_when_no_profile_qualifies():
         assert not dialog.rehearsal_check.isEnabled()
     finally:
         dialog.close()
+
+
+def test_edit_dialog_fits_a_small_screen_and_only_legacy_schedules_carry_the_sql_page():
+    dialog = ScheduleEditDialog(None, [("t1", "Prod")])
+    try:
+        assert dialog.task_stack.count() == 1  # the hidden SQL page no longer inflates the backup settings
+        dialog.resize(1092, 560)
+        dialog.show()
+        _app.processEvents()
+        assert dialog.height() <= 560 and dialog.save_btn.isVisible()
+        assert dialog.save_btn.geometry().bottom() < dialog.height()
+        assert dialog.rehearsal_schema_edit.isHidden()
+        dialog.rehearsal_check.setEnabled(True)
+        dialog.rehearsal_check.setChecked(True)
+        assert not dialog.rehearsal_schema_edit.isHidden()
+    finally:
+        dialog.close()
+    legacy = ScheduleConfig(id="q1", name="old sql", tunnel_id="t1", schema="app", task_type="sql_query",
+                            sql_query="DELETE FROM t", output_dir="", cron_expression="0 3 * * *")
+    dialog = ScheduleEditDialog(None, [("t1", "Prod")], schedule=legacy)
+    try:
+        assert dialog.task_stack.count() == 2 and dialog.task_stack.currentIndex() == 1
+        assert dialog.sql_editor.toPlainText() == "DELETE FROM t"
+    finally:
+        dialog.close()
