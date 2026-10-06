@@ -326,6 +326,7 @@ pub fn count_sql(engine: &str, table: &str) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn select_chunk_sql(
     engine: &str,
     table: &str,
@@ -647,6 +648,7 @@ fn keyset_predicates(
     predicates
 }
 
+#[cfg(test)]
 pub fn insert_sql(engine: &str, table: &str, columns: &[String]) -> String {
     let column_sql = columns
         .iter()
@@ -711,6 +713,7 @@ fn insert_values_sql(
     )
 }
 
+#[cfg(test)]
 pub fn insert_rows_literal_sql(
     engine: &str,
     table: &str,
@@ -1156,6 +1159,7 @@ pub fn inspect_columns_sql(engine: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn postgresql_column_type(
     data_type: &str,
     max_length: Option<i32>,
