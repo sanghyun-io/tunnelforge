@@ -215,3 +215,56 @@ def test_resolve_connection_reports_bastion_reachability_failure():
     assert resolved is None
     assert failure.kind == "target_unreachable"
     assert failure.message == "blocked"
+
+
+def _run_cancelled_mid_tunnel(test_type, config_manager=None):
+    """터널 단계가 블로킹 중일 때 취소를 요청하고, 결과/엔진 호출 기록을 돌려준다."""
+    import os
+    import sys
+    import threading
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    from src.ui.workers.test_worker import CANCELLED_MESSAGE
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingEngine:
+        def test_connection(self, config):
+            entered.set()
+            release.wait(5)
+            return True, "tunnel ok"
+
+    worker = ConnectionTestWorker(test_type, {"id": "t"}, BlockingEngine(), config_manager)
+    results = []
+    worker.test_finished.connect(lambda s, m: results.append((s, m)))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        worker.cancel()
+        release.set()
+        assert worker.wait(5000)
+        app.processEvents()
+    finally:
+        release.set()
+        worker.wait(5000)
+    return results, CANCELLED_MESSAGE
+
+
+def test_cancel_during_tunnel_test_reports_cancelled():
+    results, cancelled = _run_cancelled_mid_tunnel(TestType.TUNNEL_ONLY)
+    assert results == [(False, cancelled)]
+
+
+def test_cancel_during_integrated_test_skips_db_stage():
+    class Credentials:
+        called = False
+
+        def get_tunnel_credentials(self, tid):
+            Credentials.called = True
+            return "u", "p"
+
+    results, cancelled = _run_cancelled_mid_tunnel(TestType.INTEGRATED, Credentials())
+    assert results == [(False, cancelled)]
+    assert Credentials.called is False

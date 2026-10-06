@@ -1212,6 +1212,9 @@ _EN_PHRASE_TRANSLATIONS = {
     "연결을 저장하면 저장된 DB 자격 증명이 삭제됩니다.\n계속하시겠습니까?": "Saving the connection deletes the stored DB credentials.\nContinue?",
     "암호화하여 저장합니다. 체크하지 않아도 입력한 값으로 테스트할 수 있습니다.": "Stored encrypted. You can test with the entered values even when unchecked.",
     "Target 정리가 켜져 있어 재개할 수 없습니다. 안전 점검 단계의 고급 설정에서 Target 정리를 끄면 재개할 수 있습니다.": "Resume is unavailable while target cleanup is on. Turn off target cleanup in the safety check's advanced settings to resume.",
+    "취소 중…": "Cancelling…",
+    "⏹ 테스트 취소됨": "⏹ Test cancelled",
+    "⏹ 사용자가 테스트를 취소했습니다.": "⏹ The test was cancelled by the user.",
     "내 컴퓨터": "my computer",
     "터널 테스트": "Tunnel Test",
     "DB 인증 정보": "DB Auth Info",
@@ -1262,6 +1265,8 @@ _EN_PHRASE_TRANSLATIONS = {
 }
 
 _EN_REGEX_TRANSLATIONS = (
+    (r"경과 (?P<n>\{\}|\d+)초", r"Elapsed \g<n>s"),
+    (r"⚠️ 포트 (?P<port>\{\}|\d+)은\(는\) 이 컴퓨터에서 이미 사용 중입니다\. 다른 포트를 고르세요\.", r"⚠️ Port \g<port> is already in use on this computer. Choose another port."),
     (r"'(?P<name>[^']+)' 그룹을 삭제하시겠습니까\?\n\n그룹에 속한 터널은 '그룹 없음'으로 이동됩니다\.", r"Do you want to delete group '\g<name>'?\n\nTunnels in this group will move to 'Ungrouped'."),
     (r"✅ '(?P<name>[^']+)' 터널이 이미 연결되어 있습니다\.", r"✅ Tunnel '\g<name>' is already connected."),
     (r"✅ '(?P<name>[^']+)' 터널 연결 테스트 성공!\n\n(?P<rest>.*)", r"✅ Tunnel connection test succeeded for '\g<name>'.\n\n\g<rest>"),
