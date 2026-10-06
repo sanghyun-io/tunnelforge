@@ -347,3 +347,19 @@ def test_error_reporting_settings_keep_consent_state_names_private_from_ui():
     source = inspect.getsource(SettingsDialog._build_error_reporting_group)
 
     assert ConsentState.DISABLED_BY_USER.value not in source
+
+
+def test_general_tab_is_scrollable_so_all_groups_stay_reachable():
+    from PyQt6.QtWidgets import QScrollArea
+
+    QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(config_manager=FakeConfigManager())
+    try:
+        general = dialog.tabs.widget(0)
+        assert isinstance(general, QScrollArea)
+        assert general.widgetResizable()
+        assert general.widget().isAncestorOf(dialog.workspace_group)
+        # 작은 창에서도 다이얼로그 최소 높이가 그룹 전체 높이에 끌려 커지지 않아야 한다
+        assert dialog.minimumSizeHint().height() < 700
+    finally:
+        dialog.close()
