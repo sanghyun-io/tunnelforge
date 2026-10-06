@@ -110,11 +110,11 @@ def _load_qicon_class():
 
 
 def _load_config_manager_class():
-    return _lazy_class("src.core", "ConfigManager")
+    return _lazy_class("src.core.config_manager", "ConfigManager")
 
 
 def _load_tunnel_engine_class():
-    return _lazy_class("src.core", "TunnelEngine")
+    return _lazy_class("src.core.tunnel_engine", "TunnelEngine")
 
 
 def _load_tunnel_manager_ui_class():

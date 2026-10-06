@@ -818,7 +818,7 @@ class SettingsDialog(QDialog):
 
     def _start_download(self):
         """업데이트 다운로드 시작"""
-        from src.ui.workers import UpdateDownloadWorker
+        from src.ui.workers.update_worker import UpdateDownloadWorker
 
         self._download_retired = False
         self._retire_active_update_download(wait=True)

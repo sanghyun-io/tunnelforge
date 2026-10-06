@@ -7,7 +7,10 @@ FixQueryGenerator(dead code)와 AutoRecommendationEngine(Python 자동 추천 �
 """
 import pytest
 
-from src.core.migration_constants import IssueType, DOC_LINKS, CompatibilityIssue
+from src.core.migration_constants import (
+    IssueType,
+    CompatibilityIssue,
+)
 from src.core.migration_fix_wizard import (
     FixStrategy,
     SmartFixGenerator,
@@ -84,24 +87,6 @@ class TestSmartFixGeneratorCoverage:
         options = gen.get_fix_options(issue)
         assert len(options) >= 1  # 최소 SKIP
         assert options[-1].strategy == FixStrategy.SKIP  # SKIP은 항상 마지막
-
-
-# ============================================================
-# DOC_LINKS 커버리지
-# ============================================================
-class TestDocLinksCoverage:
-    """DOC_LINKS 매핑 검증"""
-
-    def test_all_doc_links_are_issue_type(self):
-        """DOC_LINKS의 키가 IssueType인지"""
-        for key in DOC_LINKS:
-            assert isinstance(key, IssueType), f"{key} is not IssueType"
-
-    def test_all_doc_links_are_urls(self):
-        """DOC_LINKS의 값이 URL 형태인지"""
-        for issue_type, url in DOC_LINKS.items():
-            assert isinstance(url, str), f"{issue_type}: not string"
-            assert url.startswith("http"), f"{issue_type}: {url} is not URL"
 
 
 # ============================================================

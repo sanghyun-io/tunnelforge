@@ -353,7 +353,6 @@ class ValidatingCodeEditor(CodeEditor):
 class SQLEditorTab(QWidget):
     """단일 SQL 에디터 탭"""
 
-    modified_changed = pyqtSignal(bool)  # 수정 상태 변경
     title_changed = pyqtSignal(str)  # 탭 제목 변경 요청
 
     def __init__(self, parent=None, tab_index: int = 1):
@@ -386,7 +385,6 @@ class SQLEditorTab(QWidget):
         """텍스트 변경 시"""
         if not self.is_modified:
             self.is_modified = True
-            self.modified_changed.emit(True)
             self.title_changed.emit(self.get_title())
 
     def get_title(self) -> str:
@@ -405,10 +403,6 @@ class SQLEditorTab(QWidget):
     def set_content(self, text: str):
         """내용 설정 (수정 플래그 초기화)"""
         self._apply_text(text)
-
-    def get_content(self) -> str:
-        """내용 반환"""
-        return self.editor.toPlainText()
 
     def load_file(self, file_path: str) -> bool:
         """파일 불러오기"""
@@ -458,14 +452,8 @@ class SQLEditorTab(QWidget):
             self.file_path = target_path
             self.file_state = compute_file_state(target_path)
             self.is_modified = False
-            self.modified_changed.emit(False)
             self.title_changed.emit(self.get_title())
             return True, target_path, None
         except Exception as e:
             return False, None, str(e)
-
-    def mark_saved(self):
-        """저장 완료 표시"""
-        self.is_modified = False
-        self.modified_changed.emit(False)
-        self.title_changed.emit(self.get_title())
+

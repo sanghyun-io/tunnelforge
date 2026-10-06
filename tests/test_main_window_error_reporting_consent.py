@@ -448,8 +448,12 @@ def test_active_operation_guard_covers_modal_and_both_detached_worker_paths(monk
     monkeypatch.setattr("src.ui.main_window.QApplication.activeModalWidget", lambda: None)
     monkeypatch.setattr("src.ui.main_window.has_active_detached_migration_workers", lambda: False)
     monkeypatch.setattr("src.ui.main_window.has_active_detached_oneclick_workers", lambda: False)
+    monkeypatch.setattr("src.ui.main_window.has_active_explain_workers", lambda: False)
     assert TunnelManagerUI._has_active_database_operation(object()) is False
 
+    monkeypatch.setattr("src.ui.main_window.has_active_explain_workers", lambda: True)
+    assert TunnelManagerUI._has_active_database_operation(object()) is True
+    monkeypatch.setattr("src.ui.main_window.has_active_explain_workers", lambda: False)
     monkeypatch.setattr("src.ui.main_window.has_active_detached_migration_workers", lambda: True)
     assert TunnelManagerUI._has_active_database_operation(object()) is True
     monkeypatch.setattr("src.ui.main_window.has_active_detached_migration_workers", lambda: False)

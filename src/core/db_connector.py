@@ -70,17 +70,6 @@ class MetadataCache:
             for k in keys_to_delete:
                 del self._cache[k]
 
-    def get_stats(self) -> Dict[str, int]:
-        """캐시 통계 반환"""
-        now = time.time()
-        valid_count = sum(1 for _, (_, ts) in self._cache.items() if now - ts < self._ttl)
-        return {
-            'total_entries': len(self._cache),
-            'valid_entries': valid_count,
-            'ttl_seconds': self._ttl
-        }
-
-
 # 전역 메타데이터 캐시 인스턴스 (연결 간 공유)
 _global_metadata_cache = MetadataCache(ttl_seconds=300)
 
@@ -152,15 +141,6 @@ class MySQLConnector:
             except Exception:
                 return False
         return False
-
-    def use_database(self, database: str) -> Tuple[bool, str]:
-        """데이터베이스 선택"""
-        try:
-            self.connection.select_db(database)
-            self.database = database
-            return True, f"데이터베이스 '{database}' 선택됨"
-        except Exception as e:
-            return False, str(e)
 
     def get_schemas(self, use_cache: bool = True) -> List[str]:
         """스키마(데이터베이스) 목록 조회 (시스템 DB 제외)
@@ -382,68 +362,6 @@ class MySQLConnector:
             return f"{quote_mysql_ident(schema)}.{quote_mysql_ident(table)}"
         return quote_mysql_ident(table)
 
-    def get_create_table_statement(self, table: str, schema: str = None) -> str:
-        """CREATE TABLE 문 조회
-
-        schema가 지정되어도 세션의 현재 DB(self.database)는 전환하지 않고,
-        스키마 한정 식별자(`schema`.`table`)로 조회한다.
-        """
-        if not self.connection:
-            return ""
-
-        try:
-            table_ref = self._qualified_table_ref(table, schema)
-            with self.connection.cursor() as cursor:
-                cursor.execute(f"SHOW CREATE TABLE {table_ref}")
-                result = cursor.fetchone()
-                if result:
-                    return result.get('Create Table', '')
-            return ""
-        except Exception as e:
-            logger.error(f"CREATE TABLE 조회 오류: {e}")
-            return ""
-
-    def get_table_data(self, table: str, schema: str = None, limit: int = None) -> List[Dict[str, Any]]:
-        """테이블 데이터 조회
-
-        schema가 지정되어도 세션의 현재 DB(self.database)는 전환하지 않는다.
-        """
-        table_ref = self._qualified_table_ref(table, schema)
-        query = f"SELECT * FROM {table_ref}"
-        if limit:
-            query += f" LIMIT {int(limit)}"
-
-        return self.execute(query)
-
-    def get_row_count(self, table: str, schema: str = None) -> int:
-        """테이블 행 수 조회
-
-        schema가 지정되어도 세션의 현재 DB(self.database)는 전환하지 않는다.
-        """
-        table_ref = self._qualified_table_ref(table, schema)
-        result = self.execute(f"SELECT COUNT(*) AS cnt FROM {table_ref}")
-        if result:
-            return result[0].get('cnt', 0)
-        return 0
-
-    def invalidate_cache(self, schema: str = None):
-        """메타데이터 캐시 무효화
-
-        DDL 작업 (CREATE/DROP/ALTER TABLE 등) 후 호출하여 캐시 갱신
-
-        Args:
-            schema: 특정 스키마 캐시만 무효화 (None이면 전체)
-        """
-        if not self._cache:
-            return
-
-        if schema:
-            # 특정 스키마의 테이블 캐시만 무효화
-            self._cache.invalidate(f"{self._cache_key_prefix}:tables:{schema}")
-        else:
-            # 해당 연결의 모든 캐시 무효화
-            self._cache.invalidate(self._cache_key_prefix)
-
     def __enter__(self):
         """컨텍스트 매니저 진입"""
         self.connect()
@@ -454,11 +372,3 @@ class MySQLConnector:
         self.disconnect()
         return False
 
-
-def test_mysql_connection(host: str, port: int, user: str, password: str) -> Tuple[bool, str]:
-    """MySQL 연결 테스트 (유틸리티 함수)"""
-    connector = MySQLConnector(host, port, user, password)
-    success, msg = connector.connect()
-    if success:
-        connector.disconnect()
-    return success, msg

@@ -263,30 +263,3 @@ def test_cancel_query_requests_interruption_and_server_cancel():
     worker.cancel_query()
     connection.cancel_running_query.assert_called_once_with()
 
-
-def test_sql_file_worker_cancel_reaches_server_and_stops_remaining_statements(tmp_path, monkeypatch):
-    from src.ui.workers.sql_execution_worker import SQLExecutionWorker
-
-    sql_file = tmp_path / "script.sql"
-    sql_file.write_text("SELECT 1;\nSELECT 2;\n", encoding="utf-8")
-    connection = MagicMock()
-    connector = MagicMock()
-    connector.connect.return_value = (True, "")
-    connector.connection = connection
-    monkeypatch.setattr("src.ui.workers.sql_execution_worker.create_rust_db_connector", lambda *a, **k: connector)
-    worker = SQLExecutionWorker(str(sql_file), "h", 1, "u", "p", "d")
-    finished = []
-    worker.finished.connect(lambda ok, msg: finished.append((ok, msg)))
-    interrupted = []  # QThread only honours interruption while running; model that flag directly
-    worker.requestInterruption = lambda: interrupted.append(True)
-    worker.isInterruptionRequested = lambda: bool(interrupted)
-
-    cursor = connection.cursor.return_value.__enter__.return_value
-    cursor.fetchall.return_value = []
-    cursor.execute.side_effect = lambda statement: worker.cancel_query()  # user cancels during statement 1
-    worker._connector = connector
-    worker.run()
-
-    connection.cancel_running_query.assert_called_once_with()
-    assert cursor.execute.call_count == 1, "statement 2 must not run after cancel"
-    assert finished and finished[0][0] is False

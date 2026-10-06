@@ -300,18 +300,6 @@ pub(crate) struct DumpRange {
     pub(crate) end: i128,
 }
 
-pub(crate) enum DumpRangeEvent {
-    Done {
-        chunk_index: u64,
-        rows: u64,
-        stream_ms: u64,
-        range_start: String,
-        range_end: String,
-        checksum: String,
-    },
-    Error(String),
-}
-
 pub(crate) enum DumpGlobalEvent {
     Progress(Value),
     RangeDone {
@@ -848,7 +836,6 @@ pub(crate) fn connect_postgres(endpoint: &Endpoint) -> Result<postgres::Client, 
 }
 
 /// Out-of-band PostgreSQL cancel request; must use the same TLS policy as `connect_postgres`.
-#[allow(dead_code)] // TF-STATUS-112 wires this into query.cancel.
 pub(crate) fn cancel_postgres_query(
     token: &postgres::CancelToken,
     endpoint: &Endpoint,

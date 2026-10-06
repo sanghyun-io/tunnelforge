@@ -267,5 +267,3 @@ class ConnectionTestWorker(QThread):
             "- NACL이 5432 및 응답 ephemeral port를 막지 않는지 확인\n"
             "- RDS 엔드포인트와 포트, 기본 DB 이름이 맞는지 확인"
         )
-
-from src.ui.workers.sql_execution_worker import SQLExecutionWorker

@@ -3,7 +3,6 @@
 - Cron 스타일 스케줄 설정
 - 자동 DB Export 실행
 - 백업 보관 정책 (개수, 기간)
-- SQL 쿼리 실행 (SELECT → CSV/JSON, DML → commit)
 
 BackupScheduler는 스케줄링 엔진(등록/실행 큐/직렬화 실행 루프)만 담당하며,
 실제 작업 실행은 아래 협력 모듈에 위임한다:
@@ -11,8 +10,6 @@ BackupScheduler는 스케줄링 엔진(등록/실행 큐/직렬화 실행 루프
 - cron_parser: CronParser
 - execution_log_writer: ExecutionLogWriter (실행 로그 기록/조회)
 - backup_task_executor: BackupTaskExecutor (RustDumpExporter 백업 실행)
-- sql_query_task_executor: SqlQueryTaskExecutor (SQL 쿼리 실행)
-- retention_policy: 보관 정책 선정 로직 (위 두 executor가 공용)
 """
 import copy
 import queue
@@ -28,7 +25,6 @@ from src.core.schedule_config import ScheduleTaskType, ScheduleConfig, _Executio
 from src.core.cron_parser import CronParser
 from src.core.execution_log_writer import ExecutionLogWriter
 from src.core.backup_task_executor import BackupTaskExecutor
-from src.core.sql_query_task_executor import SqlQueryTaskExecutor
 from src.core.job_history import KIND_SCHEDULED_BACKUP, STATUS_SKIPPED, job_begin, job_finish
 from src.core.schedule_time import classify_due, validate_expression
 from src.core import scheduled_backup_store as backup_store
@@ -103,21 +99,16 @@ class BackupScheduler:
             log_writer=self._log_writer,
             rehearsal=self._rehearsal,
         )
-        self._sql_executor = SqlQueryTaskExecutor(
-            resolve_connection=self._resolve_connection,
-            connector_factory=self._make_connector,
-            log_writer=self._log_writer,
-        )
 
         # 스케줄 로드
         self._load_schedules()
 
     def _make_connector(self, *args, **kwargs):
-        """SqlQueryTaskExecutor가 주입받는 connector factory
+        """RestoreRehearsal이 주입받는 connector factory
 
         모듈 전역 이름(create_rust_db_connector)을 호출 시점에 조회하므로
         monkeypatch.setattr("src.core.scheduler.create_rust_db_connector", ...)가 그대로 반영된다.
-        SqlQueryTaskExecutor가 create_rust_db_connector를 직접 import하면 이 monkeypatch가 무효화된다.
+        협력 모듈이 create_rust_db_connector를 직접 import하면 이 monkeypatch가 무효화된다.
         """
         return create_rust_db_connector(*args, **kwargs)
 
@@ -549,7 +540,7 @@ class BackupScheduler:
             logger.warning("예약 실행 터널 정리 실패", exc_info=True)
 
     # =========================================================================
-    # 작업 실행 - BackupTaskExecutor / SqlQueryTaskExecutor로 위임
+    # 작업 실행 - BackupTaskExecutor로 위임
     # (아래 얇은 위임 메서드는 tests/test_scheduler.py가 인스턴스에서 직접 호출하는
     #  private 표면이므로 이름/시그니처를 그대로 유지한다)
     # =========================================================================
@@ -572,36 +563,3 @@ class BackupScheduler:
             로그 항목 목록
         """
         return self._log_writer.get_logs(days)
-
-    def _execute_sql_query(self, schedule: ScheduleConfig) -> Tuple[bool, str]:
-        """SQL 쿼리 실행 (SqlQueryTaskExecutor에 위임)
-
-        Returns:
-            (success, message)
-        """
-        return self._sql_executor.execute(schedule)
-
-    def _parse_sql_queries(self, sql_text: str) -> List[str]:
-        """SQL 텍스트를 개별 쿼리로 파싱 (SqlQueryTaskExecutor에 위임)."""
-        return self._sql_executor.parse_queries(sql_text)
-
-    def _execute_single_query(
-        self,
-        connector,
-        schedule: ScheduleConfig,
-        query: str,
-        timestamp: str,
-        query_index: int
-    ) -> Dict[str, Any]:
-        """단일 쿼리 실행 (SqlQueryTaskExecutor에 위임)
-
-        Returns:
-            {
-                'success': bool,
-                'error': str (실패 시),
-                'file_path': str (결과셋 저장 시),
-                'row_count': int (결과셋인 경우),
-                'affected_rows': int (DML 실행 시)
-            }
-        """
-        return self._sql_executor.execute_single(connector, schedule, query, timestamp, query_index)

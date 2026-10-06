@@ -1,6 +1,6 @@
 import pytest
 
-from src.ui.workers.test_worker import ConnectionTestWorker, TestType
+from src.ui.workers.connection_test_worker import ConnectionTestWorker, TestType
 
 
 def test_resolve_db_engine_uses_saved_config():

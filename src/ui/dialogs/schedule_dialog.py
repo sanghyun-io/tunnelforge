@@ -2,7 +2,6 @@
 스케줄 백업 관리 다이얼로그
 - 스케줄 추가/수정
 - 스케줄 목록 관리
-- SQL 쿼리 실행 스케줄
 """
 import os
 import re
@@ -15,116 +14,16 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
     QPushButton, QGroupBox, QRadioButton, QButtonGroup,
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox, QWidget, QTimeEdit, QTabWidget, QTextEdit,
-    QPlainTextEdit, QStackedWidget, QSplitter, QFrame, QScrollArea
+    QMessageBox, QWidget, QTimeEdit, QTabWidget, QTextEdit, QFrame, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTime, pyqtSignal
-from PyQt6.QtGui import QIcon, QFont, QColor, QTextCharFormat, QSyntaxHighlighter
 
 from src.core.schedule_time import validate_expression
 from src.core.scheduler import ScheduleConfig, CronParser, BackupScheduler, ScheduleTaskType
-from src.core.sql_safety import find_dangerous_sql_warnings
 from src.core.logger import get_logger
 from src.core.i18n import translate_text
 
 logger = get_logger(__name__)
-
-
-# ============================================================================
-# SQL 구문 하이라이팅
-# ============================================================================
-class SQLSyntaxHighlighter(QSyntaxHighlighter):
-    """SQL 쿼리 구문 하이라이팅"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._formats = {}
-        self._rules = []
-        self._setup_formats()
-        self._setup_rules()
-
-    def _setup_formats(self):
-        """하이라이팅 포맷 설정"""
-        # 키워드 (파란색)
-        keyword_format = QTextCharFormat()
-        keyword_format.setForeground(QColor("#0000FF"))
-        keyword_format.setFontWeight(QFont.Weight.Bold)
-        self._formats['keyword'] = keyword_format
-
-        # 함수 (보라색)
-        function_format = QTextCharFormat()
-        function_format.setForeground(QColor("#800080"))
-        self._formats['function'] = function_format
-
-        # 문자열 (빨간색)
-        string_format = QTextCharFormat()
-        string_format.setForeground(QColor("#A31515"))
-        self._formats['string'] = string_format
-
-        # 숫자 (다크 그린)
-        number_format = QTextCharFormat()
-        number_format.setForeground(QColor("#098658"))
-        self._formats['number'] = number_format
-
-        # 주석 (회색)
-        comment_format = QTextCharFormat()
-        comment_format.setForeground(QColor("#808080"))
-        comment_format.setFontItalic(True)
-        self._formats['comment'] = comment_format
-
-        # 위험 키워드 (빨간색 + 굵게)
-        danger_format = QTextCharFormat()
-        danger_format.setForeground(QColor("#FF0000"))
-        danger_format.setFontWeight(QFont.Weight.Bold)
-        self._formats['danger'] = danger_format
-
-    def _setup_rules(self):
-        """하이라이팅 규칙 설정"""
-        # SQL 키워드
-        keywords = [
-            'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'LIKE',
-            'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE',
-            'CREATE', 'TABLE', 'INDEX', 'ALTER', 'ADD', 'COLUMN',
-            'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'ON',
-            'GROUP', 'BY', 'ORDER', 'ASC', 'DESC', 'HAVING',
-            'LIMIT', 'OFFSET', 'UNION', 'ALL', 'DISTINCT',
-            'AS', 'IS', 'NULL', 'TRUE', 'FALSE', 'BETWEEN',
-            'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'IF',
-            'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'COALESCE',
-            'DATE', 'NOW', 'CURDATE', 'DATE_SUB', 'DATE_ADD', 'INTERVAL',
-            'DAY', 'MONTH', 'YEAR', 'HOUR', 'MINUTE', 'SECOND',
-        ]
-        keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
-        self._rules.append((keyword_pattern, 'keyword', True))
-
-        # 위험 키워드
-        danger_keywords = ['DROP', 'TRUNCATE', 'ALTER', 'GRANT', 'REVOKE']
-        danger_pattern = r'\b(' + '|'.join(danger_keywords) + r')\b'
-        self._rules.append((danger_pattern, 'danger', True))
-
-        # 숫자
-        self._rules.append((r'\b\d+\.?\d*\b', 'number', False))
-
-        # 문자열 (작은따옴표)
-        self._rules.append((r"'[^']*'", 'string', False))
-
-        # 문자열 (큰따옴표)
-        self._rules.append((r'"[^"]*"', 'string', False))
-
-        # 한 줄 주석
-        self._rules.append((r'--.*$', 'comment', False))
-
-        # 블록 주석 (/* */)
-        self._rules.append((r'/\*.*?\*/', 'comment', False))
-
-    def highlightBlock(self, text: str):
-        """텍스트 블록 하이라이팅"""
-        for pattern, format_name, case_insensitive in self._rules:
-            flags = re.IGNORECASE if case_insensitive else 0
-            for match in re.finditer(pattern, text, flags):
-                start = match.start()
-                length = match.end() - start
-                self.setFormat(start, length, self._formats[format_name])
 
 
 class ScheduleEditDialog(QDialog):
@@ -173,10 +72,7 @@ class ScheduleEditDialog(QDialog):
         outer_layout.addWidget(scroll, 1)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
-        # 예약은 백업만 지원한다: 작업 유형 선택은 숨기고 항상 백업으로 저장한다 (예약 SQL 실행 금지).
-        self.task_type_box = self._build_task_type_group()
-        self.task_type_box.setVisible(False)
-        layout.addWidget(self.task_type_box)
+        # 예약은 백업만 지원한다 (예약 SQL 실행 금지). 이전 버전의 SQL 일정은 삭제만 가능하다.
         self.unattended_note = QLabel(
             "예약 백업은 사람이 없는 상태로 실행됩니다. 처음 보는 SSH 호스트 키와 비밀번호가 필요한 SSH 개인키는 "
             "자동으로 수락/입력되지 않고 실패하며, 이 경우 작업 목록에 사유가 기록됩니다."
@@ -193,14 +89,8 @@ class ScheduleEditDialog(QDialog):
         layout.addWidget(self.unsupported_label)
         layout.addWidget(self._build_basic_info_group())
 
-        self.task_stack = QStackedWidget()
-        self.task_stack.addWidget(self._build_backup_page())
-        # SQL 페이지는 레거시 SQL 일정을 열 때만 스택에 넣는다. QStackedWidget은 가장 큰 페이지에 맞춰
-        # 크기를 잡으므로, 항상 넣으면 백업 설정 그룹에 큰 빈 공간이 생긴다.
-        self._sql_page = self._build_sql_page()
-        if self.schedule is not None and self.schedule.is_sql_query_task():
-            self.task_stack.addWidget(self._sql_page)
-        layout.addWidget(self.task_stack)
+        self.backup_page = self._build_backup_page()
+        layout.addWidget(self.backup_page)
 
         layout.addWidget(self._build_schedule_group())
 
@@ -227,24 +117,6 @@ class ScheduleEditDialog(QDialog):
         btn_layout.addWidget(self.save_btn)
 
         outer_layout.addLayout(btn_layout)
-
-    def _build_task_type_group(self) -> QGroupBox:
-        type_group = QGroupBox("작업 유형")
-        type_layout = QHBoxLayout(type_group)
-
-        self.task_type_group = QButtonGroup(self)
-        self.backup_radio = QRadioButton("🗄️ 백업 (데이터 Export)")
-        self.sql_radio = QRadioButton("📝 SQL 쿼리 실행")
-        self.backup_radio.setChecked(True)
-
-        self.task_type_group.addButton(self.backup_radio, 0)
-        self.task_type_group.addButton(self.sql_radio, 1)
-
-        type_layout.addWidget(self.backup_radio)
-        type_layout.addWidget(self.sql_radio)
-        type_layout.addStretch()
-
-        return type_group
 
     def _build_basic_info_group(self) -> QGroupBox:
         basic_group = QGroupBox("기본 정보")
@@ -370,84 +242,6 @@ class ScheduleEditDialog(QDialog):
         backup_layout.addWidget(backup_detail_group)
         return backup_page
 
-    def _build_sql_page(self) -> QWidget:
-        sql_page = QWidget()
-        sql_layout = QVBoxLayout(sql_page)
-        sql_layout.setContentsMargins(0, 0, 0, 0)
-
-        # SQL 에디터
-        sql_editor_group = QGroupBox("SQL 쿼리")
-        sql_editor_layout = QVBoxLayout(sql_editor_group)
-
-        self.sql_editor = QPlainTextEdit()
-        self.sql_editor.setPlaceholderText(
-            "실행할 SQL을 입력하세요.\n"
-            "여러 쿼리는 세미콜론(;)으로 구분합니다.\n\n"
-            "예시:\n"
-            "SELECT * FROM users WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY);\n"
-            "DELETE FROM logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY);"
-        )
-        self.sql_editor.setMinimumHeight(120)
-
-        # 구문 하이라이팅 적용
-        self.sql_highlighter = SQLSyntaxHighlighter(self.sql_editor.document())
-
-        sql_editor_layout.addWidget(self.sql_editor)
-
-        # 경고 레이블
-        self.sql_warning_label = QLabel("")
-        self.sql_warning_label.setStyleSheet("color: #FF6600; font-weight: bold;")
-        self.sql_warning_label.setWordWrap(True)
-        self.sql_warning_label.hide()
-        sql_editor_layout.addWidget(self.sql_warning_label)
-
-        sql_layout.addWidget(sql_editor_group)
-
-        # 결과 저장 설정
-        result_group = QGroupBox("결과 저장 설정")
-        result_layout = QFormLayout(result_group)
-
-        self.result_format_combo = QComboBox()
-        self.result_format_combo.addItem("CSV (.csv)", "csv")
-        self.result_format_combo.addItem("JSON (.json)", "json")
-        self.result_format_combo.addItem("저장 안 함 (DML용)", "none")
-        result_layout.addRow("결과 형식:", self.result_format_combo)
-
-        # 결과 출력 디렉토리
-        result_output_layout = QHBoxLayout()
-        self.result_output_edit = QLineEdit()
-        self.result_output_edit.setPlaceholderText("결과 파일 저장 위치")
-        result_output_layout.addWidget(self.result_output_edit)
-        self.result_browse_btn = QPushButton("찾아보기...")
-        self.result_browse_btn.clicked.connect(self._browse_result_output_dir)
-        result_output_layout.addWidget(self.result_browse_btn)
-        result_layout.addRow("출력 경로:", result_output_layout)
-
-        self.result_filename_edit = QLineEdit()
-        self.result_filename_edit.setText("{name}_{timestamp}")
-        self.result_filename_edit.setToolTip("변수: {name}, {timestamp}, {date}")
-        result_layout.addRow("파일명 패턴:", self.result_filename_edit)
-
-        self.query_timeout_spin = QSpinBox()
-        self.query_timeout_spin.setRange(1, 3600)
-        self.query_timeout_spin.setValue(300)
-        self.query_timeout_spin.setSuffix(" 초")
-        result_layout.addRow("타임아웃:", self.query_timeout_spin)
-
-        # 결과 파일 보관 정책
-        self.result_retention_count_spin = QSpinBox()
-        self.result_retention_count_spin.setRange(1, 100)
-        self.result_retention_count_spin.setValue(10)
-        result_layout.addRow("결과 보관 수:", self.result_retention_count_spin)
-
-        self.result_retention_days_spin = QSpinBox()
-        self.result_retention_days_spin.setRange(1, 365)
-        self.result_retention_days_spin.setValue(30)
-        result_layout.addRow("결과 보관 기간 (일):", self.result_retention_days_spin)
-
-        sql_layout.addWidget(result_group)
-        return sql_page
-
     def _build_schedule_group(self) -> QGroupBox:
         schedule_group = QGroupBox("스케줄 설정")
         schedule_layout = QVBoxLayout(schedule_group)
@@ -568,14 +362,8 @@ class ScheduleEditDialog(QDialog):
 
     def _connect_signals(self):
         """시그널 연결"""
-        self.task_type_group.idClicked.connect(self._on_task_type_changed)
         self.schedule_type_group.idClicked.connect(self._on_schedule_type_changed)
         self.cron_edit.textChanged.connect(self._on_cron_changed)
-        self.sql_editor.textChanged.connect(self._check_dangerous_query)
-
-    def _on_task_type_changed(self, button_id: int):
-        """작업 유형 변경"""
-        self.task_stack.setCurrentIndex(button_id)
 
     def _on_schedule_type_changed(self, button_id: int):
         """스케줄 타입 변경"""
@@ -583,20 +371,6 @@ class ScheduleEditDialog(QDialog):
         self.day_widget.setVisible(button_id == 2)  # 매월
         self.minute_widget.setVisible(button_id == 3)  # 매시간
         self.time_widget.setVisible(button_id != 3)  # 매시간이 아닐 때만 시간 표시
-
-    def _check_dangerous_query(self):
-        """위험한 SQL 쿼리 검사 결과를 경고 라벨에 반영한다."""
-        sql_text = self.sql_editor.toPlainText()
-        messages = find_dangerous_sql_warnings(sql_text)
-        if messages:
-            self.sql_warning_label.setText("\n".join(f"⚠️ {m}" for m in messages))
-            self.sql_warning_label.show()
-        else:
-            self.sql_warning_label.hide()
-
-    def _browse_result_output_dir(self):
-        """결과 출력 디렉토리 선택"""
-        self._browse_dir(self.result_output_edit, "결과 저장 위치 선택")
 
     def _on_cron_changed(self, text: str):
         """Cron 표현식 변경"""
@@ -653,24 +427,8 @@ class ScheduleEditDialog(QDialog):
         if schedule.is_sql_query_task():
             self.unsupported_label.setVisible(True)
             self.save_btn.setEnabled(False)
-            self.sql_radio.setChecked(True)
-            self.task_stack.setCurrentIndex(1)
-            # SQL 관련 필드
-            self.sql_editor.setPlainText(schedule.sql_query)
-            # 결과 형식
-            for i in range(self.result_format_combo.count()):
-                if self.result_format_combo.itemData(i) == schedule.result_format:
-                    self.result_format_combo.setCurrentIndex(i)
-                    break
-            self.result_output_edit.setText(schedule.result_output_dir)
-            self.result_filename_edit.setText(schedule.result_filename_pattern)
-            self.query_timeout_spin.setValue(schedule.query_timeout)
-            self.result_retention_count_spin.setValue(schedule.result_retention_count)
-            self.result_retention_days_spin.setValue(schedule.result_retention_days)
+            self.backup_page.setVisible(False)
         else:
-            self.backup_radio.setChecked(True)
-            self.task_stack.setCurrentIndex(0)
-            # 백업 관련 필드
             self.tables_edit.setText(", ".join(schedule.tables) if schedule.tables else "")
             self.output_edit.setText(schedule.output_dir)
             self.retention_count_spin.setValue(schedule.retention_count)
@@ -722,7 +480,6 @@ class ScheduleEditDialog(QDialog):
         if self.schedule is not None and self.schedule.is_sql_query_task():
             QMessageBox.warning(self, "지원되지 않음", "예약 SQL 실행은 지원되지 않습니다.")
             return
-        is_sql_task = False  # 예약은 백업만 지원한다
         rehearsal = {"tunnel_id": "", "database": "", "schema": ""}
         if self.rehearsal_check.isChecked():
             rehearsal = {"tunnel_id": self.rehearsal_tunnel_combo.currentData() or "",
@@ -766,56 +523,10 @@ class ScheduleEditDialog(QDialog):
             rehearsal_schema=rehearsal["schema"],
             last_run=self.schedule.last_run if self.schedule else None,
             next_run=next_run.isoformat(),
-            # SQL 관련 필드
-            task_type=ScheduleTaskType.SQL_QUERY.value if is_sql_task else ScheduleTaskType.BACKUP.value,
-            sql_query=task_fields["sql_query"],
-            result_format=task_fields["result_format"],
-            result_output_dir=task_fields["result_output_dir"],
-            result_filename_pattern=task_fields["result_filename_pattern"],
-            query_timeout=task_fields["query_timeout"],
-            result_retention_count=task_fields["result_retention_count"],
-            result_retention_days=task_fields["result_retention_days"],
+            task_type=ScheduleTaskType.BACKUP.value,
         )
 
         self.accept()
-
-    def _validate_and_build_sql_task(self) -> Optional[dict]:
-        sql_query = self.sql_editor.toPlainText().strip()
-        if not sql_query:
-            QMessageBox.warning(self, "입력 오류", "SQL 쿼리를 입력하세요.")
-            self.sql_editor.setFocus()
-            return None
-
-        result_format = self.result_format_combo.currentData()
-        result_output_dir = self.result_output_edit.text().strip()
-        if result_format != 'none' and not result_output_dir:
-            QMessageBox.warning(self, "입력 오류", "결과 저장 경로를 선택하세요.")
-            return None
-
-        if self.sql_warning_label.isVisible():
-            reply = QMessageBox.warning(
-                self, "위험한 쿼리 감지",
-                "이 SQL에 위험한 쿼리가 포함되어 있습니다.\n\n"
-                f"{self.sql_warning_label.text()}\n\n"
-                "정말 저장하시겠습니까?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return None
-
-        return {
-            "tables": [],
-            "output_dir": "",
-            "retention_count": 5,
-            "retention_days": 30,
-            "sql_query": sql_query,
-            "result_format": result_format,
-            "result_output_dir": result_output_dir,
-            "result_filename_pattern": self.result_filename_edit.text().strip(),
-            "query_timeout": self.query_timeout_spin.value(),
-            "result_retention_count": self.result_retention_count_spin.value(),
-            "result_retention_days": self.result_retention_days_spin.value(),
-        }
 
     def _validate_and_build_backup_task(self, schema: str) -> Optional[dict]:
         if not schema:
@@ -836,13 +547,6 @@ class ScheduleEditDialog(QDialog):
             "output_dir": output_dir,
             "retention_count": self.retention_count_spin.value(),
             "retention_days": self.retention_days_spin.value(),
-            "sql_query": "",
-            "result_format": "csv",
-            "result_output_dir": "",
-            "result_filename_pattern": "{name}_{timestamp}",
-            "query_timeout": 300,
-            "result_retention_count": 10,
-            "result_retention_days": 30,
         }
 
 

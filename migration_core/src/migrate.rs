@@ -1175,6 +1175,7 @@ pub(crate) fn live_preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
     create_only_issues_with_adapter(&schema, &options, &mut target)
 }
 
+#[cfg(test)]
 pub fn migrate_memory(
     schema: &NormalizedSchema,
     options: &MigrationOptions,
@@ -1517,6 +1518,7 @@ fn create_only_issues_with_adapter<T: MigrationAdapter>(
     issues
 }
 
+#[cfg(test)]
 pub fn verify_memory(
     schema: &NormalizedSchema,
     source: &MemoryAdapter,
@@ -1906,6 +1908,7 @@ pub fn compare_typed_keyed_rows(
     compare_keyed_rows(&table.name, key_columns, &source_rows, &target_rows)
 }
 
+#[cfg(test)]
 fn compare_typed_ordered_keyed_rows(
     table: &NormalizedTable,
     key_columns: &[String],
@@ -1961,6 +1964,7 @@ fn keyed_index(key_columns: &[String], rows: &[Value]) -> BTreeMap<String, Value
     index
 }
 
+#[cfg(test)]
 pub fn compare_typed_digest_rows(
     table: &NormalizedTable,
     source: &[Value],

@@ -174,7 +174,4 @@ class SQLValidatorHighlighter(SQLHighlighter):
                 length = min(end_col, len(text)) - start
                 if length > 0:
                     self.setFormat(start, length, fmt)
-
-    def get_issues(self) -> list:
-        """현재 이슈 목록 반환"""
-        return self._issues
+

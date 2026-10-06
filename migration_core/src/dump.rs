@@ -1028,7 +1028,6 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             &ctx,
             &export_tables,
             parallel_limits.table_workers,
-            parallel_limits.range_workers_per_table,
             |event| emit(event),
         )?,
         DumpStrategy::Sequential => {
@@ -1260,13 +1259,11 @@ enum PoolAction {
     KeepGoing,
     /// 워커 하나가 종료. 슬롯을 반환하고 pending에서 다음 작업을 리필한다.
     Advance,
-    /// 워커 하나가 종료. 슬롯은 반환하되 리필하지 않는다(에러 확산 중단 경로).
-    AdvanceNoRefill,
 }
 
 /// bounded worker-pool 디스패치 루프. `max_workers`개까지 워커를 채운 뒤, 각 이벤트를
 /// `on_event`에 넘긴다. on_event가 반환한 `PoolAction`에 따라 슬롯을 관리한다:
-/// KeepGoing은 슬롯 불변, Advance는 슬롯 반환 후 리필, AdvanceNoRefill은 반환만 한다.
+/// KeepGoing은 슬롯 불변, Advance는 슬롯 반환 후 리필한다.
 /// 이벤트별 emit·상태 누적·first_error 캡처는 전적으로 on_event가 담당해 각 호출자의
 /// bookkeeping을 그대로 보존한다. 종료 시 모든 워커 핸들을 join한다.
 fn run_bounded_pool<Item, Event>(
@@ -1302,10 +1299,6 @@ fn run_bounded_pool<Item, Event>(
                         active += 1;
                     }
                 }
-                PoolAction::AdvanceNoRefill => {
-                    completed += 1;
-                    active = active.saturating_sub(1);
-                }
             },
             Err(_) => break,
         }
@@ -1320,7 +1313,6 @@ fn dump_tables_parallel<F: FnMut(Value)>(
     ctx: &DumpJobContext,
     tables: &[NormalizedTable],
     table_threads: usize,
-    range_threads: usize,
     mut emit: F,
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
     let table_total = tables.len();
@@ -1342,7 +1334,6 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 tables[index].clone(),
                 index,
                 table_total,
-                range_threads,
                 sender.clone(),
             )
         },
@@ -1650,197 +1641,6 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
     Ok((manifests, total_rows, total_chunks))
 }
 
-fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
-    ctx: &DumpJobContext,
-    table: &NormalizedTable,
-    index: usize,
-    table_total: usize,
-    threads: usize,
-    mut emit: F,
-) -> Result<Option<(DumpTableManifest, u64, u64)>, String> {
-    let Some(pk_column) = single_numeric_primary_key(table) else {
-        return Ok(None);
-    };
-
-    let mut conn = match LiveAdapter::connect(&ctx.endpoint)? {
-        LiveAdapter::MySql(conn) => conn,
-        LiveAdapter::PostgreSql(_) => return Ok(None),
-    };
-    let table_row_count = conn
-        .query_first::<u64, _>(count_sql("mysql", &table.name))
-        .map_err(|err| format!("mysql count error for {}: {err}", table.name))?
-        .ok_or_else(|| format!("mysql count returned no result for {}", table.name))?;
-    let avg_row_bytes = mysql_table_avg_row_length(&mut conn, &ctx.endpoint, &table.name);
-    let range_chunk_size = mysql_range_chunk_size_for_avg_row(ctx.chunk_size, avg_row_bytes);
-    if !should_use_pk_range_dump(table, table_row_count, range_chunk_size) {
-        return Ok(None);
-    }
-    let Some((min_key, max_key)) = mysql_numeric_min_max(&mut conn, &table.name, pk_column)? else {
-        return Ok(None);
-    };
-    if !should_use_pk_range_dump_for_span(
-        table,
-        table_row_count,
-        range_chunk_size,
-        min_key,
-        max_key,
-    ) {
-        return Ok(None);
-    }
-
-    emit(json!({
-        "event": "table_progress",
-        "request_id": ctx.request_id,
-        "table": table.name,
-        "status": "dumping",
-        "current": index + 1,
-        "total": table_total,
-        "strategy": "pk_range_parallel",
-        "range_chunk_size": range_chunk_size,
-        "target_bytes_per_chunk": MYSQL_DUMP_TARGET_BYTES_PER_CHUNK,
-        "avg_row_bytes": avg_row_bytes
-    }));
-
-    let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
-    let table_dir = ctx.output_path.join(&table_path);
-    fs::create_dir_all(&table_dir)
-        .map_err(|err| format!("failed to create dump table dir: {err}"))?;
-    let ranges = pk_ranges(min_key, max_key, table_row_count, range_chunk_size);
-    let total_ranges = ranges.len();
-    let max_threads = threads.max(1).min(total_ranges.max(1));
-    let pending = ranges.into_iter().collect::<VecDeque<_>>();
-    let mut rows_dumped = 0_u64;
-    let mut chunk_sha256 = BTreeMap::new();
-    let mut first_error: Option<String> = None;
-    // chunks_done는 기존 `completed`와 동일하게 매 종료 이벤트(Done+Error)마다 증가하며
-    // row_progress의 "chunks_done" 필드에 쓰인다. 풀 루프 카운터는 run_bounded_pool가 관리한다.
-    let mut chunks_done = 0_u64;
-    let (sender, receiver) = mpsc::channel::<DumpRangeEvent>();
-
-    run_bounded_pool(
-        pending,
-        max_threads,
-        &receiver,
-        |range| {
-            spawn_mysql_range_worker(
-                ctx.endpoint.clone(),
-                ctx.output_path.clone(),
-                table.clone(),
-                table_path.clone(),
-                pk_column.to_string(),
-                range,
-                ctx.data_format.clone(),
-                ctx.compression.clone(),
-                sender.clone(),
-            )
-        },
-        |event| match event {
-            DumpRangeEvent::Done {
-                chunk_index,
-                rows,
-                stream_ms,
-                range_start,
-                range_end,
-                checksum,
-            } => {
-                rows_dumped += rows;
-                chunks_done += 1;
-                chunk_sha256.insert(
-                    dump_chunk_name(chunk_index, &ctx.data_format, &ctx.compression),
-                    checksum,
-                );
-                emit(json!({
-                    "event": "row_progress",
-                    "request_id": ctx.request_id,
-                    "table": table.name,
-                    "rows": rows_dumped,
-                    "total": table_row_count,
-                    "chunk_rows": rows,
-                    "chunks_done": chunks_done,
-                    "chunks_total": total_ranges,
-                    "stream_ms": stream_ms,
-                    "chunk_index": chunk_index,
-                    "range_start": range_start,
-                    "range_end": range_end,
-                    "strategy": "pk_range_parallel"
-                }));
-                PoolAction::Advance
-            }
-            // range 워커 에러는 리필하지 않는다(기존 동작 보존). chunks_done는 계속 카운트.
-            DumpRangeEvent::Error(err) => {
-                first_error.get_or_insert(err);
-                chunks_done += 1;
-                PoolAction::AdvanceNoRefill
-            }
-        },
-    );
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-
-    emit(json!({
-        "event": "table_progress",
-        "request_id": ctx.request_id,
-        "table": table.name,
-        "status": "completed",
-        "current": index + 1,
-        "total": table_total,
-        "strategy": "pk_range_parallel"
-    }));
-
-    Ok(Some((
-        DumpTableManifest {
-            name: table.name.clone(),
-            path: table_path,
-            rows: rows_dumped,
-            chunks: total_ranges as u64,
-            chunk_sha256,
-        },
-        rows_dumped,
-        total_ranges as u64,
-    )))
-}
-
-fn spawn_mysql_range_worker(
-    endpoint: Endpoint,
-    output_path: std::path::PathBuf,
-    table: NormalizedTable,
-    table_path: String,
-    pk_column: String,
-    range: DumpRange,
-    data_format: String,
-    compression: String,
-    sender: mpsc::Sender<DumpRangeEvent>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let result = dump_mysql_range_chunk(
-            &endpoint,
-            &output_path,
-            &table,
-            &table_path,
-            &pk_column,
-            &range,
-            &data_format,
-            &compression,
-        );
-        match result {
-            Ok((rows, stream_ms, checksum)) => {
-                let _ = sender.send(DumpRangeEvent::Done {
-                    chunk_index: range.chunk_index,
-                    rows,
-                    stream_ms,
-                    range_start: range.start.to_string(),
-                    range_end: range.end.to_string(),
-                    checksum,
-                });
-            }
-            Err(err) => {
-                let _ = sender.send(DumpRangeEvent::Error(err));
-            }
-        }
-    })
-}
-
 fn run_dump_global_work(
     adapter: &mut LiveAdapter,
     ctx: &DumpJobContext,
@@ -1963,58 +1763,15 @@ fn dump_mysql_range_chunk_on_conn(
     Ok((rows, stream_started.elapsed().as_millis() as u64, checksum))
 }
 
-fn dump_mysql_range_chunk(
-    endpoint: &Endpoint,
-    output_path: &Path,
-    table: &NormalizedTable,
-    table_path: &str,
-    pk_column: &str,
-    range: &DumpRange,
-    data_format: &str,
-    compression: &str,
-) -> Result<(u64, u64, String), String> {
-    let mut conn = match LiveAdapter::connect(endpoint)? {
-        LiveAdapter::MySql(conn) => conn,
-        LiveAdapter::PostgreSql(_) => {
-            return Err("pk range dump requires mysql endpoint".to_string())
-        }
-    };
-    dump_mysql_range_chunk_on_conn(
-        &mut conn,
-        output_path,
-        table,
-        table_path,
-        pk_column,
-        range,
-        data_format,
-        compression,
-    )
-}
-
 fn spawn_dump_table_worker(
     ctx: DumpJobContext,
     table: NormalizedTable,
     index: usize,
     table_total: usize,
-    range_threads: usize,
     sender: mpsc::Sender<DumpTableEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
-            if ctx.endpoint.engine == "mysql" {
-                if let Some(result) = dump_mysql_table_parallel_ranges(
-                    &ctx,
-                    &table,
-                    index,
-                    table_total,
-                    range_threads,
-                    |event| {
-                        let _ = sender.send(DumpTableEvent::Progress(event));
-                    },
-                )? {
-                    return Ok(result);
-                }
-            }
             let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
             dump_one_table(
                 &mut adapter,

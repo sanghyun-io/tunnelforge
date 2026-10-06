@@ -20,8 +20,6 @@ class TunnelTreeWidget(QTreeWidget):
     """터널 그룹핑을 지원하는 트리 위젯"""
 
     # 시그널 정의
-    tunnel_start_requested = pyqtSignal(dict)    # 터널 시작 요청
-    tunnel_stop_requested = pyqtSignal(dict)     # 터널 중지 요청
     tunnel_edit_requested = pyqtSignal(dict)     # 터널 수정 요청
     tunnel_delete_requested = pyqtSignal(dict)   # 터널 삭제 요청
     tunnel_db_connect = pyqtSignal(dict)         # DB 연결 요청

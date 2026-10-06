@@ -11,7 +11,7 @@ from src.ui.dialogs.tunnel_config import (
     _RunningTestProgressDialog,
     _TempCredentials,
 )
-from src.ui.workers.test_worker import ConnectionTestWorker, TestType
+from src.ui.workers.connection_test_worker import ConnectionTestWorker, TestType
 
 
 app = QApplication.instance() or QApplication(sys.argv)

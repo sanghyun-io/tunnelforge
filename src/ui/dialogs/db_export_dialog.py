@@ -23,7 +23,7 @@ from src.core.error_report_sanitizer import (
 )
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
-from src.core.path_safety import safe_output_dir
+from src.core.path_safety import safe_filename_component, safe_output_dir
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, build_rust_dump_config, check_rust_dump,
     DEFAULT_DUMP_COMPRESSION, is_mysql_parallel_snapshot_privilege_error,
@@ -780,10 +780,6 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         folder_name = "_".join(parts)
         return safe_output_dir(base_dir, folder_name)
-
-    def _get_default_output_dir(self) -> str:
-        """기본 출력 디렉토리 (초기값)"""
-        return self._generate_output_dir("")
 
     def _unique_output_dir(self, path: str) -> str:
         """이미 존재하는 폴더면 `_2`, `_3`, ... 을 붙여 충돌하지 않는 경로를 반환."""
@@ -1632,7 +1628,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             status = "running"
         else:
             status = "success" if self.export_success else "failed"
-        default_filename = f"export_log_{self.export_schema}_{status}_{timestamp}.txt"
+        schema_name = safe_filename_component(_escape_local_diagnostic_text(self.export_schema or ""), "unknown")
+        default_filename = f"export_log_{schema_name}_{status}_{timestamp}.txt"
 
         # 파일 저장 대화상자
         file_path, _ = QFileDialog.getSaveFileName(
