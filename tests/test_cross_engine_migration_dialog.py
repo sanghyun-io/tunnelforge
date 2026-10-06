@@ -1978,3 +1978,103 @@ def test_tunnel_combo_does_not_grow_with_long_names_and_keeps_full_name_in_toolt
         assert dialog.minimumSizeHint().width() <= 1093
     finally:
         dialog.close()
+
+
+def _preflight_payload(success, issues):
+    return {"event": "result", "command": "preflight", "success": success, "issues": issues}
+
+
+def test_preflight_issues_render_as_table_with_blocking_first_and_suggestion():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("safety")
+        dialog._on_result(_preflight_payload(False, [
+            {
+                "severity": "warning",
+                "location": "orders.note",
+                "message": "charset differs",
+                "suggestion": "convert to utf8mb4",
+                "blocking": False,
+                "issue_type": "charset_issue",
+            },
+            {
+                "severity": "error",
+                "location": "places.geom",
+                "message": "geometry column is not supported",
+                "suggestion": "drop or convert the column",
+                "blocking": True,
+                "issue_type": "unsupported_spatial_type",
+            },
+        ]))
+
+        table = dialog.tbl_safety_issues
+        assert not table.isHidden()
+        assert table.rowCount() == 2
+        headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+        assert headers == ["구분", "위치", "내용", "해결 방법"]
+        assert table.item(0, 0).text() == "차단 · 공간 타입 미지원"
+        assert table.item(0, 1).text() == "places.geom"
+        assert table.item(0, 3).text() == "drop or convert the column"
+        assert table.item(0, 0).foreground().color().name() == "#d92d20"
+        assert table.item(1, 0).text() == "경고 · 문자셋"
+        assert table.item(1, 0).foreground().color().name() == "#b54708"
+        # 원시 로그는 접혀 있지만 같은 자리에서 표와 전환해 볼 수 있다
+        assert dialog.txt_safety_log.isHidden()
+        assert not dialog.btn_toggle_safety_log.isHidden()
+        dialog.btn_toggle_safety_log.click()
+        assert not dialog.txt_safety_log.isHidden()
+        assert table.isHidden()
+        assert dialog.btn_toggle_safety_log.text() == "이슈 목록 보기"
+        dialog.btn_toggle_safety_log.click()
+        assert dialog.txt_safety_log.isHidden()
+        assert not table.isHidden()
+    finally:
+        dialog.close()
+
+
+def test_preflight_issue_table_hidden_without_issues_and_cleared_on_rerun():
+    dialog = make_dialog()
+    try:
+        dialog._on_result(_preflight_payload(True, [
+            {"severity": "warning", "location": "t", "message": "m", "suggestion": "s", "blocking": False},
+        ]))
+        assert dialog.tbl_safety_issues.rowCount() == 1
+        assert dialog.tbl_safety_issues.item(0, 0).text() == "경고"
+
+        dialog._reset_command_ui("preflight")
+        assert dialog.tbl_safety_issues.rowCount() == 0
+        assert dialog.tbl_safety_issues.isHidden()
+        assert dialog.btn_toggle_safety_log.isHidden()
+        assert not dialog.txt_safety_log.isHidden()
+
+        dialog._on_result(_preflight_payload(True, []))
+        assert dialog.tbl_safety_issues.isHidden()
+        assert not dialog.txt_safety_log.isHidden()
+    finally:
+        dialog.close()
+
+
+def test_create_only_toggle_after_passed_checks_relocks_execution():
+    dialog = make_dialog()
+    try:
+        dialog._step_completed["inspect"] = True
+        dialog._on_result(_preflight_payload(True, []))
+        dialog._step_completed["plan"] = True
+        assert dialog._execution_unlocked
+        assert dialog._step_completed["safety"]
+        assert "빈 Target에만 생성" in dialog.lbl_execute_summary.text()
+
+        dialog.chk_create_only.setChecked(False)
+
+        assert not dialog._execution_unlocked
+        assert not dialog._step_completed["safety"]
+        assert not dialog._step_completed["plan"]
+        assert dialog._step_completed["inspect"]  # Source 분석은 다시 할 필요 없음
+        assert dialog.last_result is None
+        assert "다시 점검" in dialog.lbl_safety_summary.text()
+        assert "기존 Target에 추가" in dialog.lbl_execute_summary.text()
+        dialog._show_step("execute")
+        dialog.input_approval_schema.setText("target_db")
+        assert not dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()

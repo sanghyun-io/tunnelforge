@@ -5,8 +5,9 @@ import json
 from typing import Any, Dict, List, Optional, cast
 
 from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtGui import QCloseEvent, QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -21,6 +22,9 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QStyle,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +54,17 @@ WORKER_GRACEFUL_WAIT_MS = 5000
 WORKER_CLOSE_WAIT_MS = 3000
 WORKER_TERMINATE_WAIT_MS = 1000
 # Normal finish gets the longest grace period; close and terminate waits stay shorter for responsive shutdown.
+
+# Rust preflight issue_type -> 짧은 한글 라벨 (없으면 차단/경고만 표시)
+_ISSUE_TYPE_LABELS = {
+    "target_not_empty": "Target 데이터 있음",
+    "charset_issue": "문자셋",
+    "unsupported_spatial_type": "공간 타입 미지원",
+    "unsupported_temporal_type": "날짜/시간 타입 미지원",
+    "unsupported_temporal_value": "날짜/시간 값 범위 초과",
+    "temporal_scan_failed": "날짜/시간 값 검사 실패",
+    "unsupported_fk_action": "FK 동작 미지원",
+}
 
 _WIZARD_STYLESHEET = """
     QDialog {
@@ -373,6 +388,22 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_safety_log.setMaximumBlockCount(80)
         self.txt_safety_log.setFixedHeight(110)
         self.txt_safety_log.setPlaceholderText("전환 가능 여부 점검의 최근 진행 상황이 표시됩니다.")
+        # 점검 결과 이슈 표: 차단(빨강)이 위, 경고(노랑)가 아래
+        self.tbl_safety_issues = QTableWidget(0, 4)
+        self.tbl_safety_issues.setHorizontalHeaderLabels(["구분", "위치", "내용", "해결 방법"])
+        self.tbl_safety_issues.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_safety_issues.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_safety_issues.setWordWrap(True)
+        self.tbl_safety_issues.verticalHeader().hide()
+        self.tbl_safety_issues.horizontalHeader().setStretchLastSection(True)
+        self.tbl_safety_issues.setMaximumHeight(120)  # 작은 화면(1366x768/125%) 높이 예산: 원시 로그와 같은 자리
+        self.tbl_safety_issues.hide()
+        # 이슈 표와 원시 로그는 같은 자리에서 전환한다
+        self.btn_toggle_safety_log = QPushButton("점검 로그 보기")
+        self.btn_toggle_safety_log.hide()
+        self.btn_toggle_safety_log.clicked.connect(
+            lambda: self._set_safety_log_visible(self.txt_safety_log.isHidden())
+        )
         self.target_advanced_panel = QWidget()
         target_advanced_layout = QVBoxLayout(self.target_advanced_panel)
         target_advanced_layout.setContentsMargins(0, 0, 0, 0)
@@ -396,9 +427,13 @@ class CrossEngineMigrationDialog(QDialog):
         safety_layout.addWidget(self.lbl_target_safety)
         safety_layout.addWidget(self.lbl_safety_activity)
         safety_layout.addWidget(self.safety_activity_bar)
+        safety_layout.addWidget(self.tbl_safety_issues)
         safety_layout.addWidget(self.txt_safety_log)
         safety_layout.addWidget(self.target_advanced_panel)
-        safety_layout.addWidget(self.btn_target_advanced)
+        safety_secondary_layout = QHBoxLayout()
+        safety_secondary_layout.addWidget(self.btn_toggle_safety_log)
+        safety_secondary_layout.addWidget(self.btn_target_advanced)
+        safety_layout.addLayout(safety_secondary_layout)
         safety_layout.addWidget(self.btn_run_safety)
         self.step_page_layouts["safety"].addWidget(self.safety_group)
 
@@ -515,6 +550,7 @@ class CrossEngineMigrationDialog(QDialog):
         layout.addWidget(action_group)
 
         self.txt_schema.textChanged.connect(self._lock_execution_due_to_input_change)
+        self.chk_create_only.toggled.connect(self._on_create_only_toggled)
         self._connect_endpoint_lock_signals(self.source_form)
         self._connect_endpoint_lock_signals(self.target_form)
         self.source_form.combo_tunnel.currentIndexChanged.connect(self._sync_target_engine_filter)
@@ -683,6 +719,45 @@ class CrossEngineMigrationDialog(QDialog):
         else:
             summary = f"점검 실패: 차단 이슈 {counts['blocking']}개, 경고 {counts['warnings']}개"
         self.lbl_safety_summary.setText(summary)
+
+    def _populate_safety_issue_table(self, issues):
+        rows = sorted(
+            (issue for issue in (issues if isinstance(issues, list) else []) if isinstance(issue, dict)),
+            key=lambda issue: not issue.get("blocking"),
+        )
+        table = self.tbl_safety_issues
+        table.setRowCount(len(rows))
+        style = self.style()
+        for row, issue in enumerate(rows):
+            blocking = bool(issue.get("blocking"))
+            kind = translate_text("차단" if blocking else "경고")
+            type_label = _ISSUE_TYPE_LABELS.get(str(issue.get("issue_type") or issue.get("code") or ""))
+            if type_label:
+                kind = f"{kind} · {translate_text(type_label)}"
+            kind_item = QTableWidgetItem(kind)
+            kind_item.setForeground(QColor("#d92d20" if blocking else "#b54708"))
+            if style is not None:
+                icon = QStyle.StandardPixmap.SP_MessageBoxCritical if blocking else QStyle.StandardPixmap.SP_MessageBoxWarning
+                kind_item.setIcon(style.standardIcon(icon))
+            table.setItem(row, 0, kind_item)
+            for column, key in enumerate(("location", "message", "suggestion"), start=1):
+                text = str(issue.get(key) or "-")
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                table.setItem(row, column, item)
+        table.resizeColumnsToContents()
+        table.resizeRowsToContents()
+        self.btn_toggle_safety_log.setVisible(bool(rows))
+        # 이슈가 있으면 표가 결과를 대신하고 원시 로그는 접어 둔다
+        self._set_safety_log_visible(not rows)
+
+    def _set_safety_log_visible(self, visible: bool):
+        # 숨기기를 먼저 해야 둘 다 보이는 순간이 없어 창이 커지지 않는다
+        widgets = [(self.txt_safety_log, visible),
+                   (self.tbl_safety_issues, not visible and self.tbl_safety_issues.rowCount() > 0)]
+        for widget, show in sorted(widgets, key=lambda pair: pair[1]):
+            widget.setVisible(show)
+        self.btn_toggle_safety_log.setText("이슈 목록 보기" if visible else "점검 로그 보기")
 
     def _blocking_preflight_issues(self):
         if not isinstance(self.last_result, dict) or self.last_result.get("command") != "preflight":
@@ -1067,6 +1142,7 @@ class CrossEngineMigrationDialog(QDialog):
         if payload.get("command") == "preflight":
             self._step_completed["safety"] = bool(payload.get("success")) and not target_blocked
             self._update_preflight_summary(payload, target_blocked)
+            self._populate_safety_issue_table(payload.get("issues"))
         self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)
         if self._execution_unlocked:
             self._append_log("사전 확인이 완료되어 DB 변경 실행이 활성화되었습니다.")
@@ -1355,6 +1431,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_auto_inspect.show()
         if command == "preflight":
             self.txt_safety_log.clear()
+            self._populate_safety_issue_table([])
             self.target_advanced_panel.hide()
             self.btn_target_advanced.setText("고급 설정 열기")
         if command == "verify":
@@ -1433,6 +1510,19 @@ class CrossEngineMigrationDialog(QDialog):
         if self._execution_unlocked:
             self._set_execution_unlocked(False)
         self._invalidate_stale_reports_after_input_change()
+        self._refresh_navigation_state()
+
+    def _on_create_only_toggled(self, _checked: bool):
+        """실행 모드가 바뀌면 점검 결과(target_not_empty 판정 근거)가 무효이므로 다시 점검하게 한다."""
+        inspected = self._step_completed.get("inspect", False)
+        if isinstance(self.last_result, dict) and self.last_result.get("command") == "preflight":
+            self.last_result = None
+        self._lock_execution_due_to_input_change()
+        self._step_completed["inspect"] = inspected  # Source 구조 분석은 모드와 무관
+        self.lbl_safety_summary.setText("실행 모드가 바뀌어 전환 가능 여부를 다시 점검해야 합니다.")
+        self.lbl_target_safety.setText("Target 상태를 아직 확인하지 않았습니다.")
+        self.btn_target_advanced.hide()
+        self._populate_safety_issue_table([])
         self._refresh_navigation_state()
 
     def _schema_is_empty(self) -> bool:
