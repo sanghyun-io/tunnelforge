@@ -4,8 +4,9 @@
 from typing import List
 
 from src.core.schema_diff_models import (
-    DiffType, TableDiff, TableSchema, _quote_ident, is_primary_key_index,
+    DiffType, TableDiff, TableSchema, is_primary_key_index,
 )
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 
 class SyncScriptGenerator:
@@ -73,7 +74,7 @@ class SyncScriptGenerator:
 
         clause에는 후행 세미콜론(및 필요 시 후행 주석)까지 포함해서 전달한다.
         """
-        return f"ALTER TABLE {_quote_ident(target_schema)}.{_quote_ident(table_name)} {clause}"
+        return f"ALTER TABLE {quote_mysql_ident(target_schema)}.{quote_mysql_ident(table_name)} {clause}"
 
     def _generate_fk_drops(self, diffs: List[TableDiff], target_schema: str) -> List[str]:
         """FK 삭제 문 목록 생성 (의존성 해제)"""
@@ -84,20 +85,20 @@ class SyncScriptGenerator:
                     for fk in diff.target_schema.foreign_keys:
                         fk_drops.append(self._alter_table(
                             target_schema, diff.table_name,
-                            f"DROP FOREIGN KEY {_quote_ident(fk.name)};"
+                            f"DROP FOREIGN KEY {quote_mysql_ident(fk.name)};"
                         ))
             elif diff.diff_type == DiffType.MODIFIED:
                 for fk_diff in diff.fk_diffs:
                     if fk_diff.diff_type in [DiffType.REMOVED, DiffType.MODIFIED]:
                         fk_drops.append(self._alter_table(
                             target_schema, diff.table_name,
-                            f"DROP FOREIGN KEY {_quote_ident(fk_diff.fk_name)};"
+                            f"DROP FOREIGN KEY {quote_mysql_ident(fk_diff.fk_name)};"
                         ))
                     elif fk_diff.diff_type == DiffType.RENAMED and fk_diff.old_name:
                         # FK rename = DROP old + ADD new (MySQL에 RENAME FK 없음)
                         fk_drops.append(self._alter_table(
                             target_schema, diff.table_name,
-                            f"DROP FOREIGN KEY {_quote_ident(fk_diff.old_name)}; "
+                            f"DROP FOREIGN KEY {quote_mysql_ident(fk_diff.old_name)}; "
                             f"-- renamed → {fk_diff.fk_name}"
                         ))
         return fk_drops
@@ -105,7 +106,7 @@ class SyncScriptGenerator:
     def _generate_table_drops(self, diffs: List[TableDiff], target_schema: str) -> List[str]:
         """테이블 삭제 문 목록 생성 (소스에 없는 테이블)"""
         return [
-            f"DROP TABLE IF EXISTS {_quote_ident(target_schema)}.{_quote_ident(diff.table_name)};"
+            f"DROP TABLE IF EXISTS {quote_mysql_ident(target_schema)}.{quote_mysql_ident(diff.table_name)};"
             for diff in diffs
             if diff.diff_type == DiffType.REMOVED
         ]
@@ -135,7 +136,7 @@ class SyncScriptGenerator:
                 elif col_diff.diff_type == DiffType.REMOVED:
                     alter_statements.append(self._alter_table(
                         target_schema, diff.table_name,
-                        f"DROP COLUMN {_quote_ident(col_diff.column_name)};"
+                        f"DROP COLUMN {quote_mysql_ident(col_diff.column_name)};"
                     ))
                 elif col_diff.diff_type == DiffType.MODIFIED and col_diff.source_info:
                     alter_statements.append(self._alter_table(
@@ -156,13 +157,13 @@ class SyncScriptGenerator:
                 elif idx_diff.diff_type == DiffType.REMOVED:
                     alter_statements.append(self._alter_table(
                         target_schema, diff.table_name,
-                        f"DROP INDEX {_quote_ident(idx_diff.index_name)};"
+                        f"DROP INDEX {quote_mysql_ident(idx_diff.index_name)};"
                     ))
                 elif idx_diff.diff_type == DiffType.MODIFIED and idx_diff.source_info:
                     # 인덱스 수정 = 삭제 후 재생성
                     alter_statements.append(self._alter_table(
                         target_schema, diff.table_name,
-                        f"DROP INDEX {_quote_ident(idx_diff.index_name)};"
+                        f"DROP INDEX {quote_mysql_ident(idx_diff.index_name)};"
                     ))
                     idx_sql = idx_diff.source_info.to_sql_definition(diff.table_name)
                     alter_statements.append(self._alter_table(
@@ -172,8 +173,8 @@ class SyncScriptGenerator:
                     # MySQL 5.7+ RENAME INDEX
                     alter_statements.append(self._alter_table(
                         target_schema, diff.table_name,
-                        f"RENAME INDEX {_quote_ident(idx_diff.old_name)} "
-                        f"TO {_quote_ident(idx_diff.index_name)};"
+                        f"RENAME INDEX {quote_mysql_ident(idx_diff.old_name)} "
+                        f"TO {quote_mysql_ident(idx_diff.index_name)};"
                     ))
 
         return alter_statements
@@ -199,7 +200,7 @@ class SyncScriptGenerator:
 
     def _generate_create_table(self, schema: str, table: TableSchema) -> str:
         """CREATE TABLE 문 생성"""
-        lines = [f"CREATE TABLE {_quote_ident(schema)}.{_quote_ident(table.name)} ("]
+        lines = [f"CREATE TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(table.name)} ("]
 
         # 컬럼
         col_defs = [f"    {col.to_sql_definition()}" for col in table.columns]

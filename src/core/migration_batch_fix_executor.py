@@ -20,6 +20,7 @@ from src.core.migration_fix_models import (
 )
 from src.core.migration_fk_graph import CollationFKGraphBuilder, build_fk_graph
 from src.core.migration_fk_safe_charset import FKSafeCharsetChanger
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +249,7 @@ class BatchFixExecutor:
                 continue
 
             merged_sql = (
-                f"ALTER TABLE `{schema_name}`.`{table_name}`\n  "
+                f"ALTER TABLE {quote_mysql_ident(schema_name)}.{quote_mysql_ident(table_name)}\n  "
                 + ",\n  ".join(clauses) + ";"
             )
 

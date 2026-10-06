@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
 
+from src.core.db_core_dbapi_shim import quote_mysql_ident
+
 
 class DiffSeverity(Enum):
     """차이 심각도"""
@@ -86,14 +88,9 @@ DIFF_PREFIX_COLLATION = "Collation:"
 AUTO_INCREMENT_KEYWORD = "auto_increment"
 
 
-def _quote_ident(name: str) -> str:
-    """MySQL 식별자를 백틱으로 감싼다."""
-    return f"`{name}`"
-
-
 def _quote_idents(names: List[str]) -> str:
     """MySQL 식별자 목록을 백틱으로 감싸 콤마로 join한다."""
-    return ", ".join(_quote_ident(n) for n in names)
+    return ", ".join(quote_mysql_ident(n) for n in names)
 
 
 @dataclass
@@ -110,7 +107,7 @@ class ColumnInfo:
 
     def to_sql_definition(self) -> str:
         """SQL 컬럼 정의 생성"""
-        parts = [_quote_ident(self.name), self.data_type]
+        parts = [quote_mysql_ident(self.name), self.data_type]
 
         if self.charset and self.charset not in self.data_type:
             parts.append(f"CHARACTER SET {self.charset}")
@@ -147,9 +144,9 @@ class IndexInfo:
         if is_primary_key_index(self.name):
             return f"PRIMARY KEY ({cols})"
         elif self.unique:
-            return f"UNIQUE INDEX {_quote_ident(self.name)} ({cols}) USING {self.type}"
+            return f"UNIQUE INDEX {quote_mysql_ident(self.name)} ({cols}) USING {self.type}"
         else:
-            return f"INDEX {_quote_ident(self.name)} ({cols}) USING {self.type}"
+            return f"INDEX {quote_mysql_ident(self.name)} ({cols}) USING {self.type}"
 
 
 @dataclass
@@ -167,8 +164,8 @@ class ForeignKeyInfo:
         cols = _quote_idents(self.columns)
         ref_cols = _quote_idents(self.ref_columns)
         return (
-            f"CONSTRAINT {_quote_ident(self.name)} FOREIGN KEY ({cols}) "
-            f"REFERENCES {_quote_ident(self.ref_table)} ({ref_cols}) "
+            f"CONSTRAINT {quote_mysql_ident(self.name)} FOREIGN KEY ({cols}) "
+            f"REFERENCES {quote_mysql_ident(self.ref_table)} ({ref_cols}) "
             f"ON DELETE {self.on_delete} ON UPDATE {self.on_update}"
         )
 

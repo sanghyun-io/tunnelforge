@@ -8,6 +8,7 @@ import time
 from typing import List, Dict, Callable, Optional
 
 from src.core.migration_analysis_models import OrphanRecord, ForeignKeyInfo
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 # 고아 레코드 탐지 임계값 (인라인 매직넘버 대체)
 LARGE_TABLE_ROW_THRESHOLD = 500_000  # 50만 행 이상이면 큰 테이블(최적화 쿼리 사용)
@@ -101,20 +102,20 @@ class ForeignKeyAnalyzer:
         if is_large:
             query = f"""
         SELECT {select_expr}
-        FROM `{schema}`.`{fk.child_table}` c
-        WHERE c.`{fk.child_column}` IS NOT NULL
+        FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(fk.child_table)} c
+        WHERE c.{quote_mysql_ident(fk.child_column)} IS NOT NULL
             AND NOT EXISTS (
-                SELECT 1 FROM `{schema}`.`{fk.parent_table}` p
-                WHERE p.`{fk.parent_column}` = c.`{fk.child_column}`
+                SELECT 1 FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(fk.parent_table)} p
+                WHERE p.{quote_mysql_ident(fk.parent_column)} = c.{quote_mysql_ident(fk.child_column)}
             )"""
         else:
             query = f"""
         SELECT {select_expr}
-        FROM `{schema}`.`{fk.child_table}` c
-        LEFT JOIN `{schema}`.`{fk.parent_table}` p
-            ON c.`{fk.child_column}` = p.`{fk.parent_column}`
-        WHERE c.`{fk.child_column}` IS NOT NULL
-            AND p.`{fk.parent_column}` IS NULL"""
+        FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(fk.child_table)} c
+        LEFT JOIN {quote_mysql_ident(schema)}.{quote_mysql_ident(fk.parent_table)} p
+            ON c.{quote_mysql_ident(fk.child_column)} = p.{quote_mysql_ident(fk.parent_column)}
+        WHERE c.{quote_mysql_ident(fk.child_column)} IS NOT NULL
+            AND p.{quote_mysql_ident(fk.parent_column)} IS NULL"""
 
         if limit is not None:
             query += f"\n        LIMIT {limit}"
@@ -164,7 +165,7 @@ class ForeignKeyAnalyzer:
                     # 샘플 값 조회 (항상 LIMIT으로 제한)
                     sample_query = self._build_orphan_query(
                         schema, fk, is_large,
-                        f"DISTINCT c.`{fk.child_column}` as orphan_value",
+                        f"DISTINCT c.{quote_mysql_ident(fk.child_column)} as orphan_value",
                         limit=sample_limit
                     )
                     samples = self.connector.execute(sample_query)

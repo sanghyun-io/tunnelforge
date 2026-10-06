@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Callable, Optional
 
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 from src.core.migration_constants import (
     ALL_REMOVED_FUNCTIONS,
     ALL_RESERVED_KEYWORDS,
@@ -73,7 +74,7 @@ def _issue_year2(schema: str, col: dict) -> Optional[CompatibilityIssue]:
         suggestion="YEAR(4) 또는 YEAR로 변경 필요",
         table_name=col['TABLE_NAME'],
         column_name=col['COLUMN_NAME'],
-        fix_query=f"ALTER TABLE `{schema}`.`{col['TABLE_NAME']}` MODIFY `{col['COLUMN_NAME']}` YEAR;"
+        fix_query=f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(col['TABLE_NAME'])} MODIFY {quote_mysql_ident(col['COLUMN_NAME'])} YEAR;"
     )
 
 
@@ -89,7 +90,7 @@ def _issue_deprecated_engine(schema: str, table: dict) -> Optional[Compatibility
         description=f"deprecated 스토리지 엔진: {engine}",
         suggestion=policy['suggestion'],
         table_name=table['TABLE_NAME'],
-        fix_query=f"ALTER TABLE `{schema}`.`{table['TABLE_NAME']}` ENGINE=InnoDB;" if engine != 'MEMORY' else None
+        fix_query=f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(table['TABLE_NAME'])} ENGINE=InnoDB;" if engine != 'MEMORY' else None
     )
 
 
@@ -114,7 +115,7 @@ def _issue_timestamp_range(schema: str, col: dict) -> Optional[CompatibilityIssu
         suggestion="2038년 이후 값이 필요한 컬럼은 DATETIME으로 변경을 검토하세요",
         table_name=col['TABLE_NAME'],
         column_name=col['COLUMN_NAME'],
-        fix_query=f"ALTER TABLE `{schema}`.`{col['TABLE_NAME']}` MODIFY `{col['COLUMN_NAME']}` DATETIME;"
+        fix_query=f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(col['TABLE_NAME'])} MODIFY {quote_mysql_ident(col['COLUMN_NAME'])} DATETIME;"
     )
 
 
@@ -578,18 +579,18 @@ class MySQLUpgradeCompatibilityChecker:
                 if data_type == 'date':
                     check_query = f"""
                     SELECT COUNT(*) as cnt
-                    FROM `{schema}`.`{table}`
-                    WHERE `{column}` = '0000-00-00'
-                        OR (`{column}` IS NOT NULL
-                            AND (MONTH(`{column}`) = 0 OR DAY(`{column}`) = 0))
+                    FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(table)}
+                    WHERE {quote_mysql_ident(column)} = '0000-00-00'
+                        OR ({quote_mysql_ident(column)} IS NOT NULL
+                            AND (MONTH({quote_mysql_ident(column)}) = 0 OR DAY({quote_mysql_ident(column)}) = 0))
                     """
                 else:  # datetime, timestamp
                     check_query = f"""
                     SELECT COUNT(*) as cnt
-                    FROM `{schema}`.`{table}`
-                    WHERE `{column}` = '0000-00-00 00:00:00'
-                        OR (`{column}` IS NOT NULL
-                            AND (MONTH(`{column}`) = 0 OR DAY(`{column}`) = 0))
+                    FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(table)}
+                    WHERE {quote_mysql_ident(column)} = '0000-00-00 00:00:00'
+                        OR ({quote_mysql_ident(column)} IS NOT NULL
+                            AND (MONTH({quote_mysql_ident(column)}) = 0 OR DAY({quote_mysql_ident(column)}) = 0))
                     """
 
                 result = self.connector.execute(check_query)
@@ -604,7 +605,7 @@ class MySQLUpgradeCompatibilityChecker:
                         suggestion="NULL로 변경하거나 유효한 날짜로 수정 필요 (8.4 NO_ZERO_DATE)",
                         table_name=table,
                         column_name=column,
-                        fix_query=f"UPDATE `{schema}`.`{table}` SET `{column}` = NULL WHERE `{column}` = '0000-00-00' OR MONTH(`{column}`) = 0 OR DAY(`{column}`) = 0;"
+                        fix_query=f"UPDATE {quote_mysql_ident(schema)}.{quote_mysql_ident(table)} SET {quote_mysql_ident(column)} = NULL WHERE {quote_mysql_ident(column)} = '0000-00-00' OR MONTH({quote_mysql_ident(column)}) = 0 OR DAY({quote_mysql_ident(column)}) = 0;"
                     ))
                     self._log(f"    ⚠️ {table}.{column}: 잘못된 날짜 {invalid_count:,}개")
 

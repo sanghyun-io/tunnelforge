@@ -3,6 +3,7 @@
 """
 from typing import List, Dict, Set, Optional, Tuple, Any
 
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 from src.core.db_connector import MySQLConnector
 from src.core.migration_fix_models import (
     FixStrategy,
@@ -120,13 +121,13 @@ class RollbackSQLGenerator:
         add_sqls = []
         for fk in fk_map.values():
             drop_sqls.append(
-                f"ALTER TABLE `{schema}`.`{fk['table']}` DROP FOREIGN KEY `{fk['constraint']}`;"
+                f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(fk['table'])} DROP FOREIGN KEY {quote_mysql_ident(fk['constraint'])};"
             )
-            cols = ", ".join(f"`{c}`" for c in fk['columns'])
-            ref_cols = ", ".join(f"`{c}`" for c in fk['ref_columns'])
+            cols = ", ".join(quote_mysql_ident(c) for c in fk['columns'])
+            ref_cols = ", ".join(quote_mysql_ident(c) for c in fk['ref_columns'])
             add_sqls.append(
-                f"ALTER TABLE `{schema}`.`{fk['table']}` ADD CONSTRAINT `{fk['constraint']}` "
-                f"FOREIGN KEY ({cols}) REFERENCES `{fk['ref_table']}` ({ref_cols}) "
+                f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(fk['table'])} ADD CONSTRAINT {quote_mysql_ident(fk['constraint'])} "
+                f"FOREIGN KEY ({cols}) REFERENCES {quote_mysql_ident(fk['ref_table'])} ({ref_cols}) "
                 f"ON DELETE {fk['on_delete']} ON UPDATE {fk['on_update']};"
             )
 
@@ -258,8 +259,8 @@ class RollbackSQLGenerator:
                 lines.append(f"-- Rollback: {table}.{column} 컬럼 charset 복원")
                 lines.append(f"-- 원본: {orig_charset} / {orig_collation}")
                 lines.append(
-                    f"ALTER TABLE `{schema}`.`{table}` "
-                    f"MODIFY COLUMN `{column}` {' '.join(col_def_parts)};"
+                    f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(table)} "
+                    f"MODIFY COLUMN {quote_mysql_ident(column)} {' '.join(col_def_parts)};"
                 )
         else:
             # 테이블 레벨 롤백
@@ -270,7 +271,7 @@ class RollbackSQLGenerator:
             lines.append(f"-- Rollback: {table} 테이블 charset 복원")
             lines.append(f"-- 원본: {orig_charset} / {orig_collation}")
             lines.append(
-                f"ALTER TABLE `{schema}`.`{table}` "
+                f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(table)} "
                 f"CONVERT TO CHARACTER SET {orig_charset} COLLATE {orig_collation};"
             )
 
@@ -336,7 +337,7 @@ class RollbackSQLGenerator:
 
             lines.append(f"-- {tbl}: {orig_charset} / {orig_collation}")
             lines.append(
-                f"ALTER TABLE `{schema}`.`{tbl}` "
+                f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(tbl)} "
                 f"CONVERT TO CHARACTER SET {orig_charset} COLLATE {orig_collation};"
             )
 
