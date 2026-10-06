@@ -18,6 +18,7 @@ from src.core.migration_fix_models import (
 )
 from src.core.migration_fk_graph import CollationFKGraphBuilder, build_fk_graph
 from src.core.migration_fk_safe_charset import FKSafeCharsetChanger
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 
 class SmartFixGenerator:
@@ -158,9 +159,9 @@ class SmartFixGenerator:
     def _invalid_date_where_clause(self, column: str) -> str:
         """0000-00-00 날짜 UPDATE의 WHERE 절 (3개 옵션 공유)"""
         return (
-            f"WHERE `{column}` = '0000-00-00'\n"
-            f"   OR `{column}` = '0000-00-00 00:00:00'\n"
-            f"   OR (MONTH(`{column}`) = 0 OR DAY(`{column}`) = 0);"
+            f"WHERE {quote_mysql_ident(column)} = '0000-00-00'\n"
+            f"   OR {quote_mysql_ident(column)} = '0000-00-00 00:00:00'\n"
+            f"   OR (MONTH({quote_mysql_ident(column)}) = 0 OR DAY({quote_mysql_ident(column)}) = 0);"
         )
 
     def _get_invalid_date_options(self, issue: Any) -> List[FixOption]:
@@ -184,8 +185,8 @@ class SmartFixGenerator:
                 label="NULL로 변경 (권장)",
                 description=f"0000-00-00 값을 NULL로 변경합니다.",
                 sql_template=(
-                    f"UPDATE `{self.schema}`.`{table}`\n"
-                    f"SET `{column}` = NULL\n"
+                    f"UPDATE {quote_mysql_ident(self.schema)}.{quote_mysql_ident(table)}\n"
+                    f"SET {quote_mysql_ident(column)} = NULL\n"
                     f"{where_clause}"
                 ),
                 is_recommended=True
@@ -197,8 +198,8 @@ class SmartFixGenerator:
             label="1970-01-01로 변경",
             description="0000-00-00 값을 Unix 시작일(1970-01-01)로 변경합니다.",
             sql_template=(
-                f"UPDATE `{self.schema}`.`{table}`\n"
-                f"SET `{column}` = '1970-01-01'\n"
+                f"UPDATE {quote_mysql_ident(self.schema)}.{quote_mysql_ident(table)}\n"
+                f"SET {quote_mysql_ident(column)} = '1970-01-01'\n"
                 f"{where_clause}"
             ),
             is_recommended=not is_nullable  # nullable 아니면 이게 권장
@@ -210,8 +211,8 @@ class SmartFixGenerator:
             label="사용자 지정 날짜",
             description="원하는 날짜로 직접 지정합니다.",
             sql_template=(
-                f"UPDATE `{self.schema}`.`{table}`\n"
-                f"SET `{column}` = '{{custom_date}}'\n"
+                f"UPDATE {quote_mysql_ident(self.schema)}.{quote_mysql_ident(table)}\n"
+                f"SET {quote_mysql_ident(column)} = '{{custom_date}}'\n"
                 f"{where_clause}"
             ),
             requires_input=True,
@@ -244,12 +245,12 @@ class SmartFixGenerator:
             if col_def:
                 # 컬럼 정의를 성공적으로 조회한 경우
                 # col_def에 이미 CHARACTER SET / COLLATE가 올바른 위치(NOT NULL 앞)에 포함됨
-                modify_clause = f"`{column}` {col_def}"
+                modify_clause = f"{quote_mysql_ident(column)} {col_def}"
                 options.append(FixOption(
                     strategy=FixStrategy.COLLATION_SINGLE,
                     label="이 컬럼만 변경",
                     description=f"{table}.{column} 컬럼의 charset을 utf8mb4로 변경합니다.",
-                    sql_template=f"ALTER TABLE `{schema}`.`{table}` MODIFY COLUMN `{column}` {col_def};",
+                    sql_template=f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(table)} MODIFY COLUMN {quote_mysql_ident(column)} {col_def};",
                     modify_clause=modify_clause,  # 병합 최적화: regex 파싱 불필요
                 ))
             else:
@@ -259,7 +260,7 @@ class SmartFixGenerator:
                     label="수동 처리 필요",
                     description=f"{table}.{column} 컬럼 정보를 조회할 수 없습니다. 수동으로 확인 후 변경하세요.",
                     sql_template=f"-- {table}.{column} 컬럼 타입 확인 후 수동 변경 필요\n"
-                                 f"-- SHOW CREATE TABLE `{schema}`.`{table}`;",
+                                 f"-- SHOW CREATE TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(table)};",
                 ))
         else:
             # 테이블 레벨 charset 변경
@@ -270,7 +271,7 @@ class SmartFixGenerator:
                 label="이 테이블만 변경",
                 description=f"{table} 테이블만 utf8mb4로 변경합니다.",
                 sql_template=(
-                    f"ALTER TABLE `{schema}`.`{table}` CONVERT TO CHARACTER SET "
+                    f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(table)} CONVERT TO CHARACTER SET "
                     f"{DEFAULT_TARGET_CHARSET} COLLATE {DEFAULT_TARGET_COLLATION};"
                 )
             ))
@@ -286,7 +287,7 @@ class SmartFixGenerator:
                 sql_lines = ["SET FOREIGN_KEY_CHECKS = 0;"]
                 for t in ordered_tables:
                     sql_lines.append(
-                        f"ALTER TABLE `{schema}`.`{t}` "
+                        f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(t)} "
                         f"CONVERT TO CHARACTER SET {DEFAULT_TARGET_CHARSET} "
                         f"COLLATE {DEFAULT_TARGET_COLLATION};"
                     )
@@ -356,14 +357,14 @@ class SmartFixGenerator:
                 strategy=FixStrategy.MANUAL,
                 label="FLOAT로 변경",
                 description="정밀도 구문을 제거하고 FLOAT 타입으로 변경합니다.",
-                sql_template=f"ALTER TABLE `{self.schema}`.`{table}` MODIFY COLUMN `{column}` FLOAT;",
+                sql_template=f"ALTER TABLE {quote_mysql_ident(self.schema)}.{quote_mysql_ident(table)} MODIFY COLUMN {quote_mysql_ident(column)} FLOAT;",
                 is_recommended=True
             ),
             FixOption(
                 strategy=FixStrategy.MANUAL,
                 label="DECIMAL로 변경",
                 description="정확한 소수점 연산이 필요하면 DECIMAL을 사용합니다.",
-                sql_template=f"ALTER TABLE `{self.schema}`.`{table}` MODIFY COLUMN `{column}` DECIMAL({{precision}});",
+                sql_template=f"ALTER TABLE {quote_mysql_ident(self.schema)}.{quote_mysql_ident(table)} MODIFY COLUMN {quote_mysql_ident(column)} DECIMAL({{precision}});",
                 requires_input=True,
                 input_label="DECIMAL 정밀도 (M,D)",
                 input_default="10,2"
@@ -413,7 +414,7 @@ class SmartFixGenerator:
                 strategy=FixStrategy.MANUAL,
                 label="InnoDB로 변경",
                 description="테이블 엔진을 InnoDB로 변경합니다.",
-                sql_template=f"ALTER TABLE `{self.schema}`.`{table}` ENGINE=InnoDB;",
+                sql_template=f"ALTER TABLE {quote_mysql_ident(self.schema)}.{quote_mysql_ident(table)} ENGINE=InnoDB;",
                 is_recommended=True
             )
         ]
