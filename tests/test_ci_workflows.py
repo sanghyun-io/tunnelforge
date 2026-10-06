@@ -68,6 +68,7 @@ def test_pr_head_regression_jobs_use_read_only_checkout_without_credentials():
         "rust-core-regression-gate": {"contents": "read"},
         "dump-roundtrip-regression": {"contents": "read"},
         "live-security-regression": {"contents": "read"},
+        "python-live-regression": {"contents": "read"},
         "python-regression": {"contents": "read"},
         "python-linux-regression": {"contents": "read"},
         "macos-app-validation": {"contents": "read"},
@@ -389,6 +390,7 @@ def test_required_version_gate_is_terminal_and_aggregates_all_results():
         "rust-core-regression-gate",
         "dump-roundtrip-regression",
         "live-security-regression",
+        "python-live-regression",
         "python-regression",
         "python-linux-regression",
         "macos-app-validation",
@@ -464,7 +466,7 @@ def test_linux_regression_builds_and_launches_main_app_after_full_suite():
     assert positions == sorted(positions)
 
 
-@pytest.mark.parametrize('result_key', ['LINUX_PYTHON_RESULT', 'DUMP_ROUNDTRIP_RESULT', 'LIVE_SECURITY_RESULT'])
+@pytest.mark.parametrize('result_key', ['LINUX_PYTHON_RESULT', 'DUMP_ROUNDTRIP_RESULT', 'LIVE_SECURITY_RESULT', 'PYTHON_LIVE_RESULT'])
 @pytest.mark.parametrize('job_result', ['success', 'failure', 'skipped', 'cancelled'])
 def test_terminal_gate_requires_live_and_linux_success(result_key, job_result):
     bash = shutil.which('bash')
@@ -526,6 +528,21 @@ def test_live_security_gate_runs_tls_query_control_and_read_only_tests_strictly(
     assert 'mysql_verified_tls_fails_closed_without_server_tls' in commands
     down = [step for step in job['steps'] if step.get('run') == 'bash scripts/tls_live_env.sh down']
     assert down and down[0]['if'] == 'always()'
+
+
+def test_python_live_gate_runs_live_files_strictly():
+    job = load_version_gate()['jobs']['python-live-regression']
+    assert job['runs-on'] == 'ubuntu-24.04'
+    env = job['env']
+    assert env['TF_LIVE_REQUIRED'] == '1' and env['TF_EXPLAIN_LIVE'] == '1'
+    assert env['TF_TLS_TEST_CERT_DIR'] == env['TF_TLS_CERT_DIR']
+    assert env['TF_TLS_TEST_KEY_DIR'] and env['TF_LIVE_CORE'] == env['TF_TLS_TEST_CORE']
+    commands = '\n'.join(step.get('run', '') for step in job['steps'])
+    for live_file in ['test_tls_paths_live.py', 'test_trust_live.py', 'test_explain_plan_live.py', 'test_dump_python_live_contract.py']:
+        assert f'tests/{live_file}' in commands, live_file
+    assert 'tls_live_env.sh up-ssh' in commands and 'ssh-keygen' in commands
+    cleanup = [step for step in job['steps'] if 'tls_live_env.sh down' in step.get('run', '')]
+    assert cleanup and cleanup[0]['if'] == 'always()'
 
 
 @pytest.mark.parametrize('workflow_path, job_name', [

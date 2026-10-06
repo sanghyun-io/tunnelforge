@@ -13,7 +13,8 @@ from src.core.db_connector import MySQLConnector
 from src.exporters.rust_dump_exporter import RustDumpExporter, RustDumpImporter, build_rust_dump_config
 
 
-@pytest.mark.skipif(not os.getenv("TF_LIVE_DOCKER_RUNNER"), reason="requires disposable Docker database")
+@pytest.mark.skipif(not (os.getenv("TF_LIVE_DOCKER_RUNNER") or os.getenv("TF_LIVE_CORE")),
+                    reason="requires disposable Docker database")
 @pytest.mark.parametrize("engine", ["postgresql", "mysql"])
 @pytest.mark.parametrize("restore_mode", ["replace", "safe", "safe_new", "safe_promote"])
 def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
@@ -39,7 +40,11 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
             payload["input_dir"] = "/workspace/" + Path(payload["input_dir"]).relative_to(root).as_posix()
             return super().import_dump(payload, on_event=on_event)
 
-    facade = DockerFacade(DbCoreServiceClient(executable="docker-core", popen_factory=start_core))
+    if os.getenv("TF_LIVE_CORE"):
+        # The core runs on this host (CI): no container path remapping.
+        facade = DbCoreFacade(DbCoreServiceClient(executable=os.environ["TF_LIVE_CORE"]))
+    else:
+        facade = DockerFacade(DbCoreServiceClient(executable="docker-core", popen_factory=start_core))
     if engine == "postgresql":
         connector = PostgresConnector(os.environ["TF_LIVE_PG_HOST"], 5432, "postgres",
                                       os.environ["TF_LIVE_PG_PASSWORD"], "tf_test", facade)

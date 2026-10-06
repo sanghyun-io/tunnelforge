@@ -139,7 +139,7 @@ cmd_up_ssh() { # [public-key-file]
   ensure_net
   docker run -d --name $SSH_NAME --network $NET_NAME -p 127.0.0.1:22222:2222 \
     -e USER_NAME=tfuser -e USER_PASSWORD=tfpass -e PASSWORD_ACCESS=false \
-    lscr.io/linuxserver/openssh-server:latest >/dev/null
+    lscr.io/linuxserver/openssh-server@sha256:46f115de7c251558297e7e87566fc3fc08544b63e55502b5cf294454db5d29d1 >/dev/null
   for _ in $(seq 60); do docker logs $SSH_NAME 2>&1 | grep -q "done." && break; sleep 1; done
   sleep 2
   # the image ships AllowTcpForwarding=no; the SSH tunnel tests need direct-tcpip channels
