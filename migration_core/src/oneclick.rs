@@ -864,11 +864,7 @@ fn oneclick_live_charset_facts(
     if endpoint.engine != "mysql" {
         return Err("oneclick.derive_charset_contracts currently supports MySQL only".to_string());
     }
-    let opts = mysql_opts(endpoint);
-    let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
-    let mut conn = pool
-        .get_conn()
-        .map_err(|err| format!("mysql connection error: {err}"))?;
+    let mut conn = mysql_conn(endpoint)?;
     let table_facts = conn
         .exec_map(
             "SELECT t.TABLE_NAME, ccsa.CHARACTER_SET_NAME, t.TABLE_COLLATION \

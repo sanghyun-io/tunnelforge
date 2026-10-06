@@ -433,12 +433,15 @@ pub(crate) fn plan(request: &Request) -> Vec<Value> {
 
 fn plan_table_summaries(request: &Request, schema: &NormalizedSchema) -> Vec<Value> {
     let mut rows_by_table = BTreeMap::<String, usize>::new();
+    // 테스트 전용: 메모리 어댑터 데이터로 행 수를 추정한다.
+    #[cfg(test)]
     if let Some(source_data) = request.payload.get("source_data") {
         let source = MemoryAdapter::from_value(Some(source_data));
         for table in &schema.tables {
             rows_by_table.insert(table.name.clone(), source.row_count(&table.name));
         }
-    } else if let Some(source_value) = request.payload.get("source") {
+    }
+    if let Some(source_value) = request.payload.get("source") {
         if let Ok(source_endpoint) = endpoint_from_value(source_value) {
             if let Ok(mut source) = LiveAdapter::connect(&source_endpoint) {
                 for table in &schema.tables {
@@ -583,15 +586,20 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
         return;
     }
 
-    if request.payload.get("source_data").is_none() {
-        emit(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": "live data streaming is not implemented in this helper build"
-        }));
-        return;
+    // 테스트 전용: 메모리 어댑터로 migrate 프로토콜(이벤트 순서, request_id)을 검증한다.
+    #[cfg(test)]
+    if request.payload.get("source_data").is_some() {
+        return migrate_memory_request(request, emit);
     }
+    emit(json!({
+        "event": "error",
+        "request_id": request.request_id,
+        "message": "migrate requires source and target endpoints"
+    }));
+}
 
+#[cfg(test)]
+fn migrate_memory_request<F: FnMut(Value)>(request: &Request, mut emit: F) {
     let schema =
         dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
     let options = parse_options(&request.payload);
@@ -705,42 +713,27 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
         return events;
     }
 
-    if request.payload.get("source_data").is_some() && request.payload.get("target_data").is_some()
-    {
-        let schema = parse_schema(&request.payload["schema"]).unwrap_or_default();
-        let mut source = MemoryAdapter::from_value(request.payload.get("source_data"));
-        let mut target = MemoryAdapter::from_value(request.payload.get("target_data"));
-        let mut emit = |event: Value| events.push(add_request_id(event, &request.request_id));
-        let mismatches =
-            verify_with_adapters_reporting(&schema, &mut source, &mut target, 1000, &mut emit);
-        events.push(json!({
-            "event": "result",
-            "request_id": request.request_id,
-            "command": "verify",
-            "success": mismatches.is_empty(),
-            "mismatches": mismatches
-        }));
-        return events;
+    // 테스트 전용: 메모리 어댑터로 verify 프로토콜을 검증한다.
+    #[cfg(test)]
+    if request.payload.get("source_data").is_some() && request.payload.get("target_data").is_some() {
+        return verify_memory_request(request, events);
     }
+    events.push(json!({
+        "event": "error",
+        "request_id": request.request_id,
+        "message": "verification requires source and target endpoints"
+    }));
+    events
+}
 
-    let source_rows = request
-        .payload
-        .pointer("/source_rows")
-        .and_then(Value::as_array);
-    let target_rows = request
-        .payload
-        .pointer("/target_rows")
-        .and_then(Value::as_array);
-    if source_rows.is_none() || target_rows.is_none() {
-        events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": "verification requires source_rows and target_rows payloads in this helper build"
-        }));
-        return events;
-    }
-    let mismatches = compare_digest_rows(source_rows.unwrap(), target_rows.unwrap());
-
+#[cfg(test)]
+fn verify_memory_request(request: &Request, mut events: Vec<Value>) -> Vec<Value> {
+    let schema = parse_schema(&request.payload["schema"]).unwrap_or_default();
+    let mut source = MemoryAdapter::from_value(request.payload.get("source_data"));
+    let mut target = MemoryAdapter::from_value(request.payload.get("target_data"));
+    let mut emit = |event: Value| events.push(add_request_id(event, &request.request_id));
+    let mismatches =
+        verify_with_adapters_reporting(&schema, &mut source, &mut target, 1000, &mut emit);
     events.push(json!({
         "event": "result",
         "request_id": request.request_id,
@@ -985,8 +978,9 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
         });
     }
 
-    let options = parse_options(payload);
-    if options.mode == "create_only" {
+    // 테스트 전용: 메모리 target_data 로 create_only 빈 대상 검사를 흉내 낸다.
+    #[cfg(test)]
+    if parse_options(payload).mode == "create_only" {
         let target = MemoryAdapter::from_value(payload.get("target_data"));
         if let Ok(schema) = parse_schema(&payload["schema"]) {
             for table in &schema.tables {

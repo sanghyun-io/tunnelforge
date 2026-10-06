@@ -59,7 +59,25 @@ _FRAME_MODULE_PATTERN = re.compile(
     r"^src(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
 )
 _FRAME_FUNCTION_PATTERN = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*|<module>)$")
-_EMPTY_UUID_V4 = uuid.UUID("00000000-0000-4000-8000-000000000000")
+_EMPTY_UUID_V4 = "00000000-0000-4000-8000-000000000000"
+
+
+def canonical_uuid_v4(value):
+    """Return value if it is a lowercase canonical, non-empty RFC 4122 UUIDv4 string, else None."""
+    if type(value) is not str:
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError):
+        return None
+    if (
+        parsed.version == 4
+        and parsed.variant == uuid.RFC_4122
+        and str(parsed) == value
+        and value != _EMPTY_UUID_V4
+    ):
+        return value
+    return None
 
 
 class ReportValidationError(ValueError):
@@ -146,15 +164,7 @@ def _validate_report(value):
         f"{path}.anonymous_installation_id",
         maximum=36,
     )
-    try:
-        parsed_id = uuid.UUID(installation_id)
-    except (ValueError, AttributeError):
-        _fail(f"{path}.anonymous_installation_id", "format", "invalid UUIDv4")
-    if (
-        parsed_id.version != 4
-        or str(parsed_id) != installation_id
-        or parsed_id == _EMPTY_UUID_V4
-    ):
+    if canonical_uuid_v4(installation_id) is None:
         _fail(f"{path}.anonymous_installation_id", "format", "invalid UUIDv4")
 
     fingerprint = _require_string(

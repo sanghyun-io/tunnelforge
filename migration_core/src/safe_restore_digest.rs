@@ -266,32 +266,6 @@ fn json_cell(value: &Value, type_name: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn unescape_tsv(field: &str) -> Option<String> {
-    if field == "\\N" {
-        return None;
-    }
-    let mut output = String::new();
-    let mut chars = field.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            output.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('t') => output.push('\t'),
-            Some('n') => output.push('\n'),
-            Some('r') => output.push('\r'),
-            Some('\\') => output.push('\\'),
-            Some(other) => {
-                output.push('\\');
-                output.push(other);
-            }
-            None => output.push('\\'),
-        }
-    }
-    Some(output)
-}
-
 struct CheckedReader<'a> {
     file: std::fs::File,
     checksum: &'a mut Sha256,

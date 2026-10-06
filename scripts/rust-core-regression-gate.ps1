@@ -25,7 +25,6 @@ $allowedEngineLocked = @(
     "src/core/migration_fk_graph.py",
     "src/core/migration_fk_safe_charset.py",
     "src/core/migration_fix_models.py",
-    "src/exporters/rust_dump_exporter.py",
     "src/ui/dialogs/db_dialogs.py",
     "src/ui/dialogs/db_connection_dialog.py",
     "src/ui/dialogs/db_export_dialog.py",
