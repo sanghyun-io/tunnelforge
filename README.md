@@ -27,7 +27,8 @@
 |:-:|---------|-------------|
 | 🔐 | **SSH Tunnel** | One-click secure connection via bastion hosts. RSA, Ed25519, ECDSA keys supported. |
 | 🔗 | **Direct Connect** | Skip the tunnel — connect directly to local or accessible MySQL/PostgreSQL databases. |
-| 📁 | **Tunnel Groups** | Organize tunnels into color-coded groups with drag-and-drop reordering and bulk connect/disconnect. |
+| 📁 | **Tunnel Groups** | Organize tunnels into color-coded groups with drag-and-drop reordering and bulk connect/disconnect. Move a connection into a group by drag and drop, by the right-click **Move to Group** menu (existing group, remove from group, new group), or with the **Group** field in the add/edit dialog. The connection dialog scrolls on small screens and keeps its buttons visible. |
+| 🔒 | **Verified TLS & SSH Trust** | DB TLS with `verify_full` (default for new profiles), `verify_ca`, or `disable`, plus an optional CA file; SSH host keys are trusted on first use after you confirm the fingerprint; encrypted SSH keys supported. See [connection trust policy](docs/connection_trust_policy.md). |
 | 📡 | **Tunnel Monitoring** | Real-time health checks with auto-reconnect, plus a detail view of connection duration and recent events. |
 | 🖥️ | **System Tray** | Runs quietly in the background, always one click away. |
 
@@ -40,7 +41,12 @@
 | 🔁 | **Transaction Mode** | Manual commit/rollback with a running list of pending, uncommitted changes. |
 | ✏️ | **Inline Cell Editing** | Edit query results directly in the grid — updates are scoped safely by primary key. |
 | 🕘 | **Query History** | Revisit and re-run past queries. |
-| 🛡️ | **Production Guard** | Confirmation prompts before risky operations against production databases. |
+| 🛡️ | **Production Guard** | Production profiles open SQL sessions read-only by default; unlock a window by typing the schema name, and review a change summary before commit. Export/Import/migration keep their confirmation prompts. See [production read-only sessions](docs/production_read_only.md). |
+| ⏹️ | **Query Cancel & Timeout** | Server-side cancel and timeout for running queries, with row and byte limits on results. |
+| 🌊 | **Streaming Result Grid** | Results stream into the grid while the query is still running. |
+| 💾 | **Save Results** | Save results to CSV or JSON Lines — the shown rows or the full result. See [saving results](docs/query_results_export.md). |
+| 🧭 | **Execution Plan View** | Open the plan from the toolbar or with Ctrl+E; EXPLAIN ANALYZE runs in a read-only transaction that is rolled back. See [execution plan view](docs/explain_plan.md). |
+| ♻️ | **Workspace Recovery** | SQL editor tabs and text are restored after a restart or crash. |
 
 ### Schema Management
 
@@ -57,17 +63,19 @@
 | 🚀 | **One-Click Migration** | Guided, dry-run-first MySQL 8.0 → 8.4 upgrade in a single flow, powered by Rust DB Core. |
 | 🛡️ | **Upgrade Compatibility Analysis** | Detailed checks surface MySQL 8.4 upgrade risks — deprecated functions, reserved words, charset issues, orphaned records, and more. |
 | 🧙 | **Guided Fix Wizard** | Step-by-step wizard that previews fixes and generates manual SQL for review; it does not apply changes automatically. |
-| 🔄 | **Cross-Engine Migration** | Guided MySQL ↔ PostgreSQL migration powered by Rust DB Core. |
+| 🔄 | **Cross-Engine Migration** | Guided MySQL ↔ PostgreSQL migration powered by Rust DB Core. Type-preserving mapping (numeric range/precision, UNSIGNED widening, FLOAT/DOUBLE, UUID, BIT, arrays as text, TIMESTAMPTZ in UTC), chunked copy, resume, and full row verification that does not depend on either engine's collation order. Values the other engine cannot store (MySQL zero dates and TIME beyond 24:00; PostgreSQL infinity, BC dates, years after 9999, timetz) and MySQL spatial/PostGIS columns are refused at the pre-check instead of failing mid-copy. |
 | 📊 | **Migration Report** | Export detailed HTML/JSON reports of compatibility findings. |
 
 ### Data Tools
 
 | | Feature | Description |
 |:-:|---------|-------------|
-| ⚡ | **Export/Import** | Validated table transfers with engine-specific snapshot policies, parallel MySQL paths, and explicit restore constraints. |
+| ⚡ | **Export/Import** | Validated table transfers with engine-specific snapshot policies, parallel MySQL paths, and explicit restore constraints. Import modes: **Safe restore** (default: restores into a new namespace and verifies before anything changes), **Overwrite** (safe restore, then an automatic swap under the original name; the old data is kept as a backup), and **Replace** (advanced; table by table like mysqldump; destructive). See the [Export/Import contract](docs/export_import_policy.md). |
 | 🧩 | **Orphan Record Analysis** | Detect rows left behind by broken foreign-key relationships and export the findings as a report. |
+| 📋 | **Job List** | Export, Import, promotion and migration runs with persistent run history, filters, reports and failure reasons. See [job list](docs/job_list.md). |
+| 🗄️ | **Backup Lifecycle** | List and reconcile backups, clean them up only after verification, and roll back with a guided flow. |
 
-Scheduled backups are available (backup tasks only: DST-aware times, at most one catch-up after sleep, unattended runs that never auto-accept SSH host keys, ownership-checked retention). Scheduled SQL execution is not supported. See [SCHEDULE.md](SCHEDULE.md).
+Scheduled backups are available (backup tasks only: DST-aware times, at most one catch-up after sleep, unattended runs that never auto-accept SSH host keys, ownership-checked retention, optional restore rehearsal into a non-production profile, and PostgreSQL database selection). Scheduled SQL execution is not supported. See [SCHEDULE.md](SCHEDULE.md).
 
 ### General
 
@@ -113,13 +121,14 @@ Click **"Add Tunnel"** and configure your connection:
 | SSH Key | Private key file path | `C:\Users\me\.ssh\id_rsa` |
 | DB Host | Target database (from bastion's perspective) | `db.internal:3306` |
 | DB Credentials | Username & password | `admin` / `••••` |
+| DB TLS | `verify_full` (default), `verify_ca`, or `disable`; optional CA file | `verify_full` |
 
 ### 3. Connect & Go
 
 Select a tunnel → Click **"Connect"** → Use the database tools:
 - **SQL Editor** — Run queries, review results, commit or roll back changes
 - **Export** — Backup schemas or selected tables
-- **Import** — Restore from backup files
+- **Import** — Restore from backup files with **Safe restore** (default), **Overwrite**, or **Replace** (advanced, destructive); see the [Export/Import contract](docs/export_import_policy.md)
 - Right-click a tunnel for **Schema Diff**, **Migration Analysis**, and **Orphan Record Analysis**
 
 ---
@@ -155,7 +164,8 @@ Create separate tunnel configs for each environment (Dev, Staging, Production) w
 - Review the [Export/Import contract](docs/export_import_policy.md) before restoring a backup
 - Use **table selection** to export only what you need
 - MySQL shared-snapshot export supports parallel workers; privilege fallback and PostgreSQL use one consistent session
-- New v3 dumps require **TunnelForge 2.6.0+**; existing v1/v2 dumps remain readable
+- Dumps use manifest v3 (**TunnelForge 2.6.0+**); dumps with MySQL BIT columns are v4 (**2.12.2+**); dumps with MySQL spatial columns (GEOMETRY, POINT, ...) are v5 (**2.12.4+**); existing v1/v2 dumps remain readable
+- **Re-export** these older backups: backups taken before 2.12.1 of tables keyed by BINARY/VARBINARY/BYTEA, MySQL ENUM keys, or composite keys containing a backslash; backups with MySQL BIT columns taken before 2.12.2; backups with MySQL spatial columns taken before 2.12.4 (older spatial dumps are refused on import with a re-export message)
 
 </details>
 
@@ -163,7 +173,7 @@ Create separate tunnel configs for each environment (Dev, Staging, Production) w
 <summary><b>SQL Editor Safety</b></summary>
 
 - Leave **Transaction Mode** on to review pending changes before committing
-- **Production Guard** will prompt for confirmation on risky statements against production tunnels
+- Production tunnels open the SQL editor read-only; type the schema name to unlock a window, and **Production Guard** shows a change summary before commit
 - Inline cell edits are scoped by primary key, so only the row you touched is updated
 
 </details>

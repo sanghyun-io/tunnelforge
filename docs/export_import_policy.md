@@ -1,6 +1,6 @@
 # Export/Import policy and compatibility
 
-This contract applies to the proposed 2.6.0 release. Database operations belong
+This contract applies to current releases. Database operations belong
 to the bundled Rust Core. Use the matching application/Core build.
 
 ## File compatibility
@@ -9,6 +9,8 @@ to the bundled Rust Core. Use the matching application/Core build.
 | --- | --- |
 | Existing manifest v1/v2 | Supported, with legacy metadata limitations below |
 | New manifest v3 | Requires TunnelForge 2.6.0 or later; both JSONL and TSV use v3 |
+| Manifest v4 | Written when a MySQL BIT column is present; requires TunnelForge 2.12.2 or later |
+| Manifest v5 | Written when a MySQL spatial column is present; requires TunnelForge 2.12.4 or later |
 | Future/unknown version | Rejected before target modification |
 
 V3 protects namespace, timezone and column attribute semantics. Older importers
