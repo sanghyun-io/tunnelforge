@@ -228,6 +228,38 @@ def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
     assert "Run `cargo build --manifest-path migration_core/Cargo.toml --release` first." in spec
 
 
+def test_windows_pe_files_embed_versioninfo_from_single_version_source():
+    """SignPath requires ProductName/ProductVersion on every signed PE file."""
+    from scripts.pyinstaller_version_info import build_version_info, version_tuple
+    from src.version import __version__
+
+    assert version_tuple("2.15.0") == (2, 15, 0, 0)
+    info = build_version_info("TunnelForge", "TunnelForge.exe")
+    rendered = str(info)
+    assert f"prodvers={version_tuple(__version__)}" in rendered
+    assert "'ProductName', 'TunnelForge'" in rendered
+    assert f"'ProductVersion', '{__version__}'" in rendered
+
+    for spec_path in ("tunnel-manager.spec", "bootstrapper/bootstrapper.spec"):
+        spec = (PROJECT_ROOT / spec_path).read_text(encoding="utf-8")
+        assert "from scripts.pyinstaller_version_info import build_version_info" in spec
+        assert "if os.name == 'nt' else None" in spec
+        assert "version_file=None" not in spec
+
+    iss = (PROJECT_ROOT / "installer" / "TunnelForge.iss").read_text(encoding="utf-8")
+    assert "VersionInfoVersion={#MyAppVersion}" in iss
+    assert "VersionInfoProductVersion={#MyAppVersion}" in iss
+    assert "VersionInfoProductName={#MyAppName}" in iss
+    assert len(re.findall(r"\d+\.\d+\.\d+", iss)) == 1  # only the bumped #define
+
+    build_rs = (PROJECT_ROOT / "migration_core" / "build.rs").read_text(encoding="utf-8")
+    assert '"../src/version.py"' in build_rs
+    assert 'Ok("windows")' in build_rs
+    assert '.set("ProductName", "TunnelForge")' in build_rs
+    cargo = tomllib.loads((PROJECT_ROOT / "migration_core" / "Cargo.toml").read_text(encoding="utf-8"))
+    assert "winresource" in cargo["build-dependencies"]
+
+
 def test_windows_installer_builds_and_checks_core_service_binaries():
     script_path = PROJECT_ROOT / "scripts" / "build-installer.ps1"
     assert script_path.read_bytes().startswith(b"\xef\xbb\xbf")

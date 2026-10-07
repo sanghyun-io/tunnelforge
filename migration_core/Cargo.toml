@@ -22,6 +22,10 @@ serde_json = "1"
 sha2 = "0.10"
 zstd = "0.13"
 
+# build.rs: Windows VERSIONINFO (no-op on other targets).
+[build-dependencies]
+winresource = "0.1"
+
 # Vendored mysql 26.0.1 + SslOpts::with_tls_server_name (see vendor/mysql/PATCH.md).
 [patch.crates-io]
 mysql = { path = "vendor/mysql" }

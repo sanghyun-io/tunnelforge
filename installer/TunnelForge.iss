@@ -23,6 +23,14 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 
+; Setup.exe VERSIONINFO (SignPath 서명 요건: ProductName/ProductVersion)
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppName} Setup
+VersionInfoCopyright=MIT License
+
 ; 설치 경로 설정
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
