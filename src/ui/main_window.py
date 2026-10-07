@@ -27,10 +27,11 @@ from src.ui.dialogs.oneclick_migration_dialog import (
     has_active_detached_oneclick_workers,
 )
 from src.ui.dialogs.explain_plan_dialog import has_active_explain_workers
+from src.ui.workers.cancellable_worker import worker_is_running
 from src.core.logger import get_logger
 from src.core.platform_integration import restore_window_to_front
 from src.core.resources import app_icon_path
-from src.core.i18n import tr
+from src.core.i18n import tr, translate_text
 from src.core.error_report_consent import ConsentPolicy
 from src.ui.dialogs.error_reporting_consent_dialog import ErrorReportingConsentDialog
 
@@ -51,6 +52,49 @@ from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
 from src.core.tunnel_monitor import TunnelMonitor, TunnelState
 from src.core.mysql_login_path import MysqlLoginPathManager
+
+
+_WORKER_ATTRIBUTES = ("worker", "cleanup_worker", "_worker")
+
+
+def running_background_work(scheduler=None) -> list:
+    """앱을 종료하면 중단될 DB 작업 목록 (사용자에게 보여 줄 이름)."""
+    running = []
+    for widget in QApplication.topLevelWidgets():
+        try:
+            if widget.isVisible() and any(
+                worker_is_running(getattr(widget, name, None)) for name in _WORKER_ATTRIBUTES
+            ):
+                running.append(widget.windowTitle() or translate_text("작업 창"))
+        except RuntimeError:  # 이미 삭제된 Qt 객체
+            continue
+    if has_active_detached_migration_workers():
+        running.append(translate_text("마이그레이션 분석"))
+    if has_active_detached_oneclick_workers():
+        running.append(translate_text("One-Click 마이그레이션"))
+    if has_active_explain_workers():
+        running.append(translate_text("실행 계획(EXPLAIN)"))
+    if scheduler is not None and scheduler.has_active_jobs():
+        running.append(translate_text("예약 백업"))
+    return running
+
+
+def confirm_quit_with_running_work(parent, running: list) -> bool:
+    """실행 중인 작업이 있을 때 종료 여부를 묻는다. 기본값은 '아니오'."""
+    reply = QMessageBox.warning(
+        parent,
+        translate_text("작업 진행 중"),
+        translate_text("다음 작업이 아직 진행 중입니다:")
+        + "\n\n"
+        + "\n".join(f"• {name}" for name in running)
+        + "\n\n"
+        + translate_text("지금 종료하면 작업이 중단되어 대상 DB나 덤프 파일이 불완전하게 남을 수 있습니다.")
+        + "\n"
+        + translate_text("그래도 종료하시겠습니까?"),
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    return reply == QMessageBox.StandardButton.Yes
 
 
 class TunnelManagerUI(QMainWindow):
@@ -1042,6 +1086,9 @@ class TunnelManagerUI(QMainWindow):
             QMessageBox.information(
                 self, "연결 정리 중", "연결 요청을 정리하고 있습니다. 잠시 후 다시 종료해주세요."
             )
+            return False
+        running = running_background_work(getattr(self, "scheduler", None))
+        if running and not confirm_quit_with_running_work(self, running):
             return False
         self.prepare_for_shutdown()
         # 현재 활성화된 터널 ID 목록 저장 (다음 시작 시 자동 연결용)
