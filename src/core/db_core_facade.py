@@ -111,6 +111,23 @@ class DbCoreFacade:
         result = self.client.request("schema.inspect", {"source": endpoint.to_payload()})
         return result.get("schema") if isinstance(result.get("schema"), dict) else {"tables": []}
 
+    def compare_schemas(
+        self,
+        source: DbEndpoint,
+        target: DbEndpoint,
+        level: str = "standard",
+        exact_row_counts: bool = False,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """두 MySQL 스키마의 테이블별 차이, 심각도 요약, 동기화 SQL (Rust schema.compare)."""
+        payload = {
+            "source": source.to_payload(),
+            "target": target.to_payload(),
+            "level": level,
+            "exact_row_counts": exact_row_counts,
+        }
+        return self.client.request("schema.compare", payload, on_event=on_event)
+
     def list_tables(self, endpoint: DbEndpoint) -> List[str]:
         result = self.client.request("schema.list", {"connection": endpoint.to_payload()})
         tables = result.get("tables")
