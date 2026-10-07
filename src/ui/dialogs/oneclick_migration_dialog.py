@@ -18,7 +18,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont
 
 from src.ui.workers.cancellable_worker import has_running_worker, worker_is_running
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.migration_preflight import PreflightResult, CheckResult, CheckSeverity
 from src.core.migration_state_tracker import MigrationPhase
 from src.core.migration_report_renderer import MigrationReport, MigrationReportRenderer
@@ -54,7 +54,7 @@ class OneClickMigrationWorker(QThread):
 
     def __init__(
         self,
-        connector: MySQLConnector,
+        connector: RustDbConnector,
         schema: str,
         dry_run: bool = False,
         backup_confirmed: bool = False
@@ -669,7 +669,7 @@ def has_active_detached_oneclick_workers() -> bool:
 class OneClickMigrationDialog(QDialog):
     """One-Click 마이그레이션 다이얼로그"""
 
-    def __init__(self, parent, connector: MySQLConnector, schema: str):
+    def __init__(self, parent, connector: RustDbConnector, schema: str):
         super().__init__(parent)
         self.connector = connector
         self.schema = schema

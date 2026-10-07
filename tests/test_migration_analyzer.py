@@ -139,9 +139,10 @@ class TestExecuteCleanup:
 
     def test_dry_run_counts_rows_with_the_core_count_sql(self):
         connector = MagicMock()
-        connector.execute.return_value = [{"cnt": 7}]
+        cursor = connector.connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {"cnt": 7}
         ok, message, affected = MigrationAnalyzer(connector).execute_cleanup(self._action())
-        connector.execute.assert_called_once_with("SELECT COUNT(*) AS cnt FROM t")
+        cursor.execute.assert_called_once_with("SELECT COUNT(*) AS cnt FROM t")
         assert (ok, affected) == (True, 7) and "7개 행" in message
 
     def test_dry_run_without_count_sql_fails_explicitly(self):
@@ -151,7 +152,7 @@ class TestExecuteCleanup:
     def test_manual_action_needs_no_query(self):
         connector = MagicMock()
         assert MigrationAnalyzer(connector).execute_cleanup(self._action(action_type=ActionType.MANUAL))[0] is True
-        connector.execute.assert_not_called()
+        connector.connection.cursor.assert_not_called()
 
     def test_actual_cleanup_rejects_legacy_python_mutation_mode(self):
         with pytest.raises(RuntimeError, match="Rust Core"):
@@ -364,3 +365,18 @@ class TestDumpFileAnalyzerSqlPatterns:
             "orders.triggers.sql",
         )
         assert not any(i.issue_type == IssueType.REMOVED_SYS_VAR for i in issues)
+
+
+def test_orphan_select_sql_uses_core_select_and_flags_old_results():
+    from src.core.migration_analyzer import MISSING_CLEANUP_SQL, OrphanRecord, orphan_select_sql
+
+    composite = OrphanRecord(
+        child_table="child", child_column="a, b", parent_table="parent", parent_column="x, y",
+        orphan_count=2, cleanup_sql={"select": "SELECT c.* FROM `app`.`child` AS c\nWHERE c.`a` IS NOT NULL"},
+    )
+    sql = orphan_select_sql(composite, "app")
+    assert sql.startswith("-- child.a, b → parent.x, y\n-- 고아 레코드 수: 2개\n")
+    assert sql.endswith("WHERE c.`a` IS NOT NULL;")
+
+    saved_before_rust = OrphanRecord(child_table="c", child_column="p", parent_table="p", parent_column="id", orphan_count=1)
+    assert orphan_select_sql(saved_before_rust).endswith(MISSING_CLEANUP_SQL)

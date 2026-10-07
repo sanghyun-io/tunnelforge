@@ -4,7 +4,7 @@ import json
 import pytest
 
 from src.exporters.rust_dump_exporter import build_rust_dump_config, RustDumpExporter, RustDumpImporter
-from src.core.postgres_connector import PostgresConnector
+from src.core.db_core_service import create_rust_db_connector
 
 
 def test_postgres_dump_keeps_database_separate_from_namespace(tmp_path):
@@ -35,12 +35,15 @@ def test_postgres_import_uses_target_connection_database_and_manifest_namespace(
 
 def test_postgres_connector_exposes_dump_metadata_methods():
     facade = MagicMock()
-    connector = PostgresConnector("localhost", 5432, "u", "p", "app", facade)
-    connection = MagicMock()
-    connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [{"schema_name": "reporting"}]
-    connector.connection = connection
+    facade.catalog.return_value = ["reporting"]
+    connector = create_rust_db_connector("postgresql", "localhost", 5432, "u", "p", "app", facade=facade)
+    # 세션 ID 는 연결 객체에서 읽는다 (PR #333 CI 회귀: connection 만 넘겨받은 커넥터).
+    connector.connection = SimpleNamespace(connection_id="pg-1")
     assert connector.get_schemas() == ["reporting"]
+    assert facade.catalog.call_args.args[:2] == ("pg-1", "schemas")
     assert callable(connector.get_tables)
+    # 덤프 설정이 읽는 연결 정보
+    assert (connector.engine, connector.host, connector.port, connector.database) == ("postgresql", "localhost", 5432, "app")
 
 
 def test_import_server_timezone_explicitly_disables_manifest_override(tmp_path):

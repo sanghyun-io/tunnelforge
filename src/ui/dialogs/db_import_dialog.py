@@ -17,7 +17,7 @@ import os
 
 from src.core.connection_trust import apply_registered_tls
 from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.error_report_sanitizer import (
     sanitize_local_diagnostic,
     sanitize_local_diagnostic_data,
@@ -408,7 +408,7 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
 class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog):
     """Rust DB Core Import 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None,
+    def __init__(self, parent=None, connector: RustDbConnector = None, config_manager=None,
                  tunnel_config: dict = None):
         super().__init__(parent)
         self.setWindowTitle("데이터 Import")
@@ -1107,11 +1107,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             return False
 
         try:
-            # mysql.time_zone_name 테이블에서 Asia/Seoul 조회
-            # 단순히 테이블 존재 여부만 보지 않고 실제 데이터가 있는지 확인
-            query = "SELECT 1 FROM mysql.time_zone_name WHERE Name = 'Asia/Seoul' LIMIT 1"
-            rows = self.connector.execute(query)
-            return len(rows) > 0
+            # 테이블 존재 여부만 보지 않고 실제 데이터(Asia/Seoul)가 있는지 확인
+            return self.connector.has_named_timezone("Asia/Seoul")
         except Exception:
             logger.debug("Timezone support check failed", exc_info=True)
             return False

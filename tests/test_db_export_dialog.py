@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from src.exporters.rust_dump_exporter import OrphanRecordInfo, RustDumpConfig
+from src.exporters.rust_dump_exporter import RustDumpConfig
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 from src.ui.dialogs.db_export_dialog import (

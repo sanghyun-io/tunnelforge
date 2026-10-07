@@ -3,7 +3,6 @@ import uuid
 from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from src.core.constants import SYSTEM_SCHEMAS
 from src.core.db_core_client import (
     DbCoreServiceError,
     default_database_for_engine,
@@ -46,6 +45,14 @@ class RustDbConnector:
         self.connection_id: Optional[str] = None
         self.connection: Optional["RustDbConnection"] = None
 
+    # 연결 정보 (덤프 설정, 화면 표시용)
+    host = property(lambda self: self.endpoint.host)
+    port = property(lambda self: self.endpoint.port)
+    user = property(lambda self: self.endpoint.user)
+    password = property(lambda self: self.endpoint.password)
+    database = property(lambda self: self.endpoint.database)
+    engine = property(lambda self: self.endpoint.engine)
+
     def _log_metadata_error(self, operation: str, exc: Exception) -> None:
         logger.exception("%s 메타데이터 조회 실패: %s", operation, exc)
 
@@ -63,57 +70,29 @@ class RustDbConnector:
         self.connection_id = None
         self.connection = None
 
+    def _catalog(self, operation: str, kind: str, default: Any, **args: str) -> Any:
+        """메타데이터 조회는 Rust catalog.query 가 한다. 서비스 오류는 올리고, 그 밖의 실패는 default."""
+        if not self.connection:
+            success, _ = self.connect()
+            if not success:
+                return default
+        try:
+            # 세션 ID 는 연결 객체에서 읽는다 (connection 만 넘겨받은 커넥터도 있다).
+            return self.facade.catalog(self.connection.connection_id, kind, **args)
+        except DbCoreServiceError as exc:
+            self._log_metadata_error(operation, exc)
+            raise
+        except Exception as exc:
+            self._log_metadata_error(operation, exc)
+            return default
+
     def schema_exists(self, schema_name: Optional[str]) -> bool:
         if not schema_name:
             return True
-        if not self.connection:
-            success, _ = self.connect()
-            if not success:
-                return False
-        try:
-            with self.connection.cursor() as cursor:
-                if self.endpoint.engine == "postgresql":
-                    cursor.execute(
-                        "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
-                        (schema_name,),
-                    )
-                else:
-                    cursor.execute("SHOW DATABASES LIKE %s", (schema_name,))
-                return cursor.fetchone() is not None
-        except DbCoreServiceError as exc:
-            self._log_metadata_error("schema_exists", exc)
-            raise
-        except Exception as exc:
-            self._log_metadata_error("schema_exists", exc)
-            return False
+        return bool(self._catalog("schema_exists", "schema_exists", [], name=schema_name))
 
     def get_schemas(self, use_cache: bool = True) -> List[str]:
-        if not self.connection:
-            success, _ = self.connect()
-            if not success:
-                return []
-        try:
-            with self.connection.cursor() as cursor:
-                if self.endpoint.engine == "postgresql":
-                    cursor.execute(
-                        "SELECT schema_name FROM information_schema.schemata "
-                        "WHERE schema_name <> 'information_schema' "
-                        "AND schema_name NOT LIKE 'pg_%' "
-                        "ORDER BY schema_name"
-                    )
-                    return [str(row.get("schema_name")) for row in cursor.fetchall()]
-                cursor.execute("SHOW DATABASES")
-                return [
-                    str(row.get("Database"))
-                    for row in cursor.fetchall()
-                    if str(row.get("Database")) not in SYSTEM_SCHEMAS
-                ]
-        except DbCoreServiceError as exc:
-            self._log_metadata_error("get_schemas", exc)
-            raise
-        except Exception as exc:
-            self._log_metadata_error("get_schemas", exc)
-            return []
+        return self._catalog("get_schemas", "schemas", [])
 
     def get_tables(self, schema: Optional[str] = None, use_cache: bool = True) -> List[str]:
         endpoint = self.endpoint
@@ -134,51 +113,20 @@ class RustDbConnector:
         return parse_db_version_tuple(self.get_db_version_string())
 
     def get_db_version_string(self) -> str:
-        if not self.connection:
-            success, _ = self.connect()
-            if not success:
-                return ""
-        try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SELECT VERSION() AS version" if self.endpoint.engine == "mysql" else "SELECT version() AS version")
-                row = cursor.fetchone() or {}
-                return str(row.get("version", ""))
-        except DbCoreServiceError as exc:
-            self._log_metadata_error("get_db_version_string", exc)
-            raise
-        except Exception as exc:
-            self._log_metadata_error("get_db_version_string", exc)
-            return ""
+        values = self._catalog("get_db_version_string", "version", [])
+        return values[0] if values else ""
 
     def get_column_names(self, table: str, schema: Optional[str] = None) -> List[str]:
-        if not self.connection:
-            success, _ = self.connect()
-            if not success:
-                return []
-        try:
-            with self.connection.cursor() as cursor:
-                if self.endpoint.engine == "postgresql":
-                    cursor.execute(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_schema = %s AND table_name = %s "
-                        "ORDER BY ordinal_position",
-                        (schema or self.endpoint.schema or "public", table),
-                    )
-                else:
-                    cursor.execute(
-                        "SELECT COLUMN_NAME AS column_name FROM information_schema.columns "
-                        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
-                        "ORDER BY ORDINAL_POSITION",
-                        (schema or self.endpoint.database, table),
-                    )
-                return [str(row.get("column_name")) for row in cursor.fetchall()]
-        except DbCoreServiceError as exc:
-            self._log_metadata_error("get_column_names", exc)
-            raise
-        except Exception as exc:
-            self._log_metadata_error("get_column_names", exc)
-            return []
+        default_schema = (self.endpoint.schema or "public") if self.endpoint.engine == "postgresql" else self.endpoint.database
+        return self._catalog("get_column_names", "columns", [], schema=schema or default_schema, table=table)
 
+    def list_databases(self) -> List[str]:
+        """PostgreSQL 접속 가능한 데이터베이스 목록"""
+        return self._catalog("list_databases", "databases", [])
+
+    def has_named_timezone(self, name: str) -> bool:
+        """MySQL 이 'Asia/Seoul' 같은 지역명 타임존을 아는지 (mysql.time_zone_name 에 데이터가 있는지)"""
+        return bool(self._catalog("has_named_timezone", "named_timezone", [], name=name))
 
 def create_rust_db_connector(
     engine: Optional[str],

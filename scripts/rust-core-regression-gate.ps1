@@ -11,22 +11,8 @@ $paths = @(
 )
 
 $legacyPattern = "pymysql|psycopg|mysqlsh|MySQLShell|MySQL Shell|mysql_shell|mysqlsh_exporter|mysql_worker|check_mysqlsh|migration-core|migration_core_executable"
-$engineLockedPattern = "from src\.core\.db_connector import MySQLConnector"
-$allowedEngineLocked = @(
-    "src/core/db_connector.py",
-    "src/core/migration_preflight.py",
-    "src/core/foreign_key_resolver.py",
-    "src/ui/dialogs/db_dialogs.py",
-    "src/ui/dialogs/db_connection_dialog.py",
-    "src/ui/dialogs/db_export_dialog.py",
-    "src/ui/dialogs/db_import_dialog.py",
-    "src/ui/dialogs/db_orphan_dialog.py",
-    "src/ui/dialogs/fix_wizard_dialog.py",
-    "src/ui/dialogs/migration_dialogs.py",
-    "src/ui/dialogs/oneclick_migration_dialog.py",
-    "src/ui/workers/fix_wizard_worker.py",
-    "src/ui/workers/migration_worker.py"
-)
+# Python DB 래퍼(MySQLConnector/PostgresConnector)는 제거됐다. 커넥터는 RustDbConnector 하나다.
+$retiredConnectorPattern = "src\.core\.db_connector|src\.core\.postgres_connector|MySQLConnector|PostgresConnector"
 
 Push-Location $root
 try {
@@ -38,18 +24,9 @@ try {
         exit $LASTEXITCODE
     }
 
-    $engineHits = & rg -n $engineLockedPattern src/core src/ui
+    $connectorHits = & rg -n $retiredConnectorPattern src main.py
     if ($LASTEXITCODE -eq 0) {
-        $unexpected = @()
-        foreach ($line in $engineHits) {
-            $file = ($line -split ":", 2)[0].Replace("\", "/")
-            if ($allowedEngineLocked -notcontains $file) {
-                $unexpected += $line
-            }
-        }
-        if ($unexpected.Count -gt 0) {
-            Write-Error "Rust Core regression gate failed: product path imports MySQLConnector directly.`n$($unexpected -join "`n")"
-        }
+        Write-Error "Rust Core regression gate failed: retired Python DB connector wrapper referenced.`n$connectorHits"
     } elseif ($LASTEXITCODE -gt 1) {
         exit $LASTEXITCODE
     }

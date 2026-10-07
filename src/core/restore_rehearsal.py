@@ -137,11 +137,7 @@ class RestoreRehearsal:
             ok, message = connector.connect()
             if not ok:
                 return f"복원 리허설 대상에 연결할 수 없습니다: {message}"
-            with connector.connection.cursor() as cursor:
-                cursor.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
-                               (schedule.rehearsal_schema,))
-                exists = cursor.fetchone() is not None
-            if not exists:
+            if not connector.schema_exists(schedule.rehearsal_schema):
                 return (f"복원 리허설 대상 '{self._label(schedule)}'이(가) 없습니다. 비어 있는 네임스페이스를 먼저 "
                         "만들어 두세요 (기존 데이터는 변경되지 않으며 리허설은 별도 후보에만 복원합니다).")
         finally:
