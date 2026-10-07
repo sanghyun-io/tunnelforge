@@ -4,7 +4,7 @@
 
 # TunnelForge
 
-**Secure database management through SSH tunnels — no CLI required.**
+**A desktop app for people who reach MySQL/PostgreSQL through a bastion host: SSH tunnels, a SQL editor, verified backup/restore, and MySQL ↔ PostgreSQL migration in one window.**
 
 [한국어](README.ko.md) · [English](README.md)
 
@@ -20,6 +20,17 @@
 <sub>Open a database behind a bastion host, write SQL with table and column autocomplete, and see results — all in one window.</sub>
 
 </div>
+
+- **Safe restore by default** — imports go into a new namespace and are verified before anything changes; Overwrite swaps under the original name only after verification and keeps the old data as a backup.
+- **MySQL ↔ PostgreSQL migration you can check** — preflight, plan, chunked copy, resume, and a verify step that compares every row by its source key (by digest for tables without a key).
+- **Rust core for the database work** — auth, schema, SQL, dump/import, and migration run in `tunnelforge-core`; Python/PyQt6 is the UI.
+- **Live-database CI gates** — required pull-request checks run dump/import, safe-restore, and cross-engine tests against real MySQL and PostgreSQL containers.
+
+**Download:** [Latest release](https://github.com/sanghyun-io/tunnelforge/releases/latest) · [Windows installer (web, ~12MB)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe) · [macOS DMG (beta)](https://github.com/sanghyun-io/tunnelforge/releases/latest)
+
+> Windows builds are not code-signed yet, so SmartScreen may warn on first run: click **More info → Run anyway**. macOS builds are beta (validated in CI, not yet on a real Mac). See the [code signing policy](#code-signing-policy).
+
+Questions or ideas: [Discussions](https://github.com/sanghyun-io/tunnelforge/discussions) · Want to help: [good first issues](https://github.com/sanghyun-io/tunnelforge/labels/good%20first%20issue) · [Contributing](CONTRIBUTING.md)
 
 ---
 
@@ -112,9 +123,9 @@ Scheduled backups are available (backup tasks only: DST-aware times, at most one
 
 <div align="center">
 
-[![Web Installer](https://img.shields.io/badge/⬇_Web_Installer-Recommended_(~5MB)-2563EB?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe)
+[![Web Installer](https://img.shields.io/badge/⬇_Web_Installer-Recommended_(~12MB)-2563EB?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe)
 &nbsp;&nbsp;
-[![Offline Installer](https://img.shields.io/badge/⬇_Offline_Installer-Full_Package_(~35MB)-6B7280?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest)
+[![Offline Installer](https://img.shields.io/badge/⬇_Offline_Installer-Full_Package_(~46MB)-6B7280?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest)
 
 [Browse all releases for macOS DMG/ZIP and the versioned offline installer →](https://github.com/sanghyun-io/tunnelforge/releases)
 
@@ -230,11 +241,9 @@ Settings are stored at:
 
 ## Code signing policy
 
-Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+**Status:** Release binaries are currently **unsigned**. The SignPath Foundation open-source program declined the project for now (October 2026). The release workflow already contains the signing steps; signing will be enabled if the project is approved later. macOS DMG/ZIP builds remain unsigned beta artifacts.
 
-**Status:** Windows signing is pending approval by the SignPath Foundation open-source program. Current Windows releases are **not signed yet**; the release workflow signs them automatically once the project is approved. macOS DMG/ZIP builds remain unsigned beta artifacts.
-
-Only Windows binaries built by this repository's GitHub Actions release workflow are submitted for signing: `TunnelForge.exe`, `tunnelforge-core.exe`, `TunnelForge-WebSetup.exe`, and `TunnelForge-Setup-<version>.exe`.
+If signing is enabled, only Windows binaries built by this repository's GitHub Actions release workflow will be submitted for signing: `TunnelForge.exe`, `tunnelforge-core.exe`, `TunnelForge-WebSetup.exe`, and `TunnelForge-Setup-<version>.exe`.
 
 **Team roles**
 

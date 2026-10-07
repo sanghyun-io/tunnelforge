@@ -4,7 +4,7 @@
 
 # TunnelForge
 
-**SSH 터널을 통한 안전한 데이터베이스 관리 — CLI 없이 간편하게.**
+**Bastion 호스트를 거쳐 MySQL/PostgreSQL에 접속하는 사람을 위한 데스크톱 앱: SSH 터널, SQL 에디터, 검증되는 백업/복원, MySQL ↔ PostgreSQL 전환을 한 창에서.**
 
 [한국어](README.ko.md) · [English](README.md)
 
@@ -20,6 +20,17 @@
 <sub>Bastion 뒤에 있는 DB를 열고, 테이블·컬럼 자동완성으로 SQL을 작성해 결과까지 한 창에서 확인합니다.</sub>
 
 </div>
+
+- **기본은 안전 복원** — Import는 새 네임스페이스에 복원하고 검증을 마친 뒤에야 반영됩니다. 덮어쓰기는 검증 후에만 원래 이름으로 교체하고, 기존 데이터는 백업으로 남깁니다.
+- **확인할 수 있는 MySQL ↔ PostgreSQL 전환** — 사전 점검, 계획, 청크 단위 복사, 이어하기, 그리고 원본 키 기준으로 모든 행을 비교하는 검증(키가 없는 테이블은 digest로 비교).
+- **DB 작업은 Rust 코어가 담당** — 인증, 스키마, SQL, 덤프/Import, 전환은 `tunnelforge-core`에서 실행되고, Python/PyQt6는 UI를 맡습니다.
+- **실제 DB로 도는 CI 게이트** — PR 필수 체크가 실제 MySQL·PostgreSQL 컨테이너로 덤프/Import, 안전 복원, 엔진 간 전환 테스트를 실행합니다.
+
+**다운로드:** [최신 릴리스](https://github.com/sanghyun-io/tunnelforge/releases/latest) · [Windows 설치 (웹, ~12MB)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe) · [macOS DMG (베타)](https://github.com/sanghyun-io/tunnelforge/releases/latest)
+
+> Windows 빌드는 아직 코드 서명이 되어 있지 않아 첫 실행 시 SmartScreen 경고가 뜰 수 있습니다. **추가 정보 → 실행**을 누르세요. macOS 빌드는 베타입니다(CI에서 검증, 실제 Mac 검증은 아직). [코드 서명 정책](#code-signing-policy) 참고.
+
+질문·아이디어: [Discussions](https://github.com/sanghyun-io/tunnelforge/discussions) · 기여하고 싶다면: [good first issue](https://github.com/sanghyun-io/tunnelforge/labels/good%20first%20issue) · [기여하기](CONTRIBUTING.md)
 
 ---
 
@@ -112,9 +123,9 @@
 
 <div align="center">
 
-[![웹 설치](https://img.shields.io/badge/⬇_웹_설치-권장_(~5MB)-2563EB?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe)
+[![웹 설치](https://img.shields.io/badge/⬇_웹_설치-권장_(~12MB)-2563EB?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe)
 &nbsp;&nbsp;
-[![오프라인 설치](https://img.shields.io/badge/⬇_오프라인_설치-전체_패키지_(~35MB)-6B7280?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest)
+[![오프라인 설치](https://img.shields.io/badge/⬇_오프라인_설치-전체_패키지_(~46MB)-6B7280?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest)
 
 [macOS DMG/ZIP과 버전별 오프라인 설치 파일은 모든 릴리스에서 받기 →](https://github.com/sanghyun-io/tunnelforge/releases)
 
@@ -228,12 +239,9 @@ macOS 지원 범위와 최종 검증 체크리스트는 [macOS Support Plan](doc
 
 ## Code signing policy
 
-Free code signing provided by SignPath.io, certificate by SignPath Foundation.
-(SignPath.io가 무료 코드 서명을 제공하고, 인증서는 SignPath Foundation이 발급합니다.)
+**현황:** 릴리스 바이너리는 현재 **서명되지 않았습니다**. SignPath Foundation 오픈소스 프로그램은 이번에는 이 프로젝트를 승인하지 않았습니다(2026년 10월). 릴리스 워크플로에는 서명 단계가 이미 들어 있으며, 추후 승인되면 서명을 켭니다. macOS DMG/ZIP 빌드는 계속 서명되지 않은 베타 배포물입니다.
 
-**현황:** Windows 서명은 SignPath Foundation 오픈소스 프로그램 승인 대기 중입니다. 현재 Windows 릴리스는 **아직 서명되지 않았으며**, 승인 후 릴리스 워크플로가 자동으로 서명합니다. macOS DMG/ZIP 빌드는 계속 서명되지 않은 베타 배포물입니다.
-
-서명 대상은 이 저장소의 GitHub Actions 릴리스 워크플로가 빌드한 Windows 바이너리뿐입니다: `TunnelForge.exe`, `tunnelforge-core.exe`, `TunnelForge-WebSetup.exe`, `TunnelForge-Setup-<version>.exe`.
+서명이 켜지면, 서명 대상은 이 저장소의 GitHub Actions 릴리스 워크플로가 빌드한 Windows 바이너리뿐입니다: `TunnelForge.exe`, `tunnelforge-core.exe`, `TunnelForge-WebSetup.exe`, `TunnelForge-Setup-<version>.exe`.
 
 **팀 역할**
 

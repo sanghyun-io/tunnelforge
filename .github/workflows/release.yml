@@ -901,8 +901,8 @@ jobs:
           echo "### 📥 다운로드" >> release_notes.md
           echo "| 파일 | 설명 | 크기 |" >> release_notes.md
           echo "|------|------|------|" >> release_notes.md
-          echo "| \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |" >> release_notes.md
-          echo "| \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |" >> release_notes.md
+          echo "| \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~12MB |" >> release_notes.md
+          echo "| \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~46MB |" >> release_notes.md
           echo "| \`TunnelForge-macOS-$VERSION-arm64.dmg\` | macOS 앱 이미지 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
           echo "| \`TunnelForge-macOS-$VERSION-arm64.zip\` | macOS 앱 압축본 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
           echo "| \`TunnelForge-macOS-$VERSION-arm64.{dmg,zip}.sha256\` | macOS SHA-256 체크섬 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
