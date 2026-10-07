@@ -128,6 +128,16 @@ class DbCoreFacade:
         }
         return self.client.request("schema.compare", payload, on_event=on_event)
 
+    def analyze_upgrade(
+        self,
+        endpoint: DbEndpoint,
+        options: Optional[Dict[str, bool]] = None,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """MySQL 8.4 업그레이드 호환성 분석 (Rust upgrade.analyze, 읽기 전용)."""
+        payload = {"connection": endpoint.to_payload(), "options": dict(options or {})}
+        return self.client.request("upgrade.analyze", payload, on_event=on_event)
+
     def list_tables(self, endpoint: DbEndpoint) -> List[str]:
         result = self.client.request("schema.list", {"connection": endpoint.to_payload()})
         tables = result.get("tables")

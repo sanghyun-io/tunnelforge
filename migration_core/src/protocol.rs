@@ -41,6 +41,10 @@ impl CoreService {
             "schema.compare" => {
                 std::thread::spawn(move || schema_compare(&request, |event| emit(event)));
             }
+            // 고아 레코드/날짜 검사는 전체 스캔이라 오래 걸릴 수 있어 워커 스레드에서 실행한다.
+            "upgrade.analyze" => {
+                std::thread::spawn(move || upgrade_analyze(&request, |event| emit(event)));
+            }
             "query.cancel" => {
                 let jobs = self.jobs.clone();
                 std::thread::spawn(move || {
@@ -275,6 +279,7 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "schema.inspect" => emit_all_events(alias_events(&request, "inspect"), emit),
         "schema.diff" => emit_all_events(schema_diff(&request), emit),
         "schema.compare" => schema_compare(&request, emit),
+        "upgrade.analyze" => upgrade_analyze(&request, emit),
         "query.execute" => emit_all_events(query_execute(&request), emit),
         "query.cancel" => emit_all_events(query_cancel(&request), emit),
         "query.explain" => emit_all_events(crate::explain::explain_stateless(&request), emit),
@@ -378,6 +383,7 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "schema.inspect",
             "schema.diff",
             "schema.compare",
+            "upgrade.analyze",
             "query.execute",
             "query.cancel",
             "query.explain",
