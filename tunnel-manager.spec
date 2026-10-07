@@ -10,6 +10,7 @@ TunnelForge - PyInstaller Spec 파일
 import os
 from PyInstaller.utils.hooks import collect_submodules
 from src.version import __version__
+from scripts.pyinstaller_version_info import build_version_info
 
 # 프로젝트 루트 디렉터리
 project_root = os.path.abspath(SPECPATH)
@@ -122,6 +123,8 @@ exe = EXE(
     codesign_identity=None,  # 코드 서명 (맥OS)
     entitlements_file=None,  # 권한 파일 (맥OS)
     icon=app_icon,  # 실행 파일 아이콘
+    # Windows VERSIONINFO (SignPath 서명 요건: ProductName/ProductVersion)
+    version=build_version_info('TunnelForge', 'TunnelForge.exe') if os.name == 'nt' else None,
     exclude_binaries=True,
 )
 
