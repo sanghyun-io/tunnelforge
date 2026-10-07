@@ -11,6 +11,7 @@ import os
 import uuid
 from datetime import datetime
 
+from src.core.path_safety import safe_filename_component
 from src.core.platform_paths import log_dir
 
 
@@ -33,7 +34,10 @@ def create_oneclick_logger(schema: str) -> tuple:
 
     run_id = uuid.uuid4().hex[:8]
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename = f"migration_{schema}_{timestamp}_{run_id}.log"
+    # Quoted MySQL identifiers can contain characters that are invalid in file
+    # names (path separators, ``: * ? " < > |``); sanitize the schema for the
+    # FILE NAME only — log content keeps the real schema name (#339).
+    log_filename = f"migration_{safe_filename_component(schema, 'schema')}_{timestamp}_{run_id}.log"
     log_path = os.path.join(log_dir, log_filename)
 
     # 고유한 로거 이름 (실행마다 독립, 전역 로거와 격리)
