@@ -1,4 +1,5 @@
 mod adapters;
+mod catalog;
 mod tls;
 mod protocol;
 mod dump;

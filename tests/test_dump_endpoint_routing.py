@@ -35,11 +35,11 @@ def test_postgres_import_uses_target_connection_database_and_manifest_namespace(
 
 def test_postgres_connector_exposes_dump_metadata_methods():
     facade = MagicMock()
+    facade.catalog.return_value = ["reporting"]
     connector = PostgresConnector("localhost", 5432, "u", "p", "app", facade)
-    connection = MagicMock()
-    connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [{"schema_name": "reporting"}]
-    connector.connection = connection
+    connector.connection = MagicMock()
     assert connector.get_schemas() == ["reporting"]
+    assert facade.catalog.call_args.args[1] == "schemas"
     assert callable(connector.get_tables)
 
 

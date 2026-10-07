@@ -1,7 +1,9 @@
 import io
 import json
+import re
 import threading
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -302,10 +304,9 @@ def test_rust_connector_get_db_version_returns_legacy_tuple():
         def open_connection(self, endpoint):
             return "conn-1"
 
-        def execute_on_connection_result(self, connection_id, query, params=None):
-            assert connection_id == "conn-1"
-            assert "VERSION()" in query
-            return {"rows": [{"version": "8.4.7"}], "columns": ["version"], "rows_affected": 0}
+        def catalog(self, connection_id, kind, **args):
+            assert (connection_id, kind) == ("conn-1", "version")
+            return ["8.4.7"]
 
     connector = RustDbConnector(
         "mysql",
@@ -779,60 +780,28 @@ def test_rust_connector_uses_injected_facade_without_shared_lookup(monkeypatch):
     assert called == []
 
 
-def test_rust_connector_uses_constants_for_system_schema_filtering(monkeypatch):
-    """MySQL 스키마 필터링은 하드코딩이 아닌 SYSTEM_SCHEMAS 상수를 사용해야 한다."""
-    monkeypatch.setattr(db_core_dbapi_shim, "SYSTEM_SCHEMAS", frozenset({"mysql", "ndbinfo"}))
+def test_mysql_system_schemas_match_rust_catalog():
+    """스키마 목록의 시스템 스키마 제외는 Rust catalog.query 가 한다. Python 상수와 같은 목록이어야 한다."""
+    from src.core.constants import SYSTEM_SCHEMAS
 
-    class FakeCursor:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def execute(self, *a, **k):
-            pass
-
-        def fetchall(self):
-            return [{"Database": "app"}, {"Database": "mysql"}, {"Database": "ndbinfo"}]
-
-    class FakeConnection:
-        def cursor(self):
-            return FakeCursor()
-
-    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = FakeConnection()
-
-    assert connector.get_schemas() == ["app"]
+    source = (Path(__file__).resolve().parents[1] / "migration_core" / "src" / "catalog.rs").read_text(encoding="utf-8")
+    body = re.search(r"MYSQL_SYSTEM_SCHEMAS: &\[&str\] = &\[(.*?)\];", source, re.S).group(1)
+    assert set(re.findall(r'"([^"]+)"', body)) == set(SYSTEM_SCHEMAS)
 
 
-class _FailingCursor:
-    """execute 호출 시 지정된 예외를 던지는 cursor 스텁."""
+class _FailingCatalogFacade:
+    """catalog 호출 시 지정된 예외를 던지는 facade 스텁."""
 
     def __init__(self, exc):
         self._exc = exc
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def execute(self, *a, **k):
+    def catalog(self, *a, **k):
         raise self._exc
 
 
-class _FailingConnection:
-    def __init__(self, exc):
-        self._exc = exc
-
-    def cursor(self):
-        return _FailingCursor(self._exc)
-
-
 def test_get_schemas_propagates_and_logs_db_core_service_error(caplog):
-    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
+    connector.connection = object()
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -843,8 +812,8 @@ def test_get_schemas_propagates_and_logs_db_core_service_error(caplog):
 
 
 def test_schema_exists_propagates_and_logs_db_core_service_error(caplog):
-    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
+    connector.connection = object()
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -870,8 +839,8 @@ def test_get_tables_propagates_and_logs_db_core_service_error(caplog):
 
 
 def test_get_db_version_string_propagates_and_logs_db_core_service_error(caplog):
-    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
+    connector.connection = object()
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -882,8 +851,8 @@ def test_get_db_version_string_propagates_and_logs_db_core_service_error(caplog)
 
 
 def test_get_column_names_propagates_and_logs_db_core_service_error(caplog):
-    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
+    connector.connection = object()
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -895,8 +864,8 @@ def test_get_column_names_propagates_and_logs_db_core_service_error(caplog):
 
 def test_get_schemas_generic_exception_is_logged_and_returns_empty_default():
     """facade 예외가 아닌 일반 예외는 기존 계약대로 빈 기본값을 반환한다 (호환성 유지)."""
-    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(RuntimeError("boom"))
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(RuntimeError("boom")))
+    connector.connection = object()
 
     result = connector.get_schemas()
 
@@ -975,3 +944,21 @@ def test_facade_uses_upgrade_fix_protocols():
     assert sql_sent["payload"]["tables"] == ["a", "b"]
     assert sql_sent["payload"]["collation"] == "utf8mb4_unicode_ci"
     assert plan["steps"] == [] and parts["fk_count"] == 0
+
+
+def test_facade_uses_catalog_query_protocol():
+    process = FakeProcess([
+        '{"event":"result","command":"catalog.query","success":true,"kind":"columns","values":["b","a"]}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+
+    values = facade.catalog("conn-1", "columns", schema="app", table="t")
+
+    sent = json.loads(process.stdin.getvalue().strip())
+    assert sent["command"] == "catalog.query"
+    assert sent["payload"] == {"connection_id": "conn-1", "kind": "columns", "schema": "app", "table": "t"}
+    assert values == ["b", "a"]

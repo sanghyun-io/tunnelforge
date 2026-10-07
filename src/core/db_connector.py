@@ -11,7 +11,6 @@ from src.core.db_core_service import (
     RustDbConnector,
     get_shared_db_core_facade,
     parse_db_version_tuple,
-    quote_mysql_ident,
 )
 
 logger = get_logger('db_connector')
@@ -226,35 +225,6 @@ class MySQLConnector:
             logger.error(f"테이블 조회 오류: {e}")
             return []
 
-    def get_session_sql_mode(self) -> str:
-        """현재 세션 SQL 모드 조회"""
-        if not self.connection:
-            return ''
-        try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SELECT @@SESSION.sql_mode AS sql_mode")
-                row = cursor.fetchone()
-                return row['sql_mode'] if row else ''
-        except Exception:
-            return ''
-
-    def set_session_sql_mode(self, mode: str) -> bool:
-        """세션 SQL 모드 설정
-
-        INFORMATION_SCHEMA 조회 전 strict mode 완화 등에 사용.
-        Args:
-            mode: 설정할 sql_mode 문자열 (빈 문자열이면 모든 제한 해제)
-        """
-        if not self.connection:
-            return False
-        try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SET SESSION sql_mode = %s", (mode,))
-            return True
-        except Exception as e:
-            logger.warning(f"sql_mode 설정 오류: {e}")
-            return False
-
     def execute(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
         """쿼리 실행 및 결과 반환"""
         if not self.connection:
@@ -268,99 +238,40 @@ class MySQLConnector:
             logger.error(f"쿼리 실행 오류: {e}")
             return []
 
-    def execute_many(self, query: str, data: List[tuple]) -> int:
-        """배치 쿼리 실행"""
-        raise RuntimeError(
-            "Legacy Python execute_many mutation helper is disabled. "
-            "DB mutations must be owned by Rust Core."
-        )
-
     def get_db_version(self) -> Tuple[int, int, int]:
-        """DB 버전 반환 (major, minor, patch)
-
-        예: MySQL 8.0.32-ubuntu → (8, 0, 32)
-
-        Returns:
-            버전 튜플 (major, minor, patch) 또는 연결 실패 시 (0, 0, 0)
-        """
+        """DB 버전 반환 (major, minor, patch). 예: MySQL 8.0.32-ubuntu → (8, 0, 32), 실패 시 (0, 0, 0)"""
         return parse_db_version_tuple(self.get_db_version_string())
 
     def get_db_version_string(self) -> str:
         """DB 버전 문자열 반환 (원본)"""
         if not self.connection:
             return ""
-
         try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SELECT VERSION()")
-                result = cursor.fetchone()
-                if result:
-                    return list(result.values())[0]
+            self._delegate.connection = self.connection
+            return self._delegate.get_db_version_string()
         except Exception:
-            pass
+            return ""
 
-        return ""
-
-    def get_table_columns(self, table: str, schema: str = None, use_cache: bool = True) -> List[Dict[str, Any]]:
-        """테이블 컬럼 정보 조회 (캐싱 지원)
-
-        Args:
-            table: 테이블명
-            schema: 스키마명 (None이면 현재 데이터베이스)
-            use_cache: 캐시 사용 여부 (기본 True)
-
-        Returns:
-            컬럼 정보 목록
-        """
-        target_schema = schema or self.database
-        if not target_schema:
+    def get_column_names(self, table: str, schema: str = None) -> List[str]:
+        """테이블 컬럼명 목록 (정의 순서)"""
+        if not self.connection:
+            return []
+        try:
+            self._delegate.connection = self.connection
+            return self._delegate.get_column_names(table, schema or self.database)
+        except Exception as e:
+            logger.error(f"컬럼 조회 오류: {e}")
             return []
 
-        # 캐시 확인
-        cache_key = f"{self._cache_key_prefix}:columns:{target_schema}:{table}"
-        if use_cache and self._cache:
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                return cached
-
-        query = """
-        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-        ORDER BY ORDINAL_POSITION
-        """
-        result = self.execute(query, (target_schema, table))
-
-        # 캐시에 저장
-        if use_cache and self._cache and result:
-            self._cache.set(cache_key, result)
-
-        return result
-
-    def get_column_names(self, table: str, schema: str = None, use_cache: bool = True) -> List[str]:
-        """테이블 컬럼명 목록 반환 (간편 메서드)
-
-        Args:
-            table: 테이블명
-            schema: 스키마명 (None이면 현재 데이터베이스)
-            use_cache: 캐시 사용 여부 (기본 True)
-
-        Returns:
-            컬럼명 목록
-        """
-        columns = self.get_table_columns(table, schema, use_cache)
-        return [col['COLUMN_NAME'] for col in columns]
-
-    def table_exists(self, table: str, schema: str = None) -> bool:
-        """테이블 존재 여부 확인"""
-        tables = self.get_tables(schema)
-        return table in tables
-
-    def _qualified_table_ref(self, table: str, schema: str = None) -> str:
-        """스키마 한정 테이블 참조 생성 (현재 세션의 DB를 전환하지 않음)"""
-        if schema:
-            return f"{quote_mysql_ident(schema)}.{quote_mysql_ident(table)}"
-        return quote_mysql_ident(table)
+    def has_named_timezone(self, name: str) -> bool:
+        """MySQL 이 지역명 타임존(name)을 아는지"""
+        if not self.connection:
+            return False
+        try:
+            self._delegate.connection = self.connection
+            return self._delegate.has_named_timezone(name)
+        except Exception:
+            return False
 
     def __enter__(self):
         """컨텍스트 매니저 진입"""
