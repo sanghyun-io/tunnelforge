@@ -1107,11 +1107,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             return False
 
         try:
-            # mysql.time_zone_name 테이블에서 Asia/Seoul 조회
-            # 단순히 테이블 존재 여부만 보지 않고 실제 데이터가 있는지 확인
-            query = "SELECT 1 FROM mysql.time_zone_name WHERE Name = 'Asia/Seoul' LIMIT 1"
-            rows = self.connector.execute(query)
-            return len(rows) > 0
+            # 테이블 존재 여부만 보지 않고 실제 데이터(Asia/Seoul)가 있는지 확인
+            return self.connector.has_named_timezone("Asia/Seoul")
         except Exception:
             logger.debug("Timezone support check failed", exc_info=True)
             return False

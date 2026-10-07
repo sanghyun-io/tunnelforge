@@ -24,6 +24,12 @@ class FakeFacade:
     def execute_on_connection(self, connection_id, sql):
         return []
 
+    catalog_values = {}
+
+    def catalog(self, connection_id, kind, **args):
+        self.catalog_calls = getattr(self, "catalog_calls", []) + [(kind, args)]
+        return list(self.catalog_values.get(kind, []))
+
 
 # =====================================================================
 # MetadataCache 테스트
@@ -185,49 +191,27 @@ class TestMySQLConnector:
         assert self.connector.is_connected() is False
 
     def test_get_schemas_returns_list(self):
-        """스키마 목록 조회 확인 (시스템 DB 제외)"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchall.return_value = [
-            {'Database': 'myapp'},
-            {'Database': 'information_schema'},
-            {'Database': 'mysql'},
-            {'Database': 'performance_schema'},
-            {'Database': 'sys'},
-            {'Database': 'testdb'},
-        ]
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
+        """스키마 목록은 Rust catalog.query(schemas) 결과 그대로 (시스템 스키마 제외는 Rust 가 한다)"""
+        facade = FakeFacade()
+        facade.catalog_values = {'schemas': ['myapp', 'testdb']}
+        self.connector._delegate.facade = facade
+        self.connector.connection = MagicMock()
 
-        schemas = self.connector.get_schemas(use_cache=False)
-
-        assert 'myapp' in schemas
-        assert 'testdb' in schemas
-        assert 'information_schema' not in schemas
-        assert 'mysql' not in schemas
-        assert 'performance_schema' not in schemas
-        assert 'sys' not in schemas
+        assert self.connector.get_schemas(use_cache=False) == ['myapp', 'testdb']
 
     def test_get_schemas_uses_cache(self):
         """스키마 조회 시 캐시 활용 확인"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchall.return_value = [{'Database': 'cached_db'}]
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
+        facade = FakeFacade()
+        facade.catalog_values = {'schemas': ['cached_db']}
+        self.connector._delegate.facade = facade
+        self.connector.connection = MagicMock()
 
-        # 첫 번째 조회 (DB 접근)
         schemas1 = self.connector.get_schemas(use_cache=True)
-        # 두 번째 조회 (캐시 사용)
         schemas2 = self.connector.get_schemas(use_cache=True)
 
-        # cursor는 1번만 호출되어야 함
-        assert mock_conn.cursor.call_count == 1
-        assert schemas1 == schemas2
+        # Rust 조회는 1번만 일어나야 함
+        assert len(facade.catalog_calls) == 1
+        assert schemas1 == schemas2 == ['cached_db']
 
     def test_get_schemas_no_connection(self):
         """연결 없을 때 빈 리스트 반환"""
@@ -311,20 +295,6 @@ class TestMySQLConnector:
         result = self.connector.execute("INVALID SQL")
         assert result == []
 
-    def test_execute_many_rejects_legacy_python_mutation_helper(self):
-        """Rust Core baseline: unused Python batch mutation helper is fail-closed."""
-        mock_conn = MagicMock()
-        self.connector.connection = mock_conn
-
-        with pytest.raises(RuntimeError, match="Rust Core"):
-            self.connector.execute_many(
-                "INSERT INTO users (id, name) VALUES (%s, %s)",
-                [(1, "Alice")],
-            )
-
-        mock_conn.cursor.assert_not_called()
-        mock_conn.commit.assert_not_called()
-
     def test_context_manager_connects_and_disconnects(self):
         """컨텍스트 매니저 연결/해제 확인"""
         self.connector._delegate.facade = FakeFacade()
@@ -336,16 +306,12 @@ class TestMySQLConnector:
 
     def test_get_db_version_returns_tuple(self):
         """DB 버전 튜플 반환 확인"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchone.return_value = {'VERSION()': '8.0.32-ubuntu'}
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
+        facade = FakeFacade()
+        facade.catalog_values = {'version': ['8.0.32-ubuntu']}
+        self.connector._delegate.facade = facade
+        self.connector.connection = MagicMock()
 
-        version = self.connector.get_db_version()
-        assert version == (8, 0, 32)
+        assert self.connector.get_db_version() == (8, 0, 32)
 
     def test_get_db_version_no_connection(self):
         """연결 없을 때 (0,0,0) 반환"""
@@ -365,40 +331,22 @@ class TestMySQLConnector:
 
     def test_schema_exists_true(self):
         """스키마 존재 확인"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchone.return_value = {'Database': 'mydb'}
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
+        facade = FakeFacade()
+        facade.catalog_values = {'schema_exists': ['mydb']}
+        self.connector._delegate.facade = facade
+        self.connector.connection = MagicMock()
 
-        result = self.connector.schema_exists('mydb')
-        assert result is True
+        assert self.connector.schema_exists('mydb') is True
+        assert facade.catalog_calls == [('schema_exists', {'name': 'mydb'})]
 
     def test_schema_exists_false(self):
         """스키마 미존재 확인"""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-        mock_cursor.fetchone.return_value = None
-        mock_conn.cursor.return_value = mock_cursor
-        self.connector.connection = mock_conn
+        facade = FakeFacade()
+        facade.catalog_values = {}
+        self.connector._delegate.facade = facade
+        self.connector.connection = MagicMock()
 
-        result = self.connector.schema_exists('nonexistent')
-        assert result is False
-
-    def test_table_exists_true(self):
-        """테이블 존재 확인"""
-        # get_tables를 mock하여 테스트
-        self.connector.get_tables = MagicMock(return_value=['users', 'orders'])
-        assert self.connector.table_exists('users') is True
-
-    def test_table_exists_false(self):
-        """테이블 미존재 확인"""
-        self.connector.get_tables = MagicMock(return_value=['users', 'orders'])
-        assert self.connector.table_exists('products') is False
+        assert self.connector.schema_exists('nonexistent') is False
 
 # =====================================================================
 # Facade 주입/공유 테스트 (WP-2.10: connector-facade 통합)

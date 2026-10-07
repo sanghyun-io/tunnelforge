@@ -35,11 +35,12 @@ def test_postgres_import_uses_target_connection_database_and_manifest_namespace(
 
 def test_postgres_connector_exposes_dump_metadata_methods():
     facade = MagicMock()
+    facade.catalog.return_value = ["reporting"]
     connector = PostgresConnector("localhost", 5432, "u", "p", "app", facade)
-    connection = MagicMock()
-    connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [{"schema_name": "reporting"}]
-    connector.connection = connection
+    # 메타데이터 delegate 는 connection 만 넘겨받는다. 세션 ID 는 연결 객체에서 읽어야 한다 (PR #333 CI 회귀).
+    connector.connection = SimpleNamespace(connection_id="pg-1")
     assert connector.get_schemas() == ["reporting"]
+    assert facade.catalog.call_args.args[:2] == ("pg-1", "schemas")
     assert callable(connector.get_tables)
 
 
