@@ -234,11 +234,13 @@ def test_windows_pe_files_embed_versioninfo_from_single_version_source():
     from src.version import __version__
 
     assert version_tuple("2.15.0") == (2, 15, 0, 0)
-    info = build_version_info("TunnelForge", "TunnelForge.exe")
-    rendered = str(info)
-    assert f"prodvers={version_tuple(__version__)}" in rendered
-    assert "'ProductName', 'TunnelForge'" in rendered
-    assert f"'ProductVersion', '{__version__}'" in rendered
+    # PyInstaller 의 versioninfo 는 Windows 전용 pefile 을 import 한다 (Linux/macOS CI 에는 없음).
+    if importlib.util.find_spec("pefile") is not None:
+        info = build_version_info("TunnelForge", "TunnelForge.exe")
+        rendered = str(info)
+        assert f"prodvers={version_tuple(__version__)}" in rendered
+        assert "'ProductName', 'TunnelForge'" in rendered
+        assert f"'ProductVersion', '{__version__}'" in rendered
 
     for spec_path in ("tunnel-manager.spec", "bootstrapper/bootstrapper.spec"):
         spec = (PROJECT_ROOT / spec_path).read_text(encoding="utf-8")
