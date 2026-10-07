@@ -45,6 +45,10 @@ impl CoreService {
             "upgrade.analyze" => {
                 std::thread::spawn(move || upgrade_analyze(&request, |event| emit(event)));
             }
+            // 날짜 수정 예상 행 수는 COUNT 스캔이라 워커 스레드에서 실행한다.
+            "upgrade.fix_plan" => {
+                std::thread::spawn(move || upgrade_fix_plan(&request, |event| emit(event)));
+            }
             "query.cancel" => {
                 let jobs = self.jobs.clone();
                 std::thread::spawn(move || {
@@ -280,6 +284,8 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "schema.diff" => emit_all_events(schema_diff(&request), emit),
         "schema.compare" => schema_compare(&request, emit),
         "upgrade.analyze" => upgrade_analyze(&request, emit),
+        "upgrade.fix_plan" => upgrade_fix_plan(&request, emit),
+        "upgrade.charset_sql" => upgrade_charset_sql(&request, emit),
         "query.execute" => emit_all_events(query_execute(&request), emit),
         "query.cancel" => emit_all_events(query_cancel(&request), emit),
         "query.explain" => emit_all_events(crate::explain::explain_stateless(&request), emit),
@@ -384,6 +390,8 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "schema.diff",
             "schema.compare",
             "upgrade.analyze",
+            "upgrade.fix_plan",
+            "upgrade.charset_sql",
             "query.execute",
             "query.cancel",
             "query.explain",

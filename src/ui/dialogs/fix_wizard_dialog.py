@@ -17,7 +17,7 @@ from typing import List, Optional, Set
 from src.core.db_connector import MySQLConnector
 from src.core.migration_analyzer import CompatibilityIssue
 from src.core.migration_constants import IssueType
-from src.core.migration_fix_wizard import FixWizardStep, CharsetFixPlanBuilder, CharsetTableInfo
+from src.core.migration_fix_wizard import FixWizardStep, CharsetFixPlan, CharsetTableInfo
 from src.ui.dialogs.fix_wizard_issue_selection_page import IssueSelectionPage
 from src.ui.dialogs.fix_wizard_charset_page import CharsetFixPage
 from src.ui.dialogs.fix_wizard_option_page import FixOptionPage, BatchOptionDialog
@@ -59,7 +59,7 @@ class FixWizardDialog(QWizard):
         self.other_issues: List[CompatibilityIssue] = []
 
         # 문자셋 수정 계획
-        self.charset_plan_builder: Optional[CharsetFixPlanBuilder] = None
+        self.charset_plan_builder: Optional[CharsetFixPlan] = None
         self.charset_tables_to_fix: Set[str] = set()  # 실제 수정할 테이블
 
         self.init_ui()

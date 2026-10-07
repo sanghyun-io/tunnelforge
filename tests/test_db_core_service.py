@@ -950,3 +950,28 @@ def test_facade_uses_upgrade_analyze_protocol():
     assert sent["payload"]["options"] == {"check_orphans": False}
     assert result["issues"] == []
     assert events[0]["message"].startswith("📌 [1/15]")
+
+
+def test_facade_uses_upgrade_fix_protocols():
+    process = FakeProcess([
+        '{"event":"result","command":"upgrade.fix_plan","success":true,"steps":[],"charset_tables":[]}',
+        '{"event":"result","command":"upgrade.charset_sql","success":true,"full_sql":[],"fk_count":0}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    plan = facade.plan_upgrade_fixes(endpoint, [{"issue_type": "invalid_date"}], {"b", "a"})
+    parts = facade.charset_fix_sql(endpoint, {"b", "a"}, "utf8mb4", "utf8mb4_unicode_ci")
+
+    plan_sent, sql_sent = [json.loads(line) for line in process.stdin.getvalue().strip().splitlines()]
+    assert plan_sent["command"] == "upgrade.fix_plan"
+    assert plan_sent["payload"]["charset_tables"] == ["a", "b"]
+    assert plan_sent["payload"]["issues"] == [{"issue_type": "invalid_date"}]
+    assert sql_sent["command"] == "upgrade.charset_sql"
+    assert sql_sent["payload"]["tables"] == ["a", "b"]
+    assert sql_sent["payload"]["collation"] == "utf8mb4_unicode_ci"
+    assert plan["steps"] == [] and parts["fk_count"] == 0

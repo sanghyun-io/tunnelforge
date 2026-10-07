@@ -138,6 +138,23 @@ class DbCoreFacade:
         payload = {"connection": endpoint.to_payload(), "options": dict(options or {})}
         return self.client.request("upgrade.analyze", payload, on_event=on_event)
 
+    def plan_upgrade_fixes(
+        self,
+        endpoint: DbEndpoint,
+        issues: List[Dict[str, Any]],
+        charset_tables: Sequence[str] = (),
+    ) -> Dict[str, Any]:
+        """이슈별 수정 옵션 + 문자셋 수정 대상 테이블 계획 (Rust upgrade.fix_plan, 읽기 전용)."""
+        payload = {"connection": endpoint.to_payload(), "issues": list(issues), "charset_tables": sorted(charset_tables)}
+        return self.client.request("upgrade.fix_plan", payload)
+
+    def charset_fix_sql(
+        self, endpoint: DbEndpoint, tables: Sequence[str], charset: str = "", collation: str = ""
+    ) -> Dict[str, Any]:
+        """FK 안전 문자셋 변환 SQL (Rust upgrade.charset_sql): FK DROP → CONVERT(부모 먼저) → FK ADD."""
+        payload = {"connection": endpoint.to_payload(), "tables": sorted(tables), "charset": charset, "collation": collation}
+        return self.client.request("upgrade.charset_sql", payload)
+
     def list_tables(self, endpoint: DbEndpoint) -> List[str]:
         result = self.client.request("schema.list", {"connection": endpoint.to_payload()})
         tables = result.get("tables")

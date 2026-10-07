@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from typing import Dict, List, Set
 
-from src.core.migration_fix_wizard import CharsetTableInfo, FKSafeCharsetChanger
+from src.core.migration_fix_wizard import CharsetTableInfo
 
 
 class CharsetFixPage(QWizardPage):
@@ -30,7 +30,7 @@ class CharsetFixPage(QWizardPage):
         self.table_checkboxes: Dict[str, QCheckBox] = {}
         self.table_infos: List[CharsetTableInfo] = []
         self._updating_checkboxes = False  # 연쇄 업데이트 중 플래그
-        self._fk_cache: List = []  # 전체 테이블 대상 FK 조회 결과 (1회 캐시, UI 스레드 DB 재조회 방지)
+        self._fk_cache: List = []  # 계획 대상 테이블에 걸린 FK (계획 시 Rust 가 함께 반환)
 
         self.init_ui()
 
@@ -125,18 +125,7 @@ class CharsetFixPage(QWizardPage):
 
         self.table_infos = plan_builder.build_full_table_list()
 
-        # FK 관계를 전체 테이블 집합 기준으로 1회만 조회하여 캐시한다.
-        # (체크박스를 토글할 때마다 update_stats()에서 매번 DB를 재조회하면
-        #  UI 스레드가 매 클릭마다 블로킹된다.)
-        all_tables = {info.table_name for info in self.table_infos}
-        if all_tables:
-            changer = FKSafeCharsetChanger(
-                self.wizard_dialog.connector,
-                self.wizard_dialog.schema
-            )
-            self._fk_cache = changer.get_related_fks(all_tables)
-        else:
-            self._fk_cache = []
+        self._fk_cache = list(plan_builder.foreign_keys)
 
         # 테이블별 체크박스 생성
         for info in self.table_infos:
@@ -350,8 +339,7 @@ class CharsetFixPage(QWizardPage):
         selected = sum(1 for info in self.table_infos if not info.skip)
         skipped = total - selected
 
-        # FK 개수 계산 (initializePage()에서 전체 테이블 기준으로 1회 캐시한 결과를
-        # 현재 선택된 부분집합으로 필터링만 한다 — 체크박스 토글마다 DB를 재조회하지 않는다)
+        # FK 개수 계산 (계획에 포함된 FK 를 현재 선택된 부분집합으로 필터링만 한다)
         fk_count = 0
         if self.wizard_dialog.charset_plan_builder:
             tables_to_fix = {info.table_name for info in self.table_infos if not info.skip}

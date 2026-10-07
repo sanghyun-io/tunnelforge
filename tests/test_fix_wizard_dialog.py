@@ -181,7 +181,7 @@ def test_fix_wizard_worker_cancel_before_start_skips_all_phases(monkeypatch):
     def _fail_if_called(*_args, **_kwargs):
         raise AssertionError("취소된 워커는 어떤 DB 작업도 시작하면 안 됩니다")
 
-    monkeypatch.setattr(fix_wizard_worker, "FKSafeCharsetChanger", _fail_if_called)
+    monkeypatch.setattr(fix_wizard_worker, "charset_fix_sql", _fail_if_called)
     monkeypatch.setattr(fix_wizard_worker, "BatchFixExecutor", _fail_if_called)
 
     worker = fix_wizard_worker.FixWizardWorker(
@@ -211,17 +211,12 @@ def test_fix_wizard_worker_cancel_between_phases_skips_other_issues(monkeypatch)
 
     holder = {}
 
-    class _FakeCharsetChanger:
-        def __init__(self, _connector, _schema):
-            pass
+    def _fake_charset_fix_sql(_connector, _schema, _tables):
+        # 문자셋 변경이 진행되는 도중 다이얼로그가 닫혀 취소가 요청된 상황을 시뮬레이션
+        holder["worker"].request_cancel()
+        return {"fk_count": 0, "table_count": 1, "full_sql": []}
 
-        def execute_safe_charset_change(self, tables, charset, collation, dry_run, progress_callback):
-            # 문자셋 변경이 진행되는 도중 다이얼로그가 닫혀 취소가 요청된 상황을 시뮬레이션
-            holder["worker"].request_cancel()
-            progress_callback("문자셋 변경 진행 중")
-            return True, "ok", {"fk_count": 0}
-
-    monkeypatch.setattr(fix_wizard_worker, "FKSafeCharsetChanger", _FakeCharsetChanger)
+    monkeypatch.setattr(fix_wizard_worker, "charset_fix_sql", _fake_charset_fix_sql)
 
     batch_executor_calls = []
 
