@@ -28,6 +28,9 @@ class OrphanRecord:
     parent_column: str
     orphan_count: int
     sample_values: List[Any] = field(default_factory=list)
+    # Rust core 가 분석 시 만든 정리 SQL: {"delete", "set_null", "count"}.
+    # 복합 FK 는 child_column/parent_column 이 "a, b" 처럼 컬럼 목록이다.
+    cleanup_sql: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -56,6 +59,8 @@ class CleanupAction:
     # 직접 저장해둔다 (테이블명에 FROM/WHERE/SET 같은 키워드가 포함돼도 안전).
     target_schema: Optional[str] = None
     target_table: Optional[str] = None
+    # dry-run 영향 행 수를 세는 COUNT SQL (Rust core 가 생성)
+    count_sql: Optional[str] = None
 
 
 @dataclass
@@ -145,7 +150,8 @@ class AnalysisResult:
                 affected_rows=a['affected_rows'],
                 dry_run=a.get('dry_run', True),
                 target_schema=a.get('target_schema'),
-                target_table=a.get('target_table')
+                target_table=a.get('target_table'),
+                count_sql=a.get('count_sql'),
             )
             for a in data.get('cleanup_actions', [])
         ]
