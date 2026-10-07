@@ -381,6 +381,29 @@ def test_release_macos_artifacts_are_validated_before_upload():
     assert 'xcrun stapler validate "$DMG_PATH"' in verification_text
 
 
+def test_release_windows_signpath_signing_is_optional_and_ordered():
+    workflow_text = RELEASE_PATH.read_text(encoding="utf-8")
+    steps = load_workflow(RELEASE_PATH)["jobs"]["build-windows-installer"]["steps"]
+    names = [step["name"] for step in steps]
+    gate = "steps.windows-signing.outputs.enabled == 'true'"
+
+    assert steps[names.index("Check Windows signing configuration")]["id"] == "windows-signing"
+    assert "Windows signing not configured; unsigned artifacts will be built." in workflow_text
+    sign_steps = [step for step in steps if step.get("uses", "").startswith("signpath/github-action-submit-signing-request@")]
+    assert len(sign_steps) == 2
+    for step in sign_steps:
+        assert re.fullmatch(r"signpath/github-action-submit-signing-request@[0-9a-f]{40}", step["uses"])
+        assert step["with"]["api-token"] == "${{ secrets.SIGNPATH_API_TOKEN }}"
+    signing_names = [name for name in names if "sign" in name.lower() and name != "Check Windows signing configuration"]
+    assert len(signing_names) == 8
+    assert all(steps[names.index(name)]["if"] == gate for name in signing_names)
+
+    installer_index = names.index("Build Windows Installer")
+    assert names.index("Sign Windows binaries with SignPath") < names.index("Replace Windows binaries with signed copies") < installer_index
+    assert installer_index < names.index("Sign Windows installer with SignPath") < names.index("Replace Windows installer with signed copy")
+    assert names.index("Verify Windows Authenticode signatures") < names.index("Upload Windows release artifacts")
+
+
 def test_required_version_gate_is_terminal_and_aggregates_all_results():
     jobs = load_version_gate()["jobs"]
     job = load_version_gate()["jobs"]["version-gate"]

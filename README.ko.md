@@ -120,6 +120,8 @@
 
 macOS DMG/ZIP 설치파일은 최종 실제 Mac 운영자 검증 전의 베타 배포물입니다. SSH, DB, migration, LaunchAgent, Gatekeeper 흐름에서 이슈가 있을 수 있으며 운영 환경 사용은 사용자 책임이고, 최종 검증 전 동작을 보증하지 않습니다.
 
+[Code signing policy (코드 서명 정책)](#code-signing-policy)
+
 </div>
 
 ---
@@ -223,6 +225,28 @@ macOS 지원 범위와 최종 검증 체크리스트는 [macOS Support Plan](doc
 
 - Windows: `%LOCALAPPDATA%\TunnelForge\config.json`
 - macOS: `~/Library/Application Support/TunnelForge/config.json`
+
+## Code signing policy
+
+Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+(SignPath.io가 무료 코드 서명을 제공하고, 인증서는 SignPath Foundation이 발급합니다.)
+
+**현황:** Windows 서명은 SignPath Foundation 오픈소스 프로그램 승인 대기 중입니다. 현재 Windows 릴리스는 **아직 서명되지 않았으며**, 승인 후 릴리스 워크플로가 자동으로 서명합니다. macOS DMG/ZIP 빌드는 계속 서명되지 않은 베타 배포물입니다.
+
+서명 대상은 이 저장소의 GitHub Actions 릴리스 워크플로가 빌드한 Windows 바이너리뿐입니다: `TunnelForge.exe`, `tunnelforge-core.exe`, `TunnelForge-WebSetup.exe`, `TunnelForge-Setup-<version>.exe`.
+
+**팀 역할**
+
+- Committers / Reviewers: [sanghyun-io](https://github.com/sanghyun-io)
+- Approvers: [sanghyun-io](https://github.com/sanghyun-io)
+
+**개인정보 처리 방침 (Privacy policy)**
+
+TunnelForge는 개인정보를 수집하지 않으며 사용 통계(텔레메트리)도 없습니다. 네트워크 연결은 다음뿐입니다.
+
+- 사용자가 설정한 SSH 서버와 데이터베이스
+- 새 버전 확인을 위한 공개 GitHub Releases API(`api.github.com`) 조회 — **기본으로 켜져 있어 앱 시작 시 실행**되며, 요청 외의 데이터는 보내지 않고 설정(자동 업데이트 확인)에서 끌 수 있음
+- 메인테이너가 운영하는 오류 보고 중계 서버(Cloudflare Workers)를 거쳐 GitHub 이슈로 등록되는 익명 오류 보고 — 사용자가 동의한 **경우에만** 전송 ([오류 보고 안내](docs/error_reporting.md))
 
 ---
 
