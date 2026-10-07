@@ -37,6 +37,10 @@ impl CoreService {
                     std::thread::spawn(task);
                 }
             }
+            // 두 스키마를 읽는 동안 공유 서비스가 다른 요청을 계속 처리하도록 워커 스레드에서 실행한다.
+            "schema.compare" => {
+                std::thread::spawn(move || schema_compare(&request, |event| emit(event)));
+            }
             "query.cancel" => {
                 let jobs = self.jobs.clone();
                 std::thread::spawn(move || {
@@ -270,6 +274,7 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "schema.list" => emit_all_events(schema_list(&request), emit),
         "schema.inspect" => emit_all_events(alias_events(&request, "inspect"), emit),
         "schema.diff" => emit_all_events(schema_diff(&request), emit),
+        "schema.compare" => schema_compare(&request, emit),
         "query.execute" => emit_all_events(query_execute(&request), emit),
         "query.cancel" => emit_all_events(query_cancel(&request), emit),
         "query.explain" => emit_all_events(crate::explain::explain_stateless(&request), emit),
@@ -372,6 +377,7 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "schema.list",
             "schema.inspect",
             "schema.diff",
+            "schema.compare",
             "query.execute",
             "query.cancel",
             "query.explain",

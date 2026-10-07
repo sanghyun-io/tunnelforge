@@ -901,3 +901,29 @@ def test_get_schemas_generic_exception_is_logged_and_returns_empty_default():
     result = connector.get_schemas()
 
     assert result == []
+
+
+def test_facade_uses_schema_compare_protocol():
+    process = FakeProcess([
+        '{"event":"progress","command":"schema.compare","phase":"source","message":"x"}',
+        '{"event":"result","command":"schema.compare","success":true,"tables":[],"summary":{"critical":0,"warning":0,"info":0},"sync_sql":"-- end"}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    events = []
+    source = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+    target = DbEndpoint("mysql", "127.0.0.1", 3307, "user", "secret", "app_copy")
+
+    result = facade.compare_schemas(source, target, level="strict", exact_row_counts=True, on_event=events.append)
+
+    sent = json.loads(process.stdin.getvalue().strip())
+    assert sent["command"] == "schema.compare"
+    assert sent["payload"]["level"] == "strict"
+    assert sent["payload"]["exact_row_counts"] is True
+    assert sent["payload"]["source"]["database"] == "app"
+    assert sent["payload"]["target"]["port"] == 3307
+    assert result["sync_sql"] == "-- end"
+    assert events[0]["phase"] == "source"
