@@ -80,100 +80,6 @@ RESERVED_KEYWORDS_80: Tuple[str, ...] = (
 ALL_RESERVED_KEYWORDS: Tuple[str, ...] = RESERVED_KEYWORDS_80 + NEW_RESERVED_KEYWORDS_84
 
 # ============================================================
-# MySQL 8.4에서 제거된 함수
-# ============================================================
-# mysql-upgrade-checker 참조 구현과 통일된 분류 체계
-# 8.0.x에서 deprecated → 8.4에서 완전 제거된 함수
-REMOVED_FUNCTIONS_84: Tuple[str, ...] = (
-    'PASSWORD',        # 8.0.11 deprecated → 8.4 제거
-    'ENCRYPT',         # 8.0.3 deprecated → 8.4 제거
-    'ENCODE',          # 8.0.3 deprecated → 8.4 제거
-    'DECODE',          # 8.0.3 deprecated → 8.4 제거
-    'DES_ENCRYPT',     # 8.0.3 deprecated → 8.4 제거
-    'DES_DECRYPT',     # 8.0.3 deprecated → 8.4 제거
-)
-
-# 8.4에서 deprecated된 함수 (아직 동작하나 deprecated 경고)
-DEPRECATED_FUNCTIONS_84: Tuple[str, ...] = (
-    'MASTER_POS_WAIT',      # deprecated alias, SOURCE_POS_WAIT() 사용 권장
-    'FOUND_ROWS',           # deprecated, COUNT(*) 별도 쿼리 사용 권장
-    'SQL_CALC_FOUND_ROWS',  # deprecated, COUNT(*) 별도 쿼리 사용 권장
-)
-
-# 8.0 이전에 이미 제거된 함수 (5.7 → 8.0 마이그레이션 잔존 확인용)
-REMOVED_FUNCTIONS_80X: Tuple[str, ...] = (
-    'ENCODE',
-    'DECODE',
-    'DES_ENCRYPT',
-    'DES_DECRYPT',
-    'ENCRYPT',
-    'PASSWORD',
-    'OLD_PASSWORD',    # 5.7에서 제거
-)
-
-# 마이그레이션 검사 시 사용할 전체 제거/deprecated 함수 목록
-# 세 소스 튜플 사이에 겹치는 함수명(예: ENCODE, DECODE)이 있으므로 순서를
-# 보존하면서 중복만 제거한다.
-ALL_REMOVED_FUNCTIONS: Tuple[str, ...] = tuple(dict.fromkeys(
-    REMOVED_FUNCTIONS_84 + REMOVED_FUNCTIONS_80X + DEPRECATED_FUNCTIONS_84
-))
-
-
-# ============================================================
-# 제거된/deprecated SQL 모드 (11개)
-# ============================================================
-OBSOLETE_SQL_MODES: Tuple[str, ...] = (
-    'DB2', 'MAXDB', 'MSSQL', 'MYSQL323', 'MYSQL40',
-    'ORACLE', 'POSTGRESQL', 'NO_FIELD_OPTIONS', 'NO_KEY_OPTIONS',
-    'NO_TABLE_OPTIONS', 'NO_AUTO_CREATE_USER',
-)
-
-# ============================================================
-# 스토리지 엔진 상태
-# ============================================================
-# 엔진별 상세 정책 (severity, suggestion)
-# migration_compat_checker.py의 check_deprecated_engines가 사용하는 단일 소스.
-ENGINE_POLICIES: Dict[str, Dict[str, str]] = {
-    'MyISAM': {
-        'severity': 'warning',
-        'suggestion': 'InnoDB로 변환 권장 (트랜잭션/FK 지원)',
-    },
-    'ARCHIVE': {
-        'severity': 'warning',
-        'suggestion': 'InnoDB로 변환 권장',
-    },
-    'BLACKHOLE': {
-        'severity': 'info',
-        'suggestion': '테스트/복제용 엔진 - 필요시 유지',
-    },
-    'FEDERATED': {
-        'severity': 'warning',
-        'suggestion': 'MySQL 8.4에서 제거 예정',
-    },
-    'MERGE': {
-        'severity': 'error',
-        'suggestion': 'MySQL 8.4에서 제거됨 - InnoDB 파티셔닝으로 대체',
-    },
-    'MEMORY': {
-        'severity': 'info',
-        'suggestion': '임시 테이블용으로는 유지 가능',
-    },
-    'EXAMPLE': {
-        'severity': 'warning',
-        'suggestion': '예제/스텁 엔진 - 운영 환경에서는 InnoDB로 변경 권장',
-    },
-    'NDB': {
-        'severity': 'warning',
-        'suggestion': 'NDB Cluster 전용 엔진 - 단일 인스턴스 환경에서는 지원되지 않음',
-    },
-    'CSV': {
-        'severity': 'info',
-        'suggestion': '로그/내보내기 용도로는 유지 가능, 일반 테이블은 InnoDB 권장',
-    },
-}
-
-
-# ============================================================
 # IssueType Enum (확장)
 # ============================================================
 class IssueType(Enum):
@@ -307,11 +213,6 @@ SYS_VAR_USAGE_PATTERN = re.compile(
     r"(" + "|".join(re.escape(v) for v in REMOVED_SYS_VARS_84) + r")\b(?!\s*\.)",
     re.IGNORECASE
 )
-
-
-
-
-
 
 
 # ============================================================

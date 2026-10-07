@@ -11,12 +11,6 @@ from src.core.migration_constants import (
     NEW_RESERVED_KEYWORDS_84,
     RESERVED_KEYWORDS_80,
     ALL_RESERVED_KEYWORDS,
-    ALL_REMOVED_FUNCTIONS,
-    REMOVED_FUNCTIONS_84,
-    DEPRECATED_FUNCTIONS_84,
-    REMOVED_FUNCTIONS_80X,
-    OBSOLETE_SQL_MODES,
-    ENGINE_POLICIES,
     IssueType,
     CompatibilityIssue,
     INVALID_DATE_PATTERN,
@@ -29,6 +23,15 @@ from src.core.migration_constants import (
     SUPER_PRIVILEGE_PATTERN,
     SYS_VAR_USAGE_PATTERN,
 )
+
+
+def _rust_str_array(name: str) -> set:
+    """migration_core/src/upgrade_analyze.rs 의 `const NAME: [&str; N] = [...]` 문자열 목록."""
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "migration_core" / "src" / "upgrade_analyze.rs").read_text(encoding="utf-8")
+    match = re.search(r"const " + name + r": \[&str; \d+\] = \[(.*?)\];", source, re.S)
+    assert match, f"{name} not found in upgrade_analyze.rs"
+    return set(re.findall(r'"([^"]+)"', match.group(1)))
 
 
 # ============================================================
@@ -79,47 +82,6 @@ class TestReservedKeywords:
 
     def test_80_keywords_not_empty(self):
         assert len(RESERVED_KEYWORDS_80) > 0
-
-
-class TestAllRemovedFunctions:
-    """ALL_REMOVED_FUNCTIONS 중복 제거 불변량 검증"""
-
-    def test_no_duplicates(self):
-        assert len(set(ALL_REMOVED_FUNCTIONS)) == len(ALL_REMOVED_FUNCTIONS)
-
-    def test_contains_all_source_members(self):
-        expected = set(REMOVED_FUNCTIONS_84) | set(REMOVED_FUNCTIONS_80X) | set(DEPRECATED_FUNCTIONS_84)
-        assert set(ALL_REMOVED_FUNCTIONS) == expected
-
-
-class TestObsoleteSqlModes:
-    """OBSOLETE_SQL_MODES 검증"""
-
-    def test_is_tuple(self):
-        assert isinstance(OBSOLETE_SQL_MODES, tuple)
-
-    def test_all_unique(self):
-        assert len(set(OBSOLETE_SQL_MODES)) == len(OBSOLETE_SQL_MODES)
-
-    @pytest.mark.parametrize("mode", ["ORACLE", "MYSQL323", "MYSQL40", "NO_AUTO_CREATE_USER"])
-    def test_known_modes(self, mode):
-        assert mode in OBSOLETE_SQL_MODES
-
-
-class TestEnginePolicies:
-    """ENGINE_POLICIES 정책 dict 검증"""
-
-    @pytest.mark.parametrize("engine", ["MERGE", "CSV", "EXAMPLE", "NDB"])
-    def test_known_engines_present(self, engine):
-        assert engine in ENGINE_POLICIES
-
-    def test_merge_severity_is_error(self):
-        assert ENGINE_POLICIES["MERGE"]["severity"] == "error"
-
-    def test_every_policy_has_non_empty_fields(self):
-        for engine, policy in ENGINE_POLICIES.items():
-            assert policy.get("severity"), f"{engine} policy missing severity"
-            assert policy.get("suggestion"), f"{engine} policy missing suggestion"
 
 
 # ============================================================
@@ -340,37 +302,38 @@ class TestCanonicalParity:
         assert not missing, f"REMOVED_SYS_VARS_84에 누락된 항목: {missing}"
 
     def test_removed_functions_84_parity(self, canonical_constants):
-        """REMOVED_FUNCTIONS_84가 canonical 기준값을 모두 포함하는지 검증"""
+        """Rust 검사의 함수 목록이 canonical removed_functions_84 를 모두 포함하는지 검증"""
         canonical = set(canonical_constants["removed_functions_84"])
-        actual = set(REMOVED_FUNCTIONS_84)
+        actual = _rust_str_array("ALL_REMOVED_FUNCTIONS")
         missing = canonical - actual
         assert not missing, f"REMOVED_FUNCTIONS_84에 누락된 항목: {missing}"
 
     def test_deprecated_functions_84_parity(self, canonical_constants):
-        """DEPRECATED_FUNCTIONS_84가 canonical 기준값을 모두 포함하는지 검증"""
+        """Rust 검사의 deprecated 함수 목록이 canonical 기준값을 모두 포함하는지 검증"""
         canonical = set(canonical_constants["deprecated_functions_84"])
-        actual = set(DEPRECATED_FUNCTIONS_84)
+        actual = _rust_str_array("DEPRECATED_ONLY_FUNCTIONS")
         missing = canonical - actual
         assert not missing, f"DEPRECATED_FUNCTIONS_84에 누락된 항목: {missing}"
 
     def test_removed_functions_80x_parity(self, canonical_constants):
-        """REMOVED_FUNCTIONS_80X가 canonical 기준값을 모두 포함하는지 검증"""
+        """Rust 검사의 함수 목록이 canonical removed_functions_80x 를 모두 포함하는지 검증"""
         canonical = set(canonical_constants["removed_functions_80x"])
-        actual = set(REMOVED_FUNCTIONS_80X)
+        actual = _rust_str_array("ALL_REMOVED_FUNCTIONS")
         missing = canonical - actual
         assert not missing, f"REMOVED_FUNCTIONS_80X에 누락된 항목: {missing}"
 
     def test_new_reserved_keywords_84_parity(self, canonical_constants):
-        """NEW_RESERVED_KEYWORDS_84가 canonical 기준값을 모두 포함하는지 검증"""
+        """Python(덤프 분석)과 Rust(DB 분석)의 8.4 신규 예약어가 canonical 기준값을 모두 포함하는지 검증"""
         canonical = set(canonical_constants["new_reserved_keywords_84"])
+        assert not canonical - _rust_str_array("NEW_RESERVED_KEYWORDS_84")
         actual = set(NEW_RESERVED_KEYWORDS_84)
         missing = canonical - actual
         assert not missing, f"NEW_RESERVED_KEYWORDS_84에 누락된 항목: {missing}"
 
     def test_obsolete_sql_modes_parity(self, canonical_constants):
-        """OBSOLETE_SQL_MODES가 canonical 기준값을 모두 포함하는지 검증"""
+        """Rust 검사의 obsolete SQL 모드가 canonical 기준값을 모두 포함하는지 검증"""
         canonical = set(canonical_constants["obsolete_sql_modes"])
-        actual = set(OBSOLETE_SQL_MODES)
+        actual = _rust_str_array("OBSOLETE_SQL_MODES")
         missing = canonical - actual
         assert not missing, f"OBSOLETE_SQL_MODES에 누락된 항목: {missing}"
 

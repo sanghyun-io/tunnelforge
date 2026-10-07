@@ -1,8 +1,8 @@
 """
 migration_analyzer.py 단위 테스트
 
-MigrationAnalyzer, DumpFileAnalyzer 검증.
-DB 없이 FakeMySQLConnector로 동작을 검증합니다.
+MigrationAnalyzer(Rust upgrade.analyze 결과 변환/위임), DumpFileAnalyzer 검증.
+호환성 검사 규칙 자체는 migration_core/src/upgrade_analyze.rs 와 live_upgrade_analyze.rs 가 검증한다.
 """
 import pytest
 import os
@@ -22,599 +22,142 @@ from src.core.migration_analyzer import (
     ForeignKeyInfo,
     SchemaCheckOptions,
 )
-from tests.conftest import FakeMySQLConnector
 
 
 # ============================================================
-# MigrationAnalyzer 기본 테스트
+# MigrationAnalyzer: Rust core 위임
 # ============================================================
-class TestMigrationAnalyzerInit:
-    """MigrationAnalyzer 초기화 테스트"""
+CORE_RESULT = {
+    "event": "result", "command": "upgrade.analyze", "success": True,
+    "schema": "app", "total_tables": 3, "total_fk_relations": 2,
+    "fk_tree": {"parent": ["child"]},
+    "issues": [
+        {"issue_type": "charset_issue", "severity": "warning", "location": "app.legacy",
+         "description": "테이블이 utf8mb3 collation 사용 중: utf8mb3_general_ci",
+         "suggestion": "ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+         "table_name": None, "column_name": None, "fix_query": None},
+        {"issue_type": "invalid_date", "severity": "error", "location": "app.orders.created",
+         "description": "잘못된 날짜값 3개 발견 (0000-00-00 등)", "suggestion": "NULL로 변경",
+         "table_name": "orders", "column_name": "created",
+         "fix_query": "UPDATE `app`.`orders` SET `created` = NULL WHERE ..."},
+    ],
+    "orphan_records": [{
+        "constraint_name": "fk_pair", "child_table": "child", "child_column": "a, b",
+        "parent_table": "parent", "parent_column": "x, y", "child_columns": ["a", "b"], "parent_columns": ["x", "y"],
+        "orphan_count": 1, "sample_values": ["(1, 9)"],
+        "cleanup_sql": {"delete": "DELETE c FROM `app`.`child` AS c\nWHERE ...",
+                        "set_null": "UPDATE `app`.`child` AS c\nSET c.`a` = NULL, c.`b` = NULL\nWHERE ...",
+                        "count": "SELECT COUNT(*) AS cnt FROM `app`.`child` AS c\nWHERE ..."},
+    }],
+}
 
-    def test_init(self, fake_connector):
-        analyzer = MigrationAnalyzer(fake_connector)
-        assert analyzer.connector is fake_connector
 
-    def test_progress_callback(self, fake_connector):
-        analyzer = MigrationAnalyzer(fake_connector)
+def _connector_with_facade(result=None):
+    from src.core.db_core_facade import DbEndpoint
+    connector = MagicMock()
+    connector.connection.endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "u", "p", "other_db")
+    connector.connection.facade.analyze_upgrade.return_value = result or CORE_RESULT
+    return connector
+
+
+class TestAnalyzeSchemaDelegatesToRust:
+    """분석은 Rust core upgrade.analyze 가 하고, 결과를 AnalysisResult 로 바꾼다"""
+
+    def test_calls_core_with_schema_endpoint_and_options_and_forwards_progress(self):
+        connector = _connector_with_facade()
+
+        def fake_analyze(endpoint, options, on_event):
+            on_event({"event": "progress", "message": "📌 [1/15] 고아 레코드 검사 시작..."})
+            on_event({"event": "phase", "message": "ignored"})
+            return CORE_RESULT
+
+        connector.connection.facade.analyze_upgrade.side_effect = fake_analyze
+        analyzer = MigrationAnalyzer(connector)
         messages = []
-        analyzer.set_progress_callback(lambda m: messages.append(m))
-        analyzer._log("test message")
-        assert "test message" in messages
+        analyzer.set_progress_callback(messages.append)
 
-    def test_no_callback(self, fake_connector):
-        """콜백 없으면 _log가 예외 없이 동작"""
-        analyzer = MigrationAnalyzer(fake_connector)
-        analyzer._log("should not error")
+        result = analyzer.analyze_schema("app", check_orphans=False)
 
+        endpoint, options = connector.connection.facade.analyze_upgrade.call_args.args
+        assert endpoint.database == "app" and endpoint.host == "127.0.0.1"
+        assert options == {"check_orphans": False}
+        assert messages == ["📌 [1/15] 고아 레코드 검사 시작..."]
+        assert result.schema == "app" and result.total_tables == 3 and result.total_fk_relations == 2
 
-class TestCheckCharsetIssues:
-    """check_charset_issues 테스트"""
+    def test_maps_issues_orphans_tree_and_default_cleanup_actions(self):
+        result = MigrationAnalyzer(_connector_with_facade()).analyze_schema("app")
 
-    def test_finds_utf8mb3_table(self, fake_connector):
-        fake_connector.query_results = {
-            'TABLE_COLLATION': [
-                {'TABLE_NAME': 'users', 'TABLE_COLLATION': 'utf8_general_ci'}
-            ],
-            'CHARACTER_SET_NAME': [],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_charset_issues("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.CHARSET_ISSUE
+        assert [i.issue_type for i in result.compatibility_issues] == [IssueType.CHARSET_ISSUE, IssueType.INVALID_DATE]
+        date_issue = result.compatibility_issues[1]
+        assert (date_issue.severity, date_issue.table_name, date_issue.column_name) == ("error", "orders", "created")
+        assert date_issue.fix_query.startswith("UPDATE `app`.`orders`")
+        assert result.fk_tree == {"parent": ["child"]}
 
-    def test_finds_utf8mb3_column(self, fake_connector):
-        fake_connector.query_results = {
-            'TABLE_COLLATION': [],
-            'CHARACTER_SET_NAME': [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'name', 'CHARACTER_SET_NAME': 'utf8', 'COLLATION_NAME': 'utf8_general_ci'}
-            ],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_charset_issues("test_db")
-        assert len(issues) >= 1
-        assert "utf8mb3" in issues[0].description
+        orphan = result.orphan_records[0]
+        assert (orphan.child_column, orphan.orphan_count, orphan.sample_values) == ("a, b", 1, ["(1, 9)"])
+        action = result.cleanup_actions[0]
+        assert action.action_type == ActionType.DELETE and action.sql.startswith("DELETE c FROM")
+        assert action.count_sql.startswith("SELECT COUNT(*) AS cnt")
 
-    def test_no_issues_when_clean(self, fake_connector):
-        fake_connector.query_results = {
-            'TABLE_COLLATION': [],
-            'CHARACTER_SET_NAME': [],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_charset_issues("test_db")
-        assert len(issues) == 0
+    def test_rejects_unknown_check_options(self):
+        with pytest.raises(TypeError, match="check_typo"):
+            MigrationAnalyzer(_connector_with_facade()).analyze_schema("app", check_typo=True)
+
+    def test_requires_a_connected_connector(self):
+        connector = MagicMock()
+        connector.connection = None
+        with pytest.raises(RuntimeError, match="연결"):
+            MigrationAnalyzer(connector).analyze_schema("app")
 
 
-class TestCheckReservedKeywords:
-    """check_reserved_keywords 테스트"""
-
-    def test_finds_table_keyword(self, fake_connector):
-        fake_connector._tables = {'test_db': ['rank', 'users']}
-        fake_connector.query_results = {
-            'COLUMN_NAME': []
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_reserved_keywords("test_db")
-        keyword_issues = [i for i in issues if i.issue_type == IssueType.RESERVED_KEYWORD]
-        assert len(keyword_issues) >= 1
-        assert any("RANK" in i.description.upper() for i in keyword_issues)
-
-    def test_finds_column_keyword(self, fake_connector):
-        fake_connector._tables = {'test_db': ['users']}
-        fake_connector.query_results = {
-            'COLUMN_NAME': [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'rank'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_reserved_keywords("test_db")
-        keyword_issues = [i for i in issues if i.issue_type == IssueType.RESERVED_KEYWORD]
-        assert len(keyword_issues) >= 1
-
-    def test_no_keyword_conflict(self, fake_connector):
-        fake_connector._tables = {'test_db': ['users']}
-        fake_connector.query_results = {
-            'COLUMN_NAME': [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'name'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_reserved_keywords("test_db")
-        assert len(issues) == 0
-
-
-class TestCheckDeprecatedInRoutines:
-    """check_deprecated_in_routines 테스트"""
-
-    def test_finds_deprecated_function(self, fake_connector):
-        fake_connector.query_results = {
-            'ROUTINE_DEFINITION': [
-                {
-                    'ROUTINE_NAME': 'get_hash',
-                    'ROUTINE_TYPE': 'FUNCTION',
-                    'ROUTINE_DEFINITION': "SELECT PASSWORD('test')"
-                }
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_in_routines("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.DEPRECATED_FUNCTION
-
-    def test_no_deprecated_functions(self, fake_connector):
-        fake_connector.query_results = {
-            'ROUTINE_DEFINITION': [
-                {
-                    'ROUTINE_NAME': 'safe_func',
-                    'ROUTINE_TYPE': 'FUNCTION',
-                    'ROUTINE_DEFINITION': "SELECT COUNT(*) FROM users"
-                }
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_in_routines("test_db")
-        assert len(issues) == 0
-
-    def test_password_column_reference_is_not_a_false_positive(self, fake_connector):
-        """컬럼/식별자 'password'는 PASSWORD() 함수 호출이 아니므로 오탐하면 안 된다"""
-        fake_connector.query_results = {
-            'ROUTINE_DEFINITION': [
-                {
-                    'ROUTINE_NAME': 'get_user',
-                    'ROUTINE_TYPE': 'FUNCTION',
-                    'ROUTINE_DEFINITION': "SELECT password FROM users WHERE id = 1"
-                }
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_in_routines("test_db")
-        assert issues == []
-
-    def test_aes_encrypt_is_not_flagged_as_encrypt(self, fake_connector):
-        """AES_ENCRYPT()는 ENCRYPT()와 다른 함수이므로 오탐하면 안 된다"""
-        fake_connector.query_results = {
-            'ROUTINE_DEFINITION': [
-                {
-                    'ROUTINE_NAME': 'enc_func',
-                    'ROUTINE_TYPE': 'FUNCTION',
-                    'ROUTINE_DEFINITION': "SELECT AES_ENCRYPT(secret, 'k')"
-                }
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_in_routines("test_db")
-        assert issues == []
-
-    def test_actual_password_call_still_reported(self, fake_connector):
-        """실제 PASSWORD(...) 호출은 여전히 탐지되어야 한다"""
-        fake_connector.query_results = {
-            'ROUTINE_DEFINITION': [
-                {
-                    'ROUTINE_NAME': 'get_hash',
-                    'ROUTINE_TYPE': 'FUNCTION',
-                    'ROUTINE_DEFINITION': "SELECT PASSWORD('test')"
-                }
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_in_routines("test_db")
-        assert len(issues) == 1
-
-    def test_duplicate_calls_of_same_function_reported_once(self, fake_connector):
-        """동일 함수가 여러 번 호출돼도 함수당 이슈는 1개만 보고한다"""
-        fake_connector.query_results = {
-            'ROUTINE_DEFINITION': [
-                {
-                    'ROUTINE_NAME': 'paginated_query',
-                    'ROUTINE_TYPE': 'PROCEDURE',
-                    'ROUTINE_DEFINITION': "SELECT FOUND_ROWS(); SELECT FOUND_ROWS();"
-                }
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_in_routines("test_db")
-        found_rows_issues = [i for i in issues if "FOUND_ROWS" in i.description]
-        assert len(found_rows_issues) == 1
-
-    def test_sql_calc_found_rows_without_parens_not_flagged_by_call_boundary(self, fake_connector):
-        """SQL_CALC_FOUND_ROWS는 SELECT 수정자로 괄호 없이 쓰이므로 함수-호출
-        경계 검사(뒤에 '(' 필요)에서는 잡히지 않는다 - 알려진 트레이드오프."""
-        fake_connector.query_results = {
-            'ROUTINE_DEFINITION': [
-                {
-                    'ROUTINE_NAME': 'legacy_paginate',
-                    'ROUTINE_TYPE': 'PROCEDURE',
-                    'ROUTINE_DEFINITION': "SELECT SQL_CALC_FOUND_ROWS * FROM users LIMIT 10"
-                }
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_in_routines("test_db")
-        assert issues == []
-
-
-class TestCheckSqlModes:
-    """check_sql_modes 테스트"""
-
-    def test_finds_deprecated_mode(self, fake_connector):
-        fake_connector.query_results = {
-            '@@sql_mode': [{'sql_mode': 'ONLY_FULL_GROUP_BY,NO_AUTO_CREATE_USER'}]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_sql_modes()
-        mode_issues = [i for i in issues if i.issue_type == IssueType.SQL_MODE_ISSUE]
-        assert len(mode_issues) >= 1
-        assert "NO_AUTO_CREATE_USER" in mode_issues[0].description
-
-    def test_no_deprecated_modes(self, fake_connector):
-        fake_connector.query_results = {
-            '@@sql_mode': [{'sql_mode': 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES'}]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_sql_modes()
-        assert len(issues) == 0
-
-    def test_empty_sql_mode(self, fake_connector):
-        fake_connector.query_results = {
-            '@@sql_mode': [{'sql_mode': ''}]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_sql_modes()
-        assert len(issues) == 0
-
-
-class TestCheckAuthPlugins:
-    """check_auth_plugins 테스트"""
-
-    def test_finds_native_password(self, fake_connector):
-        fake_connector.query_results = {
-            'mysql.user': [
-                {'User': 'admin', 'Host': 'localhost', 'plugin': 'mysql_native_password'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_auth_plugins()
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.AUTH_PLUGIN_ISSUE
-        assert issues[0].severity == "error"
-
-    def test_finds_sha256(self, fake_connector):
-        fake_connector.query_results = {
-            'mysql.user': [
-                {'User': 'user1', 'Host': '%', 'plugin': 'sha256_password'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_auth_plugins()
-        assert len(issues) >= 1
-        assert issues[0].severity == "warning"
-
-    def test_query_failure_no_crash(self, fake_connector):
-        """mysql.user 접근 권한 없을 때 예외 처리"""
-        fake_connector.fail_on = {'mysql.user': PermissionError("Access denied")}
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_auth_plugins()
-        assert len(issues) == 0  # 실패해도 빈 리스트
-
-
-class TestCheckZerofillColumns:
-    def test_finds_zerofill(self, fake_connector):
-        fake_connector.query_results = {
-            'ZEROFILL': [
-                {'TABLE_NAME': 'orders', 'COLUMN_NAME': 'order_num', 'COLUMN_TYPE': 'int(8) unsigned zerofill'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_zerofill_columns("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.ZEROFILL_USAGE
-
-
-class TestCheckFloatPrecision:
-    def test_finds_float_md(self, fake_connector):
-        fake_connector.query_results = {
-            'float': [
-                {'TABLE_NAME': 't', 'COLUMN_NAME': 'val', 'COLUMN_TYPE': 'float(10,2)', 'DATA_TYPE': 'float'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_float_precision("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.FLOAT_PRECISION
-
-
-class TestCheckDeprecatedEngines:
-    def test_finds_myisam(self, fake_connector):
-        fake_connector.query_results = {
-            'ENGINE': [
-                {'TABLE_NAME': 'logs', 'ENGINE': 'MyISAM'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_deprecated_engines("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.DEPRECATED_ENGINE
-
-
-class TestCheckYear2Type:
-    def test_finds_year2(self, fake_connector):
-        fake_connector.query_results = {
-            "year(2)": [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'birth', 'COLUMN_TYPE': 'year(2)'}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_year2_type("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.YEAR2_TYPE
-
-
-class TestCheckEnumEmptyValue:
-    def test_finds_empty_enum(self, fake_connector):
-        fake_connector.query_results = {
-            "enum": [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'status', "COLUMN_TYPE": "enum('active','','inactive')"}
-            ]
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_enum_empty_value("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.ENUM_EMPTY_VALUE
-
-
-class TestCheckTimestampRange:
-    def test_timestamp_column_reported_as_advisory(self, fake_connector):
-        """TIMESTAMP는 '2038-01-19 03:14:07'를 초과하는 값을 애초에 저장할 수
-        없으므로, 실데이터를 조회해 초과 여부를 판정하는 것은 항상 0건만
-        나오는 무의미한 검사다. 컬럼 존재 자체를 advisory로 보고해야 한다."""
-        fake_connector.query_results = {
-            "timestamp": [
-                {'TABLE_NAME': 'events', 'COLUMN_NAME': 'event_time'}
-            ],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_timestamp_range("test_db")
-        assert len(issues) == 1
-        assert issues[0].issue_type == IssueType.TIMESTAMP_RANGE
-        assert issues[0].severity == "warning"
-        # 항상 거짓인 라이브 데이터 조회를 더 이상 실행하지 않아야 한다
-        assert not any(
-            "2038-01-19 03:14:07" in (query or "")
-            for query, _ in fake_connector.executed_queries
-        )
-
-    def test_no_timestamp_columns_no_issues(self, fake_connector):
-        fake_connector.query_results = {"timestamp": []}
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_timestamp_range("test_db")
-        assert issues == []
-
-
-class TestCheckIntDisplayWidth:
-    """check_int_display_width 직접 호출 + 파이프라인 연결 테스트
-
-    이 메서드는 정의만 되어 있고 analyze_schema/_analyze_schema_impl
-    파이프라인 어디에서도 호출되지 않던 죽은 코드였다.
-    """
-
-    INT_DISPLAY_WIDTH_QUERY_KEY = "COLUMN_TYPE REGEXP '^(tinyint|smallint|mediumint|int|bigint)"
-
-    def test_finds_int_display_width(self, fake_connector):
-        fake_connector.query_results = {
-            self.INT_DISPLAY_WIDTH_QUERY_KEY: [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'age', 'COLUMN_TYPE': 'int(11)'}
-            ],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_int_display_width("test_db")
-        assert len(issues) == 1
-        assert issues[0].issue_type == IssueType.INT_DISPLAY_WIDTH
-        assert issues[0].severity == "info"
-
-    def _pipeline_kwargs(self, enabled: bool) -> SchemaCheckOptions:
-        return SchemaCheckOptions(
-            check_orphans=False, check_charset=False, check_keywords=False,
-            check_routines=False, check_sql_mode=False, check_auth_plugins=False,
-            check_zerofill=False, check_float_precision=False, check_fk_name_length=False,
-            check_invalid_dates=False, check_year2=False, check_deprecated_engines=False,
-            check_enum_empty=False, check_timestamp_range=False,
-            check_int_display_width=enabled,
-        )
-
-    def test_wired_into_pipeline_when_enabled(self, fake_connector):
-        fake_connector._tables = {"test_db": []}
-        fake_connector.query_results = {
-            self.INT_DISPLAY_WIDTH_QUERY_KEY: [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'age', 'COLUMN_TYPE': 'int(11)'}
-            ],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        result = analyzer._analyze_schema_impl("test_db", self._pipeline_kwargs(True))
-        int_issues = [i for i in result.compatibility_issues if i.issue_type == IssueType.INT_DISPLAY_WIDTH]
-        assert len(int_issues) == 1
-
-    def test_not_run_in_pipeline_when_disabled(self, fake_connector):
-        fake_connector._tables = {"test_db": []}
-        fake_connector.query_results = {
-            self.INT_DISPLAY_WIDTH_QUERY_KEY: [
-                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'age', 'COLUMN_TYPE': 'int(11)'}
-            ],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        result = analyzer._analyze_schema_impl("test_db", self._pipeline_kwargs(False))
-        int_issues = [i for i in result.compatibility_issues if i.issue_type == IssueType.INT_DISPLAY_WIDTH]
-        assert int_issues == []
-
-
-class TestCheckInvalidDateValues:
-    def test_finds_zero_dates(self, fake_connector):
-        fake_connector.query_results = {
-            "DATA_TYPE": [
-                {'TABLE_NAME': 'orders', 'COLUMN_NAME': 'created', 'DATA_TYPE': 'date', 'COLUMN_DEFAULT': None}
-            ],
-            "'0000-00-00'": [{'cnt': 10}],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_invalid_date_values("test_db")
-        assert len(issues) >= 1
-        assert issues[0].issue_type == IssueType.INVALID_DATE
-
-    def test_skips_on_query_error(self, fake_connector):
-        fake_connector.query_results = {
-            "DATA_TYPE": [
-                {'TABLE_NAME': 'orders', 'COLUMN_NAME': 'created', 'DATA_TYPE': 'date', 'COLUMN_DEFAULT': None}
-            ],
-        }
-        fake_connector.fail_on = {"'0000-00-00'": Exception("denied")}
-        analyzer = MigrationAnalyzer(fake_connector)
-        issues = analyzer.check_invalid_date_values("test_db")
-        assert len(issues) == 0  # 실패 시 skip
-
-
-# ============================================================
-# CleanupAction / Orphan 테스트
-# ============================================================
 class TestGenerateCleanupSql:
-    def test_delete_action(self, fake_connector):
-        analyzer = MigrationAnalyzer(fake_connector)
-        orphan = OrphanRecord(
-            child_table="orders", child_column="user_id",
-            parent_table="users", parent_column="id",
-            orphan_count=5, sample_values=[99, 100]
-        )
-        action = analyzer.generate_cleanup_sql(orphan, ActionType.DELETE, "test_db")
-        assert "DELETE" in action.sql
-        assert "FROM" in action.sql
-        assert action.action_type == ActionType.DELETE
-        assert action.affected_rows == 5
-        assert action.dry_run is True
-        assert action.target_schema == "test_db"
-        assert action.target_table == "orders"
+    """정리 SQL 은 분석 시 Rust core 가 만든 것을 쓴다"""
 
-    def test_delete_action_uses_not_exists_not_not_in(self, fake_connector):
-        """NOT IN은 부모 참조 컬럼에 NULL이 있으면 전체가 UNKNOWN이 되어
-        실제 고아 레코드가 있어도 0건으로 처리되는 NULL-안전성 문제가 있다."""
-        analyzer = MigrationAnalyzer(fake_connector)
-        orphan = OrphanRecord(
-            child_table="orders", child_column="user_id",
-            parent_table="users", parent_column="id",
-            orphan_count=5
-        )
-        action = analyzer.generate_cleanup_sql(orphan, ActionType.DELETE, "test_db")
-        assert "NOT EXISTS" in action.sql
-        assert "NOT IN" not in action.sql
+    def _orphan(self, cleanup_sql=None):
+        return OrphanRecord("child", "a, b", "parent", "x, y", 1, [], cleanup_sql if cleanup_sql is not None else CORE_RESULT["orphan_records"][0]["cleanup_sql"])
 
-    def test_set_null_action(self, fake_connector):
-        analyzer = MigrationAnalyzer(fake_connector)
-        orphan = OrphanRecord(
-            child_table="orders", child_column="user_id",
-            parent_table="users", parent_column="id",
-            orphan_count=3
-        )
-        action = analyzer.generate_cleanup_sql(orphan, ActionType.SET_NULL, "test_db")
-        assert "SET" in action.sql
-        assert "`user_id` = NULL" in action.sql
-        assert "NOT EXISTS" in action.sql
-        assert "NOT IN" not in action.sql
-        assert action.target_schema == "test_db"
-        assert action.target_table == "orders"
+    def test_delete_and_set_null_use_core_sql(self):
+        analyzer = MigrationAnalyzer(MagicMock())
+        delete = analyzer.generate_cleanup_sql(self._orphan(), ActionType.DELETE, "app")
+        set_null = analyzer.generate_cleanup_sql(self._orphan(), ActionType.SET_NULL, "app")
+        assert delete.sql.startswith("DELETE c FROM") and "1개 삭제" in delete.description
+        assert "SET c.`a` = NULL, c.`b` = NULL" in set_null.sql
+        assert delete.count_sql == set_null.count_sql and delete.target_table == "child"
 
-    def test_manual_action(self, fake_connector):
-        analyzer = MigrationAnalyzer(fake_connector)
-        orphan = OrphanRecord(
-            child_table="orders", child_column="user_id",
-            parent_table="users", parent_column="id",
-            orphan_count=1
-        )
-        action = analyzer.generate_cleanup_sql(orphan, ActionType.MANUAL, "test_db")
-        assert "수동 처리" in action.sql
+    def test_manual_action(self):
+        manual = MigrationAnalyzer(MagicMock()).generate_cleanup_sql(self._orphan(), ActionType.MANUAL, "app")
+        assert manual.sql.startswith("-- 수동 처리 필요") and manual.count_sql is None
+
+    def test_results_saved_by_older_versions_ask_for_a_new_analysis(self):
+        action = MigrationAnalyzer(MagicMock()).generate_cleanup_sql(self._orphan({}), ActionType.DELETE, "app")
+        assert "다시 분석" in action.sql and action.count_sql is None
 
 
 class TestExecuteCleanup:
-    def test_dry_run_cleanup_still_counts_affected_rows(self, fake_connector):
-        fake_connector.query_results = {
-            "SELECT COUNT(*)": [{"cnt": 7}],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        action = CleanupAction(
-            action_type=ActionType.DELETE,
-            table="orders",
-            description="delete orphan orders",
-            sql="DELETE FROM `test_db`.`orders` WHERE `user_id` IS NULL",
-            affected_rows=3,
-            target_schema="test_db",
-            target_table="orders",
-        )
+    def _action(self, count_sql="SELECT COUNT(*) AS cnt FROM t", action_type=ActionType.DELETE):
+        return CleanupAction(action_type, "child", "d", "DELETE ...", 1, True, "app", "child", count_sql)
 
-        success, message, affected = analyzer.execute_cleanup(action, dry_run=True)
+    def test_dry_run_counts_rows_with_the_core_count_sql(self):
+        connector = MagicMock()
+        connector.execute.return_value = [{"cnt": 7}]
+        ok, message, affected = MigrationAnalyzer(connector).execute_cleanup(self._action())
+        connector.execute.assert_called_once_with("SELECT COUNT(*) AS cnt FROM t")
+        assert (ok, affected) == (True, 7) and "7개 행" in message
 
-        assert success is True
-        assert affected == 7
-        assert "[DRY-RUN]" in message
-        assert len(fake_connector.executed_queries) == 1
+    def test_dry_run_without_count_sql_fails_explicitly(self):
+        ok, message, affected = MigrationAnalyzer(MagicMock()).execute_cleanup(self._action(count_sql=None))
+        assert (ok, affected) == (False, 0) and "메타데이터" in message
 
-    def test_dry_run_without_metadata_fails_explicitly(self, fake_connector):
-        """target_schema/target_table이 없으면 sql 텍스트를 재파싱해 추측하지
-        않고 명시적으로 실패한다 (구버전 직렬화 복원 등)."""
-        analyzer = MigrationAnalyzer(fake_connector)
-        action = CleanupAction(
-            action_type=ActionType.DELETE,
-            table="orders",
-            description="delete orphan orders",
-            sql="DELETE FROM `test_db`.`orders` WHERE `user_id` IS NULL",
-            affected_rows=3,
-        )
+    def test_manual_action_needs_no_query(self):
+        connector = MagicMock()
+        assert MigrationAnalyzer(connector).execute_cleanup(self._action(action_type=ActionType.MANUAL))[0] is True
+        connector.execute.assert_not_called()
 
-        success, message, affected = analyzer.execute_cleanup(action, dry_run=True)
-
-        assert success is False
-        assert affected == 0
-        assert "메타데이터" in message
-        assert fake_connector.executed_queries == []
-
-    def test_dry_run_table_name_containing_from_and_set_keywords(self, fake_connector):
-        """테이블명이 SETTINGS/ASSETS처럼 FROM/SET 키워드를 포함해도
-        저장된 target_schema/target_table을 그대로 쓰므로 안전하다."""
-        fake_connector.query_results = {
-            "SELECT COUNT(*)": [{"cnt": 2}],
-        }
-        analyzer = MigrationAnalyzer(fake_connector)
-        orphan = OrphanRecord(
-            child_table="ASSETS", child_column="owner_id",
-            parent_table="users", parent_column="id",
-            orphan_count=2
-        )
-        action = analyzer.generate_cleanup_sql(orphan, ActionType.SET_NULL, "test_db")
-
-        success, message, affected = analyzer.execute_cleanup(action, dry_run=True)
-
-        assert success is True
-        assert affected == 2
-        executed_sql = fake_connector.executed_queries[0][0]
-        assert "FROM `test_db`.`ASSETS` AS c" in executed_sql
-
-    def test_actual_cleanup_rejects_legacy_python_mutation_mode(self, fake_connector):
-        analyzer = MigrationAnalyzer(fake_connector)
-        action = CleanupAction(
-            action_type=ActionType.DELETE,
-            table="orders",
-            description="delete orphan orders",
-            sql="DELETE FROM `test_db`.`orders` WHERE `user_id` IS NULL",
-            affected_rows=3,
-        )
-
+    def test_actual_cleanup_rejects_legacy_python_mutation_mode(self):
         with pytest.raises(RuntimeError, match="Rust Core"):
-            analyzer.execute_cleanup(action, dry_run=False)
-
-        fake_connector.connection.cursor.assert_not_called()
-        fake_connector.connection.commit.assert_not_called()
-        fake_connector.connection.rollback.assert_not_called()
-        assert fake_connector.executed_queries == []
+            MigrationAnalyzer(MagicMock()).execute_cleanup(self._action(), dry_run=False)
 
 
-# ============================================================
-# AnalysisResult 직렬화 테스트
-# ============================================================
 class TestAnalysisResultSerialization:
     def test_to_dict_and_from_dict_roundtrip(self):
         result = AnalysisResult(
