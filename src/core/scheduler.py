@@ -218,6 +218,11 @@ class BackupScheduler:
         """스케줄러 실행 중 여부"""
         return self._running
 
+    def has_active_jobs(self) -> bool:
+        """대기 중이거나 실행 중인 예약 작업이 있는지"""
+        with self._lock:
+            return bool(self._active_schedule_ids)
+
     def get_schedules(self) -> List[ScheduleConfig]:
         """모든 스케줄 반환"""
         return list(self._schedules)
