@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -801,7 +802,7 @@ class _FailingCatalogFacade:
 
 def test_get_schemas_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
-    connector.connection = object()
+    connector.connection = SimpleNamespace(connection_id="conn-1")
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -813,7 +814,7 @@ def test_get_schemas_propagates_and_logs_db_core_service_error(caplog):
 
 def test_schema_exists_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
-    connector.connection = object()
+    connector.connection = SimpleNamespace(connection_id="conn-1")
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -840,7 +841,7 @@ def test_get_tables_propagates_and_logs_db_core_service_error(caplog):
 
 def test_get_db_version_string_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
-    connector.connection = object()
+    connector.connection = SimpleNamespace(connection_id="conn-1")
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -852,7 +853,7 @@ def test_get_db_version_string_propagates_and_logs_db_core_service_error(caplog)
 
 def test_get_column_names_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(DbCoreServiceError("Access denied")))
-    connector.connection = object()
+    connector.connection = SimpleNamespace(connection_id="conn-1")
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -865,7 +866,7 @@ def test_get_column_names_propagates_and_logs_db_core_service_error(caplog):
 def test_get_schemas_generic_exception_is_logged_and_returns_empty_default():
     """facade 예외가 아닌 일반 예외는 기존 계약대로 빈 기본값을 반환한다 (호환성 유지)."""
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=_FailingCatalogFacade(RuntimeError("boom")))
-    connector.connection = object()
+    connector.connection = SimpleNamespace(connection_id="conn-1")
 
     result = connector.get_schemas()
 

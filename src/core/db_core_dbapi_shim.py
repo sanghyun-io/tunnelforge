@@ -69,7 +69,9 @@ class RustDbConnector:
             if not success:
                 return default
         try:
-            return self.facade.catalog(self.connection_id, kind, **args)
+            # 세션 ID 는 연결 객체에서 읽는다. PostgresConnector/MySQLConnector 는 delegate 에
+            # connection 만 넘기므로 delegate 의 connection_id 는 비어 있을 수 있다.
+            return self.facade.catalog(self.connection.connection_id, kind, **args)
         except DbCoreServiceError as exc:
             self._log_metadata_error(operation, exc)
             raise
