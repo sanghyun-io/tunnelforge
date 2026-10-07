@@ -15,7 +15,6 @@ $engineLockedPattern = "from src\.core\.db_connector import MySQLConnector"
 $allowedEngineLocked = @(
     "src/core/db_connector.py",
     "src/core/migration_preflight.py",
-    "src/core/foreign_key_resolver.py",
     "src/ui/dialogs/db_dialogs.py",
     "src/ui/dialogs/db_connection_dialog.py",
     "src/ui/dialogs/db_export_dialog.py",

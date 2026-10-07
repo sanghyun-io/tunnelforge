@@ -364,3 +364,18 @@ class TestDumpFileAnalyzerSqlPatterns:
             "orders.triggers.sql",
         )
         assert not any(i.issue_type == IssueType.REMOVED_SYS_VAR for i in issues)
+
+
+def test_orphan_select_sql_uses_core_select_and_flags_old_results():
+    from src.core.migration_analyzer import MISSING_CLEANUP_SQL, OrphanRecord, orphan_select_sql
+
+    composite = OrphanRecord(
+        child_table="child", child_column="a, b", parent_table="parent", parent_column="x, y",
+        orphan_count=2, cleanup_sql={"select": "SELECT c.* FROM `app`.`child` AS c\nWHERE c.`a` IS NOT NULL"},
+    )
+    sql = orphan_select_sql(composite, "app")
+    assert sql.startswith("-- child.a, b → parent.x, y\n-- 고아 레코드 수: 2개\n")
+    assert sql.endswith("WHERE c.`a` IS NOT NULL;")
+
+    saved_before_rust = OrphanRecord(child_table="c", child_column="p", parent_table="p", parent_column="id", orphan_count=1)
+    assert orphan_select_sql(saved_before_rust).endswith(MISSING_CLEANUP_SQL)

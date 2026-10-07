@@ -5,7 +5,8 @@ from unittest.mock import MagicMock
 
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from src.exporters.rust_dump_exporter import OrphanRecordInfo, RustDumpConfig
+from src.core.migration_analysis_models import OrphanRecord
+from src.exporters.rust_dump_exporter import RustDumpConfig
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 from src.ui.dialogs.db_dialogs import (
@@ -18,18 +19,22 @@ def test_orphan_analysis_worker_emits_results_without_gui_thread_process_events(
     app = QApplication.instance() or QApplication([])
 
     fake_results = [object()]
+    calls = {}
 
-    class FakeResolver:
+    class FakeAnalyzer:
         def __init__(self, connector):
             self.connector = connector
 
-        def find_orphan_records(self, schema, progress_callback=None):
-            if progress_callback:
-                progress_callback("검사 중...")
-            return fake_results
+        def set_progress_callback(self, callback):
+            self.callback = callback
+
+        def analyze_schema(self, schema, **checks):
+            calls["schema"], calls["checks"] = schema, checks
+            self.callback("검사 중...")
+            return type("Result", (), {"orphan_records": fake_results})()
 
     monkeypatch.setattr(
-        "src.ui.dialogs.db_orphan_dialog.ForeignKeyResolver", FakeResolver
+        "src.ui.dialogs.db_orphan_dialog.MigrationAnalyzer", FakeAnalyzer
     )
 
     worker = OrphanAnalysisWorker(connector=MagicMock(), schema="app")
@@ -43,6 +48,9 @@ def test_orphan_analysis_worker_emits_results_without_gui_thread_process_events(
 
     assert received["results"] == fake_results
     assert received["progress"] == ["검사 중..."]
+    # Rust upgrade.analyze 에서 고아 검사만 켠다
+    assert calls["schema"] == "app"
+    assert [name for name, enabled in calls["checks"].items() if enabled] == ["check_orphans"]
 
 def test_orphan_dialog_start_analysis_starts_worker_and_disables_reentrant_actions(monkeypatch):
     app = QApplication.instance() or QApplication([])
@@ -120,9 +128,9 @@ def test_orphan_export_report_uses_current_results_not_resolver_rerun(monkeypatc
     dialog.schema_combo.setCurrentText("app")
 
     seeded_results = [
-        OrphanRecordInfo(
-            table="orders", column="user_id", referenced_table="users",
-            referenced_column="id", orphan_count=3, sample_values=["1"], query="SELECT 1",
+        OrphanRecord(
+            child_table="orders", child_column="user_id", parent_table="users",
+            parent_column="id", orphan_count=3, sample_values=[1], cleanup_sql={"select": "SELECT 1"},
         )
     ]
     dialog.orphan_results = seeded_results
