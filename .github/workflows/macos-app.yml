@@ -1,39 +1,8 @@
 name: macOS App Validation
 
+# PR 검증은 version-gate 의 macOS 작업(필수 체크)이 맡는다. 이 워크플로는 수동 서명/공증 실행 전용이다.
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/macos-app.yml"
-      - ".github/workflows/release.yml"
-      - "assets/**"
-      - "docs/macos_support.md"
-      - "main.py"
-      - "migration_core/**"
-      - "pyproject.toml"
-      - "scripts/build-macos.sh"
-      - "scripts/package-macos.sh"
-      - "scripts/validate-macos-release.sh"
-      - "scripts/macos-dmg-mount.sh"
-      - "scripts/smoke-macos-launchagent.sh"
-      - "scripts/smoke-macos-applications-install.sh"
-      - "scripts/macos-manual-validation-report.sh"
-      - "src/**"
-      - "tests/test_app_self_check.py"
-      - "tests/test_macos_support_docs.py"
-      - "tests/test_platform_integration.py"
-      - "tests/test_platform_paths.py"
-      - "tests/test_resources.py"
-      - "tests/test_rust_core_packaging.py"
-      - "tests/test_settings_update_actions.py"
-      - "tests/test_update_downloader.py"
-      - "tunnel-manager.spec"
   workflow_dispatch:
-
-# 같은 PR에 새 커밋(버전 bump 포함)이 오면 이전 head 검증은 의미가 없으므로 취소한다.
-# 수동 서명/공증 실행(workflow_dispatch)은 run_id 그룹이라 서로 취소하지 않는다.
-concurrency:
-  group: macos-app-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -100,7 +69,7 @@ jobs:
             tests/test_app_self_check.py \
             tests/test_db_connection_responsiveness.py \
             tests/test_macos_support_docs.py
-          cargo test --manifest-path migration_core/Cargo.toml
+          cargo test --manifest-path migration_core/Cargo.toml --release
 
       - name: Smoke source-run TunnelForge app
         run: |
