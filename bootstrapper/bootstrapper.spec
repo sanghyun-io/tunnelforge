@@ -10,6 +10,9 @@ import sys
 
 # 프로젝트 루트 경로
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(SPEC)))
+sys.path.insert(0, project_root)
+
+from scripts.pyinstaller_version_info import build_version_info
 
 block_cipher = None
 
@@ -77,5 +80,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=os.path.join(project_root, 'assets', 'icon.ico'),
-    version_file=None,
+    # Windows VERSIONINFO (SignPath 서명 요건: ProductName/ProductVersion = 릴리스 버전)
+    version=build_version_info('TunnelForge Web Setup', 'TunnelForge-WebSetup.exe') if os.name == 'nt' else None,
 )
