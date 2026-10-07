@@ -120,6 +120,8 @@ Scheduled backups are available (backup tasks only: DST-aware times, at most one
 
 macOS DMG/ZIP packages are beta artifacts pending final real-Mac operator validation. They may have issues in SSH, DB, migration, LaunchAgent, or Gatekeeper flows; use them at your own risk and without warranty until final validation is complete.
 
+[Code signing policy](#code-signing-policy)
+
 </div>
 
 ---
@@ -225,6 +227,27 @@ Settings are stored at:
 
 - Windows: `%LOCALAPPDATA%\TunnelForge\config.json`
 - macOS: `~/Library/Application Support/TunnelForge/config.json`
+
+## Code signing policy
+
+Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+
+**Status:** Windows signing is pending approval by the SignPath Foundation open-source program. Current Windows releases are **not signed yet**; the release workflow signs them automatically once the project is approved. macOS DMG/ZIP builds remain unsigned beta artifacts.
+
+Only Windows binaries built by this repository's GitHub Actions release workflow are submitted for signing: `TunnelForge.exe`, `tunnelforge-core.exe`, `TunnelForge-WebSetup.exe`, and `TunnelForge-Setup-<version>.exe`.
+
+**Team roles**
+
+- Committers and reviewers: [sanghyun-io](https://github.com/sanghyun-io)
+- Approvers: [sanghyun-io](https://github.com/sanghyun-io)
+
+**Privacy policy**
+
+TunnelForge collects no personal data and has no telemetry. It connects only to:
+
+- the SSH servers and databases you configure;
+- the public GitHub Releases API (`api.github.com`) to check for a newer version — **on by default at startup**, sends no data beyond the request itself, and can be turned off in Settings (automatic update check);
+- the maintainer-operated error-report relay (Cloudflare Workers), which files a GitHub issue — **only** when you opt in to anonymous error reports (see [error reporting](docs/error_reporting.md)).
 
 ---
 

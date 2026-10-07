@@ -105,6 +105,15 @@ jobs:
     runs-on: windows-2025
     needs: release-preflight
     environment: production-release
+    permissions:
+      contents: read
+      actions: read  # SignPath action이 이 run의 workflow artifact를 읽기 위해 필요
+    env:
+      # SignPath Foundation 승인 후 production-release 환경 vars로 덮어쓸 수 있는 기본 slug
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG || 'tunnelforge' }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+      SIGNPATH_BINARIES_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_BINARIES_CONFIGURATION_SLUG || 'windows-binaries' }}
+      SIGNPATH_INSTALLER_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_INSTALLER_CONFIGURATION_SLUG || 'windows-installer' }}
 
     steps:
       - name: Checkout code
@@ -113,6 +122,25 @@ jobs:
           ref: refs/tags/${{ needs.release-preflight.outputs.tag }}
           fetch-depth: 0  # 전체 히스토리 (릴리스 노트 생성용)
           persist-credentials: false
+
+      - name: Check Windows signing configuration
+        id: windows-signing
+        shell: bash
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+        run: |
+          if [[ -z "${SIGNPATH_API_TOKEN:-}" && -z "${SIGNPATH_ORGANIZATION_ID:-}" ]]; then
+            echo "Windows signing not configured; unsigned artifacts will be built."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -z "${SIGNPATH_API_TOKEN:-}" || -z "${SIGNPATH_ORGANIZATION_ID:-}" ]]; then
+            echo "Incomplete SignPath configuration: secret SIGNPATH_API_TOKEN and variable SIGNPATH_ORGANIZATION_ID must both be set." >&2
+            exit 1
+          fi
+          echo "Windows signing enabled; artifacts will be signed via SignPath."
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -204,6 +232,55 @@ jobs:
           Write-Host "✅ Bootstrapper built: TunnelForge-WebSetup.exe ($($bootstrapperSize.ToString('0.0')) MB)"
           Write-Host "   This will be included in the installer for recovery feature."
 
+      # Inno Setup 설치 파일 안의 exe는 나중에 서명할 수 없으므로 installer 빌드 전에 서명한다.
+      - name: Stage Windows binaries for signing
+        id: stage_binaries
+        if: steps.windows-signing.outputs.enabled == 'true'
+        run: |
+          $core = @(Get-ChildItem "dist\TunnelForge" -Recurse -Filter "tunnelforge-core.exe")
+          if ($core.Count -ne 1) {
+            Write-Host "::error::Expected exactly one tunnelforge-core.exe under dist\TunnelForge, found $($core.Count)"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force "build\signpath\unsigned-binaries" | Out-Null
+          Copy-Item "dist\TunnelForge\TunnelForge.exe", $core[0].FullName, "dist\TunnelForge-WebSetup.exe" "build\signpath\unsigned-binaries\"
+          echo "core_path=$($core[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload unsigned Windows binaries for SignPath
+        id: upload_unsigned_binaries
+        if: steps.windows-signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signpath-unsigned-windows-binaries-${{ steps.get_version.outputs.version }}
+          path: build/signpath/unsigned-binaries/
+          if-no-files-found: error
+          retention-days: 1
+
+      # v3.0은 GitHub Release/changelog가 없어 changelog가 확인된 v2.3에 고정한다 (차이는 connector-url 기본값뿐).
+      - name: Sign Windows binaries with SignPath
+        if: steps.windows-signing.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ env.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ env.SIGNPATH_BINARIES_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload_unsigned_binaries.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600  # 수동 승인 대기 시간
+          output-artifact-directory: build/signpath/signed-binaries
+
+      - name: Replace Windows binaries with signed copies
+        if: steps.windows-signing.outputs.enabled == 'true'
+        env:
+          CORE_PATH: ${{ steps.stage_binaries.outputs.core_path }}
+        run: |
+          $signed = "build\signpath\signed-binaries"
+          Copy-Item "$signed\TunnelForge.exe" "dist\TunnelForge\TunnelForge.exe" -Force
+          Copy-Item "$signed\tunnelforge-core.exe" $env:CORE_PATH -Force
+          Copy-Item "$signed\TunnelForge-WebSetup.exe" "dist\TunnelForge-WebSetup.exe" -Force
+
       - name: Install Inno Setup
         run: |
           choco install innosetup -y
@@ -237,6 +314,60 @@ jobs:
           Write-Host "✅ Installer built: $($installerFile.Name) ($($installerSize.ToString('0.0')) MB)"
           echo "installer_path=$($installerFile.FullName)" >> $env:GITHUB_OUTPUT
           echo "installer_name=$($installerFile.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload unsigned Windows installer for SignPath
+        id: upload_unsigned_installer
+        if: steps.windows-signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signpath-unsigned-windows-installer-${{ steps.get_version.outputs.version }}
+          path: output/TunnelForge-Setup-${{ steps.get_version.outputs.version }}.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign Windows installer with SignPath
+        if: steps.windows-signing.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ env.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ env.SIGNPATH_INSTALLER_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload_unsigned_installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600  # 수동 승인 대기 시간
+          output-artifact-directory: build/signpath/signed-installer
+
+      - name: Replace Windows installer with signed copy
+        if: steps.windows-signing.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          Copy-Item "build\signpath\signed-installer\TunnelForge-Setup-$env:VERSION.exe" "output\TunnelForge-Setup-$env:VERSION.exe" -Force
+
+      - name: Verify Windows Authenticode signatures
+        if: steps.windows-signing.outputs.enabled == 'true'
+        env:
+          CORE_PATH: ${{ steps.stage_binaries.outputs.core_path }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          $files = @(
+            "dist\TunnelForge\TunnelForge.exe",
+            $env:CORE_PATH,
+            "dist\TunnelForge-WebSetup.exe",
+            "output\TunnelForge-Setup-$env:VERSION.exe"
+          )
+          $failed = $false
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            Write-Host "$file : $($signature.Status) $($signature.SignerCertificate.Subject)"
+            if ($signature.Status -ne 'Valid') { $failed = $true }
+          }
+          if ($failed) {
+            Write-Host "::error::One or more Windows release binaries do not have a valid Authenticode signature."
+            exit 1
+          }
 
       - name: Upload Windows release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -617,6 +748,7 @@ jobs:
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: release-artifacts
+          pattern: TunnelForge-*  # SignPath 제출용 unsigned 중간 artifact 제외
           merge-multiple: true
 
       - name: Normalize release artifacts
@@ -794,6 +926,8 @@ jobs:
           echo "1. Mac 종류에 맞는 \`TunnelForge-macOS-$VERSION-{arm64|x86_64}.dmg\` 다운로드" >> release_notes.md
           echo "2. DMG를 열고 \`TunnelForge.app\`을 Applications로 이동" >> release_notes.md
           echo "3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증: \`shasum -a 256 -c <파일명>.sha256\`" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**Code signing policy:** [README](https://github.com/sanghyun-io/tunnelforge#code-signing-policy)" >> release_notes.md
 
           echo ""
           echo "========== Generated Release Notes =========="
