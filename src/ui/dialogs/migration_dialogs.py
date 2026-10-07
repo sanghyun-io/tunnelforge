@@ -22,7 +22,7 @@ from typing import Iterator, List, Optional, Dict
 from datetime import datetime
 
 from src.ui.workers.cancellable_worker import has_running_worker, worker_is_running
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.migration_analyzer import (
     MigrationAnalyzer, AnalysisResult, OrphanRecord,
     CompatibilityIssue, ActionType, orphan_select_sql
@@ -229,7 +229,7 @@ def _format_fk_tree_text(fk_tree: Dict[str, List[str]]) -> str:
 class MigrationAnalyzerDialog(QDialog):
     """마이그레이션 분석 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None):
+    def __init__(self, parent=None, connector: RustDbConnector = None, config_manager=None):
         super().__init__(parent)
         self.setWindowTitle("🔄 마이그레이션 분석기")
         self.resize(1000, 700)

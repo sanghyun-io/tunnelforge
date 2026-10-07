@@ -17,7 +17,7 @@ import json
 import os
 
 from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.error_report_sanitizer import (
     sanitize_local_diagnostic,
 )
@@ -290,7 +290,7 @@ def format_export_visible_telemetry(event: dict) -> Optional[str]:
 class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog):
     """Rust DB Core Export 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None,
+    def __init__(self, parent=None, connector: RustDbConnector = None,
                  config_manager=None, connection_info: str = "", job_context: dict = None):
         super().__init__(parent)
         self.setWindowTitle("데이터 Export")
