@@ -14,10 +14,11 @@ from datetime import datetime
 
 from src.core.db_connector import MySQLConnector
 from src.core.i18n import translate_text
-from src.exporters.rust_dump_exporter import ForeignKeyResolver, OrphanRecordInfo
+from src.core.migration_analysis_models import OrphanRecord, SchemaCheckOptions
+from src.core.migration_analyzer import MigrationAnalyzer, orphan_select_sql
 
 
-def _build_orphan_queries_sql(schema: str, orphan_results: List[OrphanRecordInfo]) -> str:
+def _build_orphan_queries_sql(schema: str, orphan_results: List[OrphanRecord]) -> str:
     """이미 수집된 고아 레코드 결과로부터 조회 쿼리 모음을 생성 (DB 재조회 없음)."""
     lines = [
         f"-- 고아 레코드 조회 쿼리 (스키마: {schema})",
@@ -27,11 +28,11 @@ def _build_orphan_queries_sql(schema: str, orphan_results: List[OrphanRecordInfo
     ]
     for index, item in enumerate(orphan_results, 1):
         lines.append(
-            f"-- [{index}] {item.table}.{item.column} -> "
-            f"{item.referenced_table}.{item.referenced_column} "
+            f"-- [{index}] {item.child_table}.{item.child_column} -> "
+            f"{item.parent_table}.{item.parent_column} "
             f"({item.orphan_count:,}건)"
         )
-        lines.append(item.query.rstrip() + ";")
+        lines.append(orphan_select_sql(item))
         lines.append("")
     return "\n".join(lines)
 
@@ -49,12 +50,12 @@ class OrphanAnalysisWorker(QThread):
 
     def run(self):
         try:
-            resolver = ForeignKeyResolver(self.connector)
-            results = resolver.find_orphan_records(
-                self.schema,
-                progress_callback=lambda msg: self.progress.emit(msg),
-            )
-            self.analysis_finished.emit(results)
+            # 고아 검사만 켠다 (복합 FK 는 FK 단위로 판정)
+            only_orphans = {name: name == "check_orphans" for name in SchemaCheckOptions.__dataclass_fields__}
+            analyzer = MigrationAnalyzer(self.connector)
+            analyzer.set_progress_callback(self.progress.emit)
+            result = analyzer.analyze_schema(self.schema, **only_orphans)
+            self.analysis_finished.emit(result.orphan_records)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -64,7 +65,7 @@ class OrphanReportWorker(QThread):
     progress = pyqtSignal(str)
     report_finished = pyqtSignal(bool, str, int)
 
-    def __init__(self, schema: str, output_path: str, orphan_results: List[OrphanRecordInfo]):
+    def __init__(self, schema: str, output_path: str, orphan_results: List[OrphanRecord]):
         super().__init__()
         self.schema = schema
         self.output_path = output_path
@@ -86,14 +87,14 @@ class OrphanReportWorker(QThread):
                     file.write(f"총 {total_orphans:,}개의 고아 레코드 발견\n\n")
                     for index, item in enumerate(orphans, 1):
                         file.write(
-                            f"## [{index}] {item.table}.{item.column} -> "
-                            f"{item.referenced_table}.{item.referenced_column}\n"
+                            f"## [{index}] {item.child_table}.{item.child_column} -> "
+                            f"{item.parent_table}.{item.parent_column}\n"
                         )
                         file.write(f"   고아 레코드 수: {item.orphan_count:,}건\n")
-                        file.write(f"   샘플 값: {', '.join(item.sample_values)}\n")
+                        file.write(f"   샘플 값: {', '.join(str(value) for value in item.sample_values)}\n")
                         file.write("\n   조회 쿼리:\n")
                         file.write("   ```sql\n")
-                        for line in item.query.split("\n"):
+                        for line in orphan_select_sql(item).split("\n"):
                             file.write(f"   {line}\n")
                         file.write("   ```\n\n")
                         file.write("-" * 80 + "\n\n")
@@ -109,9 +110,8 @@ class OrphanRecordDialog(QDialog):
         super().__init__(parent)
         self.connector = connector
         self.config_manager = config_manager
-        self.resolver: Optional[ForeignKeyResolver] = None
         self.worker: Optional[QThread] = None
-        self.orphan_results: List[OrphanRecordInfo] = []
+        self.orphan_results: List[OrphanRecord] = []
 
         self.setWindowTitle("🔍 고아 레코드 분석")
         self.setMinimumSize(900, 650)
@@ -284,7 +284,7 @@ class OrphanRecordDialog(QDialog):
         self.progress_label.setText(f"⚠️ {len(self.orphan_results)}개 관계에서 총 {total_orphans:,}개 고아 레코드 발견")
 
         for o in self.orphan_results:
-            item_text = f"⚠️ {o.table}.{o.column} → {o.referenced_table} ({o.orphan_count:,}건)"
+            item_text = f"⚠️ {o.child_table}.{o.child_column} → {o.parent_table} ({o.orphan_count:,}건)"
             self.result_list.addItem(item_text)
 
         self.export_all_queries_btn.setEnabled(True)
@@ -308,21 +308,21 @@ class OrphanRecordDialog(QDialog):
 ═══════════════════════════════════════════════════════════════════
 
 📊 FK 관계:
-   자식 테이블: {o.table}
-   FK 컬럼: {o.column}
-   부모 테이블: {o.referenced_table}
-   참조 컬럼: {o.referenced_column}
+   자식 테이블: {o.child_table}
+   FK 컬럼: {o.child_column}
+   부모 테이블: {o.parent_table}
+   참조 컬럼: {o.parent_column}
 
 ⚠️ 고아 레코드 수: {o.orphan_count:,}건
 
 📝 샘플 값 (최대 5개):
-   {', '.join(o.sample_values) if o.sample_values else '(없음)'}
+   {', '.join(str(value) for value in o.sample_values) if o.sample_values else '(없음)'}
 
 ═══════════════════════════════════════════════════════════════════
  조회 쿼리 (아래 쿼리로 고아 레코드를 직접 조회할 수 있습니다)
 ═══════════════════════════════════════════════════════════════════
 
-{o.query}
+{orphan_select_sql(o)}
 """
         self.detail_text.setText(detail)
         self.copy_query_btn.setEnabled(True)
@@ -335,7 +335,7 @@ class OrphanRecordDialog(QDialog):
 
         o = self.orphan_results[row]
         clipboard = QApplication.clipboard()
-        clipboard.setText(o.query)
+        clipboard.setText(orphan_select_sql(o))
 
         self.progress_label.setText("✅ 쿼리가 클립보드에 복사되었습니다.")
 
