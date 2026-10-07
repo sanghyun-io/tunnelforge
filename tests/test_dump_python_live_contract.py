@@ -8,8 +8,7 @@ import uuid
 import pytest
 
 from src.core.db_core_service import DbCoreFacade, DbCoreServiceClient, DbEndpoint
-from src.core.postgres_connector import PostgresConnector
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import create_rust_db_connector
 from src.exporters.rust_dump_exporter import RustDumpExporter, RustDumpImporter, build_rust_dump_config
 
 
@@ -46,11 +45,11 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
     else:
         facade = DockerFacade(DbCoreServiceClient(executable="docker-core", popen_factory=start_core))
     if engine == "postgresql":
-        connector = PostgresConnector(os.environ["TF_LIVE_PG_HOST"], 5432, "postgres",
-                                      os.environ["TF_LIVE_PG_PASSWORD"], "tf_test", facade)
+        connector = create_rust_db_connector("postgresql", os.environ["TF_LIVE_PG_HOST"], 5432, "postgres",
+                                             os.environ["TF_LIVE_PG_PASSWORD"], "tf_test", facade=facade)
     else:
-        connector = MySQLConnector(os.environ["TF_LIVE_MYSQL_HOST"], 3306, "root",
-                                   os.environ["TF_LIVE_MYSQL_PASSWORD"], "tf_test", facade=facade)
+        connector = create_rust_db_connector("mysql", os.environ["TF_LIVE_MYSQL_HOST"], 3306, "root",
+                                             os.environ["TF_LIVE_MYSQL_PASSWORD"], "tf_test", facade=facade)
     quote = '"' if engine == "postgresql" else '`'
     def table(namespace):
         return f'{quote}{namespace}{quote}.samples'

@@ -149,35 +149,6 @@ class TestRustDumpConfig:
         assert config.engine == "mysql"
 
 
-class TestForeignKeyResolver:
-    """ForeignKeyResolver 클래스 테스트"""
-
-    @pytest.fixture
-    def mock_connector(self):
-        """MySQLConnector Mock"""
-        connector = MagicMock()
-        return connector
-
-    def test_get_all_dependencies(self, mock_connector):
-        """전체 FK 의존성 조회"""
-        from src.exporters.rust_dump_exporter import ForeignKeyResolver
-
-        mock_connector.execute.return_value = [
-            {'TABLE_NAME': 'posts', 'REFERENCED_TABLE_NAME': 'users'},
-            {'TABLE_NAME': 'comments', 'REFERENCED_TABLE_NAME': 'posts'},
-            {'TABLE_NAME': 'comments', 'REFERENCED_TABLE_NAME': 'users'}
-        ]
-
-        resolver = ForeignKeyResolver(mock_connector)
-        deps = resolver.get_all_dependencies('blog')
-
-        assert 'posts' in deps
-        assert 'users' in deps['posts']
-        assert 'comments' in deps
-        assert 'posts' in deps['comments']
-        assert 'users' in deps['comments']
-
-
 class TestRustDumpExporter:
     """RustDumpExporter 클래스 테스트"""
 

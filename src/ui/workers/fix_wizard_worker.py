@@ -8,7 +8,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from typing import List, Optional, Set
 from dataclasses import dataclass
 
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.migration_fix_wizard import (
     FixWizardStep, BatchFixExecutor, BatchExecutionResult, ExecutionSummary,
     charset_fix_sql
@@ -86,7 +86,7 @@ class FixWizardWorker(QThread):
 
     def __init__(
         self,
-        connector: MySQLConnector,
+        connector: RustDbConnector,
         schema: str,
         steps: List[FixWizardStep],
         dry_run: bool = True,

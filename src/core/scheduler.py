@@ -526,9 +526,7 @@ class BackupScheduler:
             ok, message = connector.connect()
             if not ok:
                 return [], message
-            with connector.connection.cursor() as cursor:
-                cursor.execute("SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY 1")
-                return [row["datname"] for row in cursor.fetchall()], ""
+            return connector.list_databases(), ""
         except Exception as exc:
             return [], str(exc)
         finally:

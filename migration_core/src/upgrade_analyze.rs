@@ -80,6 +80,8 @@ pub struct CleanupSql {
     pub delete: String,
     pub set_null: String,
     pub count: String,
+    /// 고아 행 조회 (화면의 "조회 쿼리 복사/내보내기")
+    pub select: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -586,6 +588,7 @@ pub fn cleanup_sql(schema: &str, fk: &ForeignKeyGroup) -> CleanupSql {
         delete: format!("DELETE c FROM {child} AS c\n{where_clause}"),
         set_null: format!("UPDATE {child} AS c\nSET {set_null}\n{where_clause}"),
         count: format!("SELECT COUNT(*) AS cnt FROM {child} AS c\n{where_clause}"),
+        select: format!("SELECT c.* FROM {child} AS c\n{where_clause}"),
     }
 }
 
@@ -1115,6 +1118,16 @@ mod tests {
         assert!(sql.delete.contains("WHERE p.`x` = c.`a` AND p.`y` = c.`b`"), "{}", sql.delete);
         assert!(sql.set_null.contains("SET c.`a` = NULL, c.`b` = NULL"));
         assert!(sql.count.starts_with("SELECT COUNT(*) AS cnt FROM `app`.`child` AS c\nWHERE"));
+        assert!(sql.select.starts_with("SELECT c.* FROM `app`.`child` AS c\nWHERE c.`a` IS NOT NULL"));
+        let tricky = ForeignKeyGroup {
+            constraint_name: "fk".into(),
+            child_table: "we`ird".into(),
+            parent_table: "p".into(),
+            child_columns: vec!["c`1".into()],
+            parent_columns: vec!["id".into()],
+        };
+        let escaped = cleanup_sql("app", &tricky).select;
+        assert!(escaped.contains("`we``ird`") && escaped.contains("c.`c``1` IS NOT NULL"), "{escaped}");
         assert!(orphan_from_and_where("app", &groups[0], false).contains("LEFT JOIN `app`.`parent` p ON p.`x` = c.`a` AND p.`y` = c.`b`"));
         assert!(orphan_from_and_where("app", &groups[0], true).contains("NOT EXISTS"));
     }

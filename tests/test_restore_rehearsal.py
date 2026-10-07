@@ -77,8 +77,7 @@ def env(tmp_path, monkeypatch):
     tunnels = {"tgt": {"id": "tgt", "environment": "development"}}
     connector = MagicMock()
     connector.connect.return_value = (True, "")
-    cursor = connector.connection.cursor.return_value.__enter__.return_value
-    cursor.fetchone.return_value = (1,)
+    connector.schema_exists.return_value = True
     facade = FakeFacade()
 
     holder = SimpleNamespace(importer=None)
@@ -88,7 +87,7 @@ def env(tmp_path, monkeypatch):
         monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpImporter", holder.importer)
         return RestoreRehearsal(lambda s: (conn(), ""), tunnels.get, lambda *a, **k: connector, lambda: facade)
 
-    return SimpleNamespace(backup=str(backup), tunnels=tunnels, connector=connector, cursor=cursor,
+    return SimpleNamespace(backup=str(backup), tunnels=tunnels, connector=connector,
                            facade=facade, build=build, holder=holder)
 
 
@@ -168,9 +167,10 @@ def test_a_blocked_cleanup_retains_the_candidate_and_holds_the_backup_from_reten
 
 
 def test_a_missing_target_namespace_is_refused_and_nothing_is_created(env):
-    env.cursor.fetchone.return_value = None
+    env.connector.schema_exists.return_value = False
     outcome = env.build().run(schedule(), env.backup, conn(port=3307))
     assert not outcome.ok and "없습니다" in outcome.message
+    env.connector.schema_exists.assert_called_once_with(schedule().rehearsal_schema)
     assert env.facade.calls == []
 
 

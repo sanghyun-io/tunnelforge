@@ -19,7 +19,6 @@ from src.core.constants import (
     DEFAULT_MYSQL_PORT,
 )
 from src.core.error_report_codes import classify_error_code
-from src.core.foreign_key_resolver import ForeignKeyResolver, OrphanRecordInfo
 from src.core.logger import get_logger
 from src.exporters.dump_progress import DumpEventCallbacks, TableProgressTracker, emit_core_event
 

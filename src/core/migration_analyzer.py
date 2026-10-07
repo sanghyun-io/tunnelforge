@@ -39,6 +39,16 @@ __all__ = [
 MISSING_CLEANUP_SQL = "-- 이전 버전에서 저장한 분석 결과에는 정리 SQL이 없습니다. 다시 분석하세요."
 
 
+def orphan_select_sql(orphan: OrphanRecord, schema: str = "") -> str:
+    """고아 레코드 조회 쿼리 (Rust core 가 분석 때 만든 SELECT, 복합 FK 포함). schema 는 호출 규약 호환용."""
+    select = (orphan.cleanup_sql or {}).get("select")
+    header = (
+        f"-- {orphan.child_table}.{orphan.child_column} → {orphan.parent_table}.{orphan.parent_column}\n"
+        f"-- 고아 레코드 수: {orphan.orphan_count:,}개\n"
+    )
+    return header + (f"{select};" if select else MISSING_CLEANUP_SQL)
+
+
 def _issue_from_core(data: Dict) -> CompatibilityIssue:
     return CompatibilityIssue(
         issue_type=IssueType(data["issue_type"]),
@@ -165,6 +175,8 @@ class MigrationAnalyzer:
             return True, "수동 처리 필요", 0
         if not action.count_sql:
             return False, "❌ 정리 대상 메타데이터 없음 (다시 분석하세요)", 0
-        rows = self.connector.execute(action.count_sql)
-        affected = int(rows[0]["cnt"]) if rows else 0
+        with self.connector.connection.cursor() as cursor:
+            cursor.execute(action.count_sql)
+            row = cursor.fetchone()
+        affected = int(row["cnt"]) if row else 0
         return True, f"[DRY-RUN] {affected}개 행이 영향받음", affected

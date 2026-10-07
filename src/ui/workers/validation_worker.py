@@ -64,7 +64,7 @@ class MetadataLoadWorker(CancellableWorker):
     def __init__(self, connector, schema: str = None):
         """
         Args:
-            connector: MySQLConnector 인스턴스 (연결된 상태)
+            connector: RustDbConnector 인스턴스 (연결된 상태)
             schema: 대상 스키마 (optional)
         """
         super().__init__()

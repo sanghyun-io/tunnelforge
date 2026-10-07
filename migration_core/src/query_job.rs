@@ -78,6 +78,11 @@ impl Session {
         self.read_only
     }
 
+    /// 세션 어댑터를 잠근다. 실행 중인 쿼리가 있으면 끝날 때까지 기다린다.
+    pub(crate) fn lock_adapter(&self) -> MutexGuard<'_, LiveAdapter> {
+        lock(&self.adapter)
+    }
+
     pub(crate) fn engine(&self) -> &'static str {
         match self.canceller {
             Canceller::MySql { .. } => "mysql",

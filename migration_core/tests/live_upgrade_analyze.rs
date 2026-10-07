@@ -88,6 +88,8 @@ fn mysql_upgrade_analyze_reports_issues_and_composite_fk_orphans() {
     assert_eq!(orphan["sample_values"], json!(["(1, 9)"]));
     let count: u64 = conn.query_first(orphan["cleanup_sql"]["count"].as_str().unwrap()).unwrap().unwrap();
     assert_eq!(count, 1, "cleanup COUNT must match the detected orphans");
+    let selected: Vec<mysql::Row> = conn.query(orphan["cleanup_sql"]["select"].as_str().unwrap()).unwrap();
+    assert_eq!(selected.len(), 1, "orphan SELECT must return exactly the detected orphan rows");
 
     conn.query_drop(format!("DROP DATABASE `{db}`")).unwrap();
 }

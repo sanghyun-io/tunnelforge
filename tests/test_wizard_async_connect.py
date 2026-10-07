@@ -60,7 +60,7 @@ class BlockingConnector:
 
 
 def _wizard(monkeypatch, connector):
-    monkeypatch.setattr(db_dialogs, "MySQLConnector", lambda *args: connector)
+    monkeypatch.setattr(db_dialogs, "create_rust_db_connector", lambda *args: connector)
     tunnel = {"id": "t1", "name": "n", "connection_mode": "direct", "remote_host": "h",
               "remote_port": 3306, "db_engine": "mysql"}
     config = SimpleNamespace(get_tunnel_credentials=lambda tid: ("user", "pw"))

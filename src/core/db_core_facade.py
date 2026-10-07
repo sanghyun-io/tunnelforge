@@ -155,6 +155,12 @@ class DbCoreFacade:
         payload = {"connection": endpoint.to_payload(), "tables": sorted(tables), "charset": charset, "collation": collation}
         return self.client.request("upgrade.charset_sql", payload)
 
+    def catalog(self, connection_id: str, kind: str, **args: str) -> List[str]:
+        """열린 세션의 메타데이터 조회 (Rust catalog.query). kind 와 인자는 catalog.rs 참고."""
+        result = self.client.request("catalog.query", {"connection_id": connection_id, "kind": kind, **args})
+        values = result.get("values")
+        return [str(value) for value in values] if isinstance(values, list) else []
+
     def list_tables(self, endpoint: DbEndpoint) -> List[str]:
         result = self.client.request("schema.list", {"connection": endpoint.to_payload()})
         tables = result.get("tables")

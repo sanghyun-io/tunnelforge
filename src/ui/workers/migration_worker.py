@@ -3,7 +3,7 @@ from dataclasses import asdict, dataclass, fields
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.migration_analyzer import MigrationAnalyzer
 
 
@@ -34,7 +34,7 @@ class MigrationAnalyzerWorker(QThread):
 
     def __init__(
         self,
-        connector: MySQLConnector,
+        connector: RustDbConnector,
         schema: str,
         options: MigrationCheckOptions = None,
         **legacy_check_options
@@ -80,7 +80,7 @@ class CleanupWorker(QThread):
 
     def __init__(
         self,
-        connector: MySQLConnector,
+        connector: RustDbConnector,
         schema: str,
         actions: list,  # List[CleanupAction]
         dry_run: bool = True

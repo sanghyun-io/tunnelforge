@@ -49,6 +49,15 @@ impl CoreService {
             "upgrade.fix_plan" => {
                 std::thread::spawn(move || upgrade_fix_plan(&request, |event| emit(event)));
             }
+            // 세션에서 쿼리가 실행 중이면 어댑터 잠금을 기다려야 하므로 워커 스레드에서 실행한다.
+            "catalog.query" => {
+                let session = self.catalog_session(&request);
+                std::thread::spawn(move || {
+                    for event in catalog_events(&request, session) {
+                        emit(event);
+                    }
+                });
+            }
             "query.cancel" => {
                 let jobs = self.jobs.clone();
                 std::thread::spawn(move || {
@@ -91,6 +100,10 @@ impl CoreService {
                 }
             }
             "query.cancel" => emit_all_events(cancel_events(&request, &self.jobs), emit),
+            "catalog.query" => {
+                let session = self.catalog_session(&request);
+                emit_all_events(catalog_events(&request, session), emit)
+            }
             "service.shutdown" => {
                 self.connections.clear();
                 emit_all_events(service_shutdown(&request), emit);
@@ -158,6 +171,11 @@ impl CoreService {
             "closed": session.is_some(),
             "connection_id": connection_id
         })]
+    }
+
+    fn catalog_session(&self, request: &Request) -> Option<Arc<Session>> {
+        let connection_id = request.payload.get("connection_id").and_then(Value::as_str)?;
+        self.connections.get(connection_id).cloned()
     }
 
     /// `query.explain` on a session: one EXPLAIN statement through the normal query path.
@@ -233,6 +251,24 @@ impl CoreService {
         let jobs = self.jobs.clone();
         let emit = emit.clone();
         Some(Box::new(move || run_job(session, ctl, jobs, spec, emit)))
+    }
+}
+
+fn catalog_events(request: &Request, session: Option<Arc<Session>>) -> Vec<Value> {
+    let result = match session {
+        Some(session) => crate::catalog::catalog_values(&mut session.lock_adapter(), &request.payload),
+        None => Err("catalog.query requires an open connection_id".to_string()),
+    };
+    match result {
+        Ok(values) => vec![json!({
+            "event": "result",
+            "request_id": request.request_id,
+            "command": "catalog.query",
+            "success": true,
+            "kind": request.payload.get("kind"),
+            "values": values,
+        })],
+        Err(message) => vec![json!({"event": "error", "request_id": request.request_id, "message": message})],
     }
 }
 
@@ -386,6 +422,7 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "connection.close",
             "connection.test",
             "schema.list",
+            "catalog.query",
             "schema.inspect",
             "schema.diff",
             "schema.compare",
