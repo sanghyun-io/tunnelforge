@@ -1,0 +1,63 @@
+name: Rust Cache Warmup
+
+# version-gate 는 pull_request 에서만 돈다. PR 에서 저장한 캐시는 그 PR 안에서만 보이므로,
+# PR 끼리 Rust 의존성 빌드를 나누려면 main 범위에 캐시가 있어야 한다.
+# main 캐시는 모든 PR 이 읽을 수 있고, PR 은 main 캐시를 덮어쓸 수 없다.
+# shared-key 는 version-gate 의 같은 OS/프로필 작업과 반드시 같아야 한다 (tests/test_ci_workflows.py 가 검사).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "migration_core/**"
+      - ".github/workflows/rust-cache.yml"
+  schedule:
+    # 러너 이미지의 rustc 가 바뀌면 캐시 키도 바뀐다. 주 1회 다시 채운다.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    name: Warm ${{ matrix.key }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            key: linux-debug
+            build: cargo test --manifest-path migration_core/Cargo.toml --no-run
+          - runner: ubuntu-24.04
+            key: linux-release
+            build: cargo build --manifest-path migration_core/Cargo.toml --release
+          - runner: windows-latest
+            key: windows-release
+            build: cargo build --manifest-path migration_core/Cargo.toml --release
+          - runner: macos-14
+            key: macos-release
+            build: cargo test --manifest-path migration_core/Cargo.toml --release --no-run
+          - runner: macos-15-intel
+            key: macos-release
+            build: cargo test --manifest-path migration_core/Cargo.toml --release --no-run
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: ${{ matrix.key }}
+
+      - name: Build dependencies
+        run: ${{ matrix.build }}

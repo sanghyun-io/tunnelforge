@@ -644,8 +644,53 @@ def test_pr_workflows_cancel_superseded_runs():
     assert gate["group"] == "version-gate-${{ github.event.pull_request.number }}"
     assert gate["cancel-in-progress"] is True
 
+
+
+def test_standalone_macos_workflow_is_manual_only():
+    # PR 검증은 version-gate 의 macOS 작업(필수 체크)이 같은 단계를 돌린다.
+    # 같은 PR 에서 Mac 러너 4개를 쓰며 대기열을 막지 않게 수동 서명/공증 실행만 남긴다.
     macos_path = PROJECT_ROOT / ".github" / "workflows" / "macos-app.yml"
-    macos = yaml.safe_load(macos_path.read_text(encoding="utf-8"))["concurrency"]
-    # 수동 서명/공증 실행(workflow_dispatch)은 run_id 그룹이라 서로 취소하지 않는다.
-    assert macos["group"] == "macos-app-${{ github.event.pull_request.number || github.run_id }}"
-    assert macos["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+    triggers = yaml.safe_load(macos_path.read_text(encoding="utf-8"))[True]
+    assert list(triggers) == ["workflow_dispatch"]
+
+
+def _rust_cache_keys(job):
+    return [
+        step["with"]["shared-key"]
+        for step in job["steps"]
+        if step.get("uses", "").startswith("Swatinem/rust-cache@")
+    ]
+
+
+def test_rust_jobs_share_dependency_cache_with_main_warmup():
+    gate = load_version_gate()["jobs"]
+    expected = {
+        "rust-core-regression-gate": "linux-debug",
+        "dump-roundtrip-regression": "linux-debug",
+        "live-security-regression": "linux-debug",
+        "python-live-regression": "linux-debug",
+        "python-regression": "windows-release",
+        "python-linux-regression": "linux-release",
+        "macos-app-validation": "macos-release",
+    }
+    for job_name, key in expected.items():
+        assert _rust_cache_keys(gate[job_name]) == [key], job_name
+        steps = [step.get("name", "") for step in gate[job_name]["steps"]]
+        cache_at = next(i for i, step in enumerate(gate[job_name]["steps"]) if _rust_cache_keys({"steps": [step]}))
+        first_cargo = next(i for i, step in enumerate(gate[job_name]["steps"]) if "cargo test" in step.get("run", "") or "cargo build" in step.get("run", ""))
+        assert cache_at < first_cargo, steps
+
+    # PR 캐시는 그 PR 안에서만 보이므로 main 에서 같은 shared-key 로 미리 채운다.
+    warm_path = PROJECT_ROOT / ".github" / "workflows" / "rust-cache.yml"
+    warm_text = warm_path.read_text(encoding="utf-8")
+    warm = yaml.safe_load(warm_text)
+    assert_external_actions_are_sha_pinned(warm_text)
+    assert warm[True]["push"]["branches"] == ["main"]
+    assert "pull_request" not in warm[True] and "pull_request_target" not in warm[True]
+    matrix = warm["jobs"]["warm"]["strategy"]["matrix"]["include"]
+    assert {entry["key"] for entry in matrix} == set(expected.values())
+    runners = {entry["runner"] for entry in matrix}
+    assert {"macos-14", "macos-15-intel", "windows-latest", "ubuntu-24.04"} <= runners
+    # macOS 는 테스트도 release 프로필이라 release 빌드와 결과물을 공유한다.
+    macos_runs = "\n".join(step.get("run", "") for step in gate["macos-app-validation"]["steps"])
+    assert "cargo test --manifest-path migration_core/Cargo.toml --release" in macos_runs

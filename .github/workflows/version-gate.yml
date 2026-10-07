@@ -63,6 +63,12 @@ jobs:
         shell: pwsh
         run: ./scripts/rust-core-regression-gate.ps1
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: linux-debug
+
       - name: Run Rust Core tests
         run: cargo test --manifest-path migration_core/Cargo.toml
 
@@ -113,6 +119,12 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: linux-debug
 
       - name: Run live export and import regressions
         run: |
@@ -189,6 +201,12 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: linux-debug
 
       - name: Build live security tests
         run: |
@@ -281,6 +299,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: linux-debug
+
       - name: Build tunnelforge-core (Rust)
         run: cargo build --manifest-path migration_core/Cargo.toml
 
@@ -357,6 +381,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: windows-release
+
       - name: Build tunnelforge-core (Rust)
         shell: pwsh
         run: cargo build --manifest-path migration_core/Cargo.toml --release
@@ -426,6 +456,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: linux-release
+
       - name: Build tunnelforge-core (Rust)
         run: cargo build --manifest-path migration_core/Cargo.toml --release
 
@@ -471,6 +507,12 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: migration_core
+          shared-key: macos-release
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -494,7 +536,7 @@ jobs:
             tests/test_app_self_check.py \
             tests/test_db_connection_responsiveness.py \
             tests/test_macos_support_docs.py
-          cargo test --manifest-path migration_core/Cargo.toml
+          cargo test --manifest-path migration_core/Cargo.toml --release
 
       - name: Smoke source-run TunnelForge app
         run: |
