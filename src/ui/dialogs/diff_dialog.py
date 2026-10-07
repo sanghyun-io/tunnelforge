@@ -11,18 +11,16 @@ from PyQt6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QGroupBox,
     QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter,
     QWidget, QProgressBar, QMessageBox, QFileDialog,
-    QHeaderView
+    QHeaderView, QCheckBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor, QPainter, QPen
 
+from src.core.db_core_facade import DbEndpoint
 from src.core.schema_diff import (
-    SchemaExtractor, SchemaComparator, SyncScriptGenerator,
     TableDiff, ColumnDiff, IndexDiff, ForeignKeyDiff,
-    DiffType, DiffSeverity, CompareLevel,
-    SeverityClassifier, VersionContext, SeveritySummary
+    DiffType, DiffSeverity, CompareLevel, VersionContext, SeveritySummary,
 )
-from src.core.db_connector import MySQLConnector
 from src.ui.dialogs.diff_workers import SchemaCompareThread, SchemaLoadThread
 from src.ui.dialogs.diff_pixel_loading_widget import PixelLoadingWidget
 from src.ui.dialogs.diff_sync_script_dialog import SyncScriptDialog
@@ -51,9 +49,9 @@ class SchemaDiffDialog(QDialog):
         self.tunnel_engine = tunnel_engine
         self.config_manager = config_manager
 
-        self._source_connector = None
-        self._target_connector = None
         self._diffs = []
+        self._sync_sql = ""
+        self._row_counts_exact = False
         self._compare_thread = None
         self._severity_summary = None
         self._version_ctx = None
@@ -125,6 +123,9 @@ class SchemaDiffDialog(QDialog):
         self.level_combo.setCurrentIndex(1)  # Standard 기본
         self.level_combo.setMinimumWidth(140)
         level_layout.addRow("비교 수준:", self.level_combo)
+        self.exact_rows_check = QCheckBox("정확한 행 수 (COUNT(*), 느림)")
+        self.exact_rows_check.setToolTip("끄면 information_schema 의 추정치를 보여 줍니다.")
+        level_layout.addRow("", self.exact_rows_check)
         conn_layout.addLayout(level_layout)
 
         conn_layout.addStretch()
@@ -332,38 +333,17 @@ class SchemaDiffDialog(QDialog):
         _, source_host, source_port, source_user, source_pw = source_params
         _, target_host, target_port, target_user, target_pw = target_params
 
-        # 이전 비교에서 남아있는 커넥터 정리 (반복 비교 시 세션 누수 방지)
-        self._disconnect_connectors()
-
         # 비교 시작 시점의 스키마 이름을 캡처 (비교 중 콤보가 바뀌어도 결과와 일치 보장)
         self._compared_source_schema = source_schema
         self._compared_target_schema = target_schema
 
-        # 연결 생성
-        try:
-            self._source_connector = MySQLConnector(
-                host=source_host, port=source_port,
-                user=source_user, password=source_pw
-            )
-            success, _ = self._source_connector.connect()
-            if not success:
-                raise Exception("소스 연결 실패")
-
-            self._target_connector = MySQLConnector(
-                host=target_host, port=target_port,
-                user=target_user, password=target_pw
-            )
-            success, _ = self._target_connector.connect()
-            if not success:
-                # 소스 연결 정리 후 예외 발생
-                self._disconnect_connectors()
-                raise Exception("타겟 연결 실패")
-
-        except Exception as e:
-            # 연결 정리
-            self._disconnect_connectors()
-            QMessageBox.critical(self, "연결 오류", f"DB 연결 실패: {e}")
-            return
+        # 연결·조회는 Rust core 가 한다 (연결 실패는 비교 오류로 돌아온다)
+        source_endpoint = DbEndpoint(
+            "mysql", source_host, int(source_port), source_user, source_pw, source_schema
+        )
+        target_endpoint = DbEndpoint(
+            "mysql", target_host, int(target_port), target_user, target_pw, target_schema
+        )
 
         # UI 업데이트 - 비교 중 입력 비활성화
         self.compare_btn.setEnabled(False)
@@ -383,8 +363,8 @@ class SchemaDiffDialog(QDialog):
 
         # 백그라운드 스레드에서 비교
         self._compare_thread = SchemaCompareThread(
-            self._source_connector, self._target_connector,
-            source_schema, target_schema, compare_level
+            source_endpoint, target_endpoint, compare_level,
+            exact_row_counts=self.exact_rows_check.isChecked(),
         )
         self._compare_thread.progress.connect(self._on_progress)
         self._compare_thread.compare_finished.connect(self._on_compare_finished)
@@ -395,11 +375,14 @@ class SchemaDiffDialog(QDialog):
         """진행 상태 업데이트"""
         self.loading_widget.update_status(message)
 
-    def _on_compare_finished(self, diffs, summary, version_ctx):
-        """비교 완료"""
+    def _on_compare_finished(self, result):
+        """비교 완료 (result: schema_diff.CompareResult)"""
+        diffs, summary, version_ctx = result.diffs, result.summary, result.version_ctx
         self._diffs = diffs
         self._severity_summary = summary
         self._version_ctx = version_ctx
+        self._sync_sql = result.sync_sql
+        self._row_counts_exact = result.row_counts_exact
         self.compare_btn.setEnabled(True)
         self.source_tunnel_combo.setEnabled(True)
         self.source_schema_combo.setEnabled(True)
@@ -460,17 +443,6 @@ class SchemaDiffDialog(QDialog):
         }
         return icons.get(severity, "")
 
-    def _disconnect_connectors(self):
-        """Disconnect and clear dialog-owned DB connectors."""
-        for attr_name in ("_source_connector", "_target_connector"):
-            connector = getattr(self, attr_name)
-            if connector:
-                try:
-                    connector.disconnect()
-                except Exception:
-                    pass
-            setattr(self, attr_name, None)
-
     def _on_compare_error(self, error: str):
         """비교 오류"""
         self.compare_btn.setEnabled(True)
@@ -510,11 +482,12 @@ class SchemaDiffDialog(QDialog):
                 status = "동일"
                 unchanged += 1
 
-            # 테이블 항목
+            # 테이블 항목 (추정 행 수는 ≈ 로 표시)
+            approx = "" if self._row_counts_exact else "≈"
             item = QTreeWidgetItem([
                 f"{icon} {diff.table_name}",
                 status,
-                f"{diff.row_count_source} / {diff.row_count_target}"
+                f"{approx}{diff.row_count_source} / {approx}{diff.row_count_target}"
             ])
             item.setData(0, Qt.ItemDataRole.UserRole, diff)
 
@@ -687,24 +660,16 @@ class SchemaDiffDialog(QDialog):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        # 비교 시작 시점에 캡처한 스키마를 사용한다 (완료 후 콤보를 바꿔도 결과와 일치)
-        target_schema = self._compared_target_schema or self.target_schema_combo.currentText()
-        generator = SyncScriptGenerator()
-        script = generator.generate_sync_script(self._diffs, target_schema)
-
-        # 스크립트 다이얼로그 열기
-        dialog = SyncScriptDialog(self, script)
+        # 스크립트는 비교 시점의 타겟 스키마 기준으로 Rust core 가 만들어 둔 것이다
+        # (완료 후 콤보를 바꿔도 결과와 일치)
+        dialog = SyncScriptDialog(self, self._sync_sql)
         dialog.exec()
 
     def closeEvent(self, event):
         """다이얼로그 닫힐 때"""
-        # 진행 중인 스레드를 먼저 정리(시그널 해제 + 대기)한 뒤 커넥터를 정리해야
-        # 스레드가 사용 중인 커넥터를 도중에 끊어버리는 경합을 피할 수 있다.
+        # 진행 중인 스레드를 정리(시그널 해제 + 대기)해 완료 콜백이 닫힌 위젯을 건드리지 않게 한다.
         self._cancel_compare_thread()
         self._cancel_schema_load_threads()
-
-        # 연결 정리
-        self._disconnect_connectors()
 
         super().closeEvent(event)
 

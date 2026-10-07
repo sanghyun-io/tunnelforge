@@ -2,7 +2,6 @@
 from src.core.db_core_dbapi_shim import quote_mysql_ident
 from src.core.migration_analysis_models import OrphanRecord
 from src.core.migration_fix_models import FKDefinition
-from src.core.schema_diff_models import ColumnInfo
 from src.ui.dialogs.migration_dialogs import build_orphan_select_sql
 
 TRICKY = "we`ird"
@@ -21,5 +20,4 @@ def test_generators_escape_backticks_in_names():
     assert "`fk``x`" in fk.get_drop_sql("app")
     assert "`a``b`" in fk.get_add_sql("app") and "`we``ird`" in fk.get_add_sql("app")
 
-    column = ColumnInfo(name=TRICKY, data_type="int", nullable=True, default=None)
-    assert column.to_sql_definition().startswith("`we``ird` ")
+    # 스키마 비교 동기화 SQL 의 식별자 escape 는 Rust schema_compare 테스트가 검증한다.
