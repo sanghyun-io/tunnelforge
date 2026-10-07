@@ -927,3 +927,26 @@ def test_facade_uses_schema_compare_protocol():
     assert sent["payload"]["target"]["port"] == 3307
     assert result["sync_sql"] == "-- end"
     assert events[0]["phase"] == "source"
+
+
+def test_facade_uses_upgrade_analyze_protocol():
+    process = FakeProcess([
+        '{"event":"progress","command":"upgrade.analyze","message":"📌 [1/15] 고아 레코드 검사 시작..."}',
+        '{"event":"result","command":"upgrade.analyze","success":true,"issues":[],"orphan_records":[]}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    events = []
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    result = facade.analyze_upgrade(endpoint, {"check_orphans": False}, on_event=events.append)
+
+    sent = json.loads(process.stdin.getvalue().strip())
+    assert sent["command"] == "upgrade.analyze"
+    assert sent["payload"]["connection"]["database"] == "app"
+    assert sent["payload"]["options"] == {"check_orphans": False}
+    assert result["issues"] == []
+    assert events[0]["message"].startswith("📌 [1/15]")
