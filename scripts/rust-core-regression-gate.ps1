@@ -30,8 +30,6 @@ $allowedEngineLocked = @(
     "src/ui/dialogs/db_export_dialog.py",
     "src/ui/dialogs/db_import_dialog.py",
     "src/ui/dialogs/db_orphan_dialog.py",
-    "src/ui/dialogs/diff_dialog.py",
-    "src/ui/dialogs/diff_workers.py",
     "src/ui/dialogs/fix_wizard_dialog.py",
     "src/ui/dialogs/migration_dialogs.py",
     "src/ui/dialogs/oneclick_migration_dialog.py",

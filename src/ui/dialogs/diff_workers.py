@@ -3,67 +3,48 @@
 """
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from src.core.schema_diff import (
-    SchemaComparator, SchemaExtractor, SeverityClassifier,
-    SeveritySummary, VersionContext, CompareLevel
-)
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_facade import DbEndpoint, get_shared_db_core_facade
+from src.core.db_core_dbapi_shim import create_rust_db_connector
+from src.core.schema_diff import CompareLevel, parse_compare_result
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class SchemaCompareThread(QThread):
-    """스키마 비교 백그라운드 스레드"""
+    """스키마 비교 백그라운드 스레드 (비교 자체는 Rust core schema.compare 가 수행)"""
 
     progress = pyqtSignal(str)
     # NOTE: QThread에는 인자 없는 기본 finished 시그널이 있으므로,
     # 이름을 겹치지 않게 compare_finished로 분리한다.
-    compare_finished = pyqtSignal(list, object, object)  # diffs, SeveritySummary, VersionContext
+    compare_finished = pyqtSignal(object)  # CompareResult
     error = pyqtSignal(str)
 
-    def __init__(self, source_connector, target_connector,
-                 source_schema: str, target_schema: str,
-                 compare_level: CompareLevel = CompareLevel.STANDARD):
+    def __init__(self, source: DbEndpoint, target: DbEndpoint,
+                 compare_level: CompareLevel = CompareLevel.STANDARD,
+                 exact_row_counts: bool = False, facade=None):
         super().__init__()
-        self.source_connector = source_connector
-        self.target_connector = target_connector
-        self.source_schema = source_schema
-        self.target_schema = target_schema
+        self.source = source
+        self.target = target
         self.compare_level = compare_level
+        self.exact_row_counts = exact_row_counts
+        self._facade = facade
+
+    def _on_event(self, event: dict):
+        if event.get("event") == "progress" and event.get("message"):
+            self.progress.emit(str(event["message"]))
 
     def run(self):
         try:
-            # MySQL 버전 감지
-            self.progress.emit("MySQL 버전 확인 중...")
-            version_ctx = VersionContext(
-                source_version=self.source_connector.get_db_version(),
-                target_version=self.target_connector.get_db_version(),
-                source_version_str=self.source_connector.get_db_version_string(),
-                target_version_str=self.target_connector.get_db_version_string(),
+            facade = self._facade or get_shared_db_core_facade()
+            result = facade.compare_schemas(
+                self.source,
+                self.target,
+                level=self.compare_level.value,
+                exact_row_counts=self.exact_row_counts,
+                on_event=self._on_event,
             )
-
-            self.progress.emit("소스 스키마 추출 중...")
-            source_extractor = SchemaExtractor(self.source_connector)
-            source_tables = source_extractor.extract_all_tables(self.source_schema)
-
-            self.progress.emit("타겟 스키마 추출 중...")
-            target_extractor = SchemaExtractor(self.target_connector)
-            target_tables = target_extractor.extract_all_tables(self.target_schema)
-
-            self.progress.emit("스키마 비교 중...")
-            comparator = SchemaComparator()
-            diffs = comparator.compare_schemas(
-                source_tables, target_tables, self.compare_level
-            )
-
-            # 심각도 분류
-            self.progress.emit("심각도 분류 중...")
-            classifier = SeverityClassifier(version_ctx)
-            diffs, summary = classifier.classify(diffs)
-
-            self.compare_finished.emit(diffs, summary, version_ctx)
-
+            self.compare_finished.emit(parse_compare_result(result))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -89,9 +70,8 @@ class SchemaLoadThread(QThread):
     def run(self):
         connector = None
         try:
-            connector = MySQLConnector(
-                host=self.host, port=self.port,
-                user=self.user, password=self.password
+            connector = create_rust_db_connector(
+                "mysql", self.host, self.port, self.user, self.password
             )
 
             success, _ = connector.connect()

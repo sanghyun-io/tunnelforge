@@ -120,6 +120,8 @@ _EN_TEXT_TRANSLATIONS = {
     "One-Click 마이그레이션": "One-Click migration",
     "실행 계획(EXPLAIN)": "Query plan (EXPLAIN)",
     "예약 백업": "Scheduled backup",
+    "정확한 행 수 (COUNT(*), 느림)": "Exact row counts (COUNT(*), slow)",
+    "끄면 information_schema 의 추정치를 보여 줍니다.": "When off, information_schema estimates are shown.",
     "다음 작업이 아직 진행 중입니다:": "These tasks are still running:",
     "지금 종료하면 작업이 중단되어 대상 DB나 덤프 파일이 불완전하게 남을 수 있습니다.": "Quitting now interrupts them and may leave the target database or dump files incomplete.",
     "그래도 종료하시겠습니까?": "Quit anyway?",
