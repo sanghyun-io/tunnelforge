@@ -14,7 +14,7 @@ from src.core.migration_constants import (
     ISSUE_TYPE_DISPLAY_NAMES,
     AUTO_FIXABLE_ISSUE_TYPES,
 )
-from src.core.migration_fix_wizard import CharsetFixPlanBuilder, create_wizard_steps
+from src.core.migration_fix_wizard import build_fix_plan
 
 
 class IssueSelectionPage(QWizardPage):
@@ -225,28 +225,21 @@ class IssueSelectionPage(QWizardPage):
         self.wizard_dialog.charset_issues = charset_issues
         self.wizard_dialog.other_issues = other_issues
 
-        # 문자셋 수정 계획 빌더 초기화
-        if charset_issues:
-            # 원본 이슈 테이블 집합 추출
-            original_tables = set()
-            for issue in charset_issues:
-                parts = issue.location.split('.')
-                if len(parts) >= 2:
-                    original_tables.add(parts[1])  # schema.table → table
+        # 원본 문자셋 이슈 테이블 집합 (schema.table → table)
+        original_tables = set()
+        for issue in charset_issues:
+            parts = issue.location.split('.')
+            if len(parts) >= 2:
+                original_tables.add(parts[1])
 
-            self.wizard_dialog.charset_plan_builder = CharsetFixPlanBuilder(
-                self.wizard_dialog.connector,
-                self.wizard_dialog.schema,
-                original_tables
-            )
-        else:
-            self.wizard_dialog.charset_plan_builder = None
-
-        # 다른 이슈에 대한 위저드 단계 생성 (문자셋 제외)
-        self.wizard_dialog.wizard_steps = create_wizard_steps(
+        # 다른 이슈의 위저드 단계 + 문자셋 수정 계획 (Rust core 한 번 호출)
+        plan = build_fix_plan(
             other_issues,
+            original_tables,
             self.wizard_dialog.connector,
             self.wizard_dialog.schema
         )
+        self.wizard_dialog.charset_plan_builder = plan.charset_plan
+        self.wizard_dialog.wizard_steps = plan.steps
 
         return True

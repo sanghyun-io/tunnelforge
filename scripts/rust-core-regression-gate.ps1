@@ -14,16 +14,8 @@ $legacyPattern = "pymysql|psycopg|mysqlsh|MySQLShell|MySQL Shell|mysql_shell|mys
 $engineLockedPattern = "from src\.core\.db_connector import MySQLConnector"
 $allowedEngineLocked = @(
     "src/core/db_connector.py",
-    "src/core/migration_fix_wizard.py",
-    "src/core/migration_rollback_sql_generator.py",
     "src/core/migration_preflight.py",
     "src/core/foreign_key_resolver.py",
-    "src/core/migration_batch_fix_executor.py",
-    "src/core/migration_charset_fix_plan.py",
-    "src/core/migration_fix_option_generator.py",
-    "src/core/migration_fk_graph.py",
-    "src/core/migration_fk_safe_charset.py",
-    "src/core/migration_fix_models.py",
     "src/ui/dialogs/db_dialogs.py",
     "src/ui/dialogs/db_connection_dialog.py",
     "src/ui/dialogs/db_export_dialog.py",

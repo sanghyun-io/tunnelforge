@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
 )
 from typing import Optional
 
-from src.core.migration_fix_wizard import FKSafeCharsetChanger, FixStrategy, render_all_steps_sql
+from src.core.migration_fix_wizard import FixStrategy, charset_fix_sql, render_all_steps_sql
 from src.ui.workers.fix_wizard_worker import FixWizardWorker
 
 
@@ -113,15 +113,10 @@ class PreviewPage(QWizardPage):
             lines.append(f"-- 테이블 목록: {', '.join(sorted(charset_tables))}")
             lines.append("")
 
-            # FKSafeCharsetChanger를 사용하여 SQL 생성
-            changer = FKSafeCharsetChanger(
+            sql_parts = charset_fix_sql(
                 self.wizard_dialog.connector,
-                self.wizard_dialog.schema
-            )
-            sql_parts = changer.generate_safe_charset_sql(
-                charset_tables,
-                charset="utf8mb4",
-                collation="utf8mb4_unicode_ci"
+                self.wizard_dialog.schema,
+                charset_tables
             )
 
             for sql_line in sql_parts['full_sql']:

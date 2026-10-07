@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from src.core.db_connector import MySQLConnector
 from src.core.migration_fix_wizard import (
     FixWizardStep, BatchFixExecutor, BatchExecutionResult, ExecutionSummary,
-    FKSafeCharsetChanger
+    charset_fix_sql
 )
 
 
@@ -128,32 +128,16 @@ class FixWizardWorker(QThread):
                 self.progress.emit(f"🔤 {mode} 문자셋 변경 시작...")
                 self.progress.emit(f"   대상 테이블: {len(self.charset_tables_to_fix)}개")
 
-                changer = FKSafeCharsetChanger(self.connector, self.schema)
+                sql_parts = charset_fix_sql(self.connector, self.schema, self.charset_tables_to_fix)
+                self.progress.emit("   📋 [DRY-RUN] FK 안전 Charset 변경 SQL 생성 완료")
+                self.progress.emit(f"      - 영향받는 FK: {sql_parts['fk_count']}개")
+                self.progress.emit(f"      - 변경할 테이블: {sql_parts['table_count']}개")
 
-                success, message, result_dict = changer.execute_safe_charset_change(
-                    tables=self.charset_tables_to_fix,
-                    charset="utf8mb4",
-                    collation="utf8mb4_unicode_ci",
-                    dry_run=True,
-                    progress_callback=lambda msg: self.progress.emit(f"   {msg}")
-                )
-
-                combined_result.charset_success = success
-                combined_result.charset_message = message
+                combined_result.charset_success = True
+                combined_result.charset_message = "DRY-RUN 완료"
                 combined_result.charset_tables_count = len(self.charset_tables_to_fix)
-                combined_result.charset_fk_count = result_dict.get('fk_count', 0)
-
-                # 에러 발생 시 롤백 SQL 저장
-                if not success:
-                    recovery_sql = result_dict.get('recovery_sql', [])
-                    if recovery_sql:
-                        combined_result.charset_rollback_sql = "\n".join(recovery_sql)
-                        self.progress.emit(f"   📋 롤백 SQL 생성됨 ({len(recovery_sql)}줄)")
-
-                if success:
-                    self.progress.emit(f"   ✅ 문자셋 변경 완료")
-                else:
-                    self.progress.emit(f"   ❌ 문자셋 변경 실패: {message}")
+                combined_result.charset_fk_count = sql_parts.get('fk_count', 0)
+                self.progress.emit("   ✅ 문자셋 변경 완료")
 
                 self.progress.emit("")
 
