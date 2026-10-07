@@ -45,6 +45,14 @@ class RustDbConnector:
         self.connection_id: Optional[str] = None
         self.connection: Optional["RustDbConnection"] = None
 
+    # 연결 정보 (덤프 설정, 화면 표시용)
+    host = property(lambda self: self.endpoint.host)
+    port = property(lambda self: self.endpoint.port)
+    user = property(lambda self: self.endpoint.user)
+    password = property(lambda self: self.endpoint.password)
+    database = property(lambda self: self.endpoint.database)
+    engine = property(lambda self: self.endpoint.engine)
+
     def _log_metadata_error(self, operation: str, exc: Exception) -> None:
         logger.exception("%s 메타데이터 조회 실패: %s", operation, exc)
 
@@ -69,8 +77,7 @@ class RustDbConnector:
             if not success:
                 return default
         try:
-            # 세션 ID 는 연결 객체에서 읽는다. PostgresConnector/MySQLConnector 는 delegate 에
-            # connection 만 넘기므로 delegate 의 connection_id 는 비어 있을 수 있다.
+            # 세션 ID 는 연결 객체에서 읽는다 (connection 만 넘겨받은 커넥터도 있다).
             return self.facade.catalog(self.connection.connection_id, kind, **args)
         except DbCoreServiceError as exc:
             self._log_metadata_error(operation, exc)

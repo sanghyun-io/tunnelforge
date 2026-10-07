@@ -9,8 +9,7 @@ from PyQt6.QtWidgets import (
 )
 from typing import Optional
 
-from src.core.db_connector import MySQLConnector
-from src.core.postgres_connector import PostgresConnector
+from src.core.db_core_service import RustDbConnector, create_rust_db_connector
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 from src.ui.workers.db_connection_worker import DBConnectionWorker
 
@@ -294,7 +293,7 @@ class DBConnectionDialog(QDialog):
         self._set_connection_busy(False)
         super().reject()
 
-    def get_connector(self) -> Optional[MySQLConnector]:
+    def get_connector(self) -> Optional[RustDbConnector]:
         """연결된 커넥터 반환"""
         return self.connector
 
@@ -323,9 +322,7 @@ class DBConnectionDialog(QDialog):
         raise ValueError("DB Engine을 선택해주세요.")
 
     def _create_connector(self, engine: str, host: str, port: int, user: str, password: str, database: str = None):
-        if engine == "postgresql":
-            return PostgresConnector(host, port, user, password, database)
-        return MySQLConnector(host, port, user, password, database)
+        return create_rust_db_connector(engine, host, port, user, password, database)
 
     def _engine_label(self, engine: str) -> str:
         return "PostgreSQL" if engine == "postgresql" else "MySQL"

@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from typing import List, Optional
 from datetime import datetime
 
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.i18n import translate_text
 from src.core.migration_analysis_models import OrphanRecord, SchemaCheckOptions
 from src.core.migration_analyzer import MigrationAnalyzer, orphan_select_sql
@@ -106,7 +106,7 @@ class OrphanReportWorker(QThread):
 class OrphanRecordDialog(QDialog):
     """고아 레코드 분석 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None):
+    def __init__(self, parent=None, connector: RustDbConnector = None, config_manager=None):
         super().__init__(parent)
         self.connector = connector
         self.config_manager = config_manager

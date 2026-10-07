@@ -3,9 +3,7 @@ Rust DB Core 기반 Export/Import 마법사
 """
 from PyQt6.QtWidgets import QDialog, QMessageBox
 
-from src.core.db_connector import MySQLConnector
-from src.core.postgres_connector import PostgresConnector
-from src.core.db_core_service import normalize_db_engine
+from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 from src.ui.dialogs.db_connection_dialog import DBConnectionDialog
 from src.ui.dialogs.preselected_connect_dialog import PreselectedConnectDialog
 from src.ui.dialogs.db_export_dialog import (
@@ -74,10 +72,7 @@ class RustDumpWizard:
             tunnel.get('default_schema') if db_engine == 'mysql' else None
         )
 
-        if db_engine == "postgresql":
-            connector = PostgresConnector(host, port, db_user, db_password, database)
-        else:
-            connector = MySQLConnector(host, port, db_user, db_password, database)
+        connector = create_rust_db_connector(db_engine, host, port, db_user, db_password, database)
         # 연결은 백그라운드 워커에서 수행한다. 모달 대기창이 이벤트 루프를 돌려 GUI 는 멈추지 않고,
         # 취소/창 닫힘 이후 늦게 도착한 결과는 폐기·정리된다.
         connect_dialog = PreselectedConnectDialog(self.parent, connector)

@@ -14,7 +14,7 @@ import logging
 from PyQt6.QtWidgets import QWizard, QMessageBox
 from typing import List, Optional, Set
 
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import RustDbConnector
 from src.core.migration_analyzer import CompatibilityIssue
 from src.core.migration_constants import IssueType
 from src.core.migration_fix_wizard import FixWizardStep, CharsetFixPlan, CharsetTableInfo
@@ -40,7 +40,7 @@ class FixWizardDialog(QWizard):
     def __init__(
         self,
         parent=None,
-        connector: MySQLConnector = None,
+        connector: RustDbConnector = None,
         issues: List[CompatibilityIssue] = None,
         schema: str = ""
     ):

@@ -9,8 +9,9 @@ from src.ui.workers.rust_dump_worker import RustDumpWorker
 def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
     captured = {}
 
-    class FakeMySQLConnector:
-        def __init__(self, host, port, user, password, database=None):
+    class FakeConnector:
+        def __init__(self, engine, host, port, user, password, database=None):
+            captured["engine"] = engine
             captured["host"] = host
             captured["port"] = port
             captured["user"] = user
@@ -20,7 +21,7 @@ def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
         def connect(self):
             return True, "ok"
 
-    monkeypatch.setattr("src.ui.dialogs.db_dialogs.MySQLConnector", FakeMySQLConnector)
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.create_rust_db_connector", FakeConnector)
     config_manager = MagicMock()
     config_manager.get_tunnel_credentials.return_value = ("root", "tunnelpass")
     tunnel_engine = MagicMock()
@@ -43,6 +44,7 @@ def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
     assert connector is not None
     assert connection_info == "MySQL 터널_root"
     assert captured == {
+        "engine": "mysql",
         "host": "127.0.0.1",
         "port": 3309,
         "user": "root",
@@ -53,14 +55,11 @@ def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
 def test_preselected_export_tunnel_uses_postgres_connector_for_postgresql(monkeypatch):
     captured = {}
 
-    class FailingMySQLConnector:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("PostgreSQL tunnel must not create MySQLConnector")
-
     class FakePostgresConnector:
         engine = "postgresql"
 
-        def __init__(self, host, port, user, password, database=None):
+        def __init__(self, engine, host, port, user, password, database=None):
+            assert engine == "postgresql", "PostgreSQL tunnel must create a PostgreSQL connector"
             captured["host"] = host
             captured["port"] = port
             captured["user"] = user
@@ -70,8 +69,7 @@ def test_preselected_export_tunnel_uses_postgres_connector_for_postgresql(monkey
         def connect(self):
             return True, "ok"
 
-    monkeypatch.setattr("src.ui.dialogs.db_dialogs.MySQLConnector", FailingMySQLConnector)
-    monkeypatch.setattr("src.ui.dialogs.db_dialogs.PostgresConnector", FakePostgresConnector)
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.create_rust_db_connector", FakePostgresConnector)
     config_manager = MagicMock()
     config_manager.get_tunnel_credentials.return_value = ("postgres", "tunnelpass")
     tunnel_engine = MagicMock()

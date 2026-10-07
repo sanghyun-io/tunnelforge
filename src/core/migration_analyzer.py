@@ -175,6 +175,8 @@ class MigrationAnalyzer:
             return True, "수동 처리 필요", 0
         if not action.count_sql:
             return False, "❌ 정리 대상 메타데이터 없음 (다시 분석하세요)", 0
-        rows = self.connector.execute(action.count_sql)
-        affected = int(rows[0]["cnt"]) if rows else 0
+        with self.connector.connection.cursor() as cursor:
+            cursor.execute(action.count_sql)
+            row = cursor.fetchone()
+        affected = int(row["cnt"]) if row else 0
         return True, f"[DRY-RUN] {affected}개 행이 영향받음", affected

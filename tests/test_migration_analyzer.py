@@ -139,9 +139,10 @@ class TestExecuteCleanup:
 
     def test_dry_run_counts_rows_with_the_core_count_sql(self):
         connector = MagicMock()
-        connector.execute.return_value = [{"cnt": 7}]
+        cursor = connector.connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {"cnt": 7}
         ok, message, affected = MigrationAnalyzer(connector).execute_cleanup(self._action())
-        connector.execute.assert_called_once_with("SELECT COUNT(*) AS cnt FROM t")
+        cursor.execute.assert_called_once_with("SELECT COUNT(*) AS cnt FROM t")
         assert (ok, affected) == (True, 7) and "7개 행" in message
 
     def test_dry_run_without_count_sql_fails_explicitly(self):
@@ -151,7 +152,7 @@ class TestExecuteCleanup:
     def test_manual_action_needs_no_query(self):
         connector = MagicMock()
         assert MigrationAnalyzer(connector).execute_cleanup(self._action(action_type=ActionType.MANUAL))[0] is True
-        connector.execute.assert_not_called()
+        connector.connection.cursor.assert_not_called()
 
     def test_actual_cleanup_rejects_legacy_python_mutation_mode(self):
         with pytest.raises(RuntimeError, match="Rust Core"):

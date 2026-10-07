@@ -114,11 +114,11 @@ class _CapturingFacade:
 
 
 def test_postgres_connector_uses_registered_policy():
-    from src.core.postgres_connector import PostgresConnector
+    from src.core.db_core_service import create_rust_db_connector
 
     ct.register_endpoint_tls("127.0.0.1", 15432, POLICY)
     facade = _CapturingFacade()
-    assert PostgresConnector("127.0.0.1", 15432, "u", "p", "d", facade=facade).connect()[0]
+    assert create_rust_db_connector("postgresql", "127.0.0.1", 15432, "u", "p", "d", facade=facade).connect()[0]
     assert facade.endpoints[0].to_payload()["tls"] == EXPECTED
 
 
