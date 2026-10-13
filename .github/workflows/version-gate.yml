@@ -350,7 +350,7 @@ jobs:
 
   python-regression:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     env:
@@ -391,6 +391,10 @@ jobs:
       - name: Build tunnelforge-core (Rust)
         shell: pwsh
         run: cargo build --manifest-path migration_core/Cargo.toml --release
+
+      - name: Run Windows-only Rust core tests
+        shell: pwsh
+        run: cargo test --manifest-path migration_core/Cargo.toml --release --lib windows_
 
       - name: Run full Python regression suite
         shell: pwsh

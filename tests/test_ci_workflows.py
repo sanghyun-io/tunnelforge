@@ -458,7 +458,7 @@ def test_python_regression_runs_full_suite_with_built_core():
     job_text = version_gate_job_text("python-regression")
 
     assert job["runs-on"] == "windows-latest"
-    assert job["timeout-minutes"] == 20
+    assert job["timeout-minutes"] == 30
     assert job["env"]["QT_QPA_PLATFORM"] == "offscreen"
     assert str(job["env"]["PYTHONUTF8"]) == "1"
     assert "${{ github.event.pull_request.head.sha }}" in job_text
@@ -468,6 +468,8 @@ def test_python_regression_runs_full_suite_with_built_core():
     assert "cargo --version" in job_text
     assert 'pip install -e ".[dev]"' in job_text
     assert "cargo build --manifest-path migration_core/Cargo.toml --release" in job_text
+    # Windows-only core paths (report replace retry) are tested nowhere else.
+    assert "cargo test --manifest-path migration_core/Cargo.toml --release --lib windows_" in job_text
     assert "pytest -q" in job_text
     assert "pyinstaller bootstrapper/bootstrapper.spec" in job_text
     assert "dist\\TunnelForge-WebSetup.exe --self-check" in job_text
