@@ -141,9 +141,26 @@ pub(crate) fn reverify_candidate(plan: &VerifiedSafeRestorePlan) -> Result<Value
         &mut |_, _, _| {},
     )?;
     if verified != plan.report["verification"] {
-        return Err("candidate verification changed since safe preparation".into());
+        let change = first_difference("verification", &plan.report["verification"], &verified).unwrap_or_default();
+        return Err(format!("candidate verification changed since safe preparation: {change}"));
     }
     Ok(verified)
+}
+
+/// The first path where two verification reports differ, so a refusal says what changed.
+fn first_difference(path: &str, before: &Value, after: &Value) -> Option<String> {
+    match (before, after) {
+        (Value::Object(left), Value::Object(right)) => left.keys().chain(right.keys()).find_map(|key| {
+            first_difference(&format!("{path}.{key}"), left.get(key).unwrap_or(&Value::Null), right.get(key).unwrap_or(&Value::Null))
+        }),
+        (Value::Array(left), Value::Array(right)) if left.len() == right.len() => left.iter().zip(right).enumerate()
+            .find_map(|(index, (left, right))| first_difference(&format!("{path}[{index}]"), left, right)),
+        _ if before == after => None,
+        _ => {
+            let short = |value: &Value| value.to_string().chars().take(160).collect::<String>();
+            Some(format!("{path} was {} and is now {}", short(before), short(after)))
+        }
+    }
 }
 
 pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
@@ -560,9 +577,14 @@ fn verify_candidate(
             .checks
             .sort_by(|left, right| left.name.cmp(&right.name));
     }
+    // The AUTO_INCREMENT counter is allocation state, not shape (content digests cover the rows),
+    // and MySQL 8.0 reports it late: NULL right after CREATE TABLE, 1 a moment later. Hashing it
+    // made a switch fail as "candidate verification changed" with nothing changed.
+    let mut shape = actual.clone();
+    shape.tables.iter_mut().for_each(|table| table.auto_increment = None);
     let actual_schema_sha256 = format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&actual).map_err(|error| error.to_string())?)
+        Sha256::digest(serde_json::to_vec(&shape).map_err(|error| error.to_string())?)
     );
     let unsupported_inventory_sha256 = format!(
         "{:x}",
