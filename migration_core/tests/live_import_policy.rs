@@ -7,14 +7,15 @@ static MYSQL_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
 fn endpoint() -> Option<Endpoint> {
     Some(Endpoint {
-        engine: "mysql".into(), host: std::env::var("TF_MYSQL_HOST").ok()?, port: 3306,
+        engine: "mysql".into(), host: std::env::var("TF_MYSQL_HOST").ok()?,
+        port: std::env::var("TF_MYSQL_PORT").ok().and_then(|port| port.parse().ok()).unwrap_or(3306),
         user: "root".into(), password: "tf_local_test".into(), database: "tf_test".into(), schema: None,
         tls: Default::default(),
     })
 }
 
 fn connect(endpoint: &Endpoint) -> mysql::PooledConn {
-    mysql::Pool::new(mysql::OptsBuilder::new().ip_or_hostname(Some(&endpoint.host))
+    mysql::Pool::new(mysql::OptsBuilder::new().ip_or_hostname(Some(&endpoint.host)).tcp_port(endpoint.port)
         .user(Some(&endpoint.user)).pass(Some(&endpoint.password)).db_name(Some(&endpoint.database)))
         .unwrap().get_conn().unwrap()
 }
@@ -1017,4 +1018,30 @@ fn mysql_scoped_replace_reports_a_view_it_cannot_replace_and_leaves_it() {
     let error = failed[0]["error"].as_str().unwrap();
     assert!(error.contains("could not be replaced") && error.contains("SYSTEM_USER"), "{error}");
     assert_eq!(views, 1, "the existing view must stay");
+}
+
+#[test]
+fn mysql_replace_refuses_a_kept_child_whose_parent_column_is_not_in_the_dump() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut conn = connect(&endpoint);
+    let parent = unique("tf_absent_parent");
+    let child = unique("tf_absent_child");
+    conn.query_drop(format!("CREATE TABLE {parent}(id INT PRIMARY KEY) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("INSERT INTO {parent} VALUES(1)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_absent"));
+    let exported = run("dump.run", json!({"source":endpoint,"tables":[parent],"output_dir":output,"data_format":"jsonl","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    // The target's parent grew a key column the dump does not have, and a kept child uses it.
+    conn.query_drop(format!("ALTER TABLE {parent} ADD COLUMN legacy INT NULL, ADD UNIQUE KEY uq_legacy (legacy)")).unwrap();
+    conn.query_drop(format!("UPDATE {parent} SET legacy=7")).unwrap();
+    conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, legacy_ref INT, CONSTRAINT fk_{child} FOREIGN KEY(legacy_ref) REFERENCES {parent}(legacy)) ENGINE=InnoDB")).unwrap();
+    let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
+    let legacy = conn.query_first::<u64,_>(format!("SELECT legacy FROM {parent} WHERE id=1"));
+    conn.query_drop(format!("DROP TABLE {child}")).unwrap();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {parent}")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert!(!success(&imported));
+    assert_eq!(legacy.ok().flatten(), Some(7), "the parent was replaced before the refusal");
+    let error = imported.iter().find(|event| event["event"] == "error").unwrap();
+    assert!(error["message"].as_str().unwrap().contains("incompatible_surviving_fk"), "{error}");
 }
