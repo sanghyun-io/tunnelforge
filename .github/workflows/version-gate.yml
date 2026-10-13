@@ -74,7 +74,7 @@ jobs:
 
   dump-roundtrip-regression:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     permissions:
       contents: read
     services:
@@ -147,9 +147,30 @@ jobs:
             --test live_fault_injection \
             --test live_safe_restore \
             --test live_backup_lifecycle \
+            --test live_real_schema \
             -- --include-ignored --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib safe_promote_ -- --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib import::safe_restore_digest:: -- --include-ignored --test-threads=1
+
+      # MySQL 8.0 behaves differently (e.g. late AUTO_INCREMENT statistics, no
+      # restrict_fk_on_non_standard_key), and production servers still run it.
+      - name: Run import regressions against MySQL 8.0
+        env:
+          TF_MYSQL_PORT: "3307"
+        run: |
+          docker run -d --name tf-ci-my80 -p 127.0.0.1:3307:3306 -e MYSQL_ROOT_PASSWORD=tf_local_test -e MYSQL_ROOT_HOST=% -e MYSQL_DATABASE=tf_test --tmpfs /var/lib/mysql mysql:8.0
+          for attempt in $(seq 1 90); do
+            docker exec tf-ci-my80 mysql -h127.0.0.1 -uroot -ptf_local_test -e 'SELECT 1' >/dev/null 2>&1 && break
+            sleep 2
+          done
+          cargo test --manifest-path migration_core/Cargo.toml \
+            --test live_import_policy \
+            --test live_real_schema \
+            -- --include-ignored --test-threads=1
+
+      - name: Remove MySQL 8.0 server
+        if: always()
+        run: docker rm -f tf-ci-my80 || true
 
   live-security-regression:
     runs-on: ubuntu-24.04

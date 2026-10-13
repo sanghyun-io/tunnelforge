@@ -388,27 +388,22 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         journal.checkpoint()?;
         emit(json!({"event":"phase", "request_id":request.request_id, "phase":journal.phase,
             "message":"서버에서 테이블 생성 정의를 검증 중입니다. 기존 대상 테이블은 아직 변경하지 않습니다."}));
-        if matches!(mode, "replace" | "recreate") {
+        let surviving = if matches!(mode, "replace" | "recreate") {
             validate_postgres_drop_dependencies(&mut adapter, &target_schema, &tables)?;
-            // Foreign keys are now added table by table, so refuse incompatible ones before any DROP.
-            validate_foreign_key_column_compatibility(&import_schema)?;
-        }
+            surviving_foreign_keys(&mut adapter, &target_schema, &import_schema)?
+        } else {
+            Vec::new()
+        };
         validate_target_check_names(&mut adapter, &target_schema, &import_schema)?;
         refuse_non_table_name_collisions(&mut adapter, &target_schema, &import_schema)?;
-        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, should_apply_post_load_ddl(mode))?;
+        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, should_apply_post_load_ddl(mode), &surviving)?;
         journal.current_table = None;
         journal.phase = "dump_import_prepare".into();
         journal.checkpoint()?;
         emit(json!({"event":"phase", "request_id":request.request_id, "phase":journal.phase,
             "message":if mode == "merge" { "검증 완료: 기존 테이블을 유지하며 데이터 적재를 준비합니다." } else { "검증 완료: 선택한 대상 테이블 교체를 준비합니다." },
             "report_path":dump_import_report_path(input_path)?.display().to_string()}));
-        prepare_import_target(
-            mode,
-            &tables,
-            &import_schema,
-            &mut adapter,
-            &target_schema,
-        )?;
+        prepare_import_target(mode, &tables, &mut adapter, &target_schema)?;
 
         let planned_set = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
         let target_engine = adapter.engine();
@@ -545,18 +540,67 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
 /// import while the target is still untouched.
 fn probe_import_ddl(
     adapter: &mut LiveAdapter, schema: &NormalizedSchema, source_engine: &str, journal: &mut ImportJournal, with_post_load: bool,
+    surviving: &[SurvivingForeignKey],
 ) -> Result<(), String> {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("cannot allocate DDL probe name: {err}"))?.as_nanos();
     let prefix = format!("tf_probe_{}_{nonce}", std::process::id());
     let engine = adapter.engine();
-    run_owned_ddl_probe(schema, source_engine, engine, with_post_load, &prefix,
+    run_owned_ddl_probe(schema, source_engine, engine, with_post_load, surviving, &prefix,
         |table| { journal.current_table = Some(table.to_string()); journal.checkpoint() },
         |sql| adapter.execute_sql(sql))
 }
 
+/// A foreign key of a table the import keeps, referencing a table the import replaces.
+pub(crate) struct SurvivingForeignKey {
+    label: String,
+    parent: String,
+    /// (the child column's type, the parent column it references)
+    columns: Vec<(String, String)>,
+}
+
+/// MySQL binds these to the recreated parent at its CREATE TABLE (with foreign_key_checks=0 the
+/// child may exist first), so the probe recreates them the same way and lets the server judge.
+fn surviving_foreign_keys(adapter: &mut LiveAdapter, schema: &str, import_schema: &NormalizedSchema) -> Result<Vec<SurvivingForeignKey>, String> {
+    let LiveAdapter::MySql(conn) = adapter else { return Ok(Vec::new()) };
+    let fold_case = mysql_folds_table_names(conn)?;
+    let key = |name: &str| if fold_case { name.to_lowercase() } else { name.to_string() };
+    let dumped = import_schema.tables.iter().map(|table| (key(&table.name), table.name.clone())).collect::<BTreeMap<_, _>>();
+    type Row = (String, String, String, String, String, String, Option<String>, Option<String>);
+    let rows: Vec<Row> = conn.exec(
+        "SELECT k.TABLE_SCHEMA, k.TABLE_NAME, k.CONSTRAINT_NAME, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, \
+                c.COLUMN_TYPE, c.CHARACTER_SET_NAME, c.COLLATION_NAME \
+         FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.COLUMNS c \
+           ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME \
+         WHERE k.REFERENCED_TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL \
+         ORDER BY k.TABLE_SCHEMA, k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+        (schema,),
+    ).map_err(|err| format!("target foreign key inspection failed: {err}"))?;
+    let mut keys: Vec<SurvivingForeignKey> = Vec::new();
+    let mut current = None;
+    for (child_schema, child, constraint, parent, parent_column, column_type, charset, collation) in rows {
+        let same_schema = child_schema == schema;
+        let Some(parent) = dumped.get(&key(&parent)) else { continue };
+        if same_schema && dumped.contains_key(&key(&child)) {
+            continue;
+        }
+        let id = (child_schema.clone(), child.clone(), constraint.clone());
+        if current.as_ref() != Some(&id) {
+            let child = if same_schema { child } else { format!("{child_schema}.{child}") };
+            keys.push(SurvivingForeignKey { label: format!("{child}.{constraint} -> {parent}"), parent: parent.clone(), columns: Vec::new() });
+            current = Some(id);
+        }
+        let definition = match (charset, collation) {
+            (Some(charset), Some(collation)) => format!("{column_type} CHARACTER SET {charset} COLLATE {collation}"),
+            _ => column_type,
+        };
+        keys.last_mut().unwrap().columns.push((definition, parent_column));
+    }
+    Ok(keys)
+}
+
 fn run_owned_ddl_probe(
-    schema: &NormalizedSchema, source_engine: &str, engine: &str, with_post_load: bool, prefix: &str,
+    schema: &NormalizedSchema, source_engine: &str, engine: &str, with_post_load: bool, surviving: &[SurvivingForeignKey], prefix: &str,
     mut enter_table: impl FnMut(&str) -> Result<(), String>,
     mut execute: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -566,8 +610,27 @@ fn run_owned_ddl_probe(
     let rejected = |what: &str, table: &str, err: String| classified_import_error(
         "ddl_preflight_failed", &format!("server rejected {what} before target replacement: {err}"), Some(table),
     );
+    let surviving_names = (0..surviving.len()).map(|index| format!("{prefix}_s{index}")).collect::<Vec<_>>();
+    let incompatible = |fk: &SurvivingForeignKey, err: String| classified_import_error(
+        "incompatible_surviving_fk",
+        &format!("a table outside the import keeps a foreign key the replacement table cannot satisfy; target tables were not changed: {}: {err}", fk.label),
+        None,
+    );
     let mut created = Vec::new();
     let mut build = || -> Result<(), String> {
+        // Children the import keeps exist before their parent is recreated, as in the real replace.
+        for (fk, name) in surviving.iter().zip(&surviving_names) {
+            let columns = fk.columns.iter().enumerate()
+                .map(|(index, (definition, _))| format!("{} {definition} NULL", quote_ident(engine, &format!("c{index}"))))
+                .collect::<Vec<_>>().join(", ");
+            let child_columns = (0..fk.columns.len()).map(|index| quote_ident(engine, &format!("c{index}"))).collect::<Vec<_>>().join(", ");
+            let parent_columns = fk.columns.iter().map(|(_, column)| quote_ident(engine, column)).collect::<Vec<_>>().join(", ");
+            execute(&format!(
+                "CREATE TABLE {} ({columns}, CONSTRAINT {} FOREIGN KEY ({child_columns}) REFERENCES {} ({parent_columns}))",
+                quote_ident(engine, name), quote_ident(engine, name), quote_ident(engine, &probe_names[fk.parent.as_str()]),
+            )).map_err(|err| incompatible(fk, err))?;
+            created.push(name.clone());
+        }
         for table in &schema.tables {
             enter_table(&table.name)?;
             let mut probe = table.clone();
@@ -583,7 +646,12 @@ fn run_owned_ddl_probe(
                 .ok_or_else(|| format!("DDL probe generation failed for {}", table.name))?;
             // Raw execution must fail on collisions; create_table intentionally treats
             // existing tables as valid during merge and cannot establish ownership.
-            execute(&ddl).map_err(|err| rejected("CREATE TABLE", &table.name, err))?;
+            execute(&ddl).map_err(|err| {
+                match surviving.iter().zip(&surviving_names).find(|(_, name)| err.contains(&format!("'{name}'"))) {
+                    Some((fk, _)) => incompatible(fk, err),
+                    None => rejected("CREATE TABLE", &table.name, err),
+                }
+            })?;
             created.push(probe.name.clone());
             if with_post_load {
                 for sql in secondary_index_ddl(&probe, engine) {
@@ -628,47 +696,28 @@ fn run_owned_ddl_probe(
     }
 }
 
-/// replace/recreate 모드일 때 대상 테이블을 바꾸기 전에 막을 수 있는 실패를 먼저 거부한다.
-///
-/// Surviving-FK preflight (MySQL 전용): import set 밖의 타겟 테이블과 그 FK는 그대로 둔다.
-/// 새 부모 정의의 타입/charset/collation/생성 시점 키가 기존 FK 계약과 달라지는 경우만
-/// 타겟을 손대기 전에 명확한 에러로 차단한다. 실제 DROP은 import 루프에서 테이블마다
-/// CREATE 직전에 수행한다(`replace_target_table`).
-///
-/// merge 모드에서는 기존 MySQL 대상의 트랜잭션 지원 여부만 확인한다.
+/// merge 모드에서는 기존 MySQL 대상의 트랜잭션 지원 여부만 확인한다. replace의 사전 점검은
+/// 모두 `probe_import_ddl`이 서버에서 직접 한다.
 fn prepare_import_target(
     mode: &str,
     tables: &[DumpTableManifest],
-    import_schema: &NormalizedSchema,
     adapter: &mut LiveAdapter,
     target_schema: &str,
 ) -> Result<(), String> {
-    if !matches!(mode, "replace" | "recreate") {
-        if let LiveAdapter::MySql(conn) = adapter {
-            for table in tables {
-                let engine: Option<String> = conn.exec_first(
-                    "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",
-                    (target_schema, &table.name),
-                ).map_err(|err| format!("mysql merge engine preflight failed: {err}"))?;
-                if engine.is_some_and(|engine| !engine.eq_ignore_ascii_case("InnoDB")) {
-                    return Err(format!("import_plan_invalid: merge requires an InnoDB target table for safe rollback: {}", table.name));
-                }
-            }
-        }
+    if matches!(mode, "replace" | "recreate") {
         return Ok(());
     }
-    // Target-only children are outside the user's replacement set. Refuse an
-    // incompatible parent definition before dropping any selected table.
-    let incompatible_fks =
-        detect_incompatible_surviving_fks(adapter, target_schema, import_schema)?;
-    if !incompatible_fks.is_empty() {
-        return Err(classified_import_error(
-            "incompatible_surviving_fk",
-            &format!("target-only foreign keys are incompatible with replacement tables; target tables were not changed: {}", incompatible_fks.join(", ")),
-            None,
-        ));
+    if let LiveAdapter::MySql(conn) = adapter {
+        for table in tables {
+            let engine: Option<String> = conn.exec_first(
+                "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",
+                (target_schema, &table.name),
+            ).map_err(|err| format!("mysql merge engine preflight failed: {err}"))?;
+            if engine.is_some_and(|engine| !engine.eq_ignore_ascii_case("InnoDB")) {
+                return Err(format!("import_plan_invalid: merge requires an InnoDB target table for safe rollback: {}", table.name));
+            }
+        }
     }
-
     Ok(())
 }
 
@@ -2237,6 +2286,24 @@ mod tests {
     }
 
     #[test]
+    fn ddl_probe_recreates_kept_children_before_their_parent_and_names_the_offender() {
+        use crate::adapters::test_support::schema as sample_schema;
+        let schema = sample_schema();
+        let kept = [SurvivingForeignKey { label: "orders.fk_user -> users".into(), parent: "users".into(), columns: vec![("bigint unsigned".into(), "id".into())] }];
+        let mut statements = Vec::new();
+        let err = run_owned_ddl_probe(&schema, "mysql", "mysql", true, &kept, "p", |_| Ok(()), |sql| {
+            statements.push(sql.to_string());
+            // MySQL judges the kept child FK when the parent is created, as in the real replace.
+            if sql.starts_with("CREATE TABLE `p_0`") {
+                Err("ERROR 3780: Referencing column 'c0' and referenced column 'id' in foreign key constraint 'p_s0' are incompatible.".into())
+            } else { Ok(()) }
+        }).unwrap_err();
+        assert_eq!(statements[0], "CREATE TABLE `p_s0` (`c0` bigint unsigned NULL, CONSTRAINT `p_s0` FOREIGN KEY (`c0`) REFERENCES `p_0` (`id`))");
+        assert!(err.starts_with("incompatible_surviving_fk:") && err.contains("orders.fk_user -> users") && err.contains("ERROR 3780"), "{err}");
+        assert_eq!(statements.last().unwrap(), "DROP TABLE IF EXISTS `p_s0`");
+    }
+
+    #[test]
     fn ddl_probe_links_foreign_keys_and_drops_only_the_probes_it_created() {
         use crate::adapters::test_support::{fk, schema as sample_schema};
         let parent = sample_schema().tables.remove(0);
@@ -2246,7 +2313,7 @@ mod tests {
         let schema = NormalizedSchema { tables: vec![parent, child] };
         let run = |fail: &str| {
             let mut statements = Vec::new();
-            let result = run_owned_ddl_probe(&schema, "mysql", "mysql", true, "p", |_| Ok(()), |sql| {
+            let result = run_owned_ddl_probe(&schema, "mysql", "mysql", true, &[], "p", |_| Ok(()), |sql| {
                 statements.push(sql.to_string());
                 if !fail.is_empty() && sql.contains(fail) { Err("denied".into()) } else { Ok(()) }
             });

@@ -47,7 +47,11 @@ because re-creating the parent would otherwise fail (ERROR 1822/6125) right afte
 the drop. FKs between selected tables are dropped from the not-yet-replaced child
 just before its parent is replaced and recreated from the dump after loading.
 Unsupported target actions, including MySQL `SET DEFAULT` foreign keys, fail
-preflight. AUTO_INCREMENT on a parent key is not a type change for this check.
+preflight. The server makes this call, not a comparison of type names: before
+any DROP, a copy of each such child FK is created first and the dumped parent
+is then created under a probe name, the same order as the real replace, so
+whatever MySQL refuses there (type, character set, collation, missing key or
+column) stops the import with the target unchanged.
 
 Before any table is dropped, the target server checks the import itself: every
 selected table is created once under a temporary probe name, for `replace` with
@@ -219,6 +223,14 @@ AUTO_INCREMENT allocation gaps, table/column comments, and
 PostgreSQL arrays, supported scalar defaults, UUID generation and ordinary
 serial/BY DEFAULT identity columns. MySQL 8.0.46/8.4.11 and PostgreSQL 13.23/18.4
 were exercised locally; this is not a claim covering every engine version.
+
+CI also replays the shape of a real production schema (311 tables, 11 views),
+anonymized by `scripts/anonymize_dump_schema.py`: replace into an empty and an
+existing database, with target-only children on every single-column key, with
+a database-scoped account, safe restore and switch, and export/re-import
+(`live_real_schema`). Into PostgreSQL, a MySQL dump is refused before any change
+when tables use MySQL `ON UPDATE` columns or CHECK expressions, which have no
+PostgreSQL translation yet; every such table is listed at once.
 
 The normalized format does not yet preserve every DB object. Selected tables
 with detected unrepresentable generated/custom-type/advanced-index/default/

@@ -509,7 +509,7 @@ def test_terminal_gate_requires_live_and_linux_success(result_key, job_result):
 def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
     job = load_version_gate()['jobs']['dump-roundtrip-regression']
     assert job['runs-on'] == 'ubuntu-24.04'
-    assert job['timeout-minutes'] == 15
+    assert job['timeout-minutes'] == 35
     for service, image, port in [('mysql', 'mysql:8.4', 3306), ('postgres', 'postgres:18.4', 5432)]:
         container = job['services'][service]
         assert container['image'] == image
@@ -527,8 +527,11 @@ def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
     commands = '\n'.join(step.get('run', '') for step in job['steps'])
     fixtures = ['live_roundtrip', 'live_binary_keyset', 'live_keyset_pk_matrix', 'live_mysql_bit', 'live_mysql_spatial', 'live_cross_engine_types', 'live_dump_cross_engine', 'live_schema_fidelity', 'live_schema_compare', 'live_upgrade_analyze', 'live_upgrade_fix', 'live_catalog',
                 'live_import_policy', 'live_foreign_key_actions', 'live_export_contract',
-                'live_fault_injection', 'live_safe_restore', 'live_backup_lifecycle']
+                'live_fault_injection', 'live_safe_restore', 'live_backup_lifecycle', 'live_real_schema',
+                # The same import suites again against a MySQL 8.0 server on port 3307.
+                'live_import_policy', 'live_real_schema']
     assert re.findall(r'--test ([a-z_]+)', commands) == fixtures
+    assert 'mysql:8.0' in commands and 'TF_MYSQL_PORT' in str(job['steps'])
     assert 'cargo test --manifest-path migration_core/Cargo.toml' in commands
     assert '--include-ignored --test-threads=1' in commands
     assert '--lib safe_promote_ -- --test-threads=1' in commands
