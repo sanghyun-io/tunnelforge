@@ -895,10 +895,23 @@ fn replace_import_report_file(source: &Path, target: &Path) -> std::io::Result<(
     }
     let source = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
     let target = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
-    // Same-directory replace without deleting the previous checkpoint first.
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0x1 | 0x8) } == 0 {
-        Err(std::io::Error::last_os_error())
-    } else { Ok(()) }
+    // Same-directory replace without deleting the previous checkpoint first. Antivirus scanners and
+    // search indexers briefly open a freshly written file, and MoveFileEx then fails with
+    // ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32); a checkpoint must not stop an import
+    // halfway over that, so those are retried for about 4.5 s. Other errors fail at once.
+    let mut delay = std::time::Duration::from_millis(50);
+    for attempt in 0.. {
+        if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0x1 | 0x8) } != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if attempt >= 8 || !matches!(err.raw_os_error(), Some(5 | 32)) {
+            return Err(err);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_secs(1));
+    }
+    unreachable!()
 }
 
 pub(crate) fn validate_dump_manifest_chunks(
@@ -1366,6 +1379,27 @@ mod tests {
     
     
     use crate::adapters::test_support::{empty_table, fk, schema};
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_report_replace_waits_out_a_scanner_holding_the_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("tf-report-retry-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        write_dump_import_report(&dir, &json!({"step": 1})).unwrap();
+        // Like an antivirus scan: a handle that shares read only, so the file cannot be replaced.
+        let held = fs::OpenOptions::new().read(true).share_mode(0x1)
+            .open(dir.join("_tunnelforge_import_report.json")).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        write_dump_import_report(&dir, &json!({"step": 2})).unwrap();
+        release.join().unwrap();
+        let report: Value = serde_json::from_slice(&fs::read(dir.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(report["step"], 2);
+    }
 
     #[test]
     fn tsv_single_column_preserves_empty_string_rows() {

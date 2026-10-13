@@ -97,6 +97,9 @@ pub(crate) fn validate_target_foreign_key_actions(table: &NormalizedTable, targe
             if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| value.trim().eq_ignore_ascii_case("uuid()") || value.trim().eq_ignore_ascii_case("(uuid())")) {
                 return Err(format!("cannot translate MySQL UUID() expression default for {}.{} to {target}",table.name,column.name));
             }
+            if let Some(value) = &column.on_update {
+                return Err(format!("cannot translate MySQL ON UPDATE {value} for {}.{} to {target}; it has no column equivalent", table.name, column.name));
+            }
         }
     }
     for check in &table.checks {

@@ -983,3 +983,38 @@ fn postgres_replace_refuses_an_incompatible_outside_parent_and_a_same_name_view_
     assert_eq!(label, "kept", "the child was replaced before a refusal");
     assert_eq!(probes, 0);
 }
+
+#[test]
+fn mysql_scoped_replace_reports_a_view_it_cannot_replace_and_leaves_it() {
+    let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, user) = (unique("tf_view_owner"), "tf_import_view_owner");
+    for sql in [
+        format!("DROP USER IF EXISTS '{user}'@'%'"),
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        format!("GRANT ALL ON {db}.* TO '{user}'@'%'"),
+        format!("CREATE TABLE {db}.items (id INT PRIMARY KEY)"),
+        format!("INSERT INTO {db}.items VALUES (1)"),
+        // Owned by root (SYSTEM_USER), as when an administrator set the database up.
+        format!("CREATE SQL SECURITY INVOKER VIEW {db}.item_ids AS SELECT id FROM {db}.items"),
+    ] { root.query_drop(sql).unwrap(); }
+    let source = Endpoint { database: db.clone(), ..endpoint.clone() };
+    let scoped = Endpoint { user: user.into(), database: db.clone(), ..endpoint.clone() };
+    let output = std::env::temp_dir().join(unique("tf_view_owner"));
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    let imported = run("dump.import", json!({"target": scoped, "input_dir": output, "mode": "replace", "threads": 1}));
+    let views: u64 = root.exec_first("SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA=? AND TABLE_NAME='item_ids'", (&db,)).unwrap().unwrap();
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    root.query_drop(format!("DROP USER '{user}'@'%'")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    let result = imported.iter().rev().find(|event| event["event"] == "result").unwrap();
+    let failed = result["views_failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{result}");
+    assert_eq!(failed[0]["name"], "item_ids");
+    let error = failed[0]["error"].as_str().unwrap();
+    assert!(error.contains("could not be replaced") && error.contains("SYSTEM_USER"), "{error}");
+    assert_eq!(views, 1, "the existing view must stay");
+}

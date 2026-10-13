@@ -81,6 +81,8 @@ fn validate_import_metadata(
         }
     }
     let mut ddls = BTreeMap::new();
+    // Every table the target cannot take is reported at once, not one per attempt.
+    let mut untranslatable = Vec::new();
     for table in &manifest.tables {
         let definition = schema.get(table.name.as_str())
             .ok_or_else(|| invalid(format!("manifest schema missing table {}", table.name)))?;
@@ -94,11 +96,18 @@ fn validate_import_metadata(
                     return Err(invalid(format!("duplicate column {} in table {}", column.name, table.name)));
                 }
             }
-            validate_target_foreign_key_actions(definition, target_engine).map_err(&invalid)?;
-            let ddl = generate_table_ddl(definition, &manifest.source_engine, target_engine)
-                .ok_or_else(|| invalid(format!("cannot generate DDL for table {}", table.name)))?;
-            ddls.insert(table.name.clone(), ddl);
+            if let Err(reason) = validate_target_foreign_key_actions(definition, target_engine) {
+                untranslatable.push(reason);
+                continue;
+            }
+            match generate_table_ddl(definition, &manifest.source_engine, target_engine) {
+                Some(ddl) => { ddls.insert(table.name.clone(), ddl); }
+                None => untranslatable.push(format!("cannot generate DDL for table {}", table.name)),
+            }
         }
+    }
+    if !untranslatable.is_empty() {
+        return Err(invalid(format!("{} tables cannot be created on {target_engine}: {}", untranslatable.len(), untranslatable.join("; "))));
     }
     Ok(ddls)
 }
@@ -1200,9 +1209,21 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
     // replace/recreate 모드면 기존 View를 먼저 정리한다 (테이블이 아닌 View 전용 DROP).
     // 검증을 통과한 View만 DROP 대상으로 삼는다.
     if matches!(mode, "replace" | "recreate") {
+        let mut undroppable = BTreeMap::new();
         for name in &validated_names {
-            let _ = adapter.execute_sql(&drop_view_sql(target_engine, name));
+            if let Err(err) = adapter.execute_sql(&drop_view_sql(target_engine, name)) {
+                undroppable.insert(name.to_string(), err);
+            }
         }
+        // CREATE would only say the view already exists; report why it could not be replaced
+        // (e.g. MySQL ERROR 1227: its DEFINER has SYSTEM_USER and this account does not).
+        pending.retain(|(name, _)| match undroppable.get(name) {
+            Some(err) => {
+                outcome.failed.push(json!({"name": name, "error": format!("existing view could not be replaced and was left as it was: {err}")}));
+                false
+            }
+            None => true,
+        });
     }
 
     // fixpoint 루프: 한 바퀴에 하나도 성공하지 못하면 중단한다.
@@ -2304,6 +2325,25 @@ mod tests {
         let warnings = source_dump_warnings(&manifest);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("independent snapshots and no shared lock"));
+    }
+
+    #[test]
+    fn every_table_the_target_cannot_take_is_reported_at_once() {
+        let mut tables = schema();
+        tables.tables[0].columns[1].on_update = Some("CURRENT_TIMESTAMP".into());
+        let mut other = tables.tables[0].clone();
+        other.name = "other".into();
+        tables.tables.push(other);
+        let entry = |name: &str| DumpTableManifest { name: name.into(), path: name.into(), rows: 0, chunks: 0, chunk_sha256: BTreeMap::new() };
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".into(), format_version: 2, data_format: "tsv".into(), compression: "none".into(),
+            source_engine: "mysql".into(), database: "app".into(), source_schema: None, source_timezone: None,
+            schema: tables, snapshot_policy: "connection_consistent".into(), strict_export: true, manifest_warnings: vec![],
+            chunk_size: 100, created_unix_seconds: 1, views: vec![], tables: vec![entry("users"), entry("other")],
+        };
+        let err = validate_import_metadata(&manifest, &BTreeSet::new(), "postgresql").unwrap_err();
+        assert!(err.contains("2 tables cannot be created on postgresql"), "{err}");
+        assert!(err.contains("ON UPDATE CURRENT_TIMESTAMP for users.name") && err.contains("other.name"), "{err}");
     }
 
     #[test]
