@@ -113,7 +113,7 @@ fn real_dump_sweep_mysql() {
     // Only this sweep's databases and the namespaces its safe restore created.
     let after: Vec<String> = root.query("SHOW DATABASES").unwrap();
     for name in after.iter().filter(|name| !before.contains(name)) {
-        if [&a, &b].contains(name) || ["tf_restore_", "tf_backup_", "tf_promote_"].iter().any(|prefix| name.starts_with(prefix)) {
+        if *name == a || *name == b || ["tf_restore_", "tf_backup_", "tf_promote_"].iter().any(|prefix| name.starts_with(prefix)) {
             root.query_drop(format!("DROP DATABASE IF EXISTS `{name}`")).unwrap();
         }
     }
