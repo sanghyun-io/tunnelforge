@@ -143,26 +143,29 @@ macOS DMG/ZIP packages are beta artifacts pending final real-Mac operator valida
 
 Run the downloaded installer and follow the setup wizard. On macOS, download the DMG for your Mac architecture (`arm64` for Apple Silicon, `x86_64` for Intel), optionally verify it with the matching `.sha256` file, open it, and move `TunnelForge.app` to Applications.
 
-### 2. Add a Tunnel
+### 2. Add a Connection
 
-Click **"Add Tunnel"** and configure your connection:
+Click **"➕ Add Connection"** (or press `Ctrl+N`) and configure your connection:
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| Tunnel Name | A friendly label | `Production DB` |
-| Bastion Host | SSH jump server | `bastion.example.com` |
+| Name (alias) | A friendly label | `Production DB` |
+| Connection mode | `SSH tunnel (through a bastion)` or `Direct connection` | `SSH tunnel` |
+| Bastion Host | SSH jump server (SSH tunnel mode only) | `bastion.example.com` |
 | SSH Key | Private key file path | `C:\Users\me\.ssh\id_rsa` |
-| DB Host | Target database (from bastion's perspective) | `db.internal:3306` |
+| Endpoint | Target database host | `db.internal` |
+| DB Port | Target database port | `3306` |
 | DB Credentials | Username & password | `admin` / `••••` |
 | DB TLS | `verify_full` (default), `verify_ca`, or `disable`; optional CA file | `verify_full` |
 
-### 3. Connect & Go
+### 3. Start & Use
 
-Select a tunnel → Click **"Connect"** → Use the database tools:
+Select a connection → Click **"Start"** in the **Power** column → Use the database tools:
 - **SQL Editor** — Run queries, review results, commit or roll back changes
 - **Export** — Backup schemas or selected tables
 - **Import** — Restore from backup files with **Safe restore** (default), **Overwrite**, or **Replace** (advanced, destructive); see the [Export/Import contract](docs/export_import_policy.md)
-- Right-click a tunnel for **Schema Diff**, **Migration Analysis**, and **Orphan Record Analysis**
+- Right-click a connection for **SQL Editor**, **Export**, **Import**, and **Orphan Record Analysis**
+- Open the **🧰 Tools** menu for **Schema Diff**, **MySQL 8.4 Upgrade Check**, and **DB Transition (MySQL ↔ PostgreSQL)**
 
 ---
 

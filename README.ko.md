@@ -143,26 +143,29 @@ macOS DMG/ZIP 설치파일은 최종 실제 Mac 운영자 검증 전의 베타 �
 
 다운로드한 설치 파일을 실행하고 설치 마법사를 따라 진행하세요. macOS에서는 Mac 아키텍처에 맞는 DMG(`arm64`는 Apple Silicon, `x86_64`는 Intel)를 받고, 필요하면 함께 제공되는 `.sha256` 파일로 검증한 뒤, DMG를 열어 `TunnelForge.app`을 Applications로 이동하세요.
 
-### 2. 터널 추가
+### 2. 연결 추가
 
-**"터널 추가"** 버튼을 클릭하고 연결 정보를 설정하세요:
+**"➕ 연결 추가"** 버튼(`Ctrl+N`)을 클릭하고 연결 정보를 설정하세요:
 
 | 항목 | 설명 | 예시 |
 |------|------|------|
-| 터널 이름 | 구분하기 쉬운 이름 | `운영 DB` |
-| Bastion 호스트 | SSH 점프 서버 주소 | `bastion.example.com` |
+| 이름(별칭) | 구분하기 쉬운 이름 | `운영 DB` |
+| 연결 방식 | `SSH 터널 (Bastion 경유)` 또는 `직접 연결 (로컬/외부 DB)` | `SSH 터널` |
+| Bastion Host | SSH 점프 서버 주소(SSH 터널 모드에서만 표시) | `bastion.example.com` |
 | SSH 키 | 개인 키 파일 경로 | `C:\Users\me\.ssh\id_rsa` |
-| DB 호스트 | 대상 DB 서버 (Bastion 기준) | `db.internal:3306` |
+| Endpoint | 대상 DB 서버 주소 | `db.internal` |
+| DB Port | 대상 DB 서버 포트 | `3306` |
 | DB 인증 정보 | 사용자명 & 비밀번호 | `admin` / `••••` |
 | DB TLS | `verify_full`(기본값), `verify_ca`, `disable` 중 선택, CA 파일 지정 가능 | `verify_full` |
 
-### 3. 연결 & 사용
+### 3. 시작 및 사용
 
-터널 선택 → **"연결"** 클릭 → 데이터베이스 도구 사용:
+연결 선택 → **Power** 열의 **"시작"** 클릭 → 데이터베이스 도구 사용:
 - **SQL 에디터** — 쿼리 실행, 결과 확인, 커밋 또는 롤백
 - **Export** — 스키마 또는 선택한 테이블 백업
 - **Import** — 백업 파일에서 **안전 복원**(기본값), **덮어쓰기**, **전체 교체**(고급 옵션, 기존 데이터 삭제) 방식으로 복원. [Export/Import 정책 및 제약](docs/export_import_policy.md) 참조
-- 터널 우클릭으로 **스키마 Diff**, **마이그레이션 분석**, **고아 레코드 분석** 실행
+- 연결 우클릭 메뉴에서 **SQL 에디터**, **Export**, **Import**, **고아 레코드 분석** 실행
+- **🧰 도구** 메뉴에서 **스키마 비교**, **MySQL 8.4 업그레이드 점검**, **DB 전환 (MySQL ↔ PostgreSQL)** 실행
 
 ---
 
