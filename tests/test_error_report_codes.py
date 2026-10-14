@@ -28,6 +28,10 @@ from src.exporters.rust_dump_exporter import _is_operation_scoped_import_error
         ("unsupported_objects", "dump.run refused: objects secret_view", "UNSUPPORTED_OBJECTS"),
         (None, "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:RELOAD:denied", "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED"),
         (None, "mysql connection error: MySqlError { ERROR 1045 (28000): Access denied for user 'secret'@'host' }", "MYSQL-1045"),
+        # Verify-in-copy refusals before a copy is made.
+        (None, "no_tables: safe restore found no tables", "NO_TABLES"),
+        (None, "spatial_unsupported: this dump was written before format version 5 and stored MySQL spatial values as text, "
+               "which corrupted them: secret_table.pos; re-export the database with this version", "SPATIAL_UNSUPPORTED"),
         # A leading identifier that is not an allowlisted code (a table name) is never reported.
         (None, "secret_table: something failed", None),
         ("secret_code_from_somewhere", "plain failure", None),
