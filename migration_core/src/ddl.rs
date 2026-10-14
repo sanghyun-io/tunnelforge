@@ -281,14 +281,6 @@ pub(crate) fn complete_imported_table<A: MigrationAdapter>(
     Ok(())
 }
 
-pub(crate) fn should_apply_post_load_ddl(mode: &str) -> bool {
-    matches!(mode, "replace" | "recreate")
-}
-
-pub(crate) fn post_load_ddl_skip_message(mode: &str) -> String {
-    format!("skipping post-load DDL for {mode} import; existing objects must already match")
-}
-
 pub(crate) fn apply_post_load_ddl<A: MigrationAdapter>(
     target: &mut A,
     schema: &NormalizedSchema,
@@ -2258,21 +2250,6 @@ mod tests {
 
     const AI_PHASE1_CACHE_JSON_INSERT_SQL: &str =
         r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES (_utf8mb4'{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#;
-
-    #[test]
-    fn post_load_ddl_policy_applies_for_recreated_targets_only() {
-        assert!(should_apply_post_load_ddl("replace"));
-        assert!(should_apply_post_load_ddl("recreate"));
-        assert!(!should_apply_post_load_ddl("merge"));
-    }
-
-    #[test]
-    fn merge_import_does_not_claim_post_load_ddl_phase() {
-        assert_eq!(
-            post_load_ddl_skip_message("merge"),
-            "skipping post-load DDL for merge import; existing objects must already match"
-        );
-    }
 
     #[test]
     fn maps_mysql_types_to_postgres() {

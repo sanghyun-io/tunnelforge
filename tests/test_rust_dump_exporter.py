@@ -722,7 +722,7 @@ def test_import_dump_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
         "secret",
         str(tmp_path),
         target_schema="analytics",
-        import_mode="merge",
+        import_mode="recreate",
         engine="postgresql",
     )
 
@@ -731,7 +731,7 @@ def test_import_dump_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
     assert results == {}
     assert captured["config"].engine == "postgresql"
     assert captured["target_schema"] == "analytics"
-    assert captured["import_mode"] == "merge"
+    assert captured["import_mode"] == "recreate"
 
 
 class TestRustDumpImporter:

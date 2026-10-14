@@ -35,7 +35,11 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | Overwrite (UI) | Runs `safe`, then, after one up-front confirmation, swaps the verified candidate in under the original name with the core's promotion plan; the replaced data stays under a backup name. The swap is automatic only for a `ready_for_switch` restore whose plan is promotable with no blockers; anything else falls back to the reviewed choice. The core receives `mode: safe` and `dump.promote`; there is no separate core mode. |
 | `replace` | Like mysqldump: each selected dump table is dropped, recreated, loaded and finished (its secondary indexes, PostgreSQL unique indexes/comments/sequences) one table at a time; each FK is added as soon as both of its tables are done (a parent outside the dump counts as done), and views follow at the end. Existing selected-table data is lost. A failure leaves at most the table in progress missing, partially loaded or unfinished; tables already replaced are complete, and tables not yet reached keep their original data; an FK such a table lost when its parent was replaced is linked again after the failure if that parent was reloaded (otherwise it stays reported as removed). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
-| `merge` | Appends dump rows to compatible existing tables (creates missing tables). It is not synchronization, deduplication, upsert, or change-data capture. Existing keys/FKs can reject rows. Existing MySQL targets must use InnoDB. |
+
+The former `merge` mode (append rows to existing tables) was removed. A request
+with `mode` or `import_mode` set to `merge`, or to any value not listed above, is
+refused as `import_plan_invalid` before anything is written, including the
+import report.
 
 Target-only tables are preserved. A target-only FK referencing an imported parent
 requires the recreated parent to retain a compatible key/type contract, including
@@ -156,7 +160,7 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
   warnings are accepted. Genuine empty ENUM labels are not confused with index zero.
   Other warnings in the same statement still cause rollback. Diagnostic-capacity
   overflow uses bounded INSERT batches rather than accepting unobserved warnings.
-- Advanced `replace`/`recreate`/`merge` are **not one atomic transaction**. MySQL DDL commits,
+- Advanced `replace`/`recreate` are **not one atomic transaction**. MySQL DDL commits,
   earlier successful chunks and already running parallel workers may remain after
   a later failure. No new chunks are scheduled once a worker failure is known.
 - Failed/unattempted/data-loaded tables are reported separately. In `replace`, a
@@ -170,8 +174,7 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
   missing from untouched original tables.
 - UI subset retry is disabled: retrying only unfinished tables could leave earlier
   tables without deferred constraints. Inspect the partial target and rerun the
-  full original selected scope from the dump with explicit confirmation. Never
-  blindly repeat `merge` against a partially loaded target.
+  full original selected scope from the dump with explicit confirmation.
 - Views have explicit imported/failed/skipped results. Table data may already be
   committed if view recreation fails; the application must not report complete
   restoration in that case.

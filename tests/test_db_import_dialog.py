@@ -1503,7 +1503,7 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
 
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", lambda *args: QMessageBox.StandardButton.Yes)
     dialog.do_import()
-    dialog.radio_merge.setChecked(True)
+    dialog.radio_recreate.setChecked(True)
     dialog.connector.host = "changed-after-job"
     dialog.tunnel_config.update(name="production-profile", environment="production", remote_host="production-db.internal", bastion_host="production-jump.internal")
     manifest_path.write_text('{"source_engine":"mysql","database":"changed_after_job","tables":[]}', encoding="utf-8")
@@ -1518,7 +1518,7 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
 
     saved_summary = output_path.read_text(encoding="utf-8").split("상세 로그", 1)[0]
     assert "Import 모드: 전체 교체 Import" in saved_summary
-    assert "Import 모드: 증분 Import (병합)" not in saved_summary
+    assert "Import 모드: 완전 재생성 Import" not in saved_summary
     assert f"127.0.0.1:{5432 if db_engine == 'postgresql' else 3306}" in saved_summary
     assert Path(dialog_paths[0]).name.startswith("import_log_original_db_failed_")
     assert dialog.worker.kwargs["target_schema"] == "original/db"
@@ -1571,8 +1571,8 @@ def test_import_mode_text_uses_single_korean_label_source(monkeypatch):
     )
     dialog = RustDumpImportDialog()
 
-    dialog.radio_merge.setChecked(True)
-    assert dialog._get_import_mode_text() == "데이터 추가 Import"
+    dialog.radio_safe.setChecked(True)
+    assert dialog._get_import_mode_text() == "안전 복원: 새 대상에 복원·검증"
 
     dialog.radio_replace.setChecked(True)
     assert dialog._get_import_mode_text() == "전체 교체 Import"
@@ -1599,16 +1599,28 @@ def test_import_retry_does_not_append_partial_data(monkeypatch, tmp_path):
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", warning)
     dialog = RustDumpImportDialog()
     dialog.input_dir.setText(str(tmp_path))
-    dialog.last_import_mode = "merge"
+    dialog.last_import_mode = "safe"
     dialog._confirm_production_guard = MagicMock(return_value=False)
     dialog.do_import(retry_tables=["users"])
     warning.assert_called_once()
     dialog._confirm_production_guard.assert_not_called()
     dialog.last_import_mode = "replace"
-    dialog.radio_merge.setChecked(True)
+    dialog.radio_safe.setChecked(True)
     dialog.do_import(retry_tables=["users"])
     assert warning.call_count == 2
     dialog._confirm_production_guard.assert_not_called()
+    dialog.close()
+
+
+def test_import_mode_without_a_checked_radio_falls_through_to_safe(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    dialog = RustDumpImportDialog()
+    assert not hasattr(dialog, "radio_merge")
+    dialog.btn_import_mode.setExclusive(False)
+    for radio in dialog.btn_import_mode.buttons():
+        radio.setChecked(False)
+    assert dialog._get_selected_import_mode() == "safe"
     dialog.close()
 
 

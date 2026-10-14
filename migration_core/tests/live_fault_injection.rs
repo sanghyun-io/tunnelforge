@@ -407,16 +407,11 @@ fn import_report(events: &[Value]) -> Value {
 }
 
 /// Invariants that must hold whatever moment the connection died.
-fn assert_target_sound(endpoint: &Endpoint, fixture: &ImportFixture, report: &Value, merge: bool, label: &str) {
+fn assert_target_sound(endpoint: &Endpoint, fixture: &ImportFixture, report: &Value, label: &str) {
     let expect_full_on_loaded = true;
     for (table, total) in [(&fixture.keyed, KEYED_ROWS), (&fixture.heap, HEAP_ROWS)] {
-        if merge {
-            let pre = scalar(endpoint, &format!("SELECT COUNT(*) FROM {table} WHERE id >= 5000000"));
-            assert_eq!(pre, PRE_ROWS, "{label}: {table} pre-existing rows must be preserved (no truncate)");
-        }
         // replace may have dropped the table when it failed; then nothing can be checked.
         let Some(loaded) = try_scalar(endpoint, &format!("SELECT COUNT(*) FROM {table} WHERE id < 5000000")) else {
-            assert!(!merge, "{label}: merge target table vanished");
             continue;
         };
         let distinct = scalar(endpoint, &format!("SELECT COUNT(DISTINCT id) FROM {table} WHERE id < 5000000"));
@@ -476,11 +471,10 @@ fn run_import_fault(endpoint: &Endpoint, mode: &str, threads: u64, drop_replies:
             assert_eq!(report["success"], false, "{label}");
             assert!(report["error"].as_str().is_some(), "{label}: failure must carry the error");
             eprintln!("{label}: failed as expected: {message}");
-            assert_target_sound(endpoint, &fixture, &report, mode == "merge", &label);
+            assert_target_sound(endpoint, &fixture, &report, &label);
         }
         None => {
             // Only a fresh replacement table may be cleared and replayed; the end state must be exact.
-            assert_ne!(mode, "merge", "{label}: merge must not report success after losing a connection: {report}");
             for (table, total) in [(&fixture.keyed, KEYED_ROWS), (&fixture.heap, HEAP_ROWS)] {
                 assert_eq!(scalar(endpoint, &format!("SELECT COUNT(*) FROM {table}")), total, "{label}: {table}");
                 assert_eq!(scalar(endpoint, &format!("SELECT COUNT(DISTINCT id) FROM {table}")), total, "{label}: {table}");
@@ -510,27 +504,13 @@ fn scenarios(endpoint: &Endpoint, common: &[Scenario], mysql_load_data: &[Scenar
 
 #[test]
 #[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
-fn merge_import_survives_connection_loss_without_duplicates_or_truncation() {
-    for endpoint in endpoints() {
-        let list = scenarios(
-            &endpoint,
-            &[(1, false, 0.45, "a", false), (1, true, 0.45, "b", false), (4, false, 0.3, "c", false), (4, true, 0.7, "d", false), (1, false, 0.85, "e", false)],
-            &[(1, false, 0.45, "i", true), (1, true, 0.45, "j", true), (4, false, 0.3, "k", true), (4, true, 0.7, "l", true)],
-        );
-        for (threads, drop_replies, fraction, tag, load_data) in list {
-            run_import_fault(&endpoint, "merge", threads, drop_replies, fraction, tag, load_data);
-        }
-    }
-}
-
-#[test]
-#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
 fn replace_import_survives_connection_loss_with_exact_or_honestly_failed_result() {
     for endpoint in endpoints() {
         let list = scenarios(
             &endpoint,
-            &[(1, false, 0.45, "f", false), (1, true, 0.45, "g", false), (4, false, 0.3, "h", false)],
-            &[(1, false, 0.45, "m", true), (1, true, 0.45, "n", true), (4, false, 0.3, "o", true)],
+            // d, e and l came from the removed merge test: lost replies under 4 workers and a late loss.
+            &[(1, false, 0.45, "f", false), (1, true, 0.45, "g", false), (4, false, 0.3, "h", false), (4, true, 0.7, "d", false), (1, false, 0.85, "e", false)],
+            &[(1, false, 0.45, "m", true), (1, true, 0.45, "n", true), (4, false, 0.3, "o", true), (4, true, 0.7, "l", true)],
         );
         for (threads, drop_replies, fraction, tag, load_data) in list {
             run_import_fault(&endpoint, "replace", threads, drop_replies, fraction, tag, load_data);
