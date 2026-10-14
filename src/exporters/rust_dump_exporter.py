@@ -738,9 +738,9 @@ class RustDumpImporter(_RustDumpClientBase):
             if import_mode != "safe" and result.get("namespace_created") is True:
                 if self.config.engine == "postgresql":
                     # Without a configured database the schema lands in the `postgres` database.
-                    message += f"\n새 스키마 {payload['target']['database']}.{final_target_schema}을 만들어 넣었습니다"
+                    message += f"\n새 스키마 {payload['target']['database']}.{payload['target']['schema']}을 만들어 넣었습니다"
                 else:
-                    message += f"\n새 DB {final_target_schema}을 만들어 넣었습니다"
+                    message += f"\n새 DB {payload['target']['database']}을 만들어 넣었습니다"
             for warning in (result.get("verification") or {}).get("warnings", []) or []:
                 warning_line = f"Import warning: {warning}"
                 message += "\n" + warning_line
