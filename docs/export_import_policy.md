@@ -61,7 +61,8 @@ import report.
 Every import attempt (`replace`, `recreate` or `safe`) writes its own report into
 the dump folder, `_tunnelforge_import_report_<nanoseconds>_<process>_<n>.json`,
 and names it (`report_path`) in its `import_report` events from the start, so a
-retry never overwrites the record of an earlier attempt. A safe restore and the
+retry never overwrites the record of an earlier attempt. The attempt's last
+`import_report` event carries its final status. A safe restore and the
 candidate import inside it share one report, which a later promotion updates in
 place. Dump folders imported by earlier versions keep their single
 `_tunnelforge_import_report.json`; it is still read, and the job list and the

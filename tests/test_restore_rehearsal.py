@@ -29,12 +29,13 @@ class FakeFacade:
         self.calls, self.can_cleanup, self.cleanup_error = [], can_cleanup, cleanup_error
         self.client = MagicMock()
         self.candidate_exists = True
+        self.others = []
 
     def restore_backups(self, payload):
         self.calls.append(payload["action"])
         assert payload["endpoint"]["database"] == "rehearsal"
         if payload["action"] == "list":
-            return {"backups": [{"restore_id": "r1", "candidate": {"exists": self.candidate_exists}}]}
+            return {"backups": [{"restore_id": "r1", "candidate": {"exists": self.candidate_exists}}, *self.others]}
         if payload["action"] == "cleanup_plan":
             assert payload["target"] == "candidate"
             return {"can_cleanup": self.can_cleanup, "plan_digest": "d", "blockers": ["still promoted"]}
@@ -44,7 +45,7 @@ class FakeFacade:
         return {"message": "dropped"}
 
 
-def make_importer(tmp_path, restored_rows=None, verified=True, unchanged=True, ok=True):
+def make_importer(tmp_path, restored_rows=None, verified=True, unchanged=True, ok=True, events=None):
     class FakeImporter:
         seen = {}
 
@@ -57,10 +58,11 @@ def make_importer(tmp_path, restored_rows=None, verified=True, unchanged=True, o
             rows = restored_rows if restored_rows is not None else {"parent": 2, "child": 3}
             report.write_text(json.dumps({"verification": {"actual_row_counts": rows,
                                                            "content_digests": {k: {} for k in rows}}}))
-            raw_output_callback(json.dumps({
-                "event": "safe_restore_ready", "restore_id": "r1", "status": "ready_for_switch",
-                "verified": verified, "original_unchanged": unchanged, "report_path": str(report),
-                "candidate_target": {"database": "tf_restore_r1"}, "blockers": []}))
+            ready = {"event": "safe_restore_ready", "restore_id": "r1", "status": "ready_for_switch",
+                     "verified": verified, "original_unchanged": unchanged, "report_path": str(report),
+                     "candidate_target": {"database": "tf_restore_r1"}, "blockers": []}
+            for event in [ready] if events is None else events:
+                raw_output_callback(json.dumps(event))
             return ok, "msg", {}
 
     return FakeImporter
@@ -147,6 +149,28 @@ def test_row_count_mismatch_fails_but_the_candidate_is_still_cleaned(env):
     assert env.facade.calls[-1] == "cleanup_apply"
     record = records()[0]
     assert record.status == jh.STATUS_FAILED and "child" in record.error_summary
+
+
+def test_a_run_that_never_learned_its_restore_id_leaves_other_restores_candidates_alone(env):
+    # The core named no restore (missing manifest, crash, timeout); r1 in the listing belongs to another restore.
+    outcome = env.build(ok=False, events=[]).run(schedule(), env.backup, conn(port=3307))
+    assert not outcome.ok and not outcome.candidate_retained
+    assert "cleanup_plan" not in env.facade.calls and "cleanup_apply" not in env.facade.calls
+    report = json.loads(open(os.path.join(env.backup, REPORT_NAME), encoding="utf-8").read())
+    assert report["candidate_cleanup"] == "nothing_to_clean"
+
+
+def test_a_failed_restore_cleans_its_own_candidate_and_no_other(env):
+    env.facade.others = [{"restore_id": "r0", "candidate": {"exists": True}}]
+    events = [{"event": "safe_restore_target", "restore_id": "r1", "status": "staging",
+               "candidate_target": {"database": "tf_restore_r1"}},
+              {"event": "safe_restore_failed", "restore_id": "r1", "status": "failed_original_untouched"}]
+    outcome = env.build(ok=False, events=events).run(schedule(), env.backup, conn(port=3307))
+    assert not outcome.ok
+    assert env.facade.calls == ["list", "cleanup_plan", "cleanup_apply"]
+    report = json.loads(open(os.path.join(env.backup, REPORT_NAME), encoding="utf-8").read())
+    assert report["restore_id"] == "r1" and report["restore_status"] == "failed_original_untouched"
+    assert report["candidate_namespace"] == "tf_restore_r1"
 
 
 def test_an_unverified_restore_is_a_failure(env):

@@ -461,6 +461,8 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         state["report_write_failed"] = json!(true);
         state["message"] = json!(redact_endpoint_secret(&message, &original));
     }
+    // Close the early "running" report event (or the candidate import's "staging" one) with the final status.
+    emit(json!({"event":"import_report", "request_id":request.request_id, "status":state["status"], "report_path":report_path}));
     let mut event = state.clone();
     event["request_id"] = json!(request.request_id);
     event["event"] = json!(if state["success"] == true {
@@ -1003,6 +1005,8 @@ mod tests {
             assert_eq!(result["status"], "failed_original_untouched", "{result}");
             assert_eq!(events[0]["event"], "import_report", "the report is named before any work: {events:?}");
             assert!(events.iter().all(|event| event.get("report_path").is_none_or(|path| *path == result["report_path"])), "{events:?}");
+            let last_report = events.iter().rev().find(|event| event["event"] == "import_report").unwrap();
+            assert_eq!(last_report["status"], "failed_original_untouched", "the last report event carries the final status: {events:?}");
             std::path::PathBuf::from(result["report_path"].as_str().unwrap())
         };
         let first = attempt();
