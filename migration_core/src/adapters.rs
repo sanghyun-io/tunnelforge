@@ -779,11 +779,17 @@ impl LiveAdapter {
 
 /// 연결 하나를 연다. 실패 메시지에는 TLS 분류 코드(error_code=...)가 붙는다.
 pub(crate) fn mysql_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
-    let pool = mysql::Pool::new(mysql_opts(endpoint)).map_err(|err| format!("mysql pool error: {err}"))?;
-    pool.get_conn().map_err(|err| {
-        let suffix = tls_error_suffix(classify_mysql_error(endpoint, &err));
-        format!("mysql connection error: {err}{suffix}")
-    })
+    mysql_conn_raw(endpoint).map_err(|err| mysql_conn_error(endpoint, &err))
+}
+
+/// The same connection with the driver's error, whose server code a caller can still read.
+pub(crate) fn mysql_conn_raw(endpoint: &Endpoint) -> Result<mysql::PooledConn, mysql::Error> {
+    mysql::Pool::new(mysql_opts(endpoint))?.get_conn()
+}
+
+pub(crate) fn mysql_conn_error(endpoint: &Endpoint, err: &mysql::Error) -> String {
+    let suffix = tls_error_suffix(classify_mysql_error(endpoint, err));
+    format!("mysql connection error: {err}{suffix}")
 }
 
 /// Raises how many warnings SHOW WARNINGS lists. MySQL 8 requires SESSION_VARIABLES_ADMIN
@@ -930,6 +936,7 @@ pub(crate) const WARNING_UNSYNCHRONIZED_SNAPSHOTS: &str = "Workers used independ
 pub(crate) const WARNING_VIEWS_OUTSIDE_SNAPSHOT: &str = "View definitions were collected outside the table data snapshot";
 pub(crate) const WARNING_OBJECT_NOT_EXPORTED: &str = "Object not exported:";
 pub(crate) const WARNING_NON_TRANSACTIONAL_EXCLUDED: &str = "Non-transactional tables excluded from export:";
+pub(crate) const WARNING_VISIBILITY_UNPROVEN: &str = "The export account's privileges do not prove it sees every object, so some may be missing:";
 
 pub(crate) fn dump_manifest_consistency_metadata(
     engine: &str,

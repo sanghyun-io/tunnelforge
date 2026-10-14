@@ -326,7 +326,9 @@ fn limited_mysql_account_export_is_refused_or_consistent_and_manifest_is_honest(
     setup_pair(&mut admin, &a, &b, 5000);
     admin.execute_sql(&format!("DROP USER IF EXISTS '{user}'@'%'")).unwrap();
     admin.execute_sql(&format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'")).unwrap();
-    admin.execute_sql(&format!("GRANT SELECT ON tf_test.* TO '{user}'@'%'")).unwrap();
+    // TRIGGER proves the account sees every trigger of the exported tables (B1), so a
+    // consistent export of them stays strict.
+    admin.execute_sql(&format!("GRANT SELECT, TRIGGER ON tf_test.* TO '{user}'@'%'")).unwrap();
     let limited = Endpoint { user: user.clone(), ..root.clone() };
 
     // (a) strict parallel snapshot needs global RELOAD/BACKUP_ADMIN: refused, nothing exported.

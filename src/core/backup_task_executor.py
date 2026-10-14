@@ -108,18 +108,23 @@ class BackupTaskExecutor:
 
             exporter = RustDumpExporter(config)
 
+            # The core picks the MySQL method (never the unsynchronized one); a table backup
+            # keeps adding the FK parents its tables need, as it always did.
             if schedule.tables:
                 success, result, _ = exporter.export_tables(
                     schema=schedule.schema,
                     tables=schedule.tables,
                     output_dir=output_subdir,
-                    threads=4
+                    threads=4,
+                    include_fk_parents=True,
+                    mysql_snapshot_mode="auto",
                 )
             else:
                 success, result = exporter.export_full_schema(
                     schema=schedule.schema,
                     output_dir=output_subdir,
-                    threads=4
+                    threads=4,
+                    mysql_snapshot_mode="auto",
                 )
 
             if success:

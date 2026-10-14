@@ -88,7 +88,8 @@ def test_details_and_rerun_are_whitelisted_and_secret_free(history):
     )
     record = history.list()[0]
     assert record.details == {"tables": 2, "note": "ok"}
-    assert record.rerun == {"schema": "app", "tables": ["a", "b"], "compression": "zstd", "threads": 4, "include_fk_parents": True}
+    # include_fk_parents is no longer kept: an old record must not bring back the automatic FK parents.
+    assert record.rerun == {"schema": "app", "tables": ["a", "b"], "compression": "zstd", "threads": 4}
     raw = history.path.read_text(encoding="utf-8").lower()
     assert "hunter" not in raw and '"password"' not in raw and "mysql://" not in raw
     assert job == record.id
