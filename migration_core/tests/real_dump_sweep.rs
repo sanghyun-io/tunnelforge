@@ -100,8 +100,12 @@ fn real_dump_sweep_mysql() {
         report(&format!("{label} scoped_account_replace (views owned by root are expected to be reported)"), Instant::now(), &import(&ep(&a, &user), &dir, "replace"));
 
         let out = std::env::temp_dir().join(format!("tf_sweep_out_{tag}"));
-        let exported = run("dump.run", json!({"source": ep(&a, "root"), "output_dir": out, "data_format": "tsv", "compression": "zstd", "threads": 4}));
-        if report(&format!("{label} export_default"), Instant::now(), &exported) {
+        // The app sends "auto" for every export.
+        let exported = run("dump.run", json!({"source": ep(&a, "root"), "output_dir": out, "data_format": "tsv", "compression": "zstd", "threads": 4, "mysql_snapshot_mode": "auto"}));
+        if let Some(value) = result(&exported) {
+            println!("SWEEP {label} export_method mode={} workers={} fallbacks={}", value["mysql_snapshot_mode"], value["worker_count"], value["snapshot_fallbacks"]);
+        }
+        if report(&format!("{label} export_auto"), Instant::now(), &exported) {
             root.query_drop(format!("CREATE DATABASE {b}")).unwrap();
             if report(&format!("{label} reimport_into_empty"), Instant::now(), &import(&ep(&b, "root"), out.to_str().unwrap(), "replace")) && full {
                 let tables: Vec<String> = root.exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_TYPE='BASE TABLE' AND TABLE_NAME NOT LIKE 'zz\\_child\\_%'", (&a,)).unwrap();
