@@ -207,7 +207,7 @@ def test_unattended_start_failure_is_reported_and_never_prompts(env):
 def test_a_tunnel_opened_by_the_schedule_is_closed_afterwards_but_a_users_tunnel_is_not(env, monkeypatch):
     class Exporter:
         def __init__(self, config): pass
-        def export_full_schema(self, schema, output_dir, threads): return True, "ok"
+        def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode): return True, "ok"
 
     monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", Exporter)
     env.engine.is_running.return_value = False
@@ -226,7 +226,7 @@ def test_a_tunnel_opened_by_the_schedule_is_closed_afterwards_but_a_users_tunnel
 def test_the_tunnel_is_closed_even_when_the_export_fails(env, monkeypatch):
     class Exporter:
         def __init__(self, config): pass
-        def export_full_schema(self, schema, output_dir, threads): raise RuntimeError("boom")
+        def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode): raise RuntimeError("boom")
 
     monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", Exporter)
     env.engine.is_running.return_value = False
@@ -245,7 +245,7 @@ class FakeExporter:
     def __init__(self, config):
         pass
 
-    def export_full_schema(self, schema, output_dir, threads):
+    def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode):
         FakeExporter.seen_state = backup_store.read_marker(output_dir)  # Rust dump refuses a non-empty folder
         if FakeExporter.outcome[0]:
             with open(os.path.join(output_dir, "_tunnelforge_dump.json"), "w", encoding="utf-8") as handle:
@@ -287,7 +287,7 @@ def test_failed_backup_is_recorded_with_its_reason_and_an_empty_folder_is_remove
 def test_failed_backup_with_partial_files_is_kept_marked_failed(env, monkeypatch):
     class Partial:
         def __init__(self, config): pass
-        def export_full_schema(self, schema, output_dir, threads):
+        def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode):
             with open(os.path.join(output_dir, "partial.chunk"), "w") as handle:
                 handle.write("x")
             return False, "connection lost"
@@ -297,6 +297,32 @@ def test_failed_backup_with_partial_files_is_kept_marked_failed(env, monkeypatch
     assert env.scheduler._execute_backup(schedule)[0] is False
     owned = backup_store.list_owned(schedule.output_dir, "s1")
     assert len(owned) == 1 and owned[0].state == backup_store.STATE_FAILED
+
+
+def test_scheduled_backups_let_the_core_pick_the_method_and_table_backups_keep_fk_parents(env, monkeypatch):
+    calls = []
+
+    class Recorder:
+        def __init__(self, config): pass
+
+        def export_full_schema(self, **kwargs):
+            calls.append(("full", kwargs))
+            return True, "ok"
+
+        def export_tables(self, **kwargs):
+            calls.append(("tables", kwargs))
+            return True, "ok", kwargs["tables"]
+
+    monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", Recorder)
+    assert env.scheduler._execute_backup(env.schedule())[0] is True
+    assert env.scheduler._execute_backup(env.schedule(id="s2", tables=["orders"]))[0] is True
+
+    (full_kind, full), (tables_kind, tables) = calls
+    assert (full_kind, full["mysql_snapshot_mode"]) == ("full", "auto")
+    # "auto" never falls on its own to the unsynchronized method; table backups add the FK parents they need.
+    assert "mysql_snapshot_fallback" not in full and "mysql_snapshot_fallback" not in tables
+    assert (tables_kind, tables["tables"], tables["include_fk_parents"], tables["mysql_snapshot_mode"]) == (
+        "tables", ["orders"], True, "auto")
 
 
 def test_retention_runs_after_success_and_only_touches_owned_folders(env, exporter):

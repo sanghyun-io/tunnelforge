@@ -16,8 +16,10 @@ failure reason and record deletion. Storage is `job_history.json` in the app-sup
 Never stored: passwords, connection strings, host or user names, data, SQL. An unknown safe-promotion
 outcome (`cutover_unknown`) is recorded as failed with an explicit "outcome unknown" message.
 
-Re-open policy: Export re-opens its dialog pre-filled with schema, scope, selected tables, compression
-and threads; the snapshot mode is never reused (a re-opened run starts with the strict parallel snapshot
-and asks again if privileges are missing), and the run itself passes the Core pre-checks again. Import, safe promotion and migration runs
+Re-open policy: Export re-opens its dialog pre-filled with schema, the checked tables (every table for a
+full export; for a table export only those the user checked, not the FK parents the dialog added),
+compression and threads; a recorded snapshot mode or FK-parent choice is never reused (the dialog's
+current Advanced settings apply and the core picks the method again), and the run itself passes the
+Core pre-checks again. Import, safe promotion and migration runs
 only open their original dialog without settings (no partial retry from the list). Scheduled backups
 are untouched.

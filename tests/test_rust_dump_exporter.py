@@ -263,59 +263,6 @@ class TestRustDumpExporter:
         assert "mysql_snapshot_fallback" not in facade.payload
         assert message.endswith(" · 같은 시점으로 내보냄 · 동시 작업 1개 (연결 하나로 읽음)")
 
-    def test_parallel_snapshot_privilege_marker_is_not_inferred_from_raw_1045(self):
-        from src.exporters.rust_dump_exporter import (
-            is_mysql_parallel_snapshot_privilege_error,
-        )
-
-        assert is_mysql_parallel_snapshot_privilege_error(
-            "Rust DB Core export 오류: "
-            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-            "FLUSH_TABLES_OR_RELOAD:ERROR 1045"
-        )
-        assert not is_mysql_parallel_snapshot_privilege_error(
-            "mysql connection error: ERROR 1045 access denied"
-        )
-
-    def test_denied_privilege_extracts_backup_admin_from_marker(self):
-        from src.exporters.rust_dump_exporter import (
-            mysql_parallel_snapshot_denied_privilege,
-        )
-
-        assert (
-            mysql_parallel_snapshot_denied_privilege(
-                "Rust DB Core export 오류: "
-                "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-                "BACKUP_ADMIN:ERROR 1227"
-            )
-            == "BACKUP_ADMIN"
-        )
-
-    def test_denied_privilege_extracts_flush_or_reload_from_marker(self):
-        from src.exporters.rust_dump_exporter import (
-            mysql_parallel_snapshot_denied_privilege,
-        )
-
-        assert (
-            mysql_parallel_snapshot_denied_privilege(
-                "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-                "FLUSH_TABLES_OR_RELOAD:ERROR 1045"
-            )
-            == "FLUSH_TABLES_OR_RELOAD"
-        )
-
-    def test_denied_privilege_is_none_without_marker(self):
-        from src.exporters.rust_dump_exporter import (
-            mysql_parallel_snapshot_denied_privilege,
-        )
-
-        assert (
-            mysql_parallel_snapshot_denied_privilege(
-                "mysql connection error: ERROR 1045 access denied"
-            )
-            is None
-        )
-
     def test_parallel_no_backup_lock_is_an_accepted_snapshot_mode(self):
         from src.exporters.rust_dump_exporter import MYSQL_SNAPSHOT_MODES
 
@@ -498,19 +445,6 @@ class TestRustDumpExporter:
 
         assert message == "Rust DB Core export 완료: 2개 테이블, 5 rows" + (f" · {expected}" if expected else "")
 
-    def test_denied_privilege_extracts_lock_tables_from_marker(self):
-        from src.exporters.rust_dump_exporter import (
-            MYSQL_PRIVILEGE_LOCK_TABLES,
-            mysql_parallel_snapshot_denied_privilege,
-        )
-
-        assert MYSQL_PRIVILEGE_LOCK_TABLES == "LOCK_TABLES"
-        assert mysql_parallel_snapshot_denied_privilege(
-            "Rust DB Core export 오류: "
-            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:LOCK_TABLES:"
-            "ERROR 1044 (42000): Access denied for user 'u'@'%' to database 'app'"
-        ) == MYSQL_PRIVILEGE_LOCK_TABLES
-
     def test_export_full_schema_passes_zstd_compression_to_rust_dump(self, tmp_path):
         """압축 선택이 Rust dump.run payload로 전달됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
@@ -608,64 +542,106 @@ class TestRustDumpExporter:
         assert facade.payload["tables"] == ["order_items", "orders", "users"]
         assert "3개 테이블" in msg
 
-    def test_resolve_required_tables_from_rust_schema_no_deps(self):
-        """FK 의존성이 없으면 선택한 테이블만 정렬되어 반환된다"""
+    def test_fetch_fk_parents_reads_one_inspect_and_keeps_only_parents_of_this_schema(self):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        facade = MagicMock()
+        facade.inspect_schema.return_value = {"tables": [
+            {"name": "users", "foreign_keys": [{"name": "fk_self", "referenced_table": "users"}]},
+            {"name": "orders", "foreign_keys": [{"name": "fk_orders_users", "referenced_table": "users"},
+                                                {"name": "fk_orders_other_db", "referenced_table": "elsewhere"}]},
+            {"name": "order_items", "foreign_keys": [{"name": "fk_items_orders", "referenced_table": "orders"}]},
+        ]}
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+
+        deps = exporter.fetch_fk_parents("app")
+
+        assert deps == {"orders": [("fk_orders_users", "users")], "order_items": [("fk_items_orders", "orders")]}
+        facade.inspect_schema.assert_called_once()
+        assert facade.inspect_schema.call_args.args[0].database == "app"
+
+    def test_fk_parent_closure_is_transitive_and_names_what_it_added(self):
+        from src.exporters.rust_dump_exporter import fk_parent_closure, fk_parents_outside
+
+        deps = {"orders": [("fk_orders_users", "users")], "order_items": [("fk_items_orders", "orders")]}
+
+        assert fk_parent_closure(["order_items"], deps) == (["order_items", "orders", "users"], ["orders", "users"])
+        assert fk_parent_closure(["products", "users"], deps) == (["products", "users"], [])
+        assert fk_parents_outside(["order_items", "users"], deps) == [
+            {"child": "order_items", "constraint": "fk_items_orders", "parent": "orders"}]
+        assert fk_parents_outside(["order_items", "orders", "users"], deps) == []
+
+    def test_export_tables_sends_exactly_the_given_tables_and_records_the_dialogs_fk_choice(self, tmp_path):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
 
         class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 2, "rows_dumped": 0}
+
             def inspect_schema(self, endpoint):
-                self.inspect_endpoint = endpoint
-                return {
-                    "tables": [
-                        {"name": "users", "foreign_keys": []},
-                        {"name": "products", "foreign_keys": []},
-                    ]
-                }
+                raise AssertionError("the dialog already resolved the FK parents")
 
         facade = FakeFacade()
-        config = RustDumpConfig("localhost", 3306, "root", "password")
-        exporter = RustDumpExporter(config, facade=facade)
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+        outside = [{"child": "orders", "constraint": "fk_orders_users", "parent": "users"}]
 
-        required, added = exporter._resolve_required_tables_from_rust_schema(
-            ["products", "users"], "app"
+        success, _, tables = exporter.export_tables(
+            "app", ["orders", "customers"], str(tmp_path), auto_added_tables=["customers", "not_exported"],
+            fk_parents_outside_dump=outside,
         )
 
-        assert required == ["products", "users"]
-        assert added == []
-        assert facade.inspect_endpoint.database == "app"
+        assert success and tables == ["orders", "customers"] == facade.payload["tables"]
+        metadata = json.loads((tmp_path / "_export_metadata.json").read_text(encoding="utf-8"))
+        assert metadata["added_fk_tables"] == ["customers"], "only parents that are in the dump"
+        assert metadata["fk_parents_outside_dump"] == outside
 
-    def test_resolve_required_tables_from_rust_schema_transitive_deps(self):
-        """전이적 FK 의존성(order_items -> orders -> users)이 모두 required에 포함된다"""
+    def test_scheduled_table_backup_adds_fk_parents_and_leaves_none_outside(self, tmp_path):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
 
-        class FakeFacade:
-            def inspect_schema(self, endpoint):
-                self.inspect_endpoint = endpoint
-                return {
-                    "tables": [
-                        {"name": "users", "foreign_keys": []},
-                        {
-                            "name": "orders",
-                            "foreign_keys": [{"name": "fk_orders_users", "referenced_table": "users"}],
-                        },
-                        {
-                            "name": "order_items",
-                            "foreign_keys": [{"name": "fk_items_orders", "referenced_table": "orders"}],
-                        },
-                    ]
-                }
+        facade = MagicMock()
+        facade.inspect_schema.return_value = {"tables": [
+            {"name": "users", "foreign_keys": []},
+            {"name": "orders", "foreign_keys": [{"name": "fk_orders_users", "referenced_table": "users"}]},
+        ]}
+        facade.run_dump.return_value = {"success": True, "tables": 2, "rows_dumped": 0}
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
 
-        facade = FakeFacade()
-        config = RustDumpConfig("localhost", 3306, "root", "password")
-        exporter = RustDumpExporter(config, facade=facade)
+        assert exporter.export_tables("app", ["orders"], str(tmp_path), include_fk_parents=True)[2] == ["orders", "users"]
 
-        required, added = exporter._resolve_required_tables_from_rust_schema(
-            ["order_items"], "app"
-        )
+        metadata = json.loads((tmp_path / "_export_metadata.json").read_text(encoding="utf-8"))
+        assert (metadata["added_fk_tables"], metadata["fk_parents_outside_dump"]) == (["users"], [])
 
-        assert required == ["order_items", "orders", "users"]
-        assert added == ["orders", "users"]
-        assert facade.inspect_endpoint.database == "app"
+    def test_fk_parents_are_never_added_by_default(self):
+        import inspect
+
+        from src.exporters import rust_dump_exporter
+
+        for function in (rust_dump_exporter.RustDumpExporter.export_tables, rust_dump_exporter.export_tables):
+            assert inspect.signature(function).parameters["include_fk_parents"].default is False
+
+    def test_last_run_names_the_method_and_the_objects_left_out(self, tmp_path):
+        from src.exporters.rust_dump_exporter import MYSQL_SNAPSHOT_AUTO_CAPABILITY, RustDumpConfig, RustDumpExporter
+
+        facade = MagicMock()
+        facade.hello.return_value = {"capabilities": [MYSQL_SNAPSHOT_AUTO_CAPABILITY]}
+        facade.run_dump.return_value = {
+            "success": True, "tables": 1, "rows_dumped": 1, "mysql_snapshot_mode": "parallel_table_lock",
+            "worker_count": 8, "snapshot_fallbacks": [{"mode": "parallel_strict", "reason": "privilege"}],
+            "manifest_warnings": ["Object not exported: trigger:t:trg", "Workers used independent snapshots"],
+        }
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+
+        assert exporter.export_full_schema("app", str(tmp_path), threads=8, mysql_snapshot_mode="auto")[0]
+
+        assert exporter.last_run == {
+            "mode": "parallel_table_lock",
+            "method": "같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어 테이블만 잠깐 잠금)",
+            "omitted": ["Object not exported: trigger:t:trg"],
+        }
+        facade.run_dump.side_effect = RuntimeError("boom")
+        assert exporter.export_full_schema("app", str(tmp_path / "again"), mysql_snapshot_mode="auto")[0] is False
+        assert exporter.last_run is None, "a failed export leaves no method behind"
 
     def test_export_full_schema_reports_view_count(self, tmp_path):
         """전체 export 결과에 View 개수가 메시지로 포함됨"""
@@ -1905,3 +1881,44 @@ def test_every_code_the_core_can_emit_has_a_korean_sentence():
             "safe_promotion", "safe_restore_content_mismatch"} <= emitted
     assert {"copy_refused", "copy_checks_unavailable", "target_events", "linked_target_only", "previous_copy_leftover"} <= emitted
     assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []
+
+@pytest.mark.parametrize("code, expected", [
+    ("trigger:orders:trg_audit", "테이블 orders: 트리거 trg_audit는 덤프에 담을 수 없습니다"),
+    ("non_transactional_table:logs:MEMORY", "테이블 logs: MEMORY 엔진 테이블이라 같은 시점으로 담을 수 없습니다"),
+    ("generated_column:orders:total", "테이블 orders: 계산 열 total의 정의를 덤프에 담을 수 없습니다"),
+    ("cross_schema_fk:orders:fk_other", "테이블 orders: 외래 키 fk_other가 다른 DB의 테이블을 가리켜 덤프에 담을 수 없습니다"),
+    ("routine:fn_total", "저장 프로시저·함수 fn_total: 덤프에 담을 수 없습니다"),
+    ("event:ev_nightly", "예약 이벤트 ev_nightly: 덤프에 담을 수 없습니다"),
+    # An unknown code still names its table; the code itself stays behind "자세히".
+    ("future_kind:orders:x", "테이블 orders: 이 객체는 담을 수 없습니다"),
+    ("future_kind", "future_kind: 이 객체는 담을 수 없습니다"),
+])
+def test_refusal_text_names_table_and_reason(code, expected):
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+
+    assert describe_export_refusal([code]) == [expected]
+
+
+def test_every_refusal_kind_the_core_reports_has_a_sentence():
+    import re
+    from pathlib import Path
+
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+
+    source = (Path(__file__).resolve().parents[1] / "migration_core" / "src" / "dump.rs").read_text(encoding="utf-8")
+    lossy = re.search(r"LOSSY_SCHEMA_KINDS: \[&str; \d+\] = \[([^\]]*)\]", source).group(1)
+    omitted = re.search(r"fn scoped_omitted_objects\b.*?\n\}", source, re.DOTALL).group(0)
+    kinds = set(re.findall(r'"([a-z_]+)"', lossy)) | set(re.findall(r'"([a-z_]+)"', omitted))
+    assert {"generated_column", "cross_schema_fk", "trigger", "non_transactional_table", "routine", "event"} <= kinds
+
+    for kind in sorted(kinds):
+        line = describe_export_refusal([f"{kind}:orders:x"])[0]
+        assert "이 객체는 담을 수 없습니다" not in line, kind
+        assert "x" in line and ":" in line, kind
+    i18n.set_language("en")
+    try:
+        lines = describe_export_refusal([f"{kind}:orders:x" for kind in sorted(kinds)] + ["future_kind:orders:x"])
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+    assert [line for line in lines if any(ord(char) in _HANGUL for char in line)] == []

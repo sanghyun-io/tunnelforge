@@ -195,8 +195,8 @@ graph LR
 <summary><b>Export 모범 사례</b></summary>
 
 - 복원 전에 [Export/Import 정책 및 제약](docs/export_import_policy.md) 확인
-- 필요한 것만 내보내려면 **테이블 선택** 사용
-- MySQL Export는 공유 스냅샷 하나로 병렬 처리. RELOAD/BACKUP_ADMIN 권한이 없으면 내보낼 테이블만 최대 2초 잠가(LOCK TABLES) 같은 보장을 유지하거나 단일 연결로 대체. PostgreSQL은 단일 일관 세션 사용
+- 처음에는 모든 테이블이 체크되어 DB 전체를 내보냄. 필요 없는 테이블은 체크를 풀면 됨. 고른 테이블이 외래 키로 가리키는 테이블은 고급 설정의 **연결된 부모 테이블 함께 담기**를 켰을 때만 함께 담음(끄면 한 줄로 알려 줌)
+- MySQL Export는 내보내는 방법을 스스로 고르고 권한을 묻지 않음: 공유 스냅샷 하나로 병렬 처리, RELOAD/BACKUP_ADMIN 권한이 없으면 내보낼 테이블만 최대 2초 잠가(LOCK TABLES) 같은 보장 유지, 그것도 안 되면 연결 하나로 읽음. 완료 메시지에 실제로 쓴 방법이 나옴. 시점을 맞추지 않고 나눠 읽는 것은 고급 설정에서 직접 켤 때만 씀. PostgreSQL은 단일 일관 세션 사용
 - 트리거·저장 프로시저·이벤트·테이블·열을 모두 볼 수 있는 권한(TRIGGER, EVENT, SHOW_ROUTINE 또는 EXECUTE, DB 전체 SELECT. 테이블을 골라 내보낼 때는 고른 테이블마다 받은 TRIGGER와 SELECT도 인정, 일부 열에만 받은 SELECT는 인정 안 함)이 확인되지 않는 MySQL 계정으로 내보내면 덤프가 불완전으로 표시됨
 - 덤프는 manifest v3(**TunnelForge 2.6.0 이상**)으로 기록되며, MySQL BIT 컬럼이 있으면 v4(**2.12.2 이상**), MySQL 공간 컬럼(GEOMETRY, POINT 등)이 있으면 v5(**2.12.4 이상**)로 기록됨. 기존 v1/v2 덤프는 계속 읽을 수 있음
 - 다음 이전 백업은 **다시 Export** 필요: 2.12.1 이전에 만든 BINARY/VARBINARY/BYTEA 키·MySQL ENUM 키·백슬래시가 들어간 복합 키를 가진 테이블의 백업, 2.12.2 이전에 만든 MySQL BIT 컬럼 백업, 2.12.4 이전에 만든 MySQL 공간 컬럼 백업(이전 공간 덤프는 Import 시 다시 Export하라는 메시지와 함께 거부됨)

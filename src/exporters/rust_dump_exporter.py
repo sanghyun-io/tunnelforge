@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from src.core.db_core_service import (
     DbCoreFacade,
@@ -28,9 +28,6 @@ from src.exporters.dump_progress import DumpEventCallbacks, TableProgressTracker
 logger = get_logger("rust_dump_exporter")
 
 DEFAULT_DUMP_COMPRESSION = "zstd"
-MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED = (
-    "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED"
-)
 MYSQL_SNAPSHOT_MODES = frozenset({
     # The core picks the method: shared locks first, then mysql_snapshot_fallback.
     "auto",
@@ -75,13 +72,19 @@ _SNAPSHOT_FALLBACK_REASONS = {
 _FEWER_WORKERS = "계정의 동시 연결 수 제한으로 줄임"
 
 
+def resolved_snapshot_mode(result: dict) -> Optional[str]:
+    """The MySQL method that ran, from a dump.run result; None for PostgreSQL."""
+    mode = result.get("mysql_snapshot_mode") or _SNAPSHOT_POLICY_MODES.get(str(result.get("snapshot_policy") or ""))
+    return mode if mode in _SNAPSHOT_METHODS else None
+
+
 def describe_snapshot_method(result: dict, requested_threads: int) -> str:
     """One line naming the MySQL method the core used, from its result; empty for PostgreSQL.
 
     e.g. "같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어 테이블만 잠깐 잠금)".
     """
-    mode = result.get("mysql_snapshot_mode") or _SNAPSHOT_POLICY_MODES.get(str(result.get("snapshot_policy") or ""))
-    if mode not in _SNAPSHOT_METHODS:
+    mode = resolved_snapshot_mode(result)
+    if mode is None:
         return ""
     guarantee, how = _SNAPSHOT_METHODS[mode]
     one_connection = mode in _ONE_CONNECTION_MODES
@@ -96,35 +99,66 @@ def describe_snapshot_method(result: dict, requested_threads: int) -> str:
     return f"{line} ({detail})" if detail else line
 
 
-# 권한 거부 마커의 권한 이름. parallel_strict 는 FTWRL(RELOAD)과
-# LOCK INSTANCE FOR BACKUP(BACKUP_ADMIN)을, parallel_table_lock 은
-# 내보낼 테이블의 LOCK TABLES ... READ 를 필요로 한다.
-MYSQL_PRIVILEGE_BACKUP_ADMIN = "BACKUP_ADMIN"
-MYSQL_PRIVILEGE_FLUSH_OR_RELOAD = "FLUSH_TABLES_OR_RELOAD"
-MYSQL_PRIVILEGE_LOCK_TABLES = "LOCK_TABLES"
+# Why dump.run refused an object (its `kind:table:name` code, schema.rs). Table-scoped kinds name
+# the object inside the table; schema-level kinds (routine, event, materialized_view) have no table.
+_TABLE_REFUSAL_REASONS = {
+    # Can be left out ("담을 수 없는 객체는 빼고 내보내기")
+    "trigger": "트리거 {}는 덤프에 담을 수 없습니다",
+    "deprecated_engine": "{} 엔진 테이블이라 같은 시점으로 담을 수 없습니다",
+    "non_transactional_table": "{} 엔진 테이블이라 같은 시점으로 담을 수 없습니다",
+    # Definitions that would be lost: never left out
+    "generated_column": "계산 열 {}의 정의를 덤프에 담을 수 없습니다",
+    "check_constraint": "CHECK 제약 {}의 조건을 덤프에 담을 수 없습니다",
+    "unsupported_default": "열 {}의 기본값을 덤프에 담을 수 없습니다",
+    "custom_type": "열 {}의 사용자 정의 형식을 덤프에 담을 수 없습니다",
+    "unsupported_index": "인덱스 {}를 덤프에 담을 수 없습니다",
+    "cross_schema_fk": "외래 키 {}가 다른 DB의 테이블을 가리켜 덤프에 담을 수 없습니다",
+}
+_SCHEMA_REFUSAL_REASONS = {
+    "routine": "저장 프로시저·함수 {}: 덤프에 담을 수 없습니다",
+    "event": "예약 이벤트 {}: 덤프에 담을 수 없습니다",
+    "materialized_view": "구체화 뷰 {}: 덤프에 담을 수 없습니다",
+}
+_UNKNOWN_TABLE_REFUSAL = "이 객체는 담을 수 없습니다"
 
 
-def is_mysql_parallel_snapshot_privilege_error(message: object) -> bool:
-    return MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED in str(message)
+def describe_export_refusal(objects: object) -> List[str]:
+    """One plain sentence per refused object, e.g. "테이블 orders: 트리거 trg는 덤프에 담을 수 없습니다".
+
+    An unknown code still names its table; the codes themselves go behind "자세히"."""
+    lines = []
+    for item in objects if isinstance(objects, list) else []:
+        kind, _, rest = str(item).partition(":")
+        table, _, name = rest.partition(":")
+        if kind in _SCHEMA_REFUSAL_REASONS:
+            lines.append(translate_text(_SCHEMA_REFUSAL_REASONS[kind]).format(rest))
+        elif name:
+            reason = translate_text(_TABLE_REFUSAL_REASONS.get(kind, _UNKNOWN_TABLE_REFUSAL)).format(name)
+            lines.append(translate_text("테이블 {}: {}").format(table, reason))
+        else:
+            lines.append(f"{item}: {translate_text(_UNKNOWN_TABLE_REFUSAL)}")
+    return lines
 
 
-def mysql_parallel_snapshot_denied_privilege(message: object) -> Optional[str]:
-    """병렬 스냅샷 권한 거부 마커에서 거부된 권한 이름을 추출한다.
+def fk_parent_closure(picks: List[str], deps: Dict[str, List[Tuple[str, str]]]) -> Tuple[List[str], List[str]]:
+    """The picked tables plus every FK parent they need, transitively, and the parents that were added.
 
-    마커 형식은 ``MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:<privilege>:<server_error>``.
-    마커가 없으면 None을 반환한다.
-    """
-    text = str(message)
-    marker = MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED
-    index = text.find(marker)
-    if index == -1:
-        return None
-    remainder = text[index + len(marker):]
-    parts = remainder.split(":")
-    # parts[0]은 마커 바로 뒤(구분자로 인한 빈 문자열), parts[1]이 권한 이름이다.
-    if len(parts) >= 2 and parts[1]:
-        return parts[1]
-    return None
+    ``deps`` maps a child table to its ``(constraint, parent)`` pairs (``fetch_fk_parents``)."""
+    required = set(picks)
+    pending = list(picks)
+    while pending:
+        for _constraint, parent in deps.get(pending.pop(), []):
+            if parent not in required:
+                required.add(parent)
+                pending.append(parent)
+    return sorted(required), sorted(required - set(picks))
+
+
+def fk_parents_outside(picks: List[str], deps: Dict[str, List[Tuple[str, str]]]) -> List[Dict[str, str]]:
+    """Each FK of a picked table whose parent was not picked: ``{child, constraint, parent}``."""
+    picked = set(picks)
+    return [{"child": child, "constraint": constraint, "parent": parent}
+            for child in sorted(picked) for constraint, parent in deps.get(child, []) if parent not in picked]
 
 
 DEFAULT_DUMP_THREADS = 8
@@ -285,44 +319,27 @@ class RustDumpExporter(_RustDumpClientBase):
     # Set when the core refused the export before writing anything
     # (error_code "unsupported_objects"): {"objects": [...], "bypassable": bool}.
     last_refusal: Optional[Dict] = None
+    # Set after a successful export, from the core's result: the MySQL method that ran
+    # ("mode", None for PostgreSQL), its one-line description ("method") and the objects
+    # the dump left out ("omitted", the "Object not exported" warnings).
+    last_run: Optional[Dict] = None
 
-    def _resolve_required_tables_from_rust_schema(
-        self,
-        selected_tables: List[str],
-        schema: str,
-    ) -> Tuple[List[str], List[str]]:
+    def fetch_fk_parents(self, schema: str) -> Dict[str, List[Tuple[str, str]]]:
+        """Child table -> its ``(constraint, parent)`` FKs, from one schema.inspect call.
+
+        Self-references and parents that are not tables of this schema are left out."""
         inspected = self.facade.inspect_schema(self._endpoint(schema))
-        table_deps: Dict[str, Set[str]] = {}
-        for table in inspected.get("tables", []) if isinstance(inspected, dict) else []:
-            if not isinstance(table, dict):
-                continue
-            table_name = str(table.get("name") or "")
-            if not table_name:
-                continue
-            parents: Set[str] = set()
-            foreign_keys = table.get("foreign_keys")
-            if isinstance(foreign_keys, list):
-                for foreign_key in foreign_keys:
-                    if not isinstance(foreign_key, dict):
-                        continue
-                    referenced_table = str(foreign_key.get("referenced_table") or "")
-                    if referenced_table and referenced_table != table_name:
-                        parents.add(referenced_table)
-            if parents:
-                table_deps[table_name] = parents
-
-        required = set(selected_tables)
-        added: Set[str] = set()
-        changed = True
-        while changed:
-            changed = False
-            for table_name in list(required):
-                for parent in table_deps.get(table_name, set()):
-                    if parent not in required:
-                        required.add(parent)
-                        added.add(parent)
-                        changed = True
-        return sorted(required), sorted(added)
+        tables = [table for table in (inspected.get("tables") or [] if isinstance(inspected, dict) else [])
+                  if isinstance(table, dict) and table.get("name")]
+        names = {str(table["name"]) for table in tables}
+        deps: Dict[str, List[Tuple[str, str]]] = {}
+        for table in tables:
+            child = str(table["name"])
+            for foreign_key in table.get("foreign_keys") or []:
+                parent = str(foreign_key.get("referenced_table") or "") if isinstance(foreign_key, dict) else ""
+                if parent in names and parent != child:
+                    deps.setdefault(child, []).append((str(foreign_key.get("name") or ""), parent))
+        return deps
 
     def _emit_core_event(
         self,
@@ -357,6 +374,7 @@ class RustDumpExporter(_RustDumpClientBase):
     ) -> Tuple[bool, str]:
         callbacks = callbacks or DumpEventCallbacks()
         self.last_refusal = None
+        self.last_run = None
         normalized_snapshot_mode = str(mysql_snapshot_mode).strip().lower()
         if normalized_snapshot_mode not in MYSQL_SNAPSHOT_MODES:
             raise ValueError(
@@ -419,13 +437,19 @@ class RustDumpExporter(_RustDumpClientBase):
             message += f" · {method}"
         # The core's own wording stays in the raw output (the result event) and the log.
         lines = []
-        for warning in result.get("manifest_warnings", []):
+        warnings = [str(warning) for warning in result.get("manifest_warnings") or []]
+        for warning in warnings:
             logger.info("Export manifest warning: %s", warning)
-            lines.append(f"Export 경고: {describe_manifest_warning(str(warning))}")
+            lines.append(f"Export 경고: {describe_manifest_warning(warning)}")
             if callbacks.progress:
                 callbacks.progress(lines[-1])
         if lines:
             message += "\n" + "\n".join(lines)
+        self.last_run = {
+            "mode": resolved_snapshot_mode(result),
+            "method": method,
+            "omitted": [warning for warning in warnings if manifest_warning_code(warning)[0] == "omitted_object"],
+        }
         return True, message
 
     def export_full_schema(
@@ -480,7 +504,7 @@ class RustDumpExporter(_RustDumpClientBase):
         output_dir: str,
         threads: int = DEFAULT_DUMP_THREADS,
         compression: str = DEFAULT_DUMP_COMPRESSION,
-        include_fk_parents: bool = True,
+        include_fk_parents: bool = False,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -489,17 +513,21 @@ class RustDumpExporter(_RustDumpClientBase):
         mysql_snapshot_mode: str = "parallel_strict",
         allow_incomplete: bool = False,
         mysql_snapshot_fallback: str = "single_connection",
+        auto_added_tables: Optional[List[str]] = None,
+        fk_parents_outside_dump: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[bool, str, List[str]]:
+        """Exports exactly ``tables`` unless ``include_fk_parents`` (scheduled table backups) adds their
+        FK parents here. The dialog adds them itself and passes, for ``_export_metadata.json``, the
+        parents it added (``auto_added_tables``) and the FKs whose parent stays out
+        (``fk_parents_outside_dump``, None when it could not tell)."""
         try:
             final_tables = list(tables)
-            added_tables: List[str] = []
+            added_tables = [table for table in auto_added_tables or [] if table in final_tables]
             if include_fk_parents:
                 if progress_callback:
-                    progress_callback("FK 의존성 분석 중...")
-                final_tables, added_tables = self._resolve_required_tables_from_rust_schema(
-                    tables,
-                    schema,
-                )
+                    progress_callback("연결된 부모 테이블 확인 중...")
+                final_tables, added_tables = fk_parent_closure(tables, self.fetch_fk_parents(schema))
+                fk_parents_outside_dump = []
 
             success, message = self._run_rust_dump(
                 schema=schema,
@@ -519,7 +547,7 @@ class RustDumpExporter(_RustDumpClientBase):
                 mysql_snapshot_fallback=mysql_snapshot_fallback,
             )
             if success:
-                self._write_metadata(output_dir, schema, "partial", final_tables, added_tables)
+                self._write_metadata(output_dir, schema, "partial", final_tables, added_tables, fk_parents_outside_dump)
                 return True, message, final_tables
             return False, message, []
         except DbCoreServiceError as exc:
@@ -538,6 +566,7 @@ class RustDumpExporter(_RustDumpClientBase):
         export_type: str,
         tables: Optional[List[str]],
         added_tables: Optional[List[str]] = None,
+        fk_parents_outside_dump: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         os.makedirs(output_dir, exist_ok=True)
         metadata = {
@@ -546,6 +575,8 @@ class RustDumpExporter(_RustDumpClientBase):
             "type": export_type,
             "tables": tables,
             "added_fk_tables": added_tables or [],
+            # [{child, constraint, parent}]; null when the dialog could not read the FKs.
+            "fk_parents_outside_dump": [] if export_type == "full" else fk_parents_outside_dump,
             "source": f"{self.config.host}:{self.config.port}",
             "format": "tunnelforge-dump",
         }
@@ -679,14 +710,18 @@ _MANIFEST_WARNING_CODES = (
 )
 
 
+def manifest_warning_code(warning: str) -> Tuple[str, str]:
+    """(code, detail) of one manifest warning: an omitted object keeps its name, an unknown warning its text."""
+    for prefix, known in _MANIFEST_WARNING_CODES:
+        if warning.startswith(prefix):
+            return known, (warning[len(prefix):].strip() if known == "omitted_object" else "")
+    return "source_dump_warning", warning
+
+
 def describe_manifest_warning(warning: str) -> str:
     """The sentence for one manifest warning; an omitted object keeps its name and an unknown
     warning its text, e.g. "내보낼 때 일부 객체가 빠졌습니다. (trigger:orders:trg)"."""
-    code, detail = "source_dump_warning", warning
-    for prefix, known in _MANIFEST_WARNING_CODES:
-        if warning.startswith(prefix):
-            code, detail = known, (warning[len(prefix):].strip() if known == "omitted_object" else "")
-            break
+    code, detail = manifest_warning_code(warning)
     sentence = describe_core_code(code)
     return f"{sentence} ({detail})" if detail else sentence
 
@@ -1009,7 +1044,7 @@ def export_tables(
     tables: List[str],
     output_dir: str,
     threads: int = DEFAULT_DUMP_THREADS,
-    include_fk_parents: bool = True,
+    include_fk_parents: bool = False,
     progress_callback: Optional[Callable[[str], None]] = None,
     engine: str = "mysql",
 ) -> Tuple[bool, str, List[str]]:

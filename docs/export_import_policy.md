@@ -381,16 +381,11 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
   잠깐 잠금)`. The wording promises no DDL protection for the table lock or one
   connection.
 
-  When `parallel_strict` is refused for missing privileges, the Export dialog asks
-  once: continue in parallel with the table lock (recommended, default), continue
-  in parallel without point-in-time consistency, continue with one connection, or
-  cancel. If the table-lock retry is refused because LOCK TABLES is also missing,
-  it asks a second and last time with only one connection (default) or
-  unsynchronized parallel. A new export starts from `parallel_strict` again, and
-  re-opening an export from the job list never reuses a recorded snapshot mode.
-  Granting RELOAD and BACKUP_ADMIN avoids the question. (The dialog still sends
-  `parallel_strict`; switching it to `auto` without these questions is the next
-  step.)
+  The Export dialog and scheduled backups send `auto` (the dialog with the
+  fallback its Advanced setting picks, below); neither asks about privileges. A
+  missing privilege only moves the core on to the next method, and the dialog's
+  completion window and log name the method that ran. A caller that sends no
+  mode still gets `parallel_strict`.
 - PostgreSQL table export uses one read-only repeatable-read transaction and
   locks exported tables against destructive DDL. Nullable UNIQUE columns are not
   used as keyset cursors. Large keyless MySQL tables use a single streaming read.
@@ -407,6 +402,80 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
 - Legacy independent-snapshot policy labels do not prove a consistent source
   backup even if an old manifest says `strict_export=true`. Warnings remain in
   Import results and reports. Worker pools use one physical connection per worker.
+
+## Export dialog
+
+The Export dialog has one default behavior and an Advanced panel that starts
+closed; the line beside its "고급 설정 열기" button lists every setting that is on
+or not at its default. There are no scope or snapshot choices.
+
+- **One table list.** It is always shown (checkboxes only, no row selection) and
+  starts with every table checked. All checked sends a full export
+  (`dump.run` without `tables`: tables plus views, routines and events); unchecking
+  any table sends exactly the checked tables, and one line under the list says
+  that views, stored procedures, functions and events are then left out.
+  "다시 열기" from the job list with `scope: full` checks everything again; with
+  `scope: tables` it checks the tables recorded for that run.
+- **Method.** The dialog always sends `mysql_snapshot_mode: "auto"` with
+  `mysql_snapshot_fallback` (`single_connection`, or `parallel_unsynchronized`
+  with the toggle below), so it never asks about privileges and never retries on
+  its own. A lock not granted in time (TF-STATUS-185) falls to the table lock and
+  then to one connection, never to the unsynchronized method unless the user
+  turned that on. The completion window and the log show the method line built
+  from the result (`내보낸 방법: 같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어
+  테이블만 잠깐 잠금)`), and the unsynchronized warning only when the result says
+  `parallel_unsynchronized`.
+
+| Setting | Default | Sends |
+| --- | --- | --- |
+| 연결된 부모 테이블 함께 담기 | off | nothing new: the dialog checks the FK parents itself (below) and sends `include_fk_parents: false` with the checked list. Not used when every table is checked. |
+| 시점 일관성 포기하고 더 빠르게 | off | `mysql_snapshot_fallback: "parallel_unsynchronized"`: only when neither shared lock works. Hidden for PostgreSQL. |
+| 담을 수 없는 객체는 빼고 내보내기 | off | `allow_incomplete: true` from the start, so the omittable objects below are left out without asking. |
+| 동시 작업 수 / 압축 | 8 / 압축(zstd) | `threads` / `compression` (압축 안 함 = `none`). |
+| 폴더 이름 직접 정하기 | off | the typed folder name; off, the folder is `{connection}_{DB}_{time}`. |
+
+Every toggle state is remembered when a run starts (`rust_dump_export_threads`,
+`_compression`, `_include_fk_parents`, `_unsynchronized`, `_allow_incomplete`,
+`_folder_mode`, `_folder_manual_name`); the table selection is not. A value of the
+wrong type is ignored. The earlier "자동 지정 / 수동 지정" folder setting keeps
+working: a saved `rust_dump_export_folder_mode: "manual"` turns "폴더 이름 직접
+정하기" on with the saved name, and the old name/schema/timestamp switches
+(`rust_dump_export_folder_use_*`) are no longer read.
+
+**FK parents.** `RustDumpExporter.fetch_fk_parents(schema)` reads the FKs with one
+`schema.inspect` call, which the dialog keeps per schema and makes only once a
+table is unchecked; the pure `fk_parent_closure(picks, deps)` and
+`fk_parents_outside(picks, deps)` run on every change of the list, whatever the
+toggle says. Only parents that are tables of the same schema count.
+
+- Toggle off: nothing is checked for the user. When a checked table references a
+  table that is not checked, one line under the list names them (`고른 테이블 1개가
+  고르지 않은 테이블을 참조합니다 (orders → customers). 고른 테이블만 내보냅니다.`), and
+  `_export_metadata.json` records `fk_parents_outside_dump: [{child, constraint,
+  parent}]` (`null` when the FKs could not be read; the line then says so).
+- Toggle on: the parents a checked table needs, transitively, are checked and
+  disabled (tooltip "연결된 테이블이라 자동으로 담음", item text unchanged) while a
+  checked table needs them, with a line `연결된 부모 테이블 자동 추가 N개: ...`.
+  Unchecking the child releases them back to unchecked. The run sends exactly the
+  checked list with `include_fk_parents: false` and `auto_added_tables`, which the
+  metadata keeps as `added_fk_tables` (only names that are in the dump). The job
+  record's re-run tables hold only the user's own picks.
+- `include_fk_parents` defaults to `false` in `RustDumpExporter.export_tables`,
+  the module-level `export_tables` and the export worker, and is no longer kept
+  in job records (`_RERUN_KEYS`), so an old record's value is dropped. Scheduled
+  table backups pass `include_fk_parents=True` explicitly and, like scheduled full
+  backups, `mysql_snapshot_mode="auto"` (fallback `single_connection`).
+
+**Refusals.** `describe_export_refusal(objects)` words each `kind:table:name`
+code as `테이블 {T}: {reason}` (routines, events and materialized views by their
+own name); an unknown code becomes `테이블 {T}: 이 객체는 담을 수 없습니다`. The codes
+themselves open from "자세히". An omittable refusal (`bypassable: true`) asks once,
+only while "담을 수 없는 객체는 빼고 내보내기" is off, and names that toggle; a lossy
+one (`bypassable: false`) shows the same sentences with only Close and "이 테이블을
+목록에서 빼면 진행할 수 있습니다". Neither lands in the generic "Export 실패" window
+or sends an error report. A run that left objects out (manifest `Object not
+exported` warnings) is recorded as `partial` and says so; with the toggle on but
+nothing to leave out, the export is complete.
 
 ## Schema support and explicit limits
 
@@ -460,8 +529,9 @@ fails before the target directory or any dump file is created, with
 `error_code: "unsupported_objects"`, `objects` (one `kind:table:name` entry per
 object) and `bypassable`. Only the waivable objects can be omitted, and only by
 the explicit choice "Export without these objects (incomplete)" (`allow_incomplete:
-true` in the `dump.run` payload; the UI lists the objects, up to 10 inline plus a
-count of the rest, before asking). The structure and data of all remaining tables
+true` in the `dump.run` payload; the dialog words the objects, up to 10 inline plus
+a count of the rest, before asking, or sends it from the start when its Advanced
+setting "담을 수 없는 객체는 빼고 내보내기" is on; see Export dialog above). The structure and data of all remaining tables
 are still exported; only the listed objects are left out. That choice
 keeps `strict_export=false` and adds a persistent `Object not exported: ...`
 warning per object. Only objects inside the export scope get that warning:

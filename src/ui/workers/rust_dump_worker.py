@@ -37,6 +37,8 @@ class RustDumpWorker(QThread):
         # Core refusal (error_code unsupported_objects) of the last export:
         # {"objects": [...], "bypassable": bool}. Set before `finished` fires.
         self.export_refusal = None
+        # What a successful export did (RustDumpExporter.last_run): {"mode", "method", "omitted"}.
+        self.export_run = None
 
     def cancel(self) -> bool:
         """실행 중인 dump/import 작업의 취소를 요청한다.
@@ -144,11 +146,9 @@ class RustDumpWorker(QThread):
                 'mysql_snapshot_mode', 'parallel_strict'
             ),
             allow_incomplete=self.kwargs.get('allow_incomplete', False),
+            mysql_snapshot_fallback=self.kwargs.get('mysql_snapshot_fallback', 'single_connection'),
         )
-        self.export_refusal = getattr(exporter, "last_refusal", None)
-        self.error_code = getattr(exporter, "last_error_code", None)
-        success, msg = self._is_cancelled_message(success, msg)
-        self.finished.emit(success, msg)
+        self._finish_export(exporter, success, msg)
 
     def _run_export_tables(self):
         exporter = RustDumpExporter(self.config)
@@ -160,7 +160,7 @@ class RustDumpWorker(QThread):
             self.kwargs['output_dir'],
             self.kwargs.get('threads', 8),
             self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
-            self.kwargs.get('include_fk_parents', True),
+            self.kwargs.get('include_fk_parents', False),
             self._on_progress,
             self._on_table_progress,
             self._on_detail,
@@ -170,8 +170,15 @@ class RustDumpWorker(QThread):
                 'mysql_snapshot_mode', 'parallel_strict'
             ),
             allow_incomplete=self.kwargs.get('allow_incomplete', False),
+            mysql_snapshot_fallback=self.kwargs.get('mysql_snapshot_fallback', 'single_connection'),
+            auto_added_tables=self.kwargs.get('auto_added_tables'),
+            fk_parents_outside_dump=self.kwargs.get('fk_parents_outside_dump'),
         )
+        self._finish_export(exporter, success, msg)
+
+    def _finish_export(self, exporter, success: bool, msg: str):
         self.export_refusal = getattr(exporter, "last_refusal", None)
+        self.export_run = getattr(exporter, "last_run", None)
         self.error_code = getattr(exporter, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)
         self.finished.emit(success, msg)

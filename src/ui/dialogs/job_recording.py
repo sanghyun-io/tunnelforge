@@ -24,39 +24,37 @@ def _profile(context: Optional[Dict[str, Any]], fallback_name: str = "") -> Dict
 
 # ------------------------------------------------------------------ export
 
-# 작업 목록에 보이는 실행 모드는 사람이 읽는 라벨로 남긴다 (원래 코드값은 rerun에 그대로 보존).
+# 작업 목록에 보이는 실행 모드는 사람이 읽는 라벨로 남긴다. 끝난 MySQL Export 는 Core 결과의 방법 문장
+# (describe_snapshot_method)을 쓰고, 그 전에는 고른 설정(시점 일관성 포기 허용 여부)만 보인다.
 _SNAPSHOT_LABELS = {
-    "parallel_strict": "일관 스냅샷(병렬)",
-    "single_connection": "일관 스냅샷(단일 연결)",
-    "parallel_no_backup_lock": "락 없는 스냅샷(단일 워커)",
-    "parallel_table_lock": "테이블 락 공유 스냅샷(병렬)",
-    "parallel_unsynchronized": "독립 스냅샷(병렬, 시점 일관성 미보장)",
+    "single_connection": "내보내는 방법 자동 선택",
+    "parallel_unsynchronized": "내보내는 방법 자동 선택(시점 일관성 포기 허용)",
 }
 _COMPRESSION_LABELS = {"none": "압축 안 함", "zstd": "zstd 압축"}
 
 
 def _export_mode(dialog) -> str:
-    scope = "전체" if dialog.radio_full.isChecked() else f"테이블 {len(dialog.get_selected_tables())}개"
-    compression = dialog.combo_compression.currentText()
-    threads = 1 if dialog._snapshot_mode == "single_connection" else dialog.spin_threads.value()
-    return (f"{scope}"
-            f" · {_SNAPSHOT_LABELS.get(dialog._snapshot_mode, dialog._snapshot_mode)}"
-            f" · {_COMPRESSION_LABELS.get(compression, compression)} · 스레드 {threads}"
-            + (" · 불완전 Export(일부 객체 제외)" if dialog._allow_incomplete else ""))
+    scope = "전체" if dialog._is_full_export() else f"테이블 {len(dialog.get_selected_tables())}개"
+    compression = dialog._compression()
+    method = getattr(dialog, "_snapshot_method", "")
+    if not method:
+        threads = f"동시 작업 {dialog.spin_threads.value()}개"
+        method = threads if dialog._engine() == "postgresql" else f"{_SNAPSHOT_LABELS[dialog._snapshot_fallback()]} · {threads}"
+    return (f"{scope} · {method} · {_COMPRESSION_LABELS.get(compression, compression)}"
+            + (" · 불완전 Export(일부 객체 제외)" if dialog._omitted_objects else ""))
 
 
 def begin_export_job(dialog) -> Optional[str]:
     try:
-        full = dialog.radio_full.isChecked()
-        tables = [] if full else list(dialog.get_selected_tables())
+        full = dialog._is_full_export()
         return job_begin(
             KIND_EXPORT_FULL if full else KIND_EXPORT_TABLES,
             target=dialog.export_schema, mode=_export_mode(dialog),
-            rerun={"schema": dialog.export_schema, "scope": "full" if full else "tables", "tables": tables,
-                   "compression": dialog.combo_compression.currentText(),
-                   "threads": dialog.spin_threads.value(),
-                   "snapshot_mode": dialog._snapshot_mode,
-                   "include_fk_parents": bool(dialog.chk_include_fk.isChecked())},
+            # 다시 열 때는 사용자가 고른 테이블만 채운다. 자동으로 더한 부모 테이블은 그때 설정대로 다시 정한다.
+            rerun={"schema": dialog.export_schema, "scope": "full" if full else "tables",
+                   "tables": [] if full else dialog._picked_tables(),
+                   "compression": dialog._compression(),
+                   "threads": dialog.spin_threads.value()},
             **_profile(getattr(dialog, "job_context", None), getattr(dialog, "connection_info", "")),
         )
     except Exception:
@@ -71,12 +69,13 @@ def finish_export_job(dialog, success: bool, message: str) -> None:
         if getattr(dialog, "_cancel_requested", False):
             status = STATUS_CANCELLED
         elif success:
-            status = STATUS_PARTIAL if getattr(dialog, "_allow_incomplete", False) else STATUS_COMPLETED
+            # 실제로 빠진 객체가 있을 때만 불완전: '빼고 내보내기'를 켜 두었어도 뺄 것이 없었으면 완전한 Export 다.
+            status = STATUS_PARTIAL if getattr(dialog, "_omitted_objects", None) else STATUS_COMPLETED
         else:
             status = STATUS_FAILED
         output = dialog.input_output_dir.text()
         details = {"tables": int(dialog.export_total_tables or 0), "rows": int(sum(dialog.export_table_done.values()))}
-        # begin은 첫 실행(parallel_strict) 모드로 기록되므로, 권한 대체·불완전 선택으로 다시 실행했으면 실제 모드로 바꾼다.
+        # begin 은 방법이 정해지기 전에 기록되므로, 끝나면 Core 가 실제로 쓴 방법으로 바꾼다.
         job_finish(job_id, status, error="" if success else message, mode=_export_mode(dialog),
                    report_path=os.path.join(output, DUMP_MANIFEST_NAME) if output else "", details=details)
     except Exception:
