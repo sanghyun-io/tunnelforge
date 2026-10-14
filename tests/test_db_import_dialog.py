@@ -19,38 +19,107 @@ from src.ui.dialogs.db_dialogs import (
     _sanitize_plain_rust_line,
 )
 from src.ui.dialogs.db_import_dialog import resolve_timezone_sql
+from src.core.production_guard import Environment
+from PyQt6.QtWidgets import QDialog
 
 
-def test_import_without_tunnel_config_uses_unknown_environment_guard(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_import_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    calls = []
+def _write_dump(path, **manifest):
+    """A dump folder the dialog accepts; by default a current MySQL dump of the database ``app``."""
+    path.mkdir(parents=True, exist_ok=True)
+    data = {"format": "tunnelforge-dump", "format_version": 5, "source_engine": "mysql", "database": "app",
+            "source_timezone": "UTC", "tables": []}
+    data.update(manifest)
+    (path / "_tunnelforge_dump.json").write_text(json.dumps(data), encoding="utf-8")
+    return str(path)
 
-    def fake_confirm(self, tunnel_config, operation, schema_name, details):
-        calls.append((tunnel_config, operation, schema_name, details))
-        return False
 
-    monkeypatch.setattr(
-        "src.core.production_guard.ProductionGuard.confirm_dangerous_operation",
-        fake_confirm,
-    )
+class _Signal:
+    def __init__(self):
+        self.slots = []
 
-    dialog = RustDumpImportDialog()
+    def connect(self, slot, *_args):
+        self.slots.append(slot)
+
+    def emit(self, *args):
+        for slot in list(self.slots):
+            slot(*args)
+
+
+_NOTHING_OVERWRITTEN = {"replace": [], "create": ["users"], "untouched": [], "blockers": [], "warnings": []}
+
+
+def _fake_plan_dialog(monkeypatch, accept=None):
+    """Replace the plan dialog; ``accept=None`` fails the test if it is shown at all (exec would block)."""
+    shown = []
+
+    class FakePlanDialog:
+        def __init__(self, parent, preview, plan, environment, target_text, name, toggles=""):
+            shown.append({"preview": preview, "plan": plan, "environment": environment, "target": target_text,
+                          "name": name, "toggles": toggles})
+
+        def exec(self):
+            assert accept is not None, "unexpected plan dialog"
+            return QDialog.DialogCode.Accepted if accept else QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.ImportPlanDialog", FakePlanDialog)
+    return shown
+
+
+def _fake_workers(monkeypatch, preview=None, preview_ok=True, preview_message=""):
+    """Replace RustDumpWorker: a preview answers at once; any other task only records itself."""
+    created = []
+
+    class FakeWorker:
+        def __init__(self, task_type, config, **kwargs):
+            self.task_type, self.config, self.kwargs, self.started = task_type, config, kwargs, False
+            for name in ("progress", "table_progress", "detail_progress", "table_status", "raw_output", "import_finished",
+                         "finished", "metadata_analyzed", "table_chunk_progress", "preview_finished", "promotion_finished"):
+                setattr(self, name, _Signal())
+            created.append(self)
+
+        def start(self):
+            self.started = True
+            if self.task_type == "import_preview":
+                self.preview_finished.emit(preview_ok, preview_message,
+                                           dict(_NOTHING_OVERWRITTEN) if preview is None else preview)
+
+        def isRunning(self):
+            return False
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
+    _fake_plan_dialog(monkeypatch)
+    return created
+
+
+def _imports(created):
+    return [worker for worker in created if worker.task_type == "import"]
+
+
+@pytest.mark.parametrize("tunnel_config", [None, {"environment": "staging"}])
+def test_staging_shows_only_plan_dialog(monkeypatch, tmp_path, tunnel_config):
+    """Staging and unclassified profiles get the one plan dialog, and no other prompt, before a run."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
+    monkeypatch.setattr("src.core.production_guard.ProductionGuard.confirm_dangerous_operation",
+                        MagicMock(side_effect=AssertionError("the old guard prompt")))
+    created = _fake_workers(monkeypatch, preview={**_NOTHING_OVERWRITTEN, "replace": ["users"], "create": []})
+    shown = _fake_plan_dialog(monkeypatch, accept=False)
+    dialog = RustDumpImportDialog(tunnel_config=tunnel_config)
     try:
-        assert dialog._confirm_production_guard("C:/dumps/app", "app") is False
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
     finally:
         dialog.close()
 
-    assert len(calls) == 1
-    tunnel_config, operation, schema_name, details = calls[0]
-    assert tunnel_config == {}
-    assert operation == "데이터 Import"
-    assert schema_name == "app"
-    assert "C:/dumps/app" in details
-    assert "Import 모드" in details
+    assert len(shown) == 1
+    assert shown[0]["environment"] == (Environment.UNKNOWN if tunnel_config is None else Environment.STAGING)
+    assert shown[0]["name"] == "app" and shown[0]["target"].endswith("/ app")
+    assert [worker.task_type for worker in created] == ["import_preview"]
 
 def test_format_import_row_labels_separates_rows_chunks_and_strategy():
     labels = format_import_row_labels({
@@ -274,207 +343,74 @@ def test_import_dialog_does_not_claim_all_objects_are_recreated(monkeypatch):
     assert "테이블" in labels
     dialog.close()
 
+class _PgConnector:
+    host = "pg.example.com"
+    port = 5432
+    user = "importer"
+    password = "secret"
+    engine = "postgresql"
+    database = "appdb"
+
+    def get_schemas(self):
+        return ["app"]
+
+
 def test_import_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp_path):
-    app = QApplication.instance() or QApplication([])
-
-    class FakeSignal:
-        def connect(self, _callback):
-            pass
-
-    captured = {}
-
-    class FakeWorker:
-        progress = FakeSignal()
-        table_progress = FakeSignal()
-        detail_progress = FakeSignal()
-        table_status = FakeSignal()
-        raw_output = FakeSignal()
-        import_finished = FakeSignal()
-        finished = FakeSignal()
-        metadata_analyzed = FakeSignal()
-        table_chunk_progress = FakeSignal()
-
-        def __init__(self, task_type, config, **kwargs):
-            captured["task_type"] = task_type
-            captured["config"] = config
-            captured["kwargs"] = kwargs
-
-        def start(self):
-            captured["started"] = True
-
-        def isRunning(self):
-            return False
-
-    class FakeConnector:
-        host = "db.example.com"
-        port = 5432
-        user = "importer"
-        password = "secret"
-        engine = "postgresql"
-
-        def get_schemas(self):
-            return ["app"]
-
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_import_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
-
-    dump_dir = tmp_path / "dump"
-    dump_dir.mkdir()
-
-    dialog = RustDumpImportDialog(
-        connector=FakeConnector(),
-        tunnel_config={"environment": "development"},
-    )
-    dialog.input_dir.setText(str(dump_dir))
-    dialog.radio_tz_none.setChecked(True)
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    created = _fake_workers(monkeypatch)
+    dialog = RustDumpImportDialog(connector=_PgConnector(), tunnel_config={"environment": "development"})
+    dialog.input_dir.setText(_write_dump(tmp_path / "dump", source_engine="postgresql", source_schema="app"))
 
     dialog.do_import()
 
-    assert captured["task_type"] == "import"
-    assert captured["kwargs"]["import_mode"] == "safe"
-    assert captured["config"].host == "db.example.com"
-    assert captured["config"].port == 5432
-    assert captured["config"].user == "importer"
-    assert captured["config"].password == "secret"
-    assert captured["config"].engine == "postgresql"
-    assert captured["started"] is True
+    preview, imported = created
+    assert preview.task_type == "import_preview" and imported.task_type == "import"
+    assert imported.kwargs["import_mode"] == "replace"
+    assert imported.config.host == "pg.example.com"
+    assert imported.config.port == 5432
+    assert imported.config.user == "importer"
+    assert imported.config.password == "secret"
+    assert imported.config.engine == "postgresql"
+    assert imported.started is True
+    assert dialog.lbl_target_endpoint.text() == "pg.example.com:5432 / appdb /"
     dialog.deleteLater()
 
-def test_postgresql_import_auto_timezone_skips_mysql_detection(monkeypatch, tmp_path):
-    app = QApplication.instance() or QApplication([])
 
-    class FakeSignal:
-        def connect(self, _callback):
-            pass
-
-    captured = {}
-
-    class FakeWorker:
-        progress = FakeSignal()
-        table_progress = FakeSignal()
-        detail_progress = FakeSignal()
-        table_status = FakeSignal()
-        raw_output = FakeSignal()
-        import_finished = FakeSignal()
-        finished = FakeSignal()
-        metadata_analyzed = FakeSignal()
-        table_chunk_progress = FakeSignal()
-
-        def __init__(self, task_type, config, **kwargs):
-            captured["task_type"] = task_type
-            captured["config"] = config
-            captured["kwargs"] = kwargs
-
-        def start(self):
-            captured["started"] = True
-
-        def isRunning(self):
-            return False
-
-    class FakeConnector:
-        host = "pg.example.com"
-        port = 5432
-        user = "importer"
-        password = "secret"
-        engine = "postgresql"
-
-        def get_schemas(self):
-            return ["app"]
-
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_import_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
-
-    dump_dir = tmp_path / "dump"
-    dump_dir.mkdir()
-
-    dialog = RustDumpImportDialog(
-        connector=FakeConnector(),
-        tunnel_config={"environment": "development"},
-    )
-    dialog.input_dir.setText(str(dump_dir))
-    dialog.check_timezone_support = MagicMock(
-        side_effect=AssertionError("PostgreSQL import must not query MySQL timezone tables")
-    )
+def test_postgresql_import_without_the_timezone_toggle_keeps_the_dump_timezone(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    created = _fake_workers(monkeypatch)
+    dialog = RustDumpImportDialog(connector=_PgConnector(), tunnel_config={"environment": "development"})
+    dialog.input_dir.setText(_write_dump(tmp_path / "dump", source_engine="postgresql", source_schema="app"))
 
     dialog.do_import()
 
-    assert captured["task_type"] == "import"
-    assert captured["config"].engine == "postgresql"
-    assert captured["kwargs"]["timezone_sql"] is None
-    dialog.check_timezone_support.assert_not_called()
-    assert captured["started"] is True
+    for worker in created:
+        assert worker.kwargs["timezone_sql"] is None and worker.kwargs["use_source_timezone"] is True
+    assert _imports(created)[0].started is True
     dialog.deleteLater()
 
-def test_postgresql_import_forced_kst_uses_postgresql_timezone_sql(monkeypatch, tmp_path):
-    app = QApplication.instance() or QApplication([])
 
-    class FakeSignal:
-        def connect(self, _callback):
-            pass
-
-    captured = {}
-
-    class FakeWorker:
-        progress = FakeSignal()
-        table_progress = FakeSignal()
-        detail_progress = FakeSignal()
-        table_status = FakeSignal()
-        raw_output = FakeSignal()
-        import_finished = FakeSignal()
-        finished = FakeSignal()
-        metadata_analyzed = FakeSignal()
-        table_chunk_progress = FakeSignal()
-
-        def __init__(self, task_type, config, **kwargs):
-            captured["task_type"] = task_type
-            captured["config"] = config
-            captured["kwargs"] = kwargs
-
-        def start(self):
-            captured["started"] = True
-
-        def isRunning(self):
-            return False
-
-    class FakeConnector:
-        host = "pg.example.com"
-        port = 5432
-        user = "importer"
-        password = "secret"
-        engine = "postgresql"
-
-        def get_schemas(self):
-            return ["app"]
-
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_import_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
-
-    dump_dir = tmp_path / "dump"
-    dump_dir.mkdir()
-
-    dialog = RustDumpImportDialog(
-        connector=FakeConnector(),
-        tunnel_config={"environment": "development"},
-    )
-    dialog.input_dir.setText(str(dump_dir))
-    dialog.radio_tz_kst.setChecked(True)
+def test_postgresql_import_legacy_dump_kst_uses_postgresql_timezone_sql(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    created = _fake_workers(monkeypatch)
+    dialog = RustDumpImportDialog(connector=_PgConnector(), tunnel_config={"environment": "development"})
+    # A legacy dump records no source timezone, so the toggle is offered.
+    dialog.input_dir.setText(_write_dump(tmp_path / "dump", source_engine="postgresql", source_schema="app",
+                                         source_timezone=None))
+    dialog._update_target_options()
+    dialog.chk_timezone.setChecked(True)
+    dialog.combo_timezone.setCurrentIndex(dialog.combo_timezone.findData("kst"))
 
     dialog.do_import()
 
-    assert captured["task_type"] == "import"
-    assert captured["config"].engine == "postgresql"
-    assert captured["kwargs"]["timezone_sql"] == "SET TIME ZONE '+09:00'"
-    assert captured["started"] is True
+    imported = _imports(created)[0]
+    assert imported.kwargs["timezone_sql"] == "SET TIME ZONE '+09:00'"
+    assert imported.kwargs["use_source_timezone"] is True
     dialog.deleteLater()
+
 
 def test_sanitized_rust_event_redacts_password_and_credentials_recursively():
     from src.ui.dialogs.db_dialogs import _sanitized_rust_event
@@ -1098,57 +1034,11 @@ def test_import_input_editing_finished_runs_upgrade_check_for_valid_dir(tmp_path
     dialog.close()
 
 def test_import_fresh_run_clears_stale_progress_state(monkeypatch, tmp_path):
-    app = QApplication.instance() or QApplication([])
-
-    class FakeSignal:
-        def connect(self, _callback):
-            pass
-
-    class FakeWorker:
-        progress = FakeSignal()
-        table_progress = FakeSignal()
-        detail_progress = FakeSignal()
-        table_status = FakeSignal()
-        raw_output = FakeSignal()
-        import_finished = FakeSignal()
-        finished = FakeSignal()
-        metadata_analyzed = FakeSignal()
-        table_chunk_progress = FakeSignal()
-
-        def __init__(self, task_type, config, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-        def isRunning(self):
-            return False
-
-    class FakeConnector:
-        host = "127.0.0.1"
-        port = 3306
-        user = "root"
-        password = "pw"
-        engine = "mysql"
-
-        def get_schemas(self):
-            return ["app"]
-
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_import_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
-
-    dump_dir = tmp_path / "dump"
-    dump_dir.mkdir()
-
-    dialog = RustDumpImportDialog(
-        connector=FakeConnector(),
-        tunnel_config={"environment": "development"},
-    )
-    dialog.input_dir.setText(str(dump_dir))
-    dialog.radio_tz_none.setChecked(True)
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    _fake_workers(monkeypatch)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
 
     dialog.import_table_rows_done["users"] = 10
     dialog.import_table_rows_total["users"] = 100
@@ -1330,7 +1220,7 @@ def test_import_error_report_workers_are_retained_without_table_context(monkeypa
         }
     }
     dialog.combo_target_schema.addItem("target_schema_secret")
-    dialog.chk_use_original.setChecked(False)
+    dialog.chk_other_name.setChecked(True)
 
     engine_error = (
         'dump.import failed for schema "target_schema_secret", '
@@ -1375,15 +1265,6 @@ def test_import_error_report_workers_are_retained_without_table_context(monkeypa
     assert worker1 not in worker_module._ACTIVE_ERROR_REPORT_WORKERS
     assert worker2 not in worker_module._ACTIVE_ERROR_REPORT_WORKERS
     dialog.close()
-
-
-def test_import_retry_refuses_partial_rerun(monkeypatch):
-    warning = MagicMock()
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", warning)
-    dialog = MagicMock()
-    RustDumpImportDialog.do_retry(dialog)
-    warning.assert_called_once()
-    dialog.do_import.assert_not_called()
 
 
 def test_import_save_log_escapes_result_controls(tmp_path, monkeypatch):
@@ -1433,33 +1314,7 @@ def test_import_save_log_escapes_result_controls(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("db_engine", ["mysql", "postgresql"])
 def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeypatch, db_engine):
-    app = QApplication.instance() or QApplication([])
-
-    class FakeSignal:
-        def connect(self, _callback):
-            pass
-
-    class FakeWorker:
-        progress = FakeSignal()
-        table_progress = FakeSignal()
-        detail_progress = FakeSignal()
-        table_status = FakeSignal()
-        raw_output = FakeSignal()
-        import_finished = FakeSignal()
-        finished = FakeSignal()
-        metadata_analyzed = FakeSignal()
-        table_chunk_progress = FakeSignal()
-
-        def __init__(self, task_type, config, **kwargs):
-            self.task_type = task_type
-            self.config = config
-            self.kwargs = kwargs
-
-        def start(self):
-            pass
-
-        def isRunning(self):
-            return False
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
 
     class FakeConnector:
         host = "127.0.0.1"
@@ -1482,7 +1337,7 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
         "src.ui.dialogs.db_import_dialog.check_rust_dump",
         lambda: (True, "Rust DB Core OK"),
     )
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
+    _fake_workers(monkeypatch)
     monkeypatch.setattr(
         "src.ui.dialogs.db_import_dialog.QFileDialog.getSaveFileName",
         lambda *_args: (dialog_paths.append(_args[2]) or str(output_path), ""),
@@ -1497,12 +1352,9 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
         tunnel_config={"name": "staging-profile", "environment": "development", "connection_mode": "ssh", "remote_host": "staging-db.internal", "remote_port": 5432, "bastion_host": "staging-jump.internal", "bastion_user": "private-ssh-user", "bastion_key": "private-key-file", "db_password": "private-db-password"},
     )
     dialog.input_dir.setText(str(dump_dir))
-    dialog.radio_tz_none.setChecked(True)
-    dialog.radio_replace.setChecked(True)
 
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", lambda *args: QMessageBox.StandardButton.Yes)
     dialog.do_import()
-    dialog.radio_recreate.setChecked(True)
+    dialog.chk_verify_copy.setChecked(True)  # a toggle changed after the run does not rewrite its log
     dialog.connector.host = "changed-after-job"
     dialog.tunnel_config.update(name="production-profile", environment="production", remote_host="production-db.internal", bastion_host="production-jump.internal")
     manifest_path.write_text('{"source_engine":"mysql","database":"changed_after_job","tables":[]}', encoding="utf-8")
@@ -1516,8 +1368,8 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
     dialog.save_log()
 
     saved_summary = output_path.read_text(encoding="utf-8").split("상세 로그", 1)[0]
-    assert "Import 모드: 전체 교체 Import" in saved_summary
-    assert "Import 모드: 완전 재생성 Import" not in saved_summary
+    assert "Import 모드: 덤프 테이블 교체" in saved_summary
+    assert "Import 모드: 먼저 복사본에서 검증하고 교체" not in saved_summary
     assert f"127.0.0.1:{5432 if db_engine == 'postgresql' else 3306}" in saved_summary
     assert Path(dialog_paths[0]).name.startswith("import_log_original_db_failed_")
     assert dialog.worker.kwargs["target_schema"] == "original/db"
@@ -1562,26 +1414,6 @@ def test_import_cancellation_does_not_start_error_reporting(monkeypatch):
     assert dialog.import_success is False
     dialog.close()
 
-def test_import_mode_text_uses_single_korean_label_source(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_import_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    dialog = RustDumpImportDialog()
-
-    dialog.radio_safe.setChecked(True)
-    assert dialog._get_import_mode_text() == "안전 복원: 새 대상에 복원·검증"
-
-    dialog.radio_replace.setChecked(True)
-    assert dialog._get_import_mode_text() == "전체 교체 Import"
-
-    dialog.radio_recreate.setChecked(True)
-    assert dialog._get_import_mode_text() == "완전 재생성 Import"
-
-    dialog.close()
-
-
 def test_resolve_timezone_sql_preserves_engine_specific_modes():
     assert resolve_timezone_sql("postgresql", "auto") is None
     assert resolve_timezone_sql("postgresql", "kst") == "SET TIME ZONE '+09:00'"
@@ -1591,36 +1423,136 @@ def test_resolve_timezone_sql_preserves_engine_specific_modes():
     assert resolve_timezone_sql("mysql", "none") is None
 
 
-def test_import_retry_does_not_append_partial_data(monkeypatch, tmp_path):
-    app = QApplication.instance() or QApplication([])
+def test_import_default_is_replace_and_has_no_mode_radios(monkeypatch, tmp_path):
+    from PyQt6.QtWidgets import QRadioButton
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
-    warning = MagicMock()
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", warning)
-    dialog = RustDumpImportDialog()
-    dialog.input_dir.setText(str(tmp_path))
-    dialog.last_import_mode = "safe"
-    dialog._confirm_production_guard = MagicMock(return_value=False)
-    dialog.do_import(retry_tables=["users"])
-    warning.assert_called_once()
-    dialog._confirm_production_guard.assert_not_called()
-    dialog.last_import_mode = "replace"
-    dialog.radio_safe.setChecked(True)
-    dialog.do_import(retry_tables=["users"])
-    assert warning.call_count == 2
-    dialog._confirm_production_guard.assert_not_called()
-    dialog.close()
+    created = _fake_workers(monkeypatch)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    try:
+        assert dialog.findChildren(QRadioButton) == []
+        assert not hasattr(dialog, "btn_import_mode") and not hasattr(dialog, "radio_tz_auto")
+        assert dialog.advanced_panel.isHidden() and dialog.btn_advanced.text() == "고급 설정 열기"
+        assert not dialog.chk_verify_copy.isChecked() and not dialog.chk_other_name.isChecked()
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        assert [worker.kwargs["import_mode"] for worker in _imports(created)] == ["replace"]
+        assert "import_mode" not in created[0].kwargs  # the preview takes the payload without its mode
+    finally:
+        dialog.close()
 
 
-def test_import_mode_without_a_checked_radio_falls_through_to_safe(monkeypatch):
-    app = QApplication.instance() or QApplication([])
+@pytest.mark.parametrize(("setup", "expected"), [
+    (lambda d: None, {"import_mode": "replace", "target_schema": "app", "threads": 8,
+                      "timezone_sql": None, "use_source_timezone": True}),
+    (lambda d: (d.chk_other_name.setChecked(True), d.combo_target_schema.setCurrentText(" other ")),
+     {"target_schema": "other"}),
+    (lambda d: d.chk_verify_copy.setChecked(True), {"import_mode": "safe"}),
+    (lambda d: d.spin_threads.setValue(3), {"threads": 3}),
+    (lambda d: (d.chk_timezone.setChecked(True), d.combo_timezone.setCurrentIndex(d.combo_timezone.findData("kst"))),
+     {"timezone_sql": "SET SESSION time_zone = '+09:00'", "use_source_timezone": True}),
+    (lambda d: (d.chk_timezone.setChecked(True), d.combo_timezone.setCurrentIndex(d.combo_timezone.findData("utc"))),
+     {"timezone_sql": "SET SESSION time_zone = '+00:00'"}),
+    # 서버 기본값 turns the dump's own timezone off.
+    (lambda d: (d.chk_timezone.setChecked(True), d.combo_timezone.setCurrentIndex(d.combo_timezone.findData("none"))),
+     {"timezone_sql": None, "use_source_timezone": False}),
+    (lambda d: (d.chk_verify_copy.setChecked(True), d.chk_other_name.setChecked(True),
+                d.combo_target_schema.setCurrentText("other")),
+     {"import_mode": "safe", "target_schema": "other"}),
+])
+def test_import_toggle_payloads(monkeypatch, tmp_path, setup, expected):
+    """Each toggle changes only its own field, and the preview gets the same payload without the mode."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
-    dialog = RustDumpImportDialog()
-    assert not hasattr(dialog, "radio_merge")
-    dialog.btn_import_mode.setExclusive(False)
-    for radio in dialog.btn_import_mode.buttons():
-        radio.setChecked(False)
-    assert dialog._get_selected_import_mode() == "safe"
-    dialog.close()
+    created = _fake_workers(monkeypatch)
+    _fake_plan_dialog(monkeypatch, accept=True)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump", source_timezone=None))  # legacy: timezone offered
+        dialog._update_target_options()
+        setup(dialog)
+        dialog.do_import()
+        preview, imported = created
+        default = {"input_dir": str(tmp_path / "dump"), "import_mode": "replace", "target_schema": "app", "threads": 8,
+                   "timezone_sql": None, "use_source_timezone": True}
+        assert imported.kwargs == {**default, **expected}
+        assert preview.kwargs == {key: value for key, value in imported.kwargs.items() if key != "import_mode"}
+    finally:
+        dialog.close()
+
+
+def test_plan_dialog_only_when_a_table_is_overwritten_but_production_always_types_the_name(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    for environment, preview, plan_shown in (
+        ("development", _NOTHING_OVERWRITTEN, False),
+        ("staging", _NOTHING_OVERWRITTEN, False),
+        ("development", {**_NOTHING_OVERWRITTEN, "replace": ["users"]}, True),
+        ("production", _NOTHING_OVERWRITTEN, True),
+        # A warning that the data may be off is shown even when nothing is overwritten.
+        ("development", {**_NOTHING_OVERWRITTEN, "snapshot_policy": "mysql_parallel_unsynchronized_snapshots",
+                         "warnings": [{"code": "unsynchronized_snapshot", "detail": "x"}]}, True),
+        ("development", {**_NOTHING_OVERWRITTEN, "warnings": [{"code": "views_outside_snapshot", "detail": "x"}]}, False),
+        ("development", {**_NOTHING_OVERWRITTEN, "blockers": [{"code": "no_tables", "table": None, "detail": "x"}]}, True),
+    ):
+        created = _fake_workers(monkeypatch, preview=preview)
+        shown = _fake_plan_dialog(monkeypatch, accept=True)
+        dialog = RustDumpImportDialog(tunnel_config={"environment": environment})
+        try:
+            dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+            dialog.do_import()
+            assert bool(shown) is plan_shown, (environment, preview)
+            assert len(_imports(created)) == 1
+        finally:
+            dialog.close()
+
+
+def test_import_preview_failure_never_starts_import(monkeypatch, tmp_path):
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    raw = "Rust DB Core import 미리보기 오류: dump_invalid: chunk checksum mismatch"
+    created = _fake_workers(monkeypatch, preview={}, preview_ok=False, preview_message=raw)
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        assert [worker.task_type for worker in created] == ["import_preview"]
+        box = _open_failure_window(dialog)
+        assert box.windowTitle() == "Import를 시작하지 않았습니다"
+        assert box.text() == "덤프 파일 내용에 문제가 있어 넣을 수 없습니다." and "checksum" not in box.text()
+        _click_details(box)
+        assert shown == [raw]
+        assert dialog.btn_import.isEnabled() and dialog.btn_import.text() == "📥 Import 시작"
+    finally:
+        dialog.close()
+
+
+def test_preview_refused_without_core_capability_starts_no_worker(monkeypatch, tmp_path):
+    """A core built before the preview gets nothing: neither the preview nor an import."""
+    from src.exporters import rust_dump_exporter
+
+    class OldCore:
+        client = MagicMock()
+
+        def hello(self):
+            return {"capabilities": ["dump.run", "dump.import"]}
+
+        def preview_import(self, payload):
+            raise AssertionError("an old core must not get the preview")
+
+        def import_dump(self, payload, on_event=None):
+            raise AssertionError("no import after a refused preview")
+
+    monkeypatch.setattr("src.ui.workers.rust_dump_worker.RustDumpImporter",
+                        lambda config: rust_dump_exporter.RustDumpImporter(config, facade=OldCore()))
+    monkeypatch.setattr(RustDumpWorker, "start", lambda self: self.run())  # run in this thread
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    dialog.tunnel_config = {"environment": "development"}
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        assert shown == ["이 Rust DB Core는 Import 미리보기를 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."]
+        assert dialog.last_import_mode == "" and dialog.btn_import.isEnabled()
+    finally:
+        dialog.close()
 
 
 def test_import_guard_reads_rust_manifest_namespace(tmp_path):
@@ -1632,19 +1564,17 @@ def test_import_guard_reads_rust_manifest_namespace(tmp_path):
     assert RustDumpImportDialog._get_dump_schema_name(dialog, str(tmp_path)) == "reporting"
 
 
-def test_import_replace_policy_discloses_destructive_alias_and_partial_failure(monkeypatch):
-    from PyQt6.QtWidgets import QLabel
-    app = QApplication.instance() or QApplication([])
+def test_import_default_description_discloses_per_table_replace_and_no_rollback(monkeypatch):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
     dialog = RustDumpImportDialog()
     descriptions = "\n".join(label.text() for label in dialog.findChildren(QLabel))
-    assert dialog._get_selected_import_mode() == "safe"
-    assert "권장" not in dialog.radio_replace.text()
-    assert "동일" in dialog.radio_recreate.text()
-    assert "하나씩 삭제한 직후" in descriptions
-    assert "원본 데이터를 유지" in descriptions
-    assert "자동으로 되돌리지" in descriptions
-    assert "선택한 테이블" in dialog.radio_replace.toolTip()
+    assert "하나씩 지우고 다시 만들어" in descriptions
+    assert "덤프에 없는 테이블은 그대로" in descriptions
+    assert "되돌리지 않습니다" in descriptions
+    for visible in (descriptions, dialog.chk_verify_copy.text(), dialog.chk_other_name.text()):
+        for jargon in ("preflight", "manifest", "namespace", "replace 모드", "safe restore", "안전 복원"):
+            assert jargon not in visible
     dialog.close()
 
 
@@ -1692,60 +1622,223 @@ def test_replace_failure_details_name_lost_and_untouched_tables():
                                                  "새 대상을 만들었는지 확인하지 못함: app.new_schema")
 
 
-def test_import_unknown_original_namespace_requires_explicit_ui_selection(monkeypatch, tmp_path):
-    import json
-    app = QApplication.instance() or QApplication([])
+def test_forced_name_field_is_on_main_line(monkeypatch, tmp_path):
+    """A dump that names no DB of this engine needs a typed name, on the target line, not in the closed panel."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text: warnings.append(text))
+    created = _fake_workers(monkeypatch)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "pg", source_engine="postgresql", source_schema="app"))
+        dialog._update_target_options()
+        assert dialog.chk_other_name.isChecked() and not dialog.chk_other_name.isEnabled()
+        assert dialog.advanced_panel.isHidden()
+        assert not dialog.combo_target_schema.isHidden() and dialog.combo_target_schema.isEditable()
+        assert not dialog.advanced_panel.isAncestorOf(dialog.combo_target_schema)
+        assert dialog.lbl_target_name.isHidden()
+        assert dialog.lbl_advanced_summary.text().startswith("켜진 고급 설정: 다른 DB 이름(")
+        # Another engine's dump cannot be verified in a copy either, and the panel says why.
+        assert not dialog.chk_verify_copy.isEnabled() and not dialog.lbl_verify_note.isHidden()
+        dialog.do_import()
+        assert warnings == ["원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요."] and created == []
+        dialog.combo_target_schema.setCurrentText("typed")
+        dialog.do_import()
+        assert _imports(created)[0].kwargs["target_schema"] == "typed"
+
+        # A dump of this engine names its DB again: the name is no longer forced.
+        dialog.input_dir.setText(_write_dump(tmp_path / "mysql"))
+        dialog._update_target_options()
+        assert not dialog.chk_other_name.isChecked() and dialog.chk_other_name.isEnabled()
+        assert dialog.combo_target_schema.isHidden() and dialog.lbl_target_name.text() == "app"
+        assert dialog.chk_verify_copy.isEnabled() and dialog.lbl_verify_note.isHidden()
+    finally:
+        dialog.close()
+
+
+def test_timezone_toggle_disabled_for_dump_with_source_timezone(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
     dialog = RustDumpImportDialog()
-    (tmp_path / "_tunnelforge_dump.json").write_text(json.dumps({"source_engine": "postgresql", "database": "app"}), encoding="utf-8")
-    dialog._update_original_schema_option(str(tmp_path))
-    assert not dialog.chk_use_original.isEnabled()
-    assert not dialog.chk_use_original.isChecked()
-    assert dialog.combo_target_schema.isEnabled()
-    assert dialog.combo_target_schema.isEditable()
-    dialog.close()
+    try:
+        assert not dialog.chk_timezone.isEnabled() and dialog.lbl_timezone_note.isHidden()  # no dump yet
+        dialog.input_dir.setText(_write_dump(tmp_path / "legacy", source_timezone=None))
+        dialog._update_target_options()
+        assert dialog.chk_timezone.isEnabled() and dialog.lbl_timezone_note.isHidden()
+        dialog.chk_timezone.setChecked(True)
+        assert dialog.combo_timezone.isEnabled()
+        dialog.input_dir.setText(_write_dump(tmp_path / "current"))
+        dialog._update_target_options()
+        assert not dialog.chk_timezone.isEnabled() and not dialog.chk_timezone.isChecked()
+        assert not dialog.combo_timezone.isEnabled()
+        assert dialog.lbl_timezone_note.text() == "이 덤프는 시간대가 기록되어 있어 그대로 씁니다."
+        assert not dialog.lbl_timezone_note.isHidden()
+    finally:
+        dialog.close()
+
+
+def test_advanced_summary_lists_active_toggles(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    dialog = RustDumpImportDialog()
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump", source_timezone=None))
+        dialog._update_target_options()
+        assert dialog.lbl_advanced_summary.text() == ""
+        dialog.chk_other_name.setChecked(True)
+        dialog.combo_target_schema.setCurrentText("abc")
+        dialog.chk_verify_copy.setChecked(True)
+        dialog.chk_timezone.setChecked(True)
+        dialog.spin_threads.setValue(4)
+        assert dialog.lbl_advanced_summary.text() == (
+            "켜진 고급 설정: 다른 DB 이름(abc), 먼저 복사본에서 검증, 타임존 한국 시간(+09:00), 동시 작업 4개")
+        dialog._toggle_advanced_options()
+        assert not dialog.advanced_panel.isHidden() and dialog.btn_advanced.text() == "고급 설정 닫기"
+    finally:
+        dialog.close()
+
+
+def _settings(values):
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: values.get(key, default)
+    config_manager.set_app_settings.side_effect = values.update
+    return config_manager
+
+
+def test_only_threads_and_verify_in_copy_are_remembered(monkeypatch, tmp_path):
+    """F5: the toggles are remembered; the other DB name and the timezone never are."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    _fake_workers(monkeypatch)
+    saved = {}
+    dialog = RustDumpImportDialog(config_manager=_settings(saved), tunnel_config={"environment": "development"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump", source_timezone=None))
+        dialog._update_target_options()
+        dialog.chk_other_name.setChecked(True)
+        dialog.combo_target_schema.setCurrentText("other")
+        dialog.chk_verify_copy.setChecked(True)
+        dialog.chk_timezone.setChecked(True)
+        dialog.spin_threads.setValue(3)
+        dialog.do_import()
+    finally:
+        dialog.close()
+    assert saved == {"rust_dump_import_dir": str(tmp_path / "dump"), "rust_dump_last_dump_dir": str(tmp_path / "dump"),
+                     "rust_dump_import_threads": 3, "rust_dump_import_verify_in_copy": True}
+
+    again = RustDumpImportDialog(config_manager=_settings(saved))
+    try:
+        assert again.spin_threads.value() == 3 and again.chk_verify_copy.isChecked()
+        assert not again.chk_other_name.isChecked() and not again.chk_timezone.isChecked()
+        assert again.combo_target_schema.currentText() != "other"
+    finally:
+        again.close()
+
+
+@pytest.mark.parametrize("threads, verify", [("8", "true"), (None, 1), (99, None), (True, [True]), (0, "yes")])
+def test_old_or_edited_settings_do_not_break_the_dialog(monkeypatch, threads, verify):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    dialog = RustDumpImportDialog(config_manager=_settings({
+        "rust_dump_import_threads": threads, "rust_dump_import_verify_in_copy": verify,
+        # Keys earlier versions might have left behind are ignored.
+        "rust_dump_import_mode": "merge", "rust_dump_import_timezone": "kst"}))
+    try:
+        assert dialog.spin_threads.value() == 8 and not dialog.chk_verify_copy.isChecked()
+        assert not dialog.chk_timezone.isChecked()
+    finally:
+        dialog.close()
 
 
 @pytest.mark.parametrize("restore_status", ["ready_for_switch", "ready_for_review"])
-def test_safe_restore_candidate_handoff_excludes_credentials(monkeypatch, restore_status):
-    app = QApplication.instance() or QApplication([])
+def test_verified_copy_swaps_or_stops_without_any_handoff_button(monkeypatch, restore_status):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    monkeypatch.setattr(QMessageBox, "information", MagicMock(side_effect=AssertionError("success opens no window")))
+    scheduled = []
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QTimer.singleShot", lambda delay, callback: scheduled.append(callback))
     dialog = RustDumpImportDialog()
-    assert dialog._get_selected_import_mode() == "safe"
-    dialog.last_import_mode = "safe"
-    dialog.on_raw_output(json.dumps({
-        "event": "safe_restore_ready", "status": restore_status, "verified": True,
-        "original_unchanged": True, "cutover_pending": True,
-        "original_target": {"engine": "mysql", "database": "original"},
-        "candidate_target": {"engine": "mysql", "host": "127.0.0.1", "port": 3333, "database": "candidate", "password": "private", "user": "private-user"},
-    }))
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.information", lambda *args: None)
-    dialog.on_finished(True, "candidate ready")
-    assert ("전환 대기" if restore_status == "ready_for_switch" else "검토 필요") in dialog.label_status.text()
-    assert dialog.btn_copy_restore_target.isEnabled()
-    dialog.copy_restore_target()
-    copied = json.loads(app.clipboard().text())
-    assert copied["database"] == "candidate"
-    assert "password" not in copied and "user" not in copied
-    assert dialog.import_audit["original_target"]["database"] == "original"
-    dialog.close()
+    try:
+        for removed in ("btn_copy_restore_target", "btn_review_restore", "btn_manage_backups"):
+            assert not hasattr(dialog, removed)
+        dialog.last_import_mode = "safe"
+        dialog.on_raw_output(json.dumps({
+            "event": "safe_restore_ready", "status": restore_status, "verified": True,
+            "original_unchanged": True, "cutover_pending": True, "candidate_created": True, "namespace_existed": True,
+            "original_target": {"engine": "mysql", "database": "original"},
+            "candidate_target": {"engine": "mysql", "host": "127.0.0.1", "port": 3333, "database": "candidate",
+                                 "password": "private", "user": "private-user"},
+        }))
+        dialog.on_finished(True, "candidate ready")
+        if restore_status == "ready_for_switch":
+            assert scheduled == [dialog._plan_promotion]  # the swap follows without asking again
+        else:
+            assert scheduled == []
+            box = _open_failure_window(dialog)
+            assert [button.text() for button in box.buttons()] == ["닫기"]
+            assert box.text().startswith("복사본 candidate에 넣고 검증했지만 다음 이유로 교체하지 않았습니다.")
+            assert "작업 목록 > 복원 백업 관리" in box.text() and "private" not in box.text()
+            assert dialog.label_status.text() == "교체하지 않았습니다 · 원본은 그대로입니다"
+    finally:
+        dialog.close()
 
 
-def test_destructive_import_decline_never_starts_worker(monkeypatch, tmp_path):
-    app = QApplication.instance() or QApplication([])
+def test_plan_decline_starts_no_import_worker(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
-    question = MagicMock(return_value=QMessageBox.StandardButton.No)
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", question)
-    dialog = RustDumpImportDialog()
-    dialog.input_dir.setText(str(tmp_path))
-    dialog.radio_replace.setChecked(True)
-    dialog._confirm_production_guard = MagicMock(return_value=True)
+    created = _fake_workers(monkeypatch, preview={**_NOTHING_OVERWRITTEN, "replace": ["users"]})
+    shown = _fake_plan_dialog(monkeypatch, accept=False)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
     dialog._begin_error_report_operation = MagicMock()
-    dialog.do_import()
-    assert question.call_args.args[-1] == QMessageBox.StandardButton.No
-    dialog._begin_error_report_operation.assert_not_called()
-    assert dialog.worker is None
-    dialog.close()
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        assert len(shown) == 1 and _imports(created) == []
+        dialog._begin_error_report_operation.assert_not_called()
+        assert dialog.btn_import.isEnabled() and dialog.input_dir.isEnabled() and dialog.btn_stop.isHidden()
+        assert dialog.last_import_mode == ""
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgresql"])
+def test_import_success_has_no_modal(monkeypatch, engine):
+    """Success puts one sentence on the status line and in the log, and opens no window."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    for name in ("information", "warning"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.finish_promotion_job", lambda *a: None)
+    dialog = RustDumpImportDialog()
+    try:
+        dialog.last_import_context = {"engine": engine}
+        dialog.last_import_mode = "replace"
+        dialog.import_results = {"users": {"status": "done"}, "orders": {"status": "done"}}
+        dialog.on_finished(True, "Rust DB Core import 완료")
+        assert dialog.label_status.text() == "✅ 덤프 테이블 2개를 교체했습니다"
+        assert dialog.txt_log.item(dialog.txt_log.count() - 1).text() == "✅ 덤프 테이블 2개를 교체했습니다"
+
+        name = "app" if engine == "mysql" else "appdb.app"
+        kind = "DB" if engine == "mysql" else "스키마"
+        dialog.import_audit = {"created_namespace": name}
+        dialog.on_finished(True, "Rust DB Core import 완료")
+        assert dialog.label_status.text() == f"✅ 새 {kind} {name}을 만들어 넣었습니다"
+
+        dialog.last_import_mode = "safe"
+        dialog.import_audit = {"restore_status": "completed_new_target", "namespace_existed": False,
+                               "namespace_created": True, "verified": True, "original_unchanged": True,
+                               "cutover_pending": False,
+                               "candidate_target": {"engine": engine, "database": "appdb" if engine == "postgresql" else "app",
+                                                    "schema": "app"}}
+        dialog.on_finished(True, "verified")
+        assert dialog.label_status.text() == f"✅ 새 {kind} {name}을 만들어 넣었습니다"
+
+        dialog._promotion_action = "confirm"
+        dialog._on_promotion_finished(True, "", {"status": "promoted", "backup_namespace": "tf_backup_1"})
+        assert dialog.label_status.text() == "✅ 교체했습니다. 이전 테이블은 tf_backup_1에 있습니다"
+    finally:
+        dialog.close()
 
 
 def test_import_table_result_helpers_ignore_fk_restore_and_non_dict_entries():
@@ -1857,11 +1950,13 @@ def test_import_close_while_running_still_stops_and_closes_after_finish(monkeypa
 
 
 def _stop_test_dialog(monkeypatch):
-    QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
     for name in ("warning", "information"):
         monkeypatch.setattr(QMessageBox, name, lambda *a, **k: None)
-    return RustDumpImportDialog()
+    dialog = RustDumpImportDialog()
+    dialog._test_app = app  # keep the QApplication alive while the dialog exists
+    return dialog
 
 
 def test_stopped_safe_import_shows_stopped_status_not_safe_restore_failure(monkeypatch):
@@ -2042,7 +2137,7 @@ def test_safe_restore_failure_passes_core_reason_through(monkeypatch, tmp_path):
         dialog.on_finished(False, message)
 
         box = _open_failure_window(dialog)
-        assert "원본 미변경" in box.text()
+        assert box.windowTitle() == "Import 실패" and "원본은 그대로입니다" in box.text()
         assert f"users: {_LOAD_FAILED}" in box.text()
         assert "MySqlError" not in box.text() and "absent from this dump" not in box.text()
         assert "남겨 둠" not in box.text()  # no copy was made

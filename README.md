@@ -21,7 +21,7 @@
 
 </div>
 
-- **Safe restore by default** — imports go into a new namespace and are verified before anything changes; Overwrite swaps under the original name only after verification and keeps the old data as a backup.
+- **Import like mysqldump, but see it first** — Import replaces the dump's tables one at a time and leaves other tables alone; before it overwrites anything it lists what will be replaced, created and left alone. One advanced setting verifies everything in a copy first and swaps it in only when it checks out, keeping the old tables as a backup.
 - **MySQL ↔ PostgreSQL migration you can check** — preflight, plan, chunked copy, resume, and a verify step that compares every row by its source key (by digest for tables without a key).
 - **Rust core for the database work** — auth, schema, SQL, dump/import, and migration run in `tunnelforge-core`; Python/PyQt6 is the UI.
 - **Live-database CI gates** — required pull-request checks run dump/import, safe-restore, and cross-engine tests against real MySQL and PostgreSQL containers.
@@ -85,7 +85,7 @@ Questions or ideas: [Discussions](https://github.com/sanghyun-io/tunnelforge/dis
 
 | | Feature | Description |
 |:-:|---------|-------------|
-| ⚡ | **Export/Import** | Validated table transfers with engine-specific snapshot policies, parallel MySQL paths, and explicit restore constraints. Import modes: **Safe restore** (default: restores into a new namespace and verifies before anything changes), **Overwrite** (safe restore, then an automatic swap under the original name; the old data is kept as a backup), and **Replace** (advanced; table by table like mysqldump; destructive). See the [Export/Import contract](docs/export_import_policy.md). |
+| ⚡ | **Export/Import** | Validated table transfers with engine-specific snapshot policies, parallel MySQL paths, and explicit restore constraints. Import has one default: like mysqldump, each dump table is dropped and recreated in turn, and a confirmation lists the tables it would overwrite before it starts. Advanced settings: import under another name, **verify in a copy first, then swap** (the old tables stay as a backup), choose the timezone of an old dump, and the number of parallel tasks. See the [Export/Import contract](docs/export_import_policy.md). |
 | 🧩 | **Orphan Record Analysis** | Detect rows left behind by broken foreign-key relationships and export the findings as a report. |
 | 📋 | **Job List** | Export, Import, promotion and migration runs with persistent run history, filters, reports and failure reasons. See [job list](docs/job_list.md). |
 | 🗄️ | **Backup Lifecycle** | List and reconcile backups, clean them up only after verification, and roll back with a guided flow. |
@@ -110,10 +110,10 @@ Scheduled backups are available (backup tasks only: DST-aware times, at most one
 | <img src="docs/images/main.png" width="420" alt="Connection list with groups and live tunnel status" /> | <img src="docs/images/sql_editor.png" width="420" alt="SQL editor with schema tree and results" /> |
 | Tunnels grouped by environment with live status (connected, reconnecting). | Schema tree, highlighting, validation, results and transaction controls. |
 
-| Connection settings | Safe import modes | MySQL ↔ PostgreSQL |
+| Connection settings | Import | MySQL ↔ PostgreSQL |
 |:-:|:-:|:-:|
-| <img src="docs/images/connection.png" width="270" alt="Connection dialog with SSH tunnel and TLS" /> | <img src="docs/images/import.png" width="270" alt="Import dialog with safe restore, overwrite and replace" /> | <img src="docs/images/migration.png" width="270" alt="Cross-engine migration wizard" /> |
-| SSH tunnel through a bastion, verified TLS, saved credentials. | Safe restore by default; overwrite swaps only after verification. | Step-by-step migration with pre-checks and verification. |
+| <img src="docs/images/connection.png" width="270" alt="Connection dialog with SSH tunnel and TLS" /> | <img src="docs/images/import.png" width="270" alt="Import dialog with its target line and advanced settings" /> | <img src="docs/images/migration.png" width="270" alt="Cross-engine migration wizard" /> |
+| SSH tunnel through a bastion, verified TLS, saved credentials. | Shows what it will overwrite first; verify-in-copy is one setting away. | Step-by-step migration with pre-checks and verification. |
 
 <sub>Screenshots use demo data.</sub>
 
@@ -161,7 +161,7 @@ Click **"Add Tunnel"** and configure your connection:
 Select a tunnel → Click **"Connect"** → Use the database tools:
 - **SQL Editor** — Run queries, review results, commit or roll back changes
 - **Export** — Backup schemas or selected tables
-- **Import** — Restore from backup files with **Safe restore** (default), **Overwrite**, or **Replace** (advanced, destructive); see the [Export/Import contract](docs/export_import_policy.md)
+- **Import** — Restore from backup files: the dump's tables are replaced one at a time, after a confirmation that lists what gets overwritten; advanced settings add another target name, verify in a copy first then swap, a timezone for old dumps, and the thread count; see the [Export/Import contract](docs/export_import_policy.md)
 - Right-click a tunnel for **Schema Diff**, **Migration Analysis**, and **Orphan Record Analysis**
 
 ---

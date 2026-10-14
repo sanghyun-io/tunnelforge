@@ -703,7 +703,8 @@ def test_import_dump_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
             input_dir,
             target_schema=None,
             threads=8,
-            import_mode="replace",
+            *,
+            import_mode,
             progress_callback=None,
             table_chunk_progress_callback=None,
         ):
@@ -1091,6 +1092,7 @@ class TestRustDumpImporter:
 
         success, message, results = importer.import_dump(
             str(dump_dir),
+            import_mode='replace',
             table_status_callback=lambda *event: status_events.append(event),
         )
 

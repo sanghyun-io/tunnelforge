@@ -177,6 +177,7 @@ class RustDumpWorker(QThread):
         self.finished.emit(success, msg)
 
     def _run_import(self):
+        import_mode = self.kwargs['import_mode']  # 기본값 없음: replace 또는 safe 를 호출자가 정한다
         importer = RustDumpImporter(self.config)
         self._active_runner = importer
 
@@ -184,16 +185,16 @@ class RustDumpWorker(QThread):
             self.kwargs['input_dir'],
             self.kwargs.get('target_schema'),
             self.kwargs.get('threads', 8),
-            self.kwargs.get('import_mode', 'safe'),
-            self.kwargs.get('timezone_sql'),
-            self._on_progress,
-            self._on_table_progress,
-            self._on_detail,
-            self._on_table_status,
-            self._on_raw_output,
-            self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
-            self._on_metadata,
-            self._on_table_chunk_progress,
+            import_mode=import_mode,
+            timezone_sql=self.kwargs.get('timezone_sql'),
+            progress_callback=self._on_progress,
+            table_progress_callback=self._on_table_progress,
+            detail_callback=self._on_detail,
+            table_status_callback=self._on_table_status,
+            raw_output_callback=self._on_raw_output,
+            retry_tables=self.kwargs.get('retry_tables'),
+            metadata_callback=self._on_metadata,
+            table_chunk_progress_callback=self._on_table_chunk_progress,
             use_source_timezone=self.kwargs.get('use_source_timezone', True),
         )
         self.error_code = getattr(importer, "last_error_code", None)

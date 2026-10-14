@@ -87,13 +87,34 @@ def finish_export_job(dialog, success: bool, message: str) -> None:
 
 # ------------------------------------------------------------------ import
 
-def begin_import_job(dialog, target: str, import_mode: str, threads: int) -> Optional[str]:
+IMPORT_LABEL = "Import · 덤프 테이블 교체"
+# 작업 목록이 백업 관리를 여는 표시 (job_list_dialog.BACKUP_MODE_MARKERS).
+COPY_SUFFIX = " · 복사본 검증"
+
+
+def import_job_label(audit: Dict[str, Any], other_name: str = "") -> str:
+    """작업 목록의 Import 실행 모드. 고른 설정이 아니라 실제로 일어난 일로 정한다."""
+    label = IMPORT_LABEL
+    if audit.get("candidate_created") is True and audit.get("namespace_existed") is not False:
+        label += COPY_SUFFIX  # 복사본(이후 백업)이 남았다
+    elif audit.get("restore_status") == "completed_new_target" or audit.get("created_namespace"):
+        label += " · 새 DB 생성"
+    if other_name:
+        label += f" · 대상 {other_name}"
+    return label
+
+
+def _other_name(dialog) -> str:
+    return str((getattr(dialog, "last_import_context", None) or {}).get("other_name") or "")
+
+
+def begin_import_job(dialog, target: str) -> Optional[str]:
     # 보고서는 실행마다 새 파일이라 Core 가 이름을 알려 줄 때 기록한다 (record_import_report).
     try:
         profile = getattr(dialog, "tunnel_config", None) or {}
         context = {"profile_id": profile.get("id"), "profile_name": profile.get("name")}
         return job_begin(
-            KIND_IMPORT, target=target, mode=f"{import_mode} · 스레드 {threads}",
+            KIND_IMPORT, target=target, mode=import_job_label({}, _other_name(dialog)),
             **_profile(context, getattr(dialog, "connection_info", "")),
         )
     except Exception:
@@ -122,6 +143,7 @@ def finish_import_job(dialog, success: bool, message: str, done: int, errors: in
         audit = getattr(dialog, "import_audit", {}) or {}
         report = audit.get("report_path") or ""
         job_finish(job_id, status, error="" if success else message, report_path=str(report),
+                   mode=import_job_label(audit, _other_name(dialog)),
                    details={"tables_done": done, "tables_failed": errors, "tables_not_run": blocked,
                             "restore_status": str(audit.get("restore_status") or "")})
     except Exception:
