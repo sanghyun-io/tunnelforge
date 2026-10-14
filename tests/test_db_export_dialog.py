@@ -198,12 +198,13 @@ def test_export_completion_names_the_snapshot_method(monkeypatch):
     method = "같은 시점으로 내보냄 · 동시 작업 1개 (잠금 권한이 없어 연결 하나로 읽음)"
     dialog.worker = _finished_worker("single_connection", method)
     try:
-        dialog.on_finished(True, "Rust DB Core export 완료: 1개 테이블, 2 rows")
+        # The exporter's message already ends with the method (RustDumpExporter._run_rust_dump).
+        dialog.on_finished(True, f"Export 완료: 테이블 1개, 행 2개 · {method}")
 
         assert f"\n내보낸 방법: {method}" in dialog._show_export_done.call_args.args[0]
         visible = [dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count())]
-        assert f"📋 내보낸 방법: {method}" in visible
-        assert any(entry.endswith(f"내보낸 방법: {method}") for entry in dialog.log_entries)
+        assert visible == [f"✅ Export 완료: 테이블 1개, 행 2개 · {method}"], "the method is in the run log once"
+        assert sum(method in entry for entry in dialog.log_entries) == 1, "and once in the saved log"
     finally:
         dialog.worker = None
         dialog.close()
@@ -245,7 +246,7 @@ def test_incomplete_export_prompt_lists_objects_inline_up_to_ten(monkeypatch):
     assert "이 객체 없이 내보내기 (불완전)" in text
     assert "구조와 데이터는 모두 내보냅니다" in text
     assert "'담을 수 없는 객체는 빼고 내보내기'를 켜 두면 다음부터 묻지 않습니다" in text
-    assert all(f"• 테이블 t: 트리거 trg{i}는 덤프에 담을 수 없습니다" in text for i in range(10))
+    assert all(f"• 테이블 t: 트리거(trg{i})는 덤프에 담을 수 없습니다" in text for i in range(10))
     assert "trigger:t:" not in text, "the core's codes stay behind '자세히'"
     assert "trg10" not in text and "trg11" not in text
     assert text.rstrip().endswith("외 2개")
@@ -270,9 +271,9 @@ def test_incomplete_export_completion_says_structure_and_data_were_exported(monk
         dialog.on_finished(True, "ok")
 
         shown = dialog._show_export_done.call_args.args[0]
-        assert "일부 객체를 제외한 불완전 Export" in shown
-        assert "구조와 데이터는 모두 내보냈으며" in shown
-        assert "결과 경고" in shown and "manifest" not in shown
+        assert "일부 객체를 빼고 내보냈습니다(불완전 Export)" in shown
+        assert "구조와 데이터는 모두 담았습니다" in shown
+        assert "실행 로그의 'Export 경고' 줄" in shown and "manifest" not in shown
     finally:
         dialog.worker = None
         dialog.close()
@@ -309,7 +310,11 @@ def test_new_export_strings_have_english_translations(monkeypatch):
             module._UNSYNCHRONIZED_EXPORT_WARNING,
             module._INCOMPLETE_EXPORT_WARNING,
             module._PARTIAL_EXPORT_NOTE,
+            module._PARTIAL_EXPORT_NOTE_POSTGRESQL,
             module._FK_AUTO_TOOLTIP,
+            "DB를 선택하세요.",
+            "테이블을 하나 이상 고르세요.",
+            "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다.",
             "이 객체 없이 내보내기 (불완전)",
             "사용자가 '이 객체 없이 내보내기 (불완전)'를 선택했습니다.",
             "일부 객체를 제외한 Export (불완전) 진행 중...",
@@ -332,12 +337,14 @@ def test_new_export_strings_have_english_translations(monkeypatch):
         translated = {text: i18n.translate_text(text) for text in korean}
         translated.update({
             "summary": dialog._advanced_summary(),
-            "refusal": "\n".join(describe_export_refusal(["trigger:t:trg", "generated_column:t:g", "event:e"])),
+            "refusal": "\n".join(describe_export_refusal([
+                "trigger:t:trg", "generated_column:t:g", "event:e", "unsupported_index:t:i", "cross_schema_fk:t:f",
+                "non_transactional_table:t:MEMORY"])),
         })
         english = []
         monkeypatch.setattr(QMessageBox, "exec", lambda box: english.append(_box_snapshot(box)))
         dialog._prompt_incomplete_export([f"trigger:t:trg{i}" for i in range(11)])
-        english.append(_box_snapshot(dialog._show_lossy_refusal(["generated_column:t:g"])))
+        english.append(_box_snapshot(dialog._show_lossy_refusal(["generated_column:t:g", "trigger:t:trg"])))
         dialog.chk_include_fk.setChecked(True)
         dialog.chk_unsynchronized.setChecked(True)
         dialog.chk_allow_incomplete.setChecked(True)
@@ -1250,6 +1257,13 @@ def test_lossy_refusal_offers_no_proceed(monkeypatch):
         visible = [dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count())]
         assert "❌ 담을 수 없는 객체가 있어 Export를 시작하지 않았습니다." in visible
         assert not any("generated_column" in line for line in visible)
+        # The saved log keeps sentences, not the core's English text.
+        result = [entry for entry in dialog.log_entries if "결과 메시지:" in entry]
+        assert len(result) == 1 and result[0].endswith(
+            "결과 메시지: 담을 수 없는 객체가 있어 Export를 시작하지 않았습니다. "
+            "테이블 t: 계산 열 g의 정의를 덤프에 담을 수 없습니다; 테이블 t: 트리거(trg)는 덤프에 담을 수 없습니다")
+        assert not any("dump.run refused" in entry for entry in dialog.log_entries)
+        assert dialog.label_data.text() == "📦 데이터: -" and dialog.label_status.text() == "⏹ Export를 시작하지 않았습니다"
     finally:
         dialog.worker = None
         dialog.close()
@@ -1265,9 +1279,31 @@ def test_lossy_refusal_window_names_the_table_and_has_only_close(monkeypatch):
         dialog.close()
 
     assert "• 테이블 orders: 계산 열 total의 정의를 덤프에 담을 수 없습니다" in snapshot["text"]
-    assert snapshot["text"].rstrip().endswith("이 테이블을 목록에서 빼면 진행할 수 있습니다.")
+    assert snapshot["text"].rstrip().endswith(
+        "목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다. "
+        "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."), "a full export says what unchecking costs"
+    assert "그 밖에" not in snapshot["text"]
     assert "generated_column" not in snapshot["text"]
     assert set(snapshot["buttons"]) == {"export_refusal_close", "export_refusal_details"}
+
+
+def test_lossy_refusal_lists_the_omittable_objects_apart(monkeypatch):
+    # The core puts the omittable objects after the lossy ones (dump_scope_refusal) when any is lossy.
+    dialog = _dialog(monkeypatch)
+    dialog.export_tables = ["orders", "logs"]  # already a table export: no word about views
+    try:
+        box = dialog._show_lossy_refusal(["generated_column:orders:total", "trigger:orders:trg", "deprecated_engine:logs:MyISAM"])
+        text = box.text()
+        box.close()
+    finally:
+        dialog.close()
+
+    lossy, _, rest = text.partition("그 밖에 빼고 내보낼 수 있는 객체:")
+    assert lossy.startswith("덤프에 그대로 담을 수 없는 테이블 정의가 있어 Export를 시작하지 않았습니다.")
+    assert "계산 열 total" in lossy and "trg" not in lossy and "MyISAM" not in lossy
+    assert "• 테이블 orders: 트리거(trg)는 덤프에 담을 수 없습니다" in rest
+    assert "• 테이블 logs: MyISAM 엔진이라 다른 테이블과 같은 시점으로 읽을 수 없습니다. 빼고 내보내면 이 테이블이 통째로 빠집니다" in rest
+    assert rest.rstrip().endswith("목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다.")
 
 
 def test_allow_incomplete_toggle_skips_prompt(monkeypatch):
@@ -1505,7 +1541,7 @@ def test_export_sends_exact_checked_list(monkeypatch, tmp_path):
     try:
         _uncheck(dialog, "items", "logs")
         assert not dialog.lbl_partial_note.isHidden()
-        assert "뷰·저장 프로시저·함수·예약 이벤트는 담지 않습니다" in dialog.lbl_partial_note.text()
+        assert dialog.lbl_partial_note.text() == "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
         dialog.do_export()
         (worker,) = _CapturingWorker.created
         assert worker.task_type == "export_tables"
@@ -1533,9 +1569,14 @@ def test_fk_toggle_off_shows_missing_parent_notice_and_checks_nothing(monkeypatc
         _uncheck(dialog, "customers", "logs")
         assert dialog.get_selected_tables() == ["items", "orders"], "nothing is checked for the user"
         assert dialog.lbl_fk_note.text() == (
-            "고른 테이블 1개가 고르지 않은 테이블을 참조합니다 (orders → customers). 고른 테이블만 내보냅니다.")
+            "고른 테이블 1개의 연결된 부모 테이블이 체크되어 있지 않습니다 (orders → customers). 고른 테이블만 내보냅니다. "
+            "함께 담으려면 고급 설정에서 '연결된 부모 테이블 함께 담기'를 켜세요.")
         _uncheck(dialog, "orders")
         assert "(items → orders)" in dialog.lbl_fk_note.text()
+        dialog._fk_outside = [{"child": f"c{i}", "constraint": "fk", "parent": "p"} for i in range(5)]
+        dialog._update_table_notes()
+        assert "(c0 → p, c1 → p, c2 → p 외 2개)" in dialog.lbl_fk_note.text()
+        dialog._refresh_table_state()
         dialog.do_export()
         (worker,) = _CapturingWorker.created
         assert worker.kwargs["tables"] == ["items"]
@@ -1555,7 +1596,8 @@ def test_fk_toggle_on_disables_auto_added_parents(monkeypatch, tmp_path):
         # items needs orders, which needs customers: both are checked again and locked while it needs them.
         assert dialog.get_selected_tables() == ["customers", "items", "orders"]
         assert not _enabled(items["orders"]) and not _enabled(items["customers"]) and _enabled(items["items"])
-        assert items["orders"].toolTip() == "연결된 테이블이라 자동으로 담음"
+        assert items["orders"].toolTip() == (
+            "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는 테이블의 체크를 풀면 다시 고를 수 있습니다.")
         assert items["orders"].text() == "orders", "the table name stays the list text"
         assert dialog.lbl_fk_note.text() == "연결된 부모 테이블 자동 추가 2개: customers, orders"
         dialog.do_export()
@@ -1576,12 +1618,81 @@ def test_fk_lookup_failure_says_so_and_exports_the_checked_tables(monkeypatch, t
     dialog = _toggles_dialog(monkeypatch, tmp_path)
     dialog.connector.facade.inspect_schema = MagicMock(side_effect=RuntimeError("core down"))
     try:
-        dialog.chk_include_fk.setChecked(True)
         _uncheck(dialog, "customers")
         assert dialog.lbl_fk_note.text() == "연결된 부모 테이블을 확인하지 못했습니다. 고른 테이블만 내보냅니다."
         dialog.do_export()
         assert _CapturingWorker.created[0].kwargs["tables"] == ["items", "logs", "orders"]
+        assert _CapturingWorker.created[0].kwargs["include_fk_parents"] is False, "the toggle is off"
         assert _CapturingWorker.created[0].kwargs["fk_parents_outside_dump"] is None
+    finally:
+        dialog.close()
+
+
+def test_fk_lookup_failure_with_the_toggle_on_reads_them_again_in_the_worker(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    dialog.connector.facade.inspect_schema = MagicMock(side_effect=RuntimeError("core down"))
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        _uncheck(dialog, "customers")
+        assert dialog.lbl_fk_note.text() == (
+            "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다.")
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        # The worker's own exporter reads the FKs and adds the parents, or fails the run if it cannot.
+        assert (worker.kwargs["tables"], worker.kwargs["include_fk_parents"]) == (["items", "logs", "orders"], True)
+    finally:
+        dialog.close()
+
+
+def test_fk_lookup_is_tried_again_after_a_failure(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    working = dialog.connector.facade.inspect_schema
+    dialog.connector.facade.inspect_schema = MagicMock(side_effect=RuntimeError("core down"))
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        _uncheck(dialog, "customers")
+        assert dialog.get_selected_tables() == ["items", "logs", "orders"]
+        dialog.connector.facade.inspect_schema = working  # the core is back
+        _uncheck(dialog, "logs")
+        assert dialog.get_selected_tables() == ["customers", "items", "orders"], "the parents are read on the next change"
+        assert dialog.lbl_fk_note.text() == "연결된 부모 테이블 자동 추가 1개: customers"
+    finally:
+        dialog.close()
+
+
+def test_unchecking_a_needed_parent_keeps_a_table_export_and_says_so(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        _uncheck(dialog, "customers")  # orders still needs it: checked again and locked
+        assert dialog.get_selected_tables() == ["customers", "items", "logs", "orders"]
+        assert not _enabled(_items(dialog)["customers"])
+        assert not dialog._is_full_export(), "the user unchecked a table: no views, routines or events"
+        assert not dialog.lbl_partial_note.isHidden()
+        assert dialog.lbl_fk_note.text() == "연결된 부모 테이블 자동 추가 1개: customers"
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        assert worker.task_type == "export_tables"
+        assert (worker.kwargs["tables"], worker.kwargs["auto_added_tables"]) == (["customers", "items", "logs", "orders"],
+                                                                                 ["customers"])
+    finally:
+        dialog.close()
+
+
+def test_select_all_makes_an_added_parent_the_users_own_pick(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        dialog.deselect_all_tables()
+        _items(dialog)["orders"].setCheckState(Qt.CheckState.Checked)
+        assert dialog._fk_auto_added == {"customers"}
+        dialog.select_all_tables()
+        assert dialog._fk_auto_added == set() and dialog._is_full_export()
+        assert _enabled(_items(dialog)["customers"]) and _items(dialog)["customers"].toolTip() == ""
+        _uncheck(dialog, "items", "orders")
+        assert dialog.get_selected_tables() == ["customers", "logs"], "'전체 선택' picked customers too"
+        dialog.chk_include_fk.setChecked(False)
+        assert dialog.get_selected_tables() == ["customers", "logs"]
     finally:
         dialog.close()
 
@@ -1625,14 +1736,14 @@ def test_toggle_states_are_remembered_but_not_the_table_selection(monkeypatch, t
     assert {key: store[key] for key in store if key.startswith("rust_dump_export_") and key != "rust_dump_export_base_dir"
             and key != "rust_dump_export_dir"} == {
         "rust_dump_export_threads": 4, "rust_dump_export_compression": "none",
-        "rust_dump_export_include_fk_parents": True, "rust_dump_export_unsynchronized": True,
-        "rust_dump_export_allow_incomplete": True, "rust_dump_export_folder_mode": "auto",
+        "rust_dump_export_include_fk_parents": True, "rust_dump_export_folder_mode": "auto",
         "rust_dump_export_folder_manual_name": "",
-    }
-    again = _toggles_dialog(monkeypatch, tmp_path, settings=store)
+    }, "giving up consistency or leaving objects out is chosen again for every run"
+    again = _toggles_dialog(monkeypatch, tmp_path, settings={
+        **store, "rust_dump_export_unsynchronized": True, "rust_dump_export_allow_incomplete": True})
     try:
         assert (again.chk_include_fk.isChecked(), again.chk_unsynchronized.isChecked(),
-                again.chk_allow_incomplete.isChecked()) == (True, True, True)
+                again.chk_allow_incomplete.isChecked()) == (True, False, False), "older saved values are not read"
         assert (again.spin_threads.value(), again._compression()) == (4, "none")
         assert again._is_full_export(), "the table list starts fully checked again"
     finally:
@@ -1680,8 +1791,8 @@ def test_advanced_summary_lists_active_toggles(monkeypatch, tmp_path):
         dialog.combo_compression.setCurrentIndex(dialog.combo_compression.findData("none"))
         dialog.chk_manual_folder.setChecked(True)
         assert dialog.lbl_advanced_summary.text() == (
-            "적용 중인 고급 설정: 연결된 부모 테이블 함께 담기, 시점 일관성 포기, 담을 수 없는 객체 빼기, "
-            "동시 작업 2개, 압축 안 함, 폴더 이름(입력 필요)")
+            "적용 중인 고급 설정: 연결된 부모 테이블 함께 담기, 시점 일관성 포기 허용, 담을 수 없는 객체 빼기, "
+            "동시 작업 2개, 압축 안 함, 폴더 이름(비우면 export_시각)")
         dialog._toggle_advanced_options()
         assert not dialog.advanced_panel.isHidden() and dialog.btn_advanced.text() == "고급 설정 닫기"
     finally:

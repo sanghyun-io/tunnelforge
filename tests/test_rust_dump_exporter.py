@@ -390,7 +390,7 @@ class TestRustDumpExporter:
 
         success, message = exporter.export_full_schema("app", str(tmp_path / "dump"), mysql_snapshot_mode="auto")
         assert (success, message) == (
-            False, "이 Rust DB Core는 내보내기 방법 자동 선택을 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."
+            False, "이 Rust DB Core는 내보내는 방법 자동 선택을 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."
         )
         assert exporter.export_tables("app", ["t"], str(tmp_path / "part"), include_fk_parents=False,
                                       mysql_snapshot_mode="auto")[0] is False
@@ -443,7 +443,7 @@ class TestRustDumpExporter:
 
         _, message = exporter.export_full_schema("app", str(tmp_path / "dump"), threads=threads, mysql_snapshot_mode="auto")
 
-        assert message == "Rust DB Core export 완료: 2개 테이블, 5 rows" + (f" · {expected}" if expected else "")
+        assert message == "Export 완료: 테이블 2개, 행 5개" + (f" · {expected}" if expected else "")
 
     def test_export_full_schema_passes_zstd_compression_to_rust_dump(self, tmp_path):
         """압축 선택이 Rust dump.run payload로 전달됨"""
@@ -540,7 +540,7 @@ class TestRustDumpExporter:
         assert tables == ["order_items", "orders", "users"]
         assert facade.inspect_endpoint.database == "app"
         assert facade.payload["tables"] == ["order_items", "orders", "users"]
-        assert "3개 테이블" in msg
+        assert "테이블 3개" in msg
 
     def test_fetch_fk_parents_reads_one_inspect_and_keeps_only_parents_of_this_schema(self):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
@@ -658,7 +658,7 @@ class TestRustDumpExporter:
         success, msg = exporter.export_full_schema('app', str(tmp_path / 'dump'))
 
         assert success is True
-        assert "View 2개" in msg
+        assert "뷰 2개" in msg
 
     def test_export_full_schema_preserves_postgresql_engine_in_rust_payload(self, tmp_path):
         """PostgreSQL export는 Rust dump.run payload에 postgresql endpoint를 보낸다."""
@@ -1883,10 +1883,12 @@ def test_every_code_the_core_can_emit_has_a_korean_sentence():
     assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []
 
 @pytest.mark.parametrize("code, expected", [
-    ("trigger:orders:trg_audit", "테이블 orders: 트리거 trg_audit는 덤프에 담을 수 없습니다"),
-    ("non_transactional_table:logs:MEMORY", "테이블 logs: MEMORY 엔진 테이블이라 같은 시점으로 담을 수 없습니다"),
+    ("trigger:orders:trg_audit", "테이블 orders: 트리거(trg_audit)는 덤프에 담을 수 없습니다"),
+    ("non_transactional_table:logs:MEMORY",
+     "테이블 logs: MEMORY 엔진이라 다른 테이블과 같은 시점으로 읽을 수 없습니다. 빼고 내보내면 이 테이블이 통째로 빠집니다"),
+    ("unsupported_index:orders:idx_name", "테이블 orders: 인덱스(idx_name)는 덤프에 담을 수 없습니다"),
     ("generated_column:orders:total", "테이블 orders: 계산 열 total의 정의를 덤프에 담을 수 없습니다"),
-    ("cross_schema_fk:orders:fk_other", "테이블 orders: 외래 키 fk_other가 다른 DB의 테이블을 가리켜 덤프에 담을 수 없습니다"),
+    ("cross_schema_fk:orders:fk_other", "테이블 orders: 외래 키(fk_other)가 다른 DB나 스키마의 테이블을 가리켜 덤프에 담을 수 없습니다"),
     ("routine:fn_total", "저장 프로시저·함수 fn_total: 덤프에 담을 수 없습니다"),
     ("event:ev_nightly", "예약 이벤트 ev_nightly: 덤프에 담을 수 없습니다"),
     # An unknown code still names its table; the code itself stays behind "자세히".
@@ -1904,11 +1906,12 @@ def test_every_refusal_kind_the_core_reports_has_a_sentence():
     from pathlib import Path
 
     from src.core import i18n
-    from src.exporters.rust_dump_exporter import describe_export_refusal
+    from src.exporters.rust_dump_exporter import LOSSY_REFUSAL_KINDS, describe_export_refusal
 
     source = (Path(__file__).resolve().parents[1] / "migration_core" / "src" / "dump.rs").read_text(encoding="utf-8")
     lossy = re.search(r"LOSSY_SCHEMA_KINDS: \[&str; \d+\] = \[([^\]]*)\]", source).group(1)
     omitted = re.search(r"fn scoped_omitted_objects\b.*?\n\}", source, re.DOTALL).group(0)
+    assert set(re.findall(r'"([a-z_]+)"', lossy)) == LOSSY_REFUSAL_KINDS, "the dialog splits a refusal by the core's own list"
     kinds = set(re.findall(r'"([a-z_]+)"', lossy)) | set(re.findall(r'"([a-z_]+)"', omitted))
     assert {"generated_column", "cross_schema_fk", "trigger", "non_transactional_table", "routine", "event"} <= kinds
 

@@ -30,7 +30,7 @@ _SNAPSHOT_LABELS = {
     "single_connection": "내보내는 방법 자동 선택",
     "parallel_unsynchronized": "내보내는 방법 자동 선택(시점 일관성 포기 허용)",
 }
-_COMPRESSION_LABELS = {"none": "압축 안 함", "zstd": "zstd 압축"}
+_COMPRESSION_LABELS = {"none": "압축 안 함", "zstd": "압축(zstd)"}
 
 
 def _export_mode(dialog) -> str:
@@ -66,7 +66,11 @@ def finish_export_job(dialog, success: bool, message: str) -> None:
     if not job_id:
         return
     try:
+        refusal = getattr(getattr(dialog, "worker", None), "export_refusal", None)
         if getattr(dialog, "_cancel_requested", False):
+            status = STATUS_CANCELLED
+        elif not success and isinstance(refusal, dict) and refusal.get("objects") and refusal.get("bypassable"):
+            # 뺄 수 있는 객체만 있었는데 사용자가 '취소'를 골랐다: 실패가 아니라 사용자가 멈춘 것이다.
             status = STATUS_CANCELLED
         elif success:
             # 실제로 빠진 객체가 있을 때만 불완전: '빼고 내보내기'를 켜 두었어도 뺄 것이 없었으면 완전한 Export 다.

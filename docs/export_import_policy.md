@@ -413,50 +413,66 @@ or not at its default. There are no scope or snapshot choices.
   starts with every table checked. All checked sends a full export
   (`dump.run` without `tables`: tables plus views, routines and events); unchecking
   any table sends exactly the checked tables, and one line under the list says
-  that views, stored procedures, functions and events are then left out.
-  "다시 열기" from the job list with `scope: full` checks everything again; with
-  `scope: tables` it checks the tables recorded for that run.
+  that views, stored procedures, functions and events are then left out
+  (`일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.`;
+  PostgreSQL leaves out "·이벤트"). A table the user unchecked that the FK toggle
+  checks again as a parent keeps the run a table export, even when every box ends
+  up checked. "다시 열기" from the job list with `scope: full` checks everything
+  again; with `scope: tables` it checks the tables recorded for that run.
 - **Method.** The dialog always sends `mysql_snapshot_mode: "auto"` with
   `mysql_snapshot_fallback` (`single_connection`, or `parallel_unsynchronized`
   with the toggle below), so it never asks about privileges and never retries on
   its own. A lock not granted in time (TF-STATUS-185) falls to the table lock and
   then to one connection, never to the unsynchronized method unless the user
-  turned that on. The completion window and the log show the method line built
-  from the result (`내보낸 방법: 같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어
-  테이블만 잠깐 잠금)`), and the unsynchronized warning only when the result says
+  turned that on. The completion window shows the method line built from the
+  result (`내보낸 방법: 같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어 테이블만
+  잠깐 잠금)`); the run log and the saved log show it once, at the end of the
+  result line (`✅ Export 완료: 테이블 3개, 행 100개 · 같은 시점으로 내보냄 · 동시 작업 8개`).
+  The unsynchronized warning shows only when the result says
   `parallel_unsynchronized`.
 
 | Setting | Default | Sends |
 | --- | --- | --- |
-| 연결된 부모 테이블 함께 담기 | off | nothing new: the dialog checks the FK parents itself (below) and sends `include_fk_parents: false` with the checked list. Not used when every table is checked. |
-| 시점 일관성 포기하고 더 빠르게 | off | `mysql_snapshot_fallback: "parallel_unsynchronized"`: only when neither shared lock works. Hidden for PostgreSQL. |
-| 담을 수 없는 객체는 빼고 내보내기 | off | `allow_incomplete: true` from the start, so the omittable objects below are left out without asking. |
+| 연결된 부모 테이블 함께 담기 | off | nothing new: the dialog checks the FK parents itself (below) and sends `include_fk_parents: false` with the checked list; `true` only when it could not read the FKs, so the worker reads them again and fails the run if it still cannot. A full export (every table checked by the user) is not affected. |
+| 시점 일관성 포기하고 더 빠르게 | off | `mysql_snapshot_fallback: "parallel_unsynchronized"`: only when neither shared lock works. Hidden for PostgreSQL. The summary line says `시점 일관성 포기 허용`. |
+| 담을 수 없는 객체는 빼고 내보내기 | off | `allow_incomplete: true` from the start, so the omittable objects below are left out without asking. A table that is not InnoDB (MyISAM, MEMORY, ...) is then left out entirely, structure and data; the tooltip says so. |
 | 동시 작업 수 / 압축 | 8 / 압축(zstd) | `threads` / `compression` (압축 안 함 = `none`). |
-| 폴더 이름 직접 정하기 | off | the typed folder name; off, the folder is `{connection}_{DB}_{time}`. |
+| 폴더 이름 직접 정하기 | off | the typed folder name, or `export_{time}` when it is left empty (the summary line says `폴더 이름(비우면 export_시각)`); off, the folder is `{connection}_{DB}_{time}`. |
 
-Every toggle state is remembered when a run starts (`rust_dump_export_threads`,
-`_compression`, `_include_fk_parents`, `_unsynchronized`, `_allow_incomplete`,
-`_folder_mode`, `_folder_manual_name`); the table selection is not. A value of the
-wrong type is ignored. The earlier "자동 지정 / 수동 지정" folder setting keeps
+The settings are remembered when a run starts (`rust_dump_export_threads`,
+`_compression`, `_include_fk_parents`, `_folder_mode`, `_folder_manual_name`); the
+table selection is not, and neither are "시점 일관성 포기하고 더 빠르게" and "담을 수
+없는 객체는 빼고 내보내기": like Import's other database name and time zone, a value
+turned on once must not make a later backup less consistent or less complete
+without being chosen again. A value of the wrong type is ignored. The earlier
+"자동 지정 / 수동 지정" folder setting keeps
 working: a saved `rust_dump_export_folder_mode: "manual"` turns "폴더 이름 직접
 정하기" on with the saved name, and the old name/schema/timestamp switches
 (`rust_dump_export_folder_use_*`) are no longer read.
 
 **FK parents.** `RustDumpExporter.fetch_fk_parents(schema)` reads the FKs with one
-`schema.inspect` call, which the dialog keeps per schema and makes only once a
-table is unchecked; the pure `fk_parent_closure(picks, deps)` and
-`fk_parents_outside(picks, deps)` run on every change of the list, whatever the
-toggle says. Only parents that are tables of the same schema count.
+`schema.inspect` call, which the dialog makes only once a table is unchecked, on
+the UI thread under a wait cursor, and keeps per schema; a failed read is not
+kept, so the next change of the list reads again. The pure
+`fk_parent_closure(picks, deps)` and `fk_parents_outside(picks, deps)` run on
+every change of the list, whatever the toggle says. Only parents that are tables
+of the same schema count.
 
 - Toggle off: nothing is checked for the user. When a checked table references a
-  table that is not checked, one line under the list names them (`고른 테이블 1개가
-  고르지 않은 테이블을 참조합니다 (orders → customers). 고른 테이블만 내보냅니다.`), and
-  `_export_metadata.json` records `fk_parents_outside_dump: [{child, constraint,
-  parent}]` (`null` when the FKs could not be read; the line then says so).
+  table that is not checked, one line under the list names them and the toggle
+  (`고른 테이블 1개의 연결된 부모 테이블이 체크되어 있지 않습니다 (orders → customers).
+  고른 테이블만 내보냅니다. 함께 담으려면 고급 설정에서 '연결된 부모 테이블 함께 담기'를
+  켜세요.`; past three pairs, `외 N개`), and `_export_metadata.json` records
+  `fk_parents_outside_dump: [{child, constraint, parent}]` (`null` when the FKs
+  could not be read; the line then says so).
 - Toggle on: the parents a checked table needs, transitively, are checked and
-  disabled (tooltip "연결된 테이블이라 자동으로 담음", item text unchanged) while a
-  checked table needs them, with a line `연결된 부모 테이블 자동 추가 N개: ...`.
-  Unchecking the child releases them back to unchecked. The run sends exactly the
+  disabled (tooltip "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는
+  테이블의 체크를 풀면 다시 고를 수 있습니다.", item text unchanged) while a checked
+  table needs them, with a line `연결된 부모 테이블 자동 추가 N개: ...`. Unchecking the
+  child releases them back to unchecked; "전체 선택" makes them the user's own picks,
+  so unchecking a child later keeps them. When the FKs could not be read, the line
+  says they are checked again when the export starts, and the run sends
+  `include_fk_parents: true`. The run otherwise sends exactly the
   checked list with `include_fk_parents: false` and `auto_added_tables`, which the
   metadata keeps as `added_fk_tables` (only names that are in the dump). The job
   record's re-run tables hold only the user's own picks.
@@ -469,13 +485,26 @@ toggle says. Only parents that are tables of the same schema count.
 **Refusals.** `describe_export_refusal(objects)` words each `kind:table:name`
 code as `테이블 {T}: {reason}` (routines, events and materialized views by their
 own name); an unknown code becomes `테이블 {T}: 이 객체는 담을 수 없습니다`. The codes
-themselves open from "자세히". An omittable refusal (`bypassable: true`) asks once,
-only while "담을 수 없는 객체는 빼고 내보내기" is off, and names that toggle; a lossy
-one (`bypassable: false`) shows the same sentences with only Close and "이 테이블을
-목록에서 빼면 진행할 수 있습니다". Neither lands in the generic "Export 실패" window
-or sends an error report. A run that left objects out (manifest `Object not
-exported` warnings) is recorded as `partial` and says so; with the toggle on but
-nothing to leave out, the export is complete.
+themselves open from "자세히". Names sit in parentheses so the Korean particle
+follows the noun (`트리거(trg)는`, `인덱스(idx)는`, `외래 키(fk)가 다른 DB나 스키마의
+테이블을 가리켜`); a table that is not InnoDB reads `MyISAM 엔진이라 다른 테이블과 같은
+시점으로 읽을 수 없습니다. 빼고 내보내면 이 테이블이 통째로 빠집니다`. An omittable
+refusal (`bypassable: true`) asks once ("덤프에 담을 수 없는 객체가 있습니다"), only
+while "담을 수 없는 객체는 빼고 내보내기" is off, and names that toggle. A lossy one
+(`bypassable: false`) has only Close: the core lists the lossy definitions
+(`LOSSY_REFUSAL_KINDS`, the same six kinds as `dump.rs`) and then every omittable
+object in scope, so the window puts the lossy ones under "덤프에 그대로 담을 수 없는
+테이블 정의가 있어 Export를 시작하지 않았습니다." and the rest under "그 밖에 빼고 내보낼
+수 있는 객체:", and ends with "목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수
+있습니다." (on a full export, followed by the partial-export line above). Neither
+lands in the generic "Export 실패" window or sends an error report. The job record
+and the saved log keep the sentences (`담을 수 없는 객체가 있어 Export를 시작하지
+않았습니다. 테이블 orders: ...`, up to 10 plus `외 N개`), never the core's English text,
+which goes to the app log only; a declined omittable refusal is `cancelled`, a lossy
+one `failed`. A run that left objects out (manifest `Object not exported` warnings)
+is recorded as `partial` and says so ("일부 객체를 빼고 내보냈습니다(불완전 Export).
+... 빠진 객체는 실행 로그의 'Export 경고' 줄에서 볼 수 있습니다."); with the toggle on
+but nothing to leave out, the export is complete.
 
 ## Schema support and explicit limits
 

@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QListWidget, QListWidgetItem, QGroupBox,
     QFileDialog, QMessageBox, QProgressBar,
     QWidget, QAbstractItemView,
-    QSplitter, QScrollArea
+    QSplitter, QScrollArea, QApplication
 )
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
@@ -27,7 +27,7 @@ from src.core.path_safety import safe_filename_component, safe_output_dir
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, RustDumpExporter, build_rust_dump_config, check_rust_dump,
     DEFAULT_DUMP_COMPRESSION, DEFAULT_DUMP_THREADS,
-    describe_export_refusal, fk_parent_closure, fk_parents_outside,
+    describe_export_refusal, fk_parent_closure, fk_parents_outside, LOSSY_REFUSAL_KINDS,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.workers.error_reporting_worker import (
@@ -45,21 +45,22 @@ _UNSYNCHRONIZED_EXPORT_WARNING = (
     "테이블마다 다른 시점에 읽었습니다. 테이블 간 시점 일관성이 보장되지 않습니다."
 )
 _INCOMPLETE_EXPORT_WARNING = (
-    "일부 객체를 제외한 불완전 Export입니다. 나머지 테이블의 구조와 데이터는 모두 내보냈으며, "
-    "제외된 객체는 결과 로그와 결과 경고를 확인하세요."
+    "일부 객체를 빼고 내보냈습니다(불완전 Export). 나머지 테이블의 구조와 데이터는 모두 담았습니다. "
+    "빠진 객체는 실행 로그의 'Export 경고' 줄에서 볼 수 있습니다."
 )
 _INCOMPLETE_EXPORT_LIST_LIMIT = 10
-_PARTIAL_EXPORT_NOTE = "일부 테이블만 고르면 테이블만 담고, 뷰·저장 프로시저·함수·예약 이벤트는 담지 않습니다."
-_FK_AUTO_TOOLTIP = "연결된 테이블이라 자동으로 담음"
+_PARTIAL_EXPORT_NOTE = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
+_PARTIAL_EXPORT_NOTE_POSTGRESQL = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수는 빠집니다."
+_FK_AUTO_TOOLTIP = "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는 테이블의 체크를 풀면 다시 고를 수 있습니다."
 _FK_NOTICE_EXAMPLES = 3
 
 # 기억하는 고급 설정 (Import 대화상자처럼 실행할 때 저장한다). 고른 테이블은 기억하지 않는다.
+# '시점 일관성 포기'와 '담을 수 없는 객체 빼기'는 기억하지 않는다: Import 가 다른 DB 이름과 시간대를
+# 기억하지 않듯, 한 번 켠 값이 다음 백업을 묻지 않고 덜 완전하게 만들면 안 된다.
 _PERSISTED_EXPORT_OPTIONS = (
     "rust_dump_export_threads",
     "rust_dump_export_compression",
     "rust_dump_export_include_fk_parents",
-    "rust_dump_export_unsynchronized",
-    "rust_dump_export_allow_incomplete",
     # 예전 '자동 지정/수동 지정' 설정과 같은 키: 'manual' 이면 '폴더 이름 직접 정하기'가 켜진다.
     "rust_dump_export_folder_mode",
     "rust_dump_export_folder_manual_name",
@@ -507,7 +508,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.list_tables.itemChanged.connect(self._refresh_table_state)
         table_layout.addWidget(self.list_tables)
 
-        self.lbl_partial_note = QLabel(_PARTIAL_EXPORT_NOTE)
+        self.lbl_partial_note = QLabel(self._partial_note())
         self.lbl_partial_note.setWordWrap(True)
         self.lbl_partial_note.setStyleSheet("color: #7f8c8d;")
         self.lbl_partial_note.setVisible(False)
@@ -542,8 +543,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         panel_layout = QVBoxLayout(self.advanced_panel)
 
         self.chk_include_fk = QCheckBox("연결된 부모 테이블 함께 담기")
-        self.chk_include_fk.setToolTip("고른 테이블이 외래 키로 가리키는 테이블을 자동으로 함께 고릅니다. "
-                                       "모든 테이블을 고르면 쓰지 않습니다.")
+        self.chk_include_fk.setToolTip("고른 테이블이 외래 키로 가리키는 부모 테이블을 자동으로 체크하고, 필요한 동안 잠가 둡니다. "
+                                       "모든 테이블을 고른 전체 Export에는 영향이 없습니다.")
         self.chk_include_fk.toggled.connect(self._refresh_table_state)
         self.chk_include_fk.toggled.connect(self._update_advanced_summary)
         panel_layout.addWidget(self.chk_include_fk)
@@ -557,8 +558,9 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         panel_layout.addWidget(self.chk_unsynchronized)
 
         self.chk_allow_incomplete = QCheckBox("담을 수 없는 객체는 빼고 내보내기")
-        self.chk_allow_incomplete.setToolTip("트리거·저장 프로시저·예약 이벤트처럼 덤프에 담을 수 없는 것이 있으면 묻지 않고 빼고 "
-                                             "내보냅니다. 결과는 완전한 백업이 아닙니다. 계산 열처럼 테이블 정의가 바뀌는 것은 "
+        self.chk_allow_incomplete.setToolTip("트리거·저장 프로시저·예약 이벤트처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 "
+                                             "묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. "
+                                             "결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 "
                                              "빼고 내보낼 수 없습니다.")
         self.chk_allow_incomplete.toggled.connect(self._update_advanced_summary)
         panel_layout.addWidget(self.chk_allow_incomplete)
@@ -613,6 +615,13 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _engine(self) -> str:
         return build_rust_dump_config(self.connector).engine
 
+    def _namespace_noun(self) -> str:
+        """What the selector picks: a PostgreSQL schema, a MySQL database."""
+        return "스키마" if self._engine() == "postgresql" else "DB"
+
+    def _partial_note(self) -> str:
+        return _PARTIAL_EXPORT_NOTE_POSTGRESQL if self._engine() == "postgresql" else _PARTIAL_EXPORT_NOTE
+
     def _compression(self) -> str:
         return self.combo_compression.currentData() or DEFAULT_DUMP_COMPRESSION
 
@@ -627,7 +636,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if self.chk_include_fk.isChecked():
             items.append(translate_text("연결된 부모 테이블 함께 담기"))
         if self._snapshot_fallback() == "parallel_unsynchronized":
-            items.append(translate_text("시점 일관성 포기"))
+            items.append(translate_text("시점 일관성 포기 허용"))
         if self.chk_allow_incomplete.isChecked():
             items.append(translate_text("담을 수 없는 객체 빼기"))
         if self.spin_threads.value() != DEFAULT_DUMP_THREADS:
@@ -636,7 +645,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             items.append(translate_text(self.combo_compression.currentText()))
         if self.chk_manual_folder.isChecked():
             name = self.input_manual_folder.text().strip()
-            items.append(translate_text("폴더 이름({})").format(name) if name else translate_text("폴더 이름(입력 필요)"))
+            items.append(translate_text("폴더 이름({})").format(name) if name else translate_text("폴더 이름(비우면 export_시각)"))
         return translate_text("적용 중인 고급 설정: {}").format(", ".join(items)) if items else ""
 
     def _update_advanced_summary(self, *_):
@@ -654,8 +663,6 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if index >= 0:
             self.combo_compression.setCurrentIndex(index)
         self.chk_include_fk.setChecked(get("rust_dump_export_include_fk_parents", False) is True)
-        self.chk_unsynchronized.setChecked(get("rust_dump_export_unsynchronized", False) is True)
-        self.chk_allow_incomplete.setChecked(get("rust_dump_export_allow_incomplete", False) is True)
         manual_name = get("rust_dump_export_folder_manual_name", "")
         self.input_manual_folder.setText(manual_name if isinstance(manual_name, str) else "")
         self.chk_manual_folder.setChecked(get("rust_dump_export_folder_mode", "auto") == "manual")
@@ -665,8 +672,6 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.spin_threads.value(),
             self._compression(),
             self.chk_include_fk.isChecked(),
-            self.chk_unsynchronized.isChecked(),
-            self.chk_allow_incomplete.isChecked(),
             "manual" if self.chk_manual_folder.isChecked() else "auto",
             self.input_manual_folder.text(),
         )))
@@ -949,19 +954,30 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _table_items(self) -> List[QListWidgetItem]:
         return [self.list_tables.item(i) for i in range(self.list_tables.count())]
 
+    def _release_auto_added(self, item: QListWidgetItem) -> None:
+        """An FK parent the dialog added becomes an ordinary table again (enabled, no tooltip)."""
+        self._fk_auto_added.discard(item.text())
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+        item.setToolTip("")
+
     def _set_table_checks(self, wanted, every: bool = False) -> None:
         """Checks the (visible, unless ``every``) tables ``wanted(item)`` picks and unchecks the rest, then
-        recomputes the FK parents once. A table added only as an FK parent is left to that recomputation."""
+        recomputes the FK parents once. A table it picks becomes the user's own pick even when it had been
+        added as an FK parent; one it does not pick that was added is left to that recomputation."""
         self._syncing_tables = True
         try:
             if every:  # a new set of picks: no table stays added for the old ones
                 for item in self._table_items():
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
-                    item.setToolTip("")
-                self._fk_auto_added = set()
+                    self._release_auto_added(item)
             for item in self._table_items():
-                if (every or not item.isHidden()) and item.text() not in self._fk_auto_added:
-                    item.setCheckState(Qt.CheckState.Checked if wanted(item) else Qt.CheckState.Unchecked)
+                if not every and item.isHidden():
+                    continue
+                if wanted(item):
+                    if item.text() in self._fk_auto_added:
+                        self._release_auto_added(item)
+                    item.setCheckState(Qt.CheckState.Checked)
+                elif item.text() not in self._fk_auto_added:
+                    item.setCheckState(Qt.CheckState.Unchecked)
         finally:
             self._syncing_tables = False
         self._refresh_table_state()
@@ -987,22 +1003,33 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         return [name for name in self.get_selected_tables() if name not in self._fk_auto_added]
 
     def _is_full_export(self) -> bool:
-        """모든 테이블이 체크되어 있으면 전체 Export 다 (뷰·저장 프로시저·예약 이벤트까지)."""
-        return all(item.checkState() == Qt.CheckState.Checked for item in self._table_items())
+        """사용자가 모든 테이블을 체크했으면 전체 Export 다 (뷰·저장 프로시저·예약 이벤트까지).
+
+        체크를 푼 테이블이 부모 테이블로 다시 담겼으면 모두 체크되어 있어도 고른 테이블 Export 다."""
+        return not self._fk_auto_added and all(
+            item.checkState() == Qt.CheckState.Checked for item in self._table_items())
 
     def _fk_parent_map(self) -> Optional[dict]:
-        """이 스키마의 외래 키 부모 (fetch_fk_parents), 스키마마다 한 번만 읽는다. 읽지 못하면 None."""
+        """이 스키마의 외래 키 부모 (fetch_fk_parents), 스키마마다 한 번 읽는다. 읽지 못하면 None 이고,
+        다음 변경 때 다시 읽는다."""
         schema = self.combo_schema.currentText()
-        if schema not in self._fk_cache:
-            facade = getattr(self.connector, "facade", None)
-            deps = None
-            if facade is not None:
-                try:
-                    deps = RustDumpExporter(build_rust_dump_config(self.connector), facade=facade).fetch_fk_parents(schema)
-                except Exception as exc:
-                    logger.warning("Export FK parent lookup failed: %s", exc)
-            self._fk_cache[schema] = deps
-        return self._fk_cache[schema]
+        if schema in self._fk_cache:
+            return self._fk_cache[schema]
+        facade = getattr(self.connector, "facade", None)
+        if facade is None:
+            return None
+        # ponytail: schema.inspect runs on the UI thread over the shared facade (a wait cursor while it
+        # does, once per schema); move it to a QThread with its own core if large schemas freeze the list.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            deps = RustDumpExporter(build_rust_dump_config(self.connector), facade=facade).fetch_fk_parents(schema)
+        except Exception as exc:
+            logger.warning("Export FK parent lookup failed: %s", exc)
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._fk_cache[schema] = deps
+        return deps
 
     def _refresh_table_state(self, *_):
         """Recomputes the FK parents of the checked tables on every change, whatever the toggle says.
@@ -1045,17 +1072,21 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.lbl_partial_note.setVisible(partial)
         note = ""
         if partial and self._fk_outside is None:
-            note = translate_text("연결된 부모 테이블을 확인하지 못했습니다. 고른 테이블만 내보냅니다.")
-        elif partial and self._fk_auto_added:
+            note = translate_text(
+                "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다."
+                if self.chk_include_fk.isChecked()
+                else "연결된 부모 테이블을 확인하지 못했습니다. 고른 테이블만 내보냅니다.")
+        elif self._fk_auto_added:
             note = translate_text("연결된 부모 테이블 자동 추가 {}개: {}").format(
                 len(self._fk_auto_added), ", ".join(sorted(self._fk_auto_added)))
         elif partial and self._fk_outside:
             children = sorted({item["child"] for item in self._fk_outside})
-            pairs = [f"{item['child']} → {item['parent']}" for item in self._fk_outside[:_FK_NOTICE_EXAMPLES]]
+            pairs = ", ".join(f"{item['child']} → {item['parent']}" for item in self._fk_outside[:_FK_NOTICE_EXAMPLES])
             if len(self._fk_outside) > _FK_NOTICE_EXAMPLES:
-                pairs.append(translate_text("외 {}개").format(len(self._fk_outside) - _FK_NOTICE_EXAMPLES))
-            note = translate_text("고른 테이블 {}개가 고르지 않은 테이블을 참조합니다 ({}). 고른 테이블만 내보냅니다.").format(
-                len(children), ", ".join(pairs))
+                pairs += " " + translate_text("외 {}개").format(len(self._fk_outside) - _FK_NOTICE_EXAMPLES)
+            note = translate_text(
+                "고른 테이블 {}개의 연결된 부모 테이블이 체크되어 있지 않습니다 ({}). 고른 테이블만 내보냅니다. "
+                "함께 담으려면 고급 설정에서 '연결된 부모 테이블 함께 담기'를 켜세요.").format(len(children), pairs)
         self.lbl_fk_note.setText(note)
         self.lbl_fk_note.setVisible(bool(note))
 
@@ -1071,12 +1102,12 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         schema = self.combo_schema.currentText()
 
         if not schema:
-            QMessageBox.warning(self, "오류", "스키마를 선택하세요.")
+            QMessageBox.warning(self, "오류", "스키마를 선택하세요." if self._engine() == "postgresql" else "DB를 선택하세요.")
             return
 
         # 모두 체크되어 있으면 전체 Export, 아니면 체크한 테이블만
         if not self._is_full_export() and not self.get_selected_tables():
-            QMessageBox.warning(self, "오류", "최소 하나의 테이블을 선택하세요.")
+            QMessageBox.warning(self, "오류", "테이블을 하나 이상 고르세요.")
             return
 
         output_dir = self._resolve_output_dir(schema)
@@ -1098,7 +1129,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._add_log(f"{'='*60}")
         self._add_log("Rust DB Core Export 시작")
         self._add_log(f"시작 시간: {self.export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        self._add_log(f"스키마: {schema}")
+        self._add_log(f"{self._namespace_noun()}: {schema}")
         self._add_log(f"Export 범위: {'전체' if self._is_full_export() else '고른 테이블'}")
         if self.export_tables:
             self._add_log(f"선택 테이블: {', '.join(self.export_tables)}")
@@ -1194,11 +1225,12 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         )
         if self._is_full_export():
             return RustDumpWorker("export_schema", config, **options)
-        # Exactly the checked tables: the parents the toggle added are already among them.
+        # Exactly the checked tables: the parents the toggle added are already among them. When the FKs
+        # could not be read here, the worker reads them again with the toggle on (and fails if it cannot).
         return RustDumpWorker(
             "export_tables", config,
             tables=self.get_selected_tables(),
-            include_fk_parents=False,
+            include_fk_parents=self.chk_include_fk.isChecked() and self._fk_outside is None,
             auto_added_tables=sorted(self._fk_auto_added),
             fk_parents_outside_dump=self._fk_outside,
             **options,
@@ -1238,15 +1270,14 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         message_box = QMessageBox(self)
         message_box.setIcon(QMessageBox.Icon.Warning)
         message_box.setTextFormat(Qt.TextFormat.PlainText)
-        title = translate_text("Export 범위에 보존할 수 없는 객체가 있습니다")
+        title = translate_text("덤프에 담을 수 없는 객체가 있습니다")
         message_box.setWindowTitle(title)
         message_box.setText(
             translate_text(
-                "선택한 범위에 덤프에 담을 수 없는 객체가 있어 Export를 시작하지 않았습니다 "
-                "(파일은 만들지 않았습니다).\n\n"
-                "'이 객체 없이 내보내기 (불완전)'를 선택하면 아래 객체만 빼고 "
-                "나머지 테이블의 구조와 데이터는 모두 내보냅니다. 결과는 완전한 백업이 아닙니다. "
-                "고급 설정의 '담을 수 없는 객체는 빼고 내보내기'를 켜 두면 다음부터 묻지 않습니다.\n\n"
+                "덤프에 담을 수 없는 객체가 있어 Export를 시작하지 않았습니다. 아직 파일은 만들지 않았습니다.\n\n"
+                "'이 객체 없이 내보내기 (불완전)'를 누르면 아래 객체만 빼고 "
+                "나머지 테이블의 구조와 데이터는 모두 내보냅니다. 완전한 백업은 아닙니다. "
+                "고급 설정에서 '담을 수 없는 객체는 빼고 내보내기'를 켜 두면 다음부터 묻지 않습니다.\n\n"
                 "뺄 객체:"
             )
             + "\n" + "\n".join(self._refusal_lines(objects))
@@ -1267,18 +1298,27 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         return message_box.clickedButton() is proceed_button
 
     def _show_lossy_refusal(self, objects: List[str]) -> QMessageBox:
-        """테이블 정의가 바뀌는 객체: 빼고 내보낼 수 없으니 이유만 보여 주고 닫기만 둔다."""
+        """테이블 정의가 바뀌는 객체: 빼고 내보낼 수 없으니 이유만 보여 주고 닫기만 둔다.
+
+        Core 는 뺄 수 있는 객체(트리거, InnoDB 가 아닌 테이블, 루틴·이벤트)도 같은 목록 뒤에 붙인다: 따로 보여 준다."""
+        lossy = [item for item in objects if str(item).partition(":")[0] in LOSSY_REFUSAL_KINDS] or objects
+        others = [item for item in objects if item not in lossy]
         box = QMessageBox(self)
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setTextFormat(Qt.TextFormat.PlainText)
         title = translate_text("Export를 시작하지 않았습니다")
         box.setWindowTitle(title)
+        hint = translate_text("목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다.")
+        if not self.export_tables:  # a full export becomes a table export once a table is unchecked
+            hint += " " + translate_text(self._partial_note())
         box.setText(
-            translate_text("아래 테이블의 정의를 덤프에 그대로 담을 수 없어 Export를 시작하지 않았습니다 "
-                           "(파일은 만들지 않았습니다).")
-            + "\n\n" + "\n".join(self._refusal_lines(objects)) + "\n\n"
-            + translate_text("이 테이블을 목록에서 빼면 진행할 수 있습니다.")
+            translate_text("덤프에 그대로 담을 수 없는 테이블 정의가 있어 Export를 시작하지 않았습니다. "
+                           "아직 파일은 만들지 않았습니다.")
+            + "\n\n" + "\n".join(self._refusal_lines(lossy))
+            + ("\n\n" + translate_text("그 밖에 빼고 내보낼 수 있는 객체:") + "\n" + "\n".join(self._refusal_lines(others))
+               if others else "")
+            + "\n\n" + hint
         )
         close_button = box.addButton(translate_text("닫기"), QMessageBox.ButtonRole.RejectRole)
         close_button.setObjectName("export_refusal_close")
@@ -1344,6 +1384,14 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 self._retry_allow_incomplete()
                 return
             self._add_log("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다 (사용자가 취소).")
+        if refused:
+            # 작업 목록과 저장한 로그에는 읽을 수 있는 문장만 남긴다. Core 원문은 앱 로그에만 둔다.
+            logger.info("Export refused by the core: %s", message)
+            objects = list(refusal["objects"])
+            message = " ".join([translate_text("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다."),
+                                "; ".join(describe_export_refusal(objects[:_INCOMPLETE_EXPORT_LIST_LIMIT]))])
+            if len(objects) > _INCOMPLETE_EXPORT_LIST_LIMIT:
+                message += " " + translate_text("외 {}개").format(len(objects) - _INCOMPLETE_EXPORT_LIST_LIMIT)
         run = getattr(self.worker, "export_run", None)
         if success and isinstance(run, dict):
             self._snapshot_mode = run.get("mode") or self._snapshot_mode
@@ -1373,11 +1421,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         unsynchronized = self._snapshot_mode == "parallel_unsynchronized"
         if success:
-            self.txt_log.addItem(f"✅ 완료: {message}")
-            if self._snapshot_method:
-                # 실제로 쓴 방법 한 줄 (권한이 없어 다른 방법으로 넘어갔으면 그 이유도)
-                self.txt_log.addItem(f"📋 내보낸 방법: {self._snapshot_method}")
-                self._add_log(f"내보낸 방법: {self._snapshot_method}")
+            # message 는 Core 가 실제로 쓴 방법으로 끝난다 ("Export 완료: 테이블 3개, 행 100개 · 같은 시점으로 내보냄 · ...").
+            self.txt_log.addItem(f"✅ {message}")
             if unsynchronized:
                 self.txt_log.addItem(f"⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}")
                 self._add_log(f"⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}")
@@ -1410,7 +1455,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 "❌ " + translate_text("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다.") if refused
                 else f"❌ 실패: {message}"
             )
-            self.label_data.setText("📦 데이터: Export 실패")
+            self.label_data.setText("📦 데이터: -" if refused else "📦 데이터: Export 실패")
             self.label_estimated_rows.setText("📐 예상 전체: -")
             self.label_speed.setText("⚡ 속도: -")
             self.label_status.setText(
@@ -1680,7 +1725,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 f.write("Rust DB Core Export Log\n")
                 f.write("=" * 70 + "\n\n")
 
-                f.write(f"스키마: {safe(self.export_schema)}\n")
+                f.write(f"{self._namespace_noun()}: {safe(self.export_schema)}\n")
                 f.write(f"Export 범위: {'고른 테이블' if self.export_tables else '전체'}\n")
                 if self.export_tables:
                     f.write(

@@ -142,13 +142,39 @@ def test_export_failure_cancel_and_incomplete_choice_statuses(history, cancel, o
         dialog.close()
 
 
+@pytest.mark.parametrize("bypassable, expected", [
+    (True, jh.STATUS_CANCELLED),  # the user chose 취소 in the "빼고 내보낼까요" window
+    (False, jh.STATUS_FAILED),
+])
+def test_a_refused_export_is_recorded_in_sentences(history, monkeypatch, bypassable, expected):
+    from PyQt6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: None)  # 취소: nothing clicked
+    monkeypatch.setattr(QMessageBox, "open", lambda box: None)
+    dialog = make_export()
+    try:
+        start_export(dialog)
+        worker = idle_worker()
+        worker.export_run = None
+        worker.export_refusal = {"objects": ["trigger:orders:trg"] if bypassable else ["generated_column:orders:total"],
+                                 "bypassable": bypassable}
+        dialog.worker = worker
+        dialog.on_finished(False, "Rust DB Core export 오류: dump.run refused: the selected scope contains objects")
+        record = only(history)
+        assert record.status == expected
+        assert record.error_summary.startswith("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다. 테이블 orders: ")
+        assert "dump.run refused" not in record.error_summary
+    finally:
+        dialog.close()
+
+
 @pytest.mark.parametrize("mode, method, unsynchronized, actual", [
     ("parallel_strict", "같은 시점으로 내보냄 · 동시 작업 8개", False,
-     "전체 · 같은 시점으로 내보냄 · 동시 작업 8개 · zstd 압축"),
+     "전체 · 같은 시점으로 내보냄 · 동시 작업 8개 · 압축(zstd)"),
     ("parallel_unsynchronized", "테이블마다 시점이 다를 수 있음 · 동시 작업 8개 (잠금 권한이 없어 시점을 맞추지 않고 나눠 읽음)", True,
-     "전체 · 테이블마다 시점이 다를 수 있음 · 동시 작업 8개 (잠금 권한이 없어 시점을 맞추지 않고 나눠 읽음) · zstd 압축"),
+     "전체 · 테이블마다 시점이 다를 수 있음 · 동시 작업 8개 (잠금 권한이 없어 시점을 맞추지 않고 나눠 읽음) · 압축(zstd)"),
     ("single_connection", "같은 시점으로 내보냄 · 동시 작업 1개 (잠금 권한이 없어 연결 하나로 읽음)", False,
-     "전체 · 같은 시점으로 내보냄 · 동시 작업 1개 (잠금 권한이 없어 연결 하나로 읽음) · zstd 압축"),
+     "전체 · 같은 시점으로 내보냄 · 동시 작업 1개 (잠금 권한이 없어 연결 하나로 읽음) · 압축(zstd)"),
 ])
 def test_export_records_the_method_the_core_actually_used(history, mode, method, unsynchronized, actual):
     dialog = make_export()
@@ -156,8 +182,8 @@ def test_export_records_the_method_the_core_actually_used(history, mode, method,
         dialog.spin_threads.setValue(8)
         dialog.chk_unsynchronized.setChecked(unsynchronized)
         start_export(dialog)
-        assert only(history).mode == ("전체 · 내보내는 방법 자동 선택(시점 일관성 포기 허용) · 동시 작업 8개 · zstd 압축"
-                                      if unsynchronized else "전체 · 내보내는 방법 자동 선택 · 동시 작업 8개 · zstd 압축")
+        assert only(history).mode == ("전체 · 내보내는 방법 자동 선택(시점 일관성 포기 허용) · 동시 작업 8개 · 압축(zstd)"
+                                      if unsynchronized else "전체 · 내보내는 방법 자동 선택 · 동시 작업 8개 · 압축(zstd)")
         dialog.worker = finished_worker(mode, method)
         dialog.on_finished(True, "ok")
         record = only(history)

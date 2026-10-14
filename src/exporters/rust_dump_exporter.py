@@ -42,7 +42,7 @@ MYSQL_SNAPSHOT_FALLBACKS = frozenset({"single_connection", "parallel_unsynchroni
 # service.hello lists it when dump.run takes "auto"; an older core would refuse every export.
 MYSQL_SNAPSHOT_AUTO_CAPABILITY = "dump.run.mysql_snapshot_auto"
 _AUTO_SNAPSHOT_UNSUPPORTED = (
-    "이 Rust DB Core는 내보내기 방법 자동 선택을 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."
+    "이 Rust DB Core는 내보내는 방법 자동 선택을 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."
 )
 _ONE_CONNECTION_MODES = frozenset({"single_connection", "parallel_no_backup_lock"})
 
@@ -101,19 +101,25 @@ def describe_snapshot_method(result: dict, requested_threads: int) -> str:
 
 # Why dump.run refused an object (its `kind:table:name` code, schema.rs). Table-scoped kinds name
 # the object inside the table; schema-level kinds (routine, event, materialized_view) have no table.
+_WHOLE_TABLE_LEFT_OUT = "{} 엔진이라 다른 테이블과 같은 시점으로 읽을 수 없습니다. 빼고 내보내면 이 테이블이 통째로 빠집니다"
 _TABLE_REFUSAL_REASONS = {
     # Can be left out ("담을 수 없는 객체는 빼고 내보내기")
-    "trigger": "트리거 {}는 덤프에 담을 수 없습니다",
-    "deprecated_engine": "{} 엔진 테이블이라 같은 시점으로 담을 수 없습니다",
-    "non_transactional_table": "{} 엔진 테이블이라 같은 시점으로 담을 수 없습니다",
+    "trigger": "트리거({})는 덤프에 담을 수 없습니다",
+    # The core drops such a table from the dump, structure and data, when it is left out.
+    "deprecated_engine": _WHOLE_TABLE_LEFT_OUT,
+    "non_transactional_table": _WHOLE_TABLE_LEFT_OUT,
     # Definitions that would be lost: never left out
     "generated_column": "계산 열 {}의 정의를 덤프에 담을 수 없습니다",
     "check_constraint": "CHECK 제약 {}의 조건을 덤프에 담을 수 없습니다",
     "unsupported_default": "열 {}의 기본값을 덤프에 담을 수 없습니다",
     "custom_type": "열 {}의 사용자 정의 형식을 덤프에 담을 수 없습니다",
-    "unsupported_index": "인덱스 {}를 덤프에 담을 수 없습니다",
-    "cross_schema_fk": "외래 키 {}가 다른 DB의 테이블을 가리켜 덤프에 담을 수 없습니다",
+    "unsupported_index": "인덱스({})는 덤프에 담을 수 없습니다",
+    "cross_schema_fk": "외래 키({})가 다른 DB나 스키마의 테이블을 가리켜 덤프에 담을 수 없습니다",
 }
+# dump.rs LOSSY_SCHEMA_KINDS: refused without a way to leave them out (bypassable false).
+LOSSY_REFUSAL_KINDS = frozenset({
+    "generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk",
+})
 _SCHEMA_REFUSAL_REASONS = {
     "routine": "저장 프로시저·함수 {}: 덤프에 담을 수 없습니다",
     "event": "예약 이벤트 {}: 덤프에 담을 수 없습니다",
@@ -123,7 +129,7 @@ _UNKNOWN_TABLE_REFUSAL = "이 객체는 담을 수 없습니다"
 
 
 def describe_export_refusal(objects: object) -> List[str]:
-    """One plain sentence per refused object, e.g. "테이블 orders: 트리거 trg는 덤프에 담을 수 없습니다".
+    """One plain sentence per refused object, e.g. "테이블 orders: 트리거(trg)는 덤프에 담을 수 없습니다".
 
     An unknown code still names its table; the codes themselves go behind "자세히"."""
     lines = []
@@ -423,15 +429,15 @@ class RustDumpExporter(_RustDumpClientBase):
             )
 
         if callbacks.progress:
-            callbacks.progress(f"Rust DB Core export 시작: {self.config.get_masked_uri()}/{schema}")
+            callbacks.progress(f"Export 시작: {self.config.get_masked_uri()}/{schema}")
 
         result = self.facade.run_dump(payload, on_event=on_core_event)
         rows = int(result.get("rows_dumped") or 0)
         table_count = int(result.get("tables") or 0)
         view_count = int(result.get("views") or 0)
-        message = f"Rust DB Core export 완료: {table_count}개 테이블, {rows:,} rows"
+        message = f"Export 완료: 테이블 {table_count}개, 행 {rows:,}개"
         if view_count:
-            message += f", View {view_count}개"
+            message += f", 뷰 {view_count}개"
         method = describe_snapshot_method(result, effective_threads)
         if method:
             message += f" · {method}"
