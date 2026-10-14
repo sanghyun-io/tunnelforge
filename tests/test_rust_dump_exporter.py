@@ -1174,6 +1174,44 @@ class TestRustDumpImporter:
         else:
             assert "만들어 넣었습니다" not in msg
 
+    def test_verify_in_copy_stop_shows_each_coded_reason(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        dump_dir.mkdir()
+        (dump_dir / '_tunnelforge_dump.json').write_text(json.dumps({
+            "format": "tunnelforge-dump", "format_version": 5, "source_engine": "mysql", "database": "app",
+            "tables": [{"name": "users", "path": "0001_users", "rows": 0, "chunks": 0}]}), encoding='utf-8')
+        payloads = []
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                payloads.append(payload)
+                return {"success": False, "status": "failed_original_untouched", "original_unchanged": True,
+                        "candidate_created": False, "error_code": "copy_refused",
+                        "error": "copy_refused: verify-in-copy stopped before making a copy: notes.fk references users",
+                        "message": "Safe restore failed; original database was not changed. copy_refused: verify-in-copy stopped",
+                        "copy_blockers": [
+                            {"code": "linked_target_only", "table": "notes", "detail": "notes.fk references users"},
+                            {"code": "linked_target_only", "table": "notes_view", "detail": "view notes_view reads users"},
+                            {"code": "metadata_visibility_unproven", "table": None, "detail": "grants"},
+                            {"code": "something_new", "table": None, "detail": "later core"},
+                        ]}
+
+        importer = RustDumpImporter(RustDumpConfig('localhost', 3306, 'root', 'password'), facade=FakeFacade())
+        success, message, _results = importer.import_dump(str(dump_dir), import_mode='safe')
+        importer.import_dump(str(dump_dir), import_mode='safe', verify_only=True)
+
+        assert success is False
+        lines = message.splitlines()
+        assert lines[0] == "복사본을 만들기 전에 멈췄습니다. 원본은 그대로입니다."
+        assert lines[1].startswith("- 덤프에 없는 테이블이나 뷰가") and lines[1].endswith(" (notes, notes_view)")
+        assert "SELECT, SHOW VIEW, PROCESS" in lines[2]
+        # A code this version does not know: no code in the sentence, the report has the detail.
+        assert lines[3] == "- 복사본에서 검증할 수 없는 다른 이유가 있습니다. Import 보고서에서 확인하세요."
+        assert "something_new" not in message and "verify-in-copy" not in message
+        assert "verify_only" not in payloads[0] and payloads[1]["verify_only"] is True
+
     def test_import_dump_reports_cross_engine_skipped_views(self, tmp_path):
         """크로스 엔진 import 시 건너뛴 View 개수가 메시지에 표시됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
@@ -1630,3 +1668,68 @@ class TestExportRefusalContract:
         assert success is True
         assert facade.payload["allow_incomplete"] is True
         assert exporter.last_refusal is None
+
+
+
+_HANGUL = range(ord("가"), ord("힣") + 1)
+
+
+@pytest.mark.parametrize(("message", "expected"), [
+    ("Rust DB Core import 오류: load_failed: orders: create_table failed: MySqlError { ERROR 1822 (HY000): x }",
+     "orders: 테이블을 만들거나 데이터를 넣다가 서버 오류로 멈췄습니다."),
+    ("target_create_failed: the target database app was not found (or is not visible to this account) and could not "
+     "be created; no target tables were changed: MySqlError { ERROR 1044 (42000): Access denied }",
+     "대상 DB(스키마)가 없거나 이 계정에 보이지 않고, 새로 만들지도 못했습니다. 대상 테이블은 바뀌지 않았습니다."),
+    # A safe restore's message puts the core reason after its own sentence.
+    ("Safe restore failed; original database was not changed. cross_engine: safe restore currently verifies "
+     "same-engine dumps only", "다른 DB 종류에서 만든 덤프는 복사본에서 검증할 수 없습니다."),
+    ("post_load_validation_failed: postgresql SQL execution error: db error; code=23503; message=x",
+     "데이터를 넣은 뒤 행 수를 확인하거나 인덱스·외래 키를 만들다가 멈췄습니다."),
+    ("mysql connection error: TLS required (error_code=tls_unavailable)",
+     "DB 서버가 TLS를 제공하지 않습니다. 서버의 TLS 설정을 확인하세요."),
+    # An unknown leading identifier (a table name) is not taken for a code.
+    ("secret_table: load_failed: x", "테이블을 만들거나 데이터를 넣다가 서버 오류로 멈췄습니다."),
+    ("secret_table: something failed", None),
+    ("connection refused", None),
+    ("", None),
+])
+def test_core_error_codes_map_to_korean(message, expected):
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES, describe_core_code, describe_core_failure
+
+    assert describe_core_failure(message) == expected
+    # A preview blocker names its table; an unknown code has no sentence.
+    assert describe_core_code("dependent_view", "orders") == "orders: 대상의 뷰가 이 테이블을 쓰고 있어 교체할 수 없습니다."
+    assert describe_core_code("SPATIAL_UNSUPPORTED") == CORE_CODE_SENTENCES["spatial_unsupported"]
+    assert describe_core_code("not_a_core_code", "orders") is None
+
+    for code, sentence in CORE_CODE_SENTENCES.items():
+        assert any(ord(char) in _HANGUL for char in sentence), code
+        assert not any(word in sentence.lower() for word in ("preflight", "manifest", "계약", "safe", "replace")), code
+    i18n.set_language("en")
+    for code in CORE_CODE_SENTENCES:
+        assert not any(ord(char) in _HANGUL for char in describe_core_code(code)), code
+
+
+def test_every_code_the_core_can_emit_has_a_korean_sentence():
+    import re
+    from pathlib import Path
+    from src.core.error_report_codes import RUST_CORE_CODES
+    from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES
+
+    emitted = set(RUST_CORE_CODES)
+    for path in (Path(__file__).resolve().parents[1] / "migration_core" / "src").rglob("*.rs"):
+        source = path.read_text(encoding="utf-8")
+        emitted.update(re.findall(r'classified_import_error\(\s*"([a-z_]+)"', source))
+        if path.name == "import_preview.rs":  # upgrade.analyze has an issue() of its own
+            emitted.update(re.findall(r'\b(?:issue|warning)\(\s*"([a-z_]+)"', source))
+        # The (code, ...) tuples that feed the preview's blockers and warnings.
+        emitted.update(re.findall(r'push\(\(\s*"([a-z_]+)"', source))
+        emitted.update(re.findall(r'"error_code"\s*:\s*"([a-z_]+)"', source))
+        if path.name == "safe_restore.rs":  # the (code, object, detail) refusals behind copy_blockers
+            emitted.update(re.findall(r'\(\s*"([a-z_]+)",\s*(?:None|Some\()', source))
+        for body in re.findall(r"fn manifest_warning_code\b.*?\n\}", source, re.DOTALL):
+            emitted.update(re.findall(r'"([a-z_]+)"', body))
+    assert {"load_failed", "dependent_object", "views_outside_snapshot", "partial_table_filter", "no_tables"} <= emitted
+    assert {"copy_refused", "copy_checks_unavailable", "target_events", "linked_target_only", "previous_copy_leftover"} <= emitted
+    assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []

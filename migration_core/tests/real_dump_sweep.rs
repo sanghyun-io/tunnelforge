@@ -8,8 +8,8 @@
 //! ```
 //!
 //! It prints one `SWEEP` line per scenario and does not fail on the first problem, so one run
-//! shows everything: fresh replace, replace with target-only children, database-scoped account,
-//! safe restore and switch, export and re-import (with per-table checksums when TF_SWEEP_FULL is set),
+//! shows everything: fresh replace, safe restore and switch, replace with target-only children (a
+//! safe restore then stops), database-scoped account, export and re-import (with per-table checksums when TF_SWEEP_FULL is set),
 //! and the same dump into PostgreSQL when TF_SWEEP_PG_HOST is set.
 use migration_core::{handle_request, Endpoint, Request};
 use mysql::prelude::Queryable;
@@ -59,25 +59,7 @@ fn real_dump_sweep_mysql() {
     root.query_drop(format!("CREATE DATABASE {a}")).unwrap();
 
     if report(&format!("{label} fresh_replace"), Instant::now(), &import(&ep(&a, "root"), &dir, "replace")) {
-        // Target-only children on single-column primary keys, typed like the parent.
-        let parents: Vec<(String, String, String, Option<String>, Option<String>)> = root.exec(
-            "SELECT k.TABLE_NAME, k.COLUMN_NAME, c.COLUMN_TYPE, c.CHARACTER_SET_NAME, c.COLLATION_NAME FROM information_schema.KEY_COLUMN_USAGE k \
-             JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA=k.TABLE_SCHEMA AND c.TABLE_NAME=k.TABLE_NAME AND c.COLUMN_NAME=k.COLUMN_NAME \
-             WHERE k.TABLE_SCHEMA=? AND k.CONSTRAINT_NAME='PRIMARY' AND k.TABLE_NAME IN (SELECT TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE \
-             WHERE TABLE_SCHEMA=? AND CONSTRAINT_NAME='PRIMARY' GROUP BY TABLE_NAME HAVING COUNT(*)=1) ORDER BY k.TABLE_NAME LIMIT 60",
-            (&a, &a)).unwrap();
-        for (index, (table, column, column_type, charset, collation)) in parents.iter().enumerate() {
-            let text = match (charset, collation) { (Some(cs), Some(co)) => format!(" CHARACTER SET {cs} COLLATE {co}"), _ => String::new() };
-            root.query_drop(format!("CREATE TABLE {a}.zz_child_{index} (id INT PRIMARY KEY, ref {column_type}{text} NULL, CONSTRAINT zz_fk_{index} FOREIGN KEY (ref) REFERENCES {a}.`{table}` (`{column}`))")).unwrap();
-        }
-        report(&format!("{label} replace_with_{}_target_only_children", parents.len()), Instant::now(), &import(&ep(&a, "root"), &dir, "replace"));
-        let kept: u64 = root.exec_first("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND CONSTRAINT_NAME LIKE 'zz\\_fk\\_%'", (&a,)).unwrap().unwrap();
-        println!("SWEEP {label} target_only_child_fks_kept={kept}/{}", parents.len());
-
-        root.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'")).unwrap();
-        root.query_drop(format!("GRANT ALL ON {a}.* TO '{user}'@'%'")).unwrap();
-        report(&format!("{label} scoped_account_replace (views owned by root are expected to be reported)"), Instant::now(), &import(&ep(&a, &user), &dir, "replace"));
-
+        // Safe restore and switch first: a target-only child linked to the dump stops it.
         let safe = import(&ep(&a, "root"), &dir, "safe");
         if report(&format!("{label} safe_restore"), Instant::now(), &safe) {
             let value = result(&safe).unwrap().clone();
@@ -92,6 +74,30 @@ fn real_dump_sweep_mysql() {
                 report(&format!("{label} promote_confirm"), Instant::now(), &promote("confirm", json!({"plan_digest": digest, "overwrite_confirmed": true})));
             }
         }
+
+        // Target-only children on single-column primary keys, typed like the parent.
+        let parents: Vec<(String, String, String, Option<String>, Option<String>)> = root.exec(
+            "SELECT k.TABLE_NAME, k.COLUMN_NAME, c.COLUMN_TYPE, c.CHARACTER_SET_NAME, c.COLLATION_NAME FROM information_schema.KEY_COLUMN_USAGE k \
+             JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA=k.TABLE_SCHEMA AND c.TABLE_NAME=k.TABLE_NAME AND c.COLUMN_NAME=k.COLUMN_NAME \
+             WHERE k.TABLE_SCHEMA=? AND k.CONSTRAINT_NAME='PRIMARY' AND k.TABLE_NAME IN (SELECT TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA=? AND CONSTRAINT_NAME='PRIMARY' GROUP BY TABLE_NAME HAVING COUNT(*)=1) ORDER BY k.TABLE_NAME LIMIT 60",
+            (&a, &a)).unwrap();
+        for (index, (table, column, column_type, charset, collation)) in parents.iter().enumerate() {
+            let text = match (charset, collation) { (Some(cs), Some(co)) => format!(" CHARACTER SET {cs} COLLATE {co}"), _ => String::new() };
+            root.query_drop(format!("CREATE TABLE {a}.zz_child_{index} (id INT PRIMARY KEY, ref {column_type}{text} NULL, CONSTRAINT zz_fk_{index} FOREIGN KEY (ref) REFERENCES {a}.`{table}` (`{column}`))")).unwrap();
+        }
+        report(&format!("{label} replace_with_{}_target_only_children", parents.len()), Instant::now(), &import(&ep(&a, "root"), &dir, "replace"));
+        let kept: u64 = root.exec_first("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND CONSTRAINT_NAME LIKE 'zz\\_fk\\_%'", (&a,)).unwrap().unwrap();
+        println!("SWEEP {label} target_only_child_fks_kept={kept}/{}", parents.len());
+        // The children now link to the dump, so a safe restore stops before making a copy.
+        let linked = import(&ep(&a, "root"), &dir, "safe");
+        let stopped = result(&linked).map(|value| (value["status"].clone(), value["copy_blockers"].as_array()
+            .map_or(0, |items| items.iter().filter(|item| item["code"] == "linked_target_only").count())));
+        println!("SWEEP {label} safe_restore_with_children (expected to stop) result={stopped:?} children={}", parents.len());
+
+        root.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'")).unwrap();
+        root.query_drop(format!("GRANT ALL ON {a}.* TO '{user}'@'%'")).unwrap();
+        report(&format!("{label} scoped_account_replace (views owned by root are expected to be reported)"), Instant::now(), &import(&ep(&a, &user), &dir, "replace"));
 
         let out = std::env::temp_dir().join(format!("tf_sweep_out_{tag}"));
         let exported = run("dump.run", json!({"source": ep(&a, "root"), "output_dir": out, "data_format": "tsv", "compression": "zstd", "threads": 4}));

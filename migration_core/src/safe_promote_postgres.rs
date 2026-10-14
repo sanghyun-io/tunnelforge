@@ -136,7 +136,7 @@ pub(crate) fn summary(planned: &PromotionPlan) -> Value {
     let views: BTreeSet<_> = planned
         .inventory
         .iter()
-        .filter(|o| o["kind"] == "v")
+        .filter(|o| namespace(o) == planned.candidate_schema && o["kind"] == "v")
         .map(|o| name(o).to_string())
         .collect();
     json!({"selected_tables":selected,"target_only_tables_preserved":extra,"views_replaced":views,
@@ -152,6 +152,11 @@ pub(crate) fn plan(
     restore_id: &str,
 ) -> Result<PromotionPlan, String> {
     plan_inner(original, candidate, restore_id, true)
+}
+
+/// Tables outside the dump whose FKs to a replaced parent this plan would drop and add again.
+pub(crate) fn repointed_tables(planned: &PromotionPlan) -> Vec<String> {
+    planned.incoming.iter().map(|key| key.table.clone()).collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 fn plan_inner(
@@ -325,7 +330,7 @@ pub(crate) fn promote(
     candidate: &Endpoint,
     planned: &PromotionPlan,
     confirmed_digest: &str,
-    report_dir: &Path,
+    report_path: &Path,
 ) -> Result<Value, String> {
     if confirmed_digest != planned.plan_digest
         || digest(planned)? != planned.plan_digest
@@ -339,10 +344,7 @@ pub(crate) fn promote(
     if inventory_digest(&fresh)? != inventory_digest(planned)? {
         return Err("promotion inventory changed after review".into());
     }
-    let verified = crate::import::safe_restore::load_verified_plan(
-        &dump_import_report_path(report_dir)?,
-        original,
-    )?;
+    let verified = crate::import::safe_restore::load_verified_plan(report_path, original)?;
     if verified.restore_id != planned.restore_id || verified.candidate != *candidate {
         return Err("verified candidate differs from promotion plan".into());
     }
@@ -354,6 +356,7 @@ pub(crate) fn promote(
     {
         return Err("invalid promotion attempt nonce".into());
     }
+    let report_dir = report_path.parent().ok_or("report directory is missing")?;
     let journal_dir = report_dir.join(format!(
         "promotion-postgres-{}-{}",
         planned.restore_id, planned.attempt_nonce
@@ -453,22 +456,13 @@ pub(crate) fn promote(
         ))
         .map_err(|e| e.to_string())?;
         // Existing views retain OIDs, ownership, grants and comments. Candidate
-        // definitions are deparsed by PostgreSQL and namespace-stripped lexically.
-        let source_views: BTreeSet<_> = planned
-            .inventory
-            .iter()
-            .filter(|o| namespace(o) == planned.candidate_schema && o["kind"] == "v")
-            .map(name)
-            .collect();
+        // definitions are deparsed by PostgreSQL and namespace-stripped lexically. Views
+        // outside the dump are left as they are; dump.promote refuses a swap while one of
+        // them reads a replaced table or view.
         let mut views: Vec<&Value> = planned
             .inventory
             .iter()
-            .filter(|o| {
-                o["kind"] == "v"
-                    && (namespace(o) == planned.candidate_schema
-                        || (namespace(o) == planned.original_schema
-                            && !source_views.contains(name(o))))
-            })
+            .filter(|o| o["kind"] == "v" && namespace(o) == planned.candidate_schema)
             .collect();
         while !views.is_empty() {
             let mut pending = Vec::new();
@@ -1181,6 +1175,10 @@ mod tests {
         );
         (original, candidate, prepared, dir)
     }
+    /// The safe restore's own report, which the promotion reads.
+    fn report(prepared: &Value) -> std::path::PathBuf {
+        prepared["report_path"].as_str().unwrap().into()
+    }
     fn cleanup(
         base: &Endpoint,
         original: &Endpoint,
@@ -1214,9 +1212,10 @@ mod tests {
         db.execute_sql("CREATE TABLE extra(id INT PRIMARY KEY, item_id INT REFERENCES items(id))")
             .unwrap();
         db.execute_sql("INSERT INTO extra VALUES(9,1)").unwrap();
-        db.execute_sql("CREATE VIEW target_only_view AS SELECT value FROM items")
+        // Outside the dump and not reading it: the swap leaves it alone.
+        db.execute_sql("CREATE VIEW target_only_view AS SELECT item_id FROM extra")
             .unwrap();
-        db.execute_sql("COMMENT ON VIEW target_only_view IS 'retained view metadata'")
+        db.execute_sql("COMMENT ON VIEW source_view IS 'retained view metadata'")
             .unwrap();
         let mut application = connect(&original).unwrap();
         let cached = application
@@ -1238,11 +1237,17 @@ mod tests {
             prepared["restore_id"].as_str().unwrap(),
         )
         .unwrap();
-        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &dir).unwrap();
+        assert_eq!(repointed_tables(&planned), ["extra"]);
+        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(result["status"], "promoted", "{result:#?}");
         let values = run(
             "query.execute",
-            json!({"connection":original,"sql":"SELECT value FROM target_only_view"}),
+            json!({"connection":original,"sql":"SELECT item_id FROM target_only_view"}),
+        );
+        assert_eq!(values["rows"], json!([{"item_id":1}]));
+        let values = run(
+            "query.execute",
+            json!({"connection":original,"sql":"SELECT value FROM source_view"}),
         );
         assert_eq!(values["rows"], json!([{"value":"restored"}]));
         assert_eq!(
@@ -1258,7 +1263,7 @@ mod tests {
                 "SELECT obj_description(to_regclass($1),'pg_class')",
                 &[&qualified(
                     original.schema.as_deref().unwrap(),
-                    "target_only_view",
+                    "source_view",
                 )],
             )
             .unwrap()
@@ -1298,7 +1303,7 @@ mod tests {
             prepared["restore_id"].as_str().unwrap(),
         )
         .unwrap();
-        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &dir).unwrap();
+        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(result["status"], "failed_original_unchanged", "{result:#?}");
         assert_eq!(db.row_count("items").unwrap(), 2);
         assert_eq!(db.row_count("source_view").unwrap(), 2);
@@ -1343,7 +1348,7 @@ mod tests {
             .unwrap()
             .execute_sql("UPDATE items SET value='tampered'")
             .unwrap();
-        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &dir).unwrap();
+        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(result["status"], "failed_original_unchanged", "{result:#?}");
         let values = run(
             "query.execute",
@@ -1403,7 +1408,7 @@ mod tests {
             original.clone(),
             candidate.clone(),
             planned.clone(),
-            dir.clone(),
+            report(&prepared),
         );
         let worker = std::thread::spawn(move || promote(&a, &b, &p, &p.plan_digest, &path));
         let mut admin = connect(&base).unwrap();
@@ -1467,7 +1472,7 @@ mod tests {
             original.clone(),
             candidate.clone(),
             planned.clone(),
-            dir.clone(),
+            report(&prepared),
         );
         let worker = std::thread::spawn(move || promote(&a, &b, &p, &p.plan_digest, &path));
         let mut admin = connect(&base).unwrap();
@@ -1519,13 +1524,13 @@ mod tests {
             qualified(&first.original_schema, "items")
         ))
         .unwrap();
-        let failed = promote(&original, &candidate, &first, &first.plan_digest, &dir).unwrap();
+        let failed = promote(&original, &candidate, &first, &first.plan_digest, &report(&prepared)).unwrap();
         held.rollback().unwrap();
         assert_eq!(failed["status"], "failed_original_unchanged", "{failed:#?}");
         let journal = std::path::PathBuf::from(failed["report_path"].as_str().unwrap());
         let old_bytes = std::fs::read(&journal).unwrap();
         assert!(
-            promote(&original, &candidate, &first, &first.plan_digest, &dir).is_err(),
+            promote(&original, &candidate, &first, &first.plan_digest, &report(&prepared)).is_err(),
             "consumed plan replayed"
         );
         let fresh = plan(&original, &candidate, restore_id).unwrap();
@@ -1533,7 +1538,7 @@ mod tests {
             fresh.plan_digest, first.plan_digest,
             "fresh retry needs independent consent digest"
         );
-        let completed = promote(&original, &candidate, &fresh, &fresh.plan_digest, &dir).unwrap();
+        let completed = promote(&original, &candidate, &fresh, &fresh.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(completed["status"], "promoted", "{completed:#?}");
         assert_eq!(
             std::fs::read(journal).unwrap(),

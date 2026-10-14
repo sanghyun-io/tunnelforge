@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock
 import pytest
 from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -87,6 +88,37 @@ def test_confirmed_unchanged_refusal_preserves_failure_details(promotion_dialog,
     assert promotion_dialog.import_audit["original_unchanged"] is True
     assert promotion_dialog.import_audit["promotion_result"]["phase"] == "validation"
     assert "차단" in promotion_dialog.label_status.text()
+
+
+def test_verify_in_copy_stop_shows_the_coded_reason(promotion_dialog, monkeypatch):
+    from src.exporters.rust_dump_exporter import describe_copy_blockers, describe_core_code
+
+    shown = []
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", lambda parent, title, text: shown.append((title, text)))
+    promotion_dialog._report_error_anonymously = MagicMock()
+    promotion_dialog.last_import_mode = "safe"
+    reason = "\n".join([describe_core_code("copy_refused"),
+                        *describe_copy_blockers([{"code": "linked_target_only", "table": "notes", "detail": "notes.fk references users"}])])
+    promotion_dialog.on_finished(False, reason)
+    title, text = shown[-1]
+    assert title == "안전 복원 실패" and text.startswith("안전 복원 실패 · 원본 미변경")
+    assert "복사본을 만들기 전에 멈췄습니다" in text
+    assert "덤프에 없는 테이블이나 뷰가" in text and text.endswith(" (notes)")
+    # The core's own text, from its safe_restore_failed event, opens from '자세히'.
+    core_text = "copy_refused: verify-in-copy stopped before making a copy: notes.fk references users"
+    promotion_dialog.on_raw_output(json.dumps({"event": "safe_restore_failed", "status": "failed_original_untouched",
+                                               "error": core_text}))
+    promotion_dialog._show_failure = MagicMock()
+    promotion_dialog.on_finished(False, reason)
+    assert promotion_dialog._show_failure.call_args.args[2] == core_text
+
+
+def test_a_plan_blocked_by_the_target_lists_the_reasons_in_korean(promotion_dialog):
+    promotion_dialog._remember_promotion_plan({
+        "can_promote": False, "status": "blocked", "blockers": ["notes.fk_notes references parents; ..."],
+        "copy_blockers": [{"code": "linked_target_only", "table": "notes", "detail": "notes.fk_notes references parents"}]})
+    blockers = promotion_dialog.import_audit["promotion_plan"]["blockers"]
+    assert blockers == ["- 덤프에 없는 테이블이나 뷰가 외래 키나 뷰로 덤프 테이블과 이어져 있어, 그대로 둔 채 교체할 수 없습니다. (notes)"]
 
 
 def test_cancelled_pending_promotion_cannot_start_later(promotion_dialog, monkeypatch):

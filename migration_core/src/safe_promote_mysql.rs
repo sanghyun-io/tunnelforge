@@ -86,7 +86,7 @@ fn connect(endpoint: &Endpoint) -> Result<Db, String> {
     Ok(conn)
 }
 
-fn has_complete_metadata_grants(grants: &[String]) -> bool {
+pub(crate) fn has_complete_metadata_grants(grants: &[String]) -> bool {
     let mut privileges = BTreeSet::new();
     for grant in grants {
         let statement = grant.trim().to_ascii_uppercase();
@@ -772,7 +772,6 @@ pub(crate) fn plan(
         hidden_views: hidden, saved_views: saved,
         warnings: vec![
             "Existing replaced-table writes before the cutover are intentionally superseded by the restored candidate.".into(),
-            "Target-only tables in the affected dependency component are copied while WRITE locks pause their readers and writers.".into(),
             "The backup namespace contains only replaced tables. Unrelated original tables remain active at their existing names.".into(),
             "Saved old-view aliases retain definitions in the original namespace and still reference active final table names. They are recovery-definition artifacts, not views over backup data; native definitions are recorded in the promotion journal.".into(),
             "A retained backup does not include application writes accepted after promotion; rollback must not discard those writes.".into(),
@@ -861,7 +860,7 @@ pub(crate) fn summary(plan: &PromotionPlan) -> Value {
         "views_replaced":plan.replacement_views.keys().collect::<Vec<_>>(),"schema_changed_tables":changed,
         "row_counts":row_counts,"data_changed_tables":data_changed,"data_not_compared":data_not_compared,
         "backup_namespace":plan.backup_database,"backup_view_aliases":plan.saved_views,
-        "lock_acquisition_timeout_seconds":2,"write_pause":"Affected readers and writers wait while target-only rows are refreshed and verified, then one atomic RENAME switches names.","warnings":plan.warnings})
+        "lock_acquisition_timeout_seconds":2,"write_pause":"Readers and writers of the replaced tables and views wait under WRITE locks while the candidate is checked once more, then one atomic RENAME switches names.","warnings":plan.warnings})
 }
 fn assert_plan_binding(
     original: &Endpoint,
@@ -1115,7 +1114,7 @@ fn validate_fks(
             .map_err(|e| error("validate staged FK graph", e))?;
         if count != Some(0) {
             return Err(format!(
-                "target-only rows are incompatible with restored parent: {}.{}",
+                "rows are incompatible with their restored parent: {}.{}",
                 fk.child, fk.name
             ));
         }
@@ -2098,6 +2097,76 @@ pub(crate) fn clone_unrecorded(endpoint: &Endpoint, plan: &PromotionPlan) -> Res
         .collect()))
 }
 
+/// Tables and views outside the dump that this plan would rebuild from their SHOW CREATE text
+/// because an FK or a view links them to the dump (TF-STATUS-173). `target_only_views` are the
+/// original's views the dump does not have, as the restore listed them.
+pub(crate) fn rebuilt_outside_dump(plan: &PromotionPlan, target_only_views: &BTreeSet<String>) -> Vec<String> {
+    let views = plan.replacement_views.keys().filter(|name| target_only_views.contains(*name));
+    plan.original_tables.keys().filter(|name| !plan.candidate_tables.contains_key(*name)).chain(views).cloned().collect()
+}
+
+/// The saved old-view aliases (`tf_p_<nonce>_oldv<i>`) still in the original database, and what
+/// stops their removal: an alias must still hold the view definition it saved, and nothing may use it.
+pub(crate) fn saved_view_aliases(endpoint: &Endpoint, plan: &PromotionPlan) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut conn = lifecycle_connect(endpoint, plan)?;
+    let uuid: Option<String> = conn.query_first("SELECT @@server_uuid").map_err(|e| e.to_string())?;
+    if uuid.as_deref() != Some(plan.server_uuid.as_str()) {
+        return Ok((Vec::new(), vec!["the server identity differs from the promotion journal".into()]));
+    }
+    let mut blockers = Vec::new();
+    if let Err(problem) = prove_metadata_visibility(&mut conn) {
+        blockers.push(problem);
+    }
+    let database = &plan.original_database;
+    let present = tables(&mut conn, database)?;
+    let mut aliases = Vec::new();
+    for (view, alias) in &plan.saved_views {
+        match present.get(alias).map(String::as_str) {
+            None => continue,
+            Some("VIEW") => {}
+            Some(_) => {
+                blockers.push(format!("{alias} is no longer a view"));
+                continue;
+            }
+        }
+        let row: Option<mysql::Row> = conn.query_first(format!("SHOW CREATE VIEW {}", qualified(database, alias))).map_err(|e| e.to_string())?;
+        let current = row.and_then(|row| row.get::<String, _>(1));
+        let saved = plan.original_views.get(view).map(|saved| saved.ddl.as_str());
+        let same = match (current.as_deref().map(view_select), saved.map(view_select)) {
+            (Some(Ok(now)), Some(Ok(then))) => now == then,
+            _ => false,
+        };
+        if !same {
+            blockers.push(format!("{alias} no longer holds the saved definition of {view}"));
+        }
+        let users: Vec<(String, String)> = conn.exec(
+            "SELECT VIEW_SCHEMA, VIEW_NAME FROM information_schema.VIEW_TABLE_USAGE WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", (database, alias),
+        ).map_err(|e| error("saved view alias use scan", e))?;
+        blockers.extend(users.into_iter().map(|(schema, user)| format!("view {schema}.{user} uses {alias}")));
+        // Routine, trigger and event bodies cannot be resolved structurally; a mention counts.
+        for (sql, kind) in [
+            ("SELECT ROUTINE_SCHEMA, ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_DEFINITION LIKE ?", "routine"),
+            ("SELECT TRIGGER_SCHEMA, TRIGGER_NAME FROM information_schema.TRIGGERS WHERE ACTION_STATEMENT LIKE ?", "trigger"),
+            ("SELECT EVENT_SCHEMA, EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_DEFINITION LIKE ?", "event"),
+        ] {
+            let rows: Vec<(String, String)> = conn.exec(sql, (format!("%{alias}%"),)).map_err(|e| error("saved view alias text scan", e))?;
+            blockers.extend(rows.into_iter().map(|(schema, name)| format!("{kind} {schema}.{name} mentions {alias}")));
+        }
+        aliases.push(alias.clone());
+    }
+    Ok((aliases, blockers))
+}
+
+/// Drop saved view aliases the caller re-checked with `saved_view_aliases` just before.
+pub(crate) fn drop_saved_view_aliases(endpoint: &Endpoint, plan: &PromotionPlan, aliases: &[String]) -> Result<(), String> {
+    if aliases.is_empty() || aliases.iter().any(|alias| !plan.saved_views.values().any(|saved| saved == alias)) {
+        return Err("only saved view aliases the promotion journal records can be dropped".into());
+    }
+    let mut conn = lifecycle_connect(endpoint, plan)?;
+    let names = aliases.iter().map(|alias| qualified(&plan.original_database, alias)).collect::<Vec<_>>();
+    conn.query_drop(format!("DROP VIEW {}", names.join(", "))).map_err(|e| error("drop saved view aliases", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2690,6 +2759,23 @@ mod tests {
             "cutover_unknown"
         );
     }
+    #[test]
+    fn plans_name_the_tables_and_views_outside_the_dump_they_would_rebuild() {
+        let table = |name: &str| json!({"name": name, "ddl": "", "static_digest": "", "table_id": 1, "columns": [], "normalized": {"name": name}, "content_digest": null});
+        let view = |ddl: &str| json!({"name": "v", "ddl": ddl, "dependencies": []});
+        let plan: PromotionPlan = serde_json::from_value(json!({
+            "restore_id": "r", "digest": "", "original_database": "o", "candidate_database": "c", "host": "h", "port": 1,
+            "server_uuid": "u", "nonce": "1", "backup_database": "tf_backup_1", "clone_database": "tf_promote_1",
+            "original_tables": {"parent": table("parent"), "child": table("child")}, "candidate_tables": {"parent": table("parent")},
+            "original_views": {"dump_view": view("old"), "child_view": view("kept"), "version": view("select '1.2'")},
+            // A dump view with no table references has the same definition in the original and the copy.
+            "replacement_views": {"dump_view": view("new"), "child_view": view("kept"), "version": view("select '1.2'")},
+            "original_fks": [], "candidate_fks": [], "hidden_views": {}, "saved_views": {}, "view_order": [], "warnings": [],
+        })).unwrap();
+        let target_only_views = ["child_view".to_string(), "unlinked_view".to_string()].into_iter().collect();
+        assert_eq!(rebuilt_outside_dump(&plan, &target_only_views), ["child", "child_view"]);
+    }
+
     #[test]
     fn native_rewriters_preserve_quoted_literals_and_reject_ambiguous_view_qualifiers() {
         let table=NativeTable{name:"child".into(),ddl:"CREATE TABLE `child` (`note` varchar(40) DEFAULT 'src.parent', CONSTRAINT `fk` FOREIGN KEY (`id`) REFERENCES `parent` (`id`))".into(),static_digest:String::new(),table_id:1,columns:vec![],normalized:serde_json::from_value(json!({"name":"child"})).unwrap(),content_digest:None};

@@ -599,15 +599,51 @@ fn foreign_key_fidelity_error(
     )
 }
 
+const IMPORT_REPORT_STEM: &str = "_tunnelforge_import_report";
+
+/// The fixed report file of a journal directory. Dump folders used it for every import before
+/// each attempt got its own report, so old dump folders may still hold one.
 pub(crate) fn dump_import_report_path(input_path: &Path) -> Result<PathBuf, String> {
     if input_path.as_os_str().is_empty() {
         return Err("cannot write import report without input_dir".to_string());
     }
-    Ok(input_path.join("_tunnelforge_import_report.json"))
+    Ok(input_path.join(format!("{IMPORT_REPORT_STEM}.json")))
+}
+
+/// A report file of its own for one import attempt in a dump folder, so a retry never
+/// overwrites the record of an earlier attempt: `_tunnelforge_import_report_<nanos>_<pid>_<n>.json`.
+pub(crate) fn new_dump_import_report_path(input_path: &Path) -> Result<PathBuf, String> {
+    static ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    dump_import_report_path(input_path)?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("cannot name the import report: {err}"))?.as_nanos();
+    let sequence = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(input_path.join(format!("{IMPORT_REPORT_STEM}_{nonce}_{}_{sequence}.json", std::process::id())))
+}
+
+/// Every import report of a dump folder, oldest first: the old single report, then one per attempt.
+pub(crate) fn dump_import_report_paths(input_path: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(input_path) else { return Vec::new() };
+    let mut paths = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name == format!("{IMPORT_REPORT_STEM}.json")
+                || (name.starts_with(&format!("{IMPORT_REPORT_STEM}_")) && name.ends_with(".json"))
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
 }
 
 pub(crate) fn write_dump_import_report(input_path: &Path, report: &Value) -> Result<(), String> {
-    let report_path = dump_import_report_path(input_path)?;
+    write_import_report_file(&dump_import_report_path(input_path)?, report)
+}
+
+pub(crate) fn write_import_report_file(report_path: &Path, report: &Value) -> Result<(), String> {
+    let input_path = report_path.parent().ok_or("cannot write import report without a directory")?;
     let bytes = serde_json::to_vec_pretty(report)
         .map_err(|err| format!("cannot serialize import report: {err}"))?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -1743,6 +1779,12 @@ mod tests {
 
         assert!(path.ends_with("_tunnelforge_import_report.json"));
         assert!(path.starts_with(dir));
+        let attempt = new_dump_import_report_path(dir).unwrap();
+        let name = attempt.file_name().unwrap().to_string_lossy().to_string();
+        assert!(attempt.starts_with(dir));
+        assert!(name.starts_with("_tunnelforge_import_report_") && name.ends_with(".json"), "{name}");
+        assert_ne!(attempt, new_dump_import_report_path(dir).unwrap(), "two attempts never share a report");
+        assert!(new_dump_import_report_path(Path::new("")).is_err());
     }
 
     #[test]

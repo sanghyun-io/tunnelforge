@@ -134,8 +134,8 @@ fn fixture(base: &Endpoint, promote: bool) -> Fixture {
     fixture_with(base, promote, true, false)
 }
 
-/// `view`: the original also has a view; `target_only`: a table outside the dump that
-/// references `parents` exists in the original (it is preserved by the promotion).
+/// `view`: the original also has a view; `target_only`: a table outside the dump, not linked to
+/// it, exists in the original (the promotion leaves it in place; a linked one stops the restore).
 fn fixture_with(base: &Endpoint, promote: bool, view: bool, target_only: bool) -> Fixture {
     let engine = base.engine.clone();
     let name = unique("tf_life");
@@ -161,13 +161,13 @@ fn fixture_with(base: &Endpoint, promote: bool, view: bool, target_only: bool) -
     let _ = result(exported);
     old.execute_sql("UPDATE parents SET value='original-live'").unwrap();
     if target_only {
-        old.execute_sql("CREATE TABLE notes(id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_notes FOREIGN KEY(parent_id) REFERENCES parents(id))").unwrap();
+        old.execute_sql("CREATE TABLE notes(id INT PRIMARY KEY, parent_id INT)").unwrap();
         old.execute_sql("INSERT INTO notes VALUES(1,1),(2,2)").unwrap();
     }
     let restored = result(call("dump.import", json!({"connection": original, "target": original, "input_dir": dir, "mode": "safe", "threads": 1})));
     assert_eq!(restored["success"], true, "{restored}");
     let restore_id = restored["restore_id"].as_str().unwrap().to_string();
-    let report_path = dir.join("_tunnelforge_import_report.json");
+    let report_path = PathBuf::from(restored["report_path"].as_str().unwrap());
     if promote {
         let planned = result(call("dump.promote", json!({"endpoint": original, "action": "plan", "report_path": report_path, "restore_id": restore_id})));
         assert_eq!(planned["can_promote"], true, "{planned}");
@@ -355,6 +355,100 @@ fn unpromoted_candidate_is_listed_and_cleanup_never_touches_the_destination_or_o
     }
 }
 
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn failed_copy_is_cleaned_only_while_it_holds_what_its_import_makes() {
+    for base in endpoints() {
+        let mysql = base.engine == "mysql";
+        let name = unique("tf_life_failed");
+        let mut admin = LiveAdapter::connect(&base).unwrap();
+        admin.execute_sql(&format!("CREATE {} {name}", if mysql { "DATABASE" } else { "SCHEMA" })).unwrap();
+        let mut original = base.clone();
+        if mysql {
+            original.database = name.clone();
+        } else {
+            original.schema = Some(name.clone());
+        }
+        let mut old = LiveAdapter::connect(&original).unwrap();
+        old.execute_sql("CREATE TABLE parents(id INT PRIMARY KEY, value VARCHAR(40))").unwrap();
+        old.execute_sql("INSERT INTO parents VALUES(1,'original')").unwrap();
+        let dir = std::env::temp_dir().join(unique("tf_life_failed_dump"));
+        let _ = result(call("dump.run", json!({"source": original, "output_dir": dir, "data_format": "jsonl", "compression": "none", "threads": 1, "mysql_snapshot_mode": "single_connection"})));
+        // A row the copy cannot load, with a matching digest: the copy is made, then its load fails.
+        let manifest_path = dir.join("_tunnelforge_dump.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let table = manifest["tables"].as_array_mut().unwrap().iter_mut().find(|t| t["name"] == "parents").unwrap();
+        let bytes = b"{\"id\":\"bad\",\"value\":\"x\"}\n";
+        std::fs::write(dir.join(table["path"].as_str().unwrap()).join("chunk_000001.jsonl"), bytes).unwrap();
+        table["chunk_sha256"]["chunk_000001.jsonl"] = json!(hex_digest(bytes));
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let failed = result(call("dump.import", json!({"target": original, "input_dir": dir, "mode": "safe", "threads": 1})));
+        assert_eq!(failed["status"], "failed_original_untouched", "{failed}");
+        assert_eq!(failed["candidate_created"], true, "{failed}");
+        let restore_id = failed["restore_id"].as_str().unwrap().to_string();
+        let mut fx = Fixture { engine: base.engine.clone(), admin, original, name, dir, restore_id, report_path: PathBuf::new() };
+        let candidate = format!("tf_restore_{}", fx.restore_id);
+        assert!(fx.exists(&candidate));
+        fx.admin.execute_sql(&format!("CREATE TABLE {candidate}.stray(id INT)")).unwrap();
+        let blocked = fx.cleanup_plan("candidate");
+        assert_eq!(blocked["can_cleanup"], false, "{blocked}");
+        assert!(blockers(&blocked).contains("stray"), "{}", blockers(&blocked));
+        fx.admin.execute_sql(&format!("DROP TABLE {candidate}.stray")).unwrap();
+        // A routine is no table, but the import makes none either, so it blocks too.
+        let (create, drop) = if mysql {
+            (format!("CREATE PROCEDURE {candidate}.stray_routine() SELECT 1"), format!("DROP PROCEDURE {candidate}.stray_routine"))
+        } else {
+            (format!("CREATE FUNCTION {candidate}.stray_routine() RETURNS int LANGUAGE sql AS 'SELECT 1'"), format!("DROP FUNCTION {candidate}.stray_routine()"))
+        };
+        fx.admin.execute_sql(&create).unwrap();
+        let blocked = fx.cleanup_plan("candidate");
+        assert_eq!(blocked["can_cleanup"], false, "{blocked}");
+        assert!(blockers(&blocked).contains("stray_routine"), "{}", blockers(&blocked));
+        fx.admin.execute_sql(&drop).unwrap();
+        let plan = fx.cleanup_plan("candidate");
+        assert_eq!(plan["can_cleanup"], true, "{plan}");
+        assert_eq!(plan["will_delete"], json!([candidate]));
+        let applied = result(backups(&fx.original, &fx.dir, "cleanup_apply", json!({"restore_id": fx.restore_id, "target": "candidate", "plan_digest": plan["plan_digest"], "confirmed": true})));
+        assert_eq!(applied["status"], "cleaned", "{applied}");
+        assert!(!fx.exists(&candidate));
+        assert_eq!(fx.scalar("SELECT value FROM parents WHERE id=1"), "original");
+        fx.finish();
+    }
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn a_second_safe_restore_keeps_the_first_report_and_both_restores_are_listed() {
+    for base in endpoints() {
+        // Without a view: a swap with views leaves old views that stop the next restore (tested below).
+        let fx = fixture_with(&base, true, false, false);
+        let first_report = std::fs::read(&fx.report_path).unwrap();
+        // The same dump restored again: before each attempt had its own report, this erased the first one.
+        let again = result(call("dump.import", json!({"connection": fx.original, "target": fx.original, "input_dir": fx.dir, "mode": "safe", "threads": 1})));
+        assert_eq!(again["success"], true, "{again}");
+        let second_id = again["restore_id"].as_str().unwrap().to_string();
+        assert_ne!(PathBuf::from(again["report_path"].as_str().unwrap()), fx.report_path);
+        assert_eq!(std::fs::read(&fx.report_path).unwrap(), first_report, "the second restore overwrote the first one's report");
+        let listed = fx.list();
+        let ids: Vec<&str> = listed["backups"].as_array().unwrap().iter().filter_map(|b| b["restore_id"].as_str()).collect();
+        assert!(ids.contains(&fx.restore_id.as_str()) && ids.contains(&second_id.as_str()), "{listed}");
+        assert!(fx.exists(&fx.backup_namespace()), "the promoted restore's backup is no longer found");
+        // The second candidate is checked against its own report, not the first restore's.
+        let candidate = format!("tf_restore_{second_id}");
+        let plan = result(backups(&fx.original, &fx.dir, "cleanup_plan", json!({"restore_id": second_id, "target": "candidate"})));
+        assert_eq!(plan["can_cleanup"], true, "{plan}");
+        let applied = result(backups(&fx.original, &fx.dir, "cleanup_apply", json!({"restore_id": second_id, "target": "candidate", "plan_digest": plan["plan_digest"], "confirmed": true})));
+        assert_eq!(applied["status"], "cleaned", "{applied}");
+        assert!(!fx.exists(&candidate));
+        fx.finish();
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
 fn attempt_path(fx: &Fixture) -> PathBuf {
     fx.plan_dir().join("attempt").join("_tunnelforge_import_report.json")
 }
@@ -391,9 +485,7 @@ fn supported_recovery_restores_the_retained_original_and_keeps_the_displaced_tab
             let broken_fk = fx.admin.execute_sql(&format!("INSERT INTO {}.children VALUES(9,999)", fx.name));
             assert!(broken_fk.is_err(), "the restored foreign key must still be enforced");
             if target_only {
-                let orphan = fx.admin.execute_sql(&format!("INSERT INTO {}.notes VALUES(9,999)", fx.name));
-                assert!(orphan.is_err(), "the target-only table must reference the restored parent");
-                assert_eq!(fx.scalar("SELECT COUNT(*) FROM notes"), "2");
+                assert_eq!(fx.scalar("SELECT COUNT(*) FROM notes"), "2", "the target-only table stays as it was");
             }
             // The tables that were active are retained, owned and listed; nothing was deleted.
             assert!(fx.exists(&displaced));
@@ -486,6 +578,16 @@ fn promoted_candidate_leftovers_are_cleaned_only_when_recorded() {
     for base in endpoints() {
         let mut fx = fixture_with(&base, true, true, false);
         let candidate = format!("tf_restore_{}", fx.restore_id);
+        // The swap's leftover views still read the restored tables, so the next restore stops until
+        // they are cleaned: MySQL's saved old views, PostgreSQL's copy that keeps its views.
+        let (target, dir) = (fx.original.clone(), fx.dir.clone());
+        let again = move || result(call("dump.import", json!({"target": target, "input_dir": dir, "mode": "safe", "threads": 1})));
+        let stopped = again();
+        assert_eq!(stopped["status"], "failed_original_untouched", "{stopped}");
+        assert_eq!(stopped["error_code"], "copy_refused", "{stopped}");
+        let (code, prefix) = if fx.mysql() { ("saved_view_alias", "tf_p_".to_string()) } else { ("previous_copy_leftover", format!("{candidate}.")) };
+        assert!(stopped["copy_blockers"].as_array().unwrap().iter()
+            .any(|item| item["code"] == code && item["table"].as_str().is_some_and(|table| table.starts_with(&prefix))), "{stopped}");
         if fx.mysql() {
             // MySQL also leaves the promotion's temporary clone database; it references the candidate.
             let blocked = fx.cleanup_plan("candidate");
@@ -494,6 +596,28 @@ fn promoted_candidate_leftovers_are_cleaned_only_when_recorded() {
             assert_eq!(clone["can_cleanup"], true, "{clone}");
             let applied = result(backups(&fx.original, &fx.dir, "cleanup_apply", json!({"restore_id": fx.restore_id, "target": "clone", "plan_digest": clone["plan_digest"], "confirmed": true})));
             assert_eq!(applied["status"], "cleaned", "{applied}");
+
+            // The old parent_view definition, saved under an alias in the original database.
+            let aliases = fx.cleanup_plan("view_aliases");
+            assert_eq!(aliases["can_cleanup"], true, "{aliases}");
+            let alias = aliases["tables"][0]["name"].as_str().unwrap().to_string();
+            assert!(alias.starts_with("tf_p_") && alias.contains("_oldv"), "{aliases}");
+            assert_eq!(aliases["will_delete"], json!([format!("{}.{alias}", fx.name)]), "{aliases}");
+            fx.admin.execute_sql(&format!("CREATE VIEW {}.uses_alias AS SELECT id FROM {}.{alias}", fx.name, fx.name)).unwrap();
+            let used = fx.cleanup_plan("view_aliases");
+            assert_eq!(used["can_cleanup"], false, "{used}");
+            assert!(blockers(&used).contains("uses_alias"), "{}", blockers(&used));
+            fx.admin.execute_sql(&format!("DROP VIEW {}.uses_alias", fx.name)).unwrap();
+            let aliases = fx.cleanup_plan("view_aliases");
+            let applied = result(backups(&fx.original, &fx.dir, "cleanup_apply", json!({"restore_id": fx.restore_id, "target": "view_aliases", "plan_digest": aliases["plan_digest"], "confirmed": true})));
+            assert_eq!(applied["status"], "cleaned", "{applied}");
+            let left = format!("SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA='{}' AND TABLE_NAME='{alias}'", fx.name);
+            assert_eq!(fx.scalar(&left), "0");
+            assert_eq!(fx.scalar("SELECT COUNT(*) FROM parent_view"), "2", "the active view is untouched");
+            assert_eq!(fx.cleanup_plan("view_aliases")["can_cleanup"], false);
+        } else {
+            let refused = error(backups(&fx.original, &fx.dir, "cleanup_plan", json!({"restore_id": fx.restore_id, "target": "view_aliases"})));
+            assert!(refused.contains("only MySQL"), "{refused}");
         }
         let plan = fx.cleanup_plan("candidate");
         // Leftover views recorded in the promotion plan are the candidate's own.
@@ -508,6 +632,12 @@ fn promoted_candidate_leftovers_are_cleaned_only_when_recorded() {
         let applied = result(backups(&fx.original, &fx.dir, "cleanup_apply", json!({"restore_id": fx.restore_id, "target": "candidate", "plan_digest": plan["plan_digest"], "confirmed": true})));
         assert_eq!(applied["status"], "cleaned", "{applied}");
         assert!(!fx.exists(&candidate));
+        // With the leftovers gone the next restore goes through.
+        let passed = again();
+        if let Some(id) = passed["restore_id"].as_str() {
+            fx.drop_ns(&format!("tf_restore_{id}"));
+        }
+        assert_eq!(passed["status"], "ready_for_switch", "{passed}");
         fx.finish();
     }
 }

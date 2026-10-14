@@ -70,11 +70,8 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     for (table, problem) in super::cross_engine_temporal_refusals(manifest, &tables, engine) {
         blockers.push(issue("temporal_unsupported", Some(table.as_str()), problem));
     }
-    let mut copy_blockers = super::safe_restore::copy_refusals(manifest, engine).into_iter()
-        .map(|(code, detail)| issue(code, None, detail)).collect::<Vec<_>>();
-    if !selected.is_empty() {
-        copy_blockers.push(issue("partial_table_filter", None, "safe restore requires the complete dump; partial table filters are not supported"));
-    }
+    let copy_blockers = super::safe_restore::copy_refusals(manifest, engine, !selected.is_empty()).into_iter()
+        .map(|(code, table, detail)| issue(code, table.as_deref(), detail)).collect::<Vec<_>>();
     Ok(DumpFindings { tables: dependency_ordered_dump_tables(&manifest.schema, tables), blockers, warnings, copy_blockers })
 }
 
@@ -85,7 +82,7 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let engine = endpoint.engine.as_str();
     let selected: BTreeSet<String> = string_list(request.payload.get("tables")).into_iter().collect();
     let strict = request.payload.get("strict_manifest").and_then(Value::as_bool).unwrap_or(true);
-    let DumpFindings { tables, mut blockers, mut warnings, copy_blockers } = dump_findings(&manifest, &selected, engine, strict)?;
+    let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict)?;
     // A timezone the import would refuse is a bad request, not a property of the target.
     super::import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), engine)?;
     let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
@@ -103,6 +100,14 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let mut admin = super::safe_restore::maintenance_connection(endpoint)?;
     let exists = super::safe_restore::target_namespace_exists(&mut admin, endpoint)?;
     let can_create = if exists { None } else { can_create_namespace(&mut admin, endpoint)? };
+    // A cross-engine dump is already refused as a whole.
+    if exists && manifest.source_engine == engine {
+        // Only verify-in-copy needs these checks, so a failed one does not fail the preview.
+        match super::safe_restore::target_copy_refusals(&mut admin, endpoint, &manifest) {
+            Ok(refusals) => copy_blockers.extend(refusals.into_iter().map(|(code, table, detail)| issue(code, table.as_deref(), detail))),
+            Err(error) => copy_blockers.push(issue("copy_checks_unavailable", None, error)),
+        }
+    }
     drop(admin);
     if !exists {
         // The replace import creates a missing namespace, so only the privilege matters.
@@ -258,7 +263,7 @@ fn can_create_namespace(admin: &mut LiveAdapter, endpoint: &Endpoint) -> Result<
     }
 }
 
-fn mysql_grants_allow(conn: &mut mysql::PooledConn, privilege: &str, database: Option<&str>) -> Option<bool> {
+pub(super) fn mysql_grants_allow(conn: &mut mysql::PooledConn, privilege: &str, database: Option<&str>) -> Option<bool> {
     let grants: Vec<String> = conn.query("SHOW GRANTS FOR CURRENT_USER").ok()?;
     // With partial_revokes on, `%` and `_` in database grants are plain characters. Servers
     // before 8.0.16 have no such variable and always treat them as wildcards.
@@ -470,7 +475,7 @@ mod tests {
         let payload = json!({"input_dir": dir.to_string_lossy(), "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "secret-value", "database": "app"}});
         let mut events = Vec::new();
         handle(&Request { command: "dump.import_preview".into(), request_id: Some("p-1".into()), payload }, |event| events.push(event));
-        let report_written = dump_import_report_path(&dir).unwrap().exists();
+        let report_written = !dump_import_report_paths(&dir).is_empty();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["event"], "error");
