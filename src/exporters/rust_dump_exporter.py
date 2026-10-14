@@ -32,12 +32,65 @@ MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED = (
     "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED"
 )
 MYSQL_SNAPSHOT_MODES = frozenset({
+    # The core picks the method: shared locks first, then mysql_snapshot_fallback.
+    "auto",
     "parallel_strict",
     "parallel_table_lock",
     "parallel_unsynchronized",
     "parallel_no_backup_lock",
     "single_connection",
 })
+# Where "auto" ends when no shared lock works; unsynchronized only by explicit choice.
+MYSQL_SNAPSHOT_FALLBACKS = frozenset({"single_connection", "parallel_unsynchronized"})
+_ONE_CONNECTION_MODES = frozenset({"single_connection", "parallel_no_backup_lock"})
+
+# How the completion line names the MySQL method that ran (the core's resolved
+# mysql_snapshot_mode): what the dump guarantees, and how the tables were read.
+_SNAPSHOT_METHODS = {
+    "parallel_strict": ("같은 시점으로 내보냄", ""),
+    "parallel_table_lock": ("같은 시점으로 내보냄", "테이블만 잠깐 잠금"),
+    "single_connection": ("같은 시점으로 내보냄", "연결 하나로 읽음"),
+    "parallel_no_backup_lock": ("같은 시점으로 내보냄", "연결 하나로 읽음"),
+    "parallel_unsynchronized": ("테이블마다 시점이 다를 수 있음", "시점을 맞추지 않고 나눠 읽음"),
+}
+# Older cores report only the manifest policy.
+_SNAPSHOT_POLICY_MODES = {
+    "mysql_shared_consistent_snapshot": "parallel_strict",
+    "mysql_table_lock_shared_snapshot": "parallel_table_lock",
+    "mysql_single_connection_consistent_snapshot": "single_connection",
+    "mysql_parallel_unsynchronized_snapshots": "parallel_unsynchronized",
+}
+# Why the automatic choice skipped a method (snapshot_fallbacks[].reason).
+_SNAPSHOT_FALLBACK_REASONS = {
+    "privilege": "잠금 권한이 없어",
+    "unsupported": "서버가 백업 잠금을 지원하지 않아",
+    "connection_limit": "동시 연결 수 제한 때문에",
+    "lock_timeout": "잠금을 제때 얻지 못해",
+}
+_FEWER_WORKERS = "계정의 동시 연결 수 제한으로 줄임"
+
+
+def describe_snapshot_method(result: dict, requested_threads: int) -> str:
+    """One line naming the MySQL method the core used, from its result; empty for PostgreSQL.
+
+    e.g. "같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어 테이블만 잠깐 잠금)".
+    """
+    mode = result.get("mysql_snapshot_mode") or _SNAPSHOT_POLICY_MODES.get(str(result.get("snapshot_policy") or ""))
+    if mode not in _SNAPSHOT_METHODS:
+        return ""
+    guarantee, how = _SNAPSHOT_METHODS[mode]
+    one_connection = mode in _ONE_CONNECTION_MODES
+    workers = int(result.get("worker_count") or (1 if one_connection else requested_threads))
+    fallbacks = [item for item in result.get("snapshot_fallbacks") or [] if isinstance(item, dict)]
+    reason = _SNAPSHOT_FALLBACK_REASONS.get(str(fallbacks[-1].get("reason"))) if fallbacks else None
+    notes = [" ".join(part for part in (reason, how) if part)]
+    if workers < requested_threads and not one_connection:
+        notes.append(_FEWER_WORKERS)
+    detail = ", ".join(note for note in notes if note)
+    line = f"{guarantee} · 동시 작업 {workers}개"
+    return f"{line} ({detail})" if detail else line
+
+
 # 권한 거부 마커의 권한 이름. parallel_strict 는 FTWRL(RELOAD)과
 # LOCK INSTANCE FOR BACKUP(BACKUP_ADMIN)을, parallel_table_lock 은
 # 내보낼 테이블의 LOCK TABLES ... READ 를 필요로 한다.
@@ -295,6 +348,7 @@ class RustDumpExporter(_RustDumpClientBase):
         callbacks: Optional[DumpEventCallbacks] = None,
         mysql_snapshot_mode: str = "parallel_strict",
         allow_incomplete: bool = False,
+        mysql_snapshot_fallback: str = "single_connection",
     ) -> Tuple[bool, str]:
         callbacks = callbacks or DumpEventCallbacks()
         self.last_refusal = None
@@ -303,6 +357,8 @@ class RustDumpExporter(_RustDumpClientBase):
             raise ValueError(
                 f"unsupported mysql_snapshot_mode: {normalized_snapshot_mode}"
             )
+        if mysql_snapshot_fallback not in MYSQL_SNAPSHOT_FALLBACKS:
+            raise ValueError(f"unsupported mysql_snapshot_fallback: {mysql_snapshot_fallback}")
         effective_threads = (
             1 if normalized_snapshot_mode == "single_connection"
             else max(1, int(threads))
@@ -317,6 +373,8 @@ class RustDumpExporter(_RustDumpClientBase):
             "compression": compression if compression in {"none", "zstd"} else DEFAULT_DUMP_COMPRESSION,
             "mysql_snapshot_mode": normalized_snapshot_mode,
         }
+        if normalized_snapshot_mode == "auto":
+            payload["mysql_snapshot_fallback"] = mysql_snapshot_fallback
         if tables:
             payload["tables"] = tables
         if allow_incomplete:
@@ -347,21 +405,9 @@ class RustDumpExporter(_RustDumpClientBase):
         message = f"Rust DB Core export 완료: {table_count}개 테이블, {rows:,} rows"
         if view_count:
             message += f", View {view_count}개"
-        snapshot_policy = result.get("snapshot_policy")
-        if snapshot_policy == "mysql_shared_consistent_snapshot":
-            message += f" (MySQL 공유 일관 스냅샷, {effective_threads}개 워커)"
-        elif snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot":
-            message += (
-                f" (MySQL 락 없는 병렬 스냅샷, {effective_threads}개 워커)"
-            )
-        elif snapshot_policy == "mysql_table_lock_shared_snapshot":
-            message += f" (MySQL 테이블 락 공유 스냅샷, {effective_threads}개 워커)"
-        elif snapshot_policy == "mysql_parallel_unsynchronized_snapshots":
-            message += (
-                f" (MySQL 병렬 독립 스냅샷 · 시점 일관성 미보장, {effective_threads}개 워커)"
-            )
-        elif snapshot_policy == "mysql_single_connection_consistent_snapshot":
-            message += " (MySQL 단일 연결 일관 스냅샷)"
+        method = describe_snapshot_method(result, effective_threads)
+        if method:
+            message += f" · {method}"
         warnings = [str(warning) for warning in result.get("manifest_warnings", [])]
         for warning in warnings:
             if callbacks.progress:
@@ -383,6 +429,7 @@ class RustDumpExporter(_RustDumpClientBase):
         raw_output_callback: Optional[Callable[[str], None]] = None,
         mysql_snapshot_mode: str = "parallel_strict",
         allow_incomplete: bool = False,
+        mysql_snapshot_fallback: str = "single_connection",
     ) -> Tuple[bool, str]:
         try:
             success, message = self._run_rust_dump(
@@ -400,6 +447,7 @@ class RustDumpExporter(_RustDumpClientBase):
                 ),
                 mysql_snapshot_mode=mysql_snapshot_mode,
                 allow_incomplete=allow_incomplete,
+                mysql_snapshot_fallback=mysql_snapshot_fallback,
             )
             if success:
                 self._write_metadata(output_dir, schema, "full", None)
@@ -428,6 +476,7 @@ class RustDumpExporter(_RustDumpClientBase):
         raw_output_callback: Optional[Callable[[str], None]] = None,
         mysql_snapshot_mode: str = "parallel_strict",
         allow_incomplete: bool = False,
+        mysql_snapshot_fallback: str = "single_connection",
     ) -> Tuple[bool, str, List[str]]:
         try:
             final_tables = list(tables)
@@ -455,6 +504,7 @@ class RustDumpExporter(_RustDumpClientBase):
                 ),
                 mysql_snapshot_mode=mysql_snapshot_mode,
                 allow_incomplete=allow_incomplete,
+                mysql_snapshot_fallback=mysql_snapshot_fallback,
             )
             if success:
                 self._write_metadata(output_dir, schema, "partial", final_tables, added_tables)
@@ -574,6 +624,7 @@ CORE_CODE_SENTENCES = {
     "unsynchronized_snapshot": "덤프의 테이블들이 같은 시점에 내보내지지 않아 서로 맞지 않을 수 있습니다.",
     "views_outside_snapshot": "뷰 정의는 테이블 데이터와 같은 시점에 담기지 않았습니다.",
     "omitted_object": "내보낼 때 일부 객체가 빠졌습니다.",
+    "visibility_unproven": "내보낸 계정의 권한으로는 트리거, 저장 프로시저·함수, 예약 이벤트, 테이블이 모두 보였는지 알 수 없어 덤프에 빠진 것이 있을 수 있습니다.",
     "source_dump_warning": "덤프를 만들 때 남긴 경고가 있습니다.",
     "not_strict": "이 덤프는 완전한 백업으로 표시되어 있지 않습니다. 내보낼 때의 한계가 그대로 남습니다.",
     "legacy_timezone": "예전 덤프라 시간대가 기록되어 있지 않습니다. 고른 시간대나 대상 서버 기본값으로 시간을 읽습니다.",

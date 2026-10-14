@@ -137,7 +137,8 @@ existing same-engine target, the target checks `safe` runs before making a copy
 (see below); when those checks cannot run, one `copy_checks_unavailable` item
 takes their place and the rest of the preview is still returned. `warnings`
 (`{code, detail}`) map the manifest's texts to `unsynchronized_snapshot`,
-`views_outside_snapshot`, `omitted_object` or `source_dump_warning`, and add
+`views_outside_snapshot`, `omitted_object`, `visibility_unproven` or
+`source_dump_warning`, and add
 `not_strict`, `legacy_timezone`, `legacy_dump`, `create_privilege_unproven`,
 `drop_privilege_unproven` and `view_dependencies_unknown`.
 
@@ -341,11 +342,35 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
 
   | Mode | Privileges | Behavior | Manifest |
   | --- | --- | --- | --- |
-  | `parallel_strict` (default) | RELOAD (or FLUSH_TABLES), BACKUP_ADMIN | All workers open one shared consistent InnoDB snapshot under `FLUSH TABLES WITH READ LOCK` + `LOCK INSTANCE FOR BACKUP`; the global read lock is acquired within a 2-second limit and released right after the snapshot opens, while DDL stays blocked until the export ends. | `mysql_shared_consistent_snapshot`, `strict_export=true` |
+  | `parallel_strict` (default when the field is absent) | BACKUP_ADMIN, RELOAD (or FLUSH_TABLES) | `LOCK INSTANCE FOR BACKUP` first, then `FLUSH TABLES WITH READ LOCK` within a 2-second limit; all workers open one shared consistent InnoDB snapshot and the global read lock is released right after, while DDL stays blocked until the export ends. Taking the backup lock first means an account without BACKUP_ADMIN is refused before FTWRL has blocked every write on the server. | `mysql_shared_consistent_snapshot`, `strict_export=true` |
   | `parallel_table_lock` | LOCK TABLES, SELECT | `LOCK TABLES ... READ` on exactly the exported tables (2-second wait limit) while every worker opens its consistent snapshot, then `UNLOCK TABLES` before any data is read. Writes to those tables wait during that moment. Same point-in-time guarantee as strict; DDL changes are checked after the dump. | `mysql_table_lock_shared_snapshot`, `strict_export=true` |
   | `parallel_unsynchronized` | none beyond SELECT | Explicit opt-in. Each worker takes its own snapshot without any lock, so cross-table and cross-chunk point-in-time consistency is **not** guaranteed. | `mysql_parallel_unsynchronized_snapshots`, `strict_export=false`, persistent warning; Import reports it again |
   | `single_connection` | none beyond SELECT | One connection, one consistent snapshot, one worker. | `mysql_single_connection_consistent_snapshot`, `strict_export=true` |
   | `parallel_no_backup_lock` | none beyond SELECT | Kept for API compatibility; runs like `single_connection`. | same as `single_connection` |
+  | `auto` | any | The core picks: `parallel_strict`, then `parallel_table_lock`, then `mysql_snapshot_fallback` (`single_connection`, the default, or `parallel_unsynchronized` when the user explicitly gave up point-in-time consistency). See below. | the method that ran; never `auto` |
+
+- `auto` moves to the next method only when a later one can still work: a missing
+  privilege (1044/1045/1142/1227), a backup lock the server does not know
+  (1064/1235, on `LOCK INSTANCE` only), a connection limit (1040/1203/1226), or a
+  lock not granted within 2 seconds (1205, or the watchdog's KILL; TF-STATUS-185).
+  A lock timeout therefore falls to the table lock and then to one connection,
+  never on its own to the unsynchronized mode. Any other error fails the export.
+  When the backup lock was taken and only FTWRL failed, the table-lock method keeps
+  it (leaving LOCK TABLES mode releases it, so it is taken again right after
+  `UNLOCK TABLES`; DDL in that moment is caught by the drift check). Every other
+  failed attempt releases it. No method needs a privilege dialog.
+- The worker count is `max(1, min(threads, max_user_connections - own_sessions - 1))`
+  when `@@session.max_user_connections` is set; `own_sessions` are the account's
+  rows in `information_schema.PROCESSLIST` (no PROCESS privilege needed, matched by
+  user name). This applies to every MySQL mode.
+- The method that ran drives the worker count, the phase events, the manifest
+  policy and the result. The `dump.run` result and the snapshot phase event carry
+  `mysql_snapshot_mode` (resolved), `worker_count` and `snapshot_fallbacks`
+  (`[{mode, reason}]`, `reason` one of `privilege`, `unsupported`,
+  `connection_limit`, `lock_timeout`); the application builds its completion line
+  from them, for example `같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어 테이블만
+  잠깐 잠금)`. The wording promises no DDL protection for the table lock or one
+  connection.
 
   When `parallel_strict` is refused for missing privileges, the Export dialog asks
   once: continue in parallel with the table lock (recommended, default), continue
@@ -354,7 +379,9 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
   it asks a second and last time with only one connection (default) or
   unsynchronized parallel. A new export starts from `parallel_strict` again, and
   re-opening an export from the job list never reuses a recorded snapshot mode.
-  Granting RELOAD and BACKUP_ADMIN avoids the question.
+  Granting RELOAD and BACKUP_ADMIN avoids the question. (The dialog still sends
+  `parallel_strict`; switching it to `auto` without these questions is the next
+  step.)
 - PostgreSQL table export uses one read-only repeatable-read transaction and
   locks exported tables against destructive DDL. Nullable UNIQUE columns are not
   used as keyset cursors. Large keyless MySQL tables use a single streaming read.
@@ -416,7 +443,7 @@ claimed.
 | Views (full export only) | Preserved as separately captured definitions; persistent warning, `strict_export=false` | Same |
 | Generated columns, unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
 | Triggers on an exported table | Refused before export; waivable | Same |
-| Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not in scope of a table subset, so a subset export proceeds with a persistent warning (unchanged behavior) | Same (no events; materialized views apply) |
+| Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not part of a table subset, so a subset export neither refuses nor warns about them | Same (no events; materialized views apply) |
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
 
 Default behavior: when the selected scope contains any refused object, `dump.run`
@@ -428,11 +455,24 @@ true` in the `dump.run` payload; the UI lists the objects, up to 10 inline plus 
 count of the rest, before asking). The structure and data of all remaining tables
 are still exported; only the listed objects are left out. That choice
 keeps `strict_export=false` and adds a persistent `Object not exported: ...`
-warning per object. Lossy table definitions (`bypassable: false`) cannot be
-waived. Scheduled backups have no such prompt and therefore fail with the
+warning per object. Only objects inside the export scope get that warning:
+triggers of unselected tables and, for a table subset, routines, events and
+materialized views do not mark the dump incomplete. Lossy table definitions
+(`bypassable: false`) cannot be waived. Scheduled backups have no such prompt and therefore fail with the
 refusal instead of silently producing an incomplete backup. Import behavior is
 unchanged. Objects this inspection does not detect (for example MySQL
 partitioning, PostgreSQL extensions, rules or privileges) are not reported.
+
+MySQL lists triggers, routines, events and tables only to accounts allowed to
+see them, so a narrow account would get a dump that looks complete while it
+lacks them (B1). Before export the core reads the account's own grants
+(`SHOW GRANTS`): TRIGGER for every export, and for a full export also SELECT on
+the whole database (the table list), SHOW_ROUTINE, global SELECT, or EXECUTE /
+CREATE ROUTINE / ALTER ROUTINE (routines), and EVENT. Anything not proven, grants
+through roles or partial revokes, or a failed check sets `strict_export=false`
+with the persistent warning `The export account's privileges do not prove it
+sees every object, so some may be missing: ...`, which Import reports as
+`visibility_unproven`. PostgreSQL is not probed yet.
 
 A successful table transfer does not certify complete database backup fidelity.
 No new signing/notarization requirement or external database dump tool is

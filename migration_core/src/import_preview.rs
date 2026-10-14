@@ -263,7 +263,7 @@ fn can_create_namespace(admin: &mut LiveAdapter, endpoint: &Endpoint) -> Result<
     }
 }
 
-pub(super) fn mysql_grants_allow(conn: &mut mysql::PooledConn, privilege: &str, database: Option<&str>) -> Option<bool> {
+pub(crate) fn mysql_grants_allow(conn: &mut mysql::PooledConn, privilege: &str, database: Option<&str>) -> Option<bool> {
     let grants: Vec<String> = conn.query("SHOW GRANTS FOR CURRENT_USER").ok()?;
     // With partial_revokes on, `%` and `_` in database grants are plain characters. Servers
     // before 8.0.16 have no such variable and always treat them as wildcards.
@@ -362,9 +362,10 @@ mod tests {
             (format!("{WARNING_VIEWS_OUTSIDE_SNAPSHOT}; their consistency with that snapshot is not guaranteed."), "views_outside_snapshot"),
             (format!("{WARNING_OBJECT_NOT_EXPORTED} trigger:orders:trg"), "omitted_object"),
             (format!("{WARNING_NON_TRANSACTIONAL_EXCLUDED} logs"), "omitted_object"),
+            (format!("{WARNING_VISIBILITY_UNPROVEN} triggers (TRIGGER)"), "visibility_unproven"),
             ("View definitions could not be collected: denied".to_string(), "source_dump_warning"),
         ]);
-        assert_eq!(cases.len(), 6);
+        assert_eq!(cases.len(), 7);
         for (text, code) in cases {
             assert_eq!(super::super::manifest_warning_code(&text), code, "{text}");
         }

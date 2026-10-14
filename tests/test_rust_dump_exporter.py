@@ -218,7 +218,8 @@ class TestRustDumpExporter:
         assert success is True
         assert facade.payload["threads"] == 1
         assert facade.payload["mysql_snapshot_mode"] == "single_connection"
-        assert "단일 연결 일관 스냅샷" in message
+        assert "mysql_snapshot_fallback" not in facade.payload
+        assert message.endswith(" · 같은 시점으로 내보냄 · 동시 작업 1개 (연결 하나로 읽음)")
 
     def test_parallel_snapshot_privilege_marker_is_not_inferred_from_raw_1045(self):
         from src.exporters.rust_dump_exporter import (
@@ -288,9 +289,7 @@ class TestRustDumpExporter:
                     "success": True,
                     "tables": 1,
                     "rows_dumped": 2,
-                    "snapshot_policy": (
-                        "mysql_parallel_no_backup_lock_consistent_snapshot"
-                    ),
+                    "snapshot_policy": "mysql_single_connection_consistent_snapshot",
                 }
 
         facade = FakeFacade()
@@ -309,18 +308,18 @@ class TestRustDumpExporter:
         assert success is True
         assert facade.payload["threads"] == 8
         assert facade.payload["mysql_snapshot_mode"] == "parallel_no_backup_lock"
-        assert "락 없는 병렬" in message
+        assert message.endswith("동시 작업 1개 (연결 하나로 읽음)"), "the core reads it over one connection"
 
     @pytest.mark.parametrize("mode, policy, suffix", [
         (
             "parallel_table_lock",
             "mysql_table_lock_shared_snapshot",
-            " (MySQL 테이블 락 공유 스냅샷, 8개 워커)",
+            " · 같은 시점으로 내보냄 · 동시 작업 8개 (테이블만 잠깐 잠금)",
         ),
         (
             "parallel_unsynchronized",
             "mysql_parallel_unsynchronized_snapshots",
-            " (MySQL 병렬 독립 스냅샷 · 시점 일관성 미보장, 8개 워커)",
+            " · 테이블마다 시점이 다를 수 있음 · 동시 작업 8개 (시점을 맞추지 않고 나눠 읽음)",
         ),
     ])
     def test_new_parallel_snapshot_modes_keep_threads_and_name_the_policy(
@@ -348,6 +347,85 @@ class TestRustDumpExporter:
         assert payload["threads"] == 8
         assert payload["mysql_snapshot_mode"] == mode
         assert message.endswith(suffix)
+
+    @pytest.mark.parametrize("fallback", [None, "single_connection", "parallel_unsynchronized"])
+    def test_exporter_sends_auto_snapshot_mode_and_fallback(self, tmp_path, fallback):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        facade = MagicMock()
+        facade.run_dump.return_value = {"success": True, "tables": 1, "rows_dumped": 2}
+        facade.inspect_schema.return_value = {"tables": []}
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+        extra = {} if fallback is None else {"mysql_snapshot_fallback": fallback}
+
+        assert exporter.export_full_schema("app", str(tmp_path / "full"), threads=8, mysql_snapshot_mode="auto", **extra)[0]
+        assert exporter.export_tables("app", ["t"], str(tmp_path / "part"), threads=8, mysql_snapshot_mode="auto", **extra)[0]
+
+        for call in facade.run_dump.call_args_list:
+            payload = call.args[0]
+            assert payload["mysql_snapshot_mode"] == "auto"
+            assert payload["mysql_snapshot_fallback"] == (fallback or "single_connection")
+            assert payload["threads"] == 8, "the core lowers the worker count itself"
+
+    def test_exporter_rejects_unknown_snapshot_fallback(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        facade = MagicMock()
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+
+        success, message = exporter.export_full_schema(
+            "app", str(tmp_path / "dump"), mysql_snapshot_mode="auto", mysql_snapshot_fallback="parallel_strict"
+        )
+
+        assert success is False
+        assert "unsupported mysql_snapshot_fallback" in message
+        facade.run_dump.assert_not_called()
+
+    @pytest.mark.parametrize("result, threads, expected", [
+        (
+            {"mysql_snapshot_mode": "parallel_strict", "worker_count": 8, "snapshot_fallbacks": []},
+            8, "같은 시점으로 내보냄 · 동시 작업 8개",
+        ),
+        (
+            {"mysql_snapshot_mode": "parallel_table_lock", "worker_count": 8,
+             "snapshot_fallbacks": [{"mode": "parallel_strict", "reason": "privilege"}]},
+            8, "같은 시점으로 내보냄 · 동시 작업 8개 (잠금 권한이 없어 테이블만 잠깐 잠금)",
+        ),
+        (
+            {"mysql_snapshot_mode": "parallel_table_lock", "worker_count": 8,
+             "snapshot_fallbacks": [{"mode": "parallel_strict", "reason": "lock_timeout"}]},
+            8, "같은 시점으로 내보냄 · 동시 작업 8개 (잠금을 제때 얻지 못해 테이블만 잠깐 잠금)",
+        ),
+        (
+            {"mysql_snapshot_mode": "single_connection", "worker_count": 1,
+             "snapshot_fallbacks": [{"mode": "parallel_strict", "reason": "privilege"},
+                                    {"mode": "parallel_table_lock", "reason": "connection_limit"}]},
+            8, "같은 시점으로 내보냄 · 동시 작업 1개 (동시 연결 수 제한 때문에 연결 하나로 읽음)",
+        ),
+        (
+            {"mysql_snapshot_mode": "parallel_strict", "worker_count": 3, "snapshot_fallbacks": []},
+            8, "같은 시점으로 내보냄 · 동시 작업 3개 (계정의 동시 연결 수 제한으로 줄임)",
+        ),
+        (
+            {"mysql_snapshot_mode": "parallel_unsynchronized", "worker_count": 8,
+             "snapshot_fallbacks": [{"mode": "parallel_strict", "reason": "privilege"},
+                                    {"mode": "parallel_table_lock", "reason": "privilege"}]},
+            8, "테이블마다 시점이 다를 수 있음 · 동시 작업 8개 (잠금 권한이 없어 시점을 맞추지 않고 나눠 읽음)",
+        ),
+        ({"snapshot_policy": "mysql_shared_consistent_snapshot"}, 4, "같은 시점으로 내보냄 · 동시 작업 4개"),
+        ({"snapshot_policy": "postgresql_repeatable_read_snapshot", "worker_count": 1}, 8, ""),
+    ])
+    def test_export_message_names_the_method_actually_used(self, tmp_path, result, threads, expected):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter, describe_snapshot_method
+
+        assert describe_snapshot_method(result, threads) == expected
+        facade = MagicMock()
+        facade.run_dump.return_value = {"success": True, "tables": 2, "rows_dumped": 5, **result}
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+
+        _, message = exporter.export_full_schema("app", str(tmp_path / "dump"), threads=threads, mysql_snapshot_mode="auto")
+
+        assert message == "Rust DB Core export 완료: 2개 테이블, 5 rows" + (f" · {expected}" if expected else "")
 
     def test_denied_privilege_extracts_lock_tables_from_marker(self):
         from src.exporters.rust_dump_exporter import (

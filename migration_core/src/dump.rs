@@ -55,6 +55,193 @@ impl MysqlSnapshotMode {
             MysqlSnapshotMode::ParallelNoBackupLock | MysqlSnapshotMode::SingleConnection
         )
     }
+
+    /// The `mysql_snapshot_mode` value naming this method; results report the resolved one.
+    fn as_str(self) -> &'static str {
+        match self {
+            MysqlSnapshotMode::ParallelStrict => "parallel_strict",
+            MysqlSnapshotMode::ParallelTableLock => "parallel_table_lock",
+            MysqlSnapshotMode::ParallelUnsynchronized => "parallel_unsynchronized",
+            MysqlSnapshotMode::ParallelNoBackupLock => "parallel_no_backup_lock",
+            MysqlSnapshotMode::SingleConnection => "single_connection",
+        }
+    }
+
+    fn from_request_value(value: &str) -> Option<Self> {
+        Some(match value {
+            "parallel_strict" => MysqlSnapshotMode::ParallelStrict,
+            "parallel_table_lock" => MysqlSnapshotMode::ParallelTableLock,
+            "parallel_unsynchronized" => MysqlSnapshotMode::ParallelUnsynchronized,
+            "parallel_no_backup_lock" => MysqlSnapshotMode::ParallelNoBackupLock,
+            "single_connection" => MysqlSnapshotMode::SingleConnection,
+            _ => return None,
+        })
+    }
+
+    fn preparing_message(self) -> &'static str {
+        match self {
+            MysqlSnapshotMode::SingleConnection => "단일 연결 일관 스냅샷 준비 중 (관리 권한 불필요)",
+            MysqlSnapshotMode::ParallelNoBackupLock => {
+                "락 없는 일관 스냅샷: 테이블 간 일관성을 위해 단일 워커로 전환 (관리 권한 불필요)"
+            }
+            MysqlSnapshotMode::ParallelStrict => {
+                "공유 일관 스냅샷 준비 중 (쓰기 잠금은 최대 2초 내 획득 후 즉시 해제)"
+            }
+            MysqlSnapshotMode::ParallelTableLock => {
+                "테이블 읽기 락 공유 스냅샷 준비 중 (내보낼 테이블의 쓰기를 최대 2초 대기시킨 뒤 즉시 해제)"
+            }
+            MysqlSnapshotMode::ParallelUnsynchronized => {
+                "병렬 독립 스냅샷 준비 중 (락 없음, 테이블 간 시점 일관성 보장 안 함)"
+            }
+        }
+    }
+
+    fn ready_message(self, workers: usize, setup_ms: u64) -> String {
+        match self {
+            MysqlSnapshotMode::SingleConnection => {
+                format!("MySQL 단일 연결 일관 스냅샷 준비 완료: 1개 워커, {setup_ms} ms")
+            }
+            MysqlSnapshotMode::ParallelNoBackupLock => format!(
+                "MySQL 단일 연결 일관 스냅샷 준비 완료 (병렬 요청을 안전한 단일 워커로 전환): {workers}개 워커, {setup_ms} ms (덤프 후 DDL 변경 검사)"
+            ),
+            MysqlSnapshotMode::ParallelStrict => format!(
+                "MySQL 공유 일관 스냅샷 준비 완료: {workers}개 워커, {setup_ms} ms (일반 쓰기 가능, DDL만 export 종료까지 제한)"
+            ),
+            MysqlSnapshotMode::ParallelTableLock => format!(
+                "MySQL 테이블 락 공유 일관 스냅샷 준비 완료: {workers}개 워커, {setup_ms} ms (DDL 변경은 덤프 후 검사)"
+            ),
+            MysqlSnapshotMode::ParallelUnsynchronized => format!(
+                "MySQL 병렬 독립 스냅샷 준비 완료: {workers}개 워커, {setup_ms} ms (테이블 간 시점 일관성 보장 안 함)"
+            ),
+        }
+    }
+}
+
+/// What dump.run was asked for: one fixed method, or `auto`, which tries the
+/// shared-lock methods first and ends at `fallback` (one connection, or the
+/// explicitly chosen unsynchronized parallel export). There is no `Auto`
+/// snapshot mode, so a manifest can only ever record the method that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MysqlSnapshotRequest {
+    Fixed(MysqlSnapshotMode),
+    Auto { fallback: MysqlSnapshotMode },
+}
+
+impl MysqlSnapshotRequest {
+    /// The methods to try, in order.
+    fn attempts(self) -> Vec<MysqlSnapshotMode> {
+        match self {
+            MysqlSnapshotRequest::Fixed(mode) => vec![mode],
+            MysqlSnapshotRequest::Auto { fallback } => vec![
+                MysqlSnapshotMode::ParallelStrict,
+                MysqlSnapshotMode::ParallelTableLock,
+                fallback,
+            ],
+        }
+    }
+}
+
+/// Codes after which a later method of the automatic chain can still work: a missing
+/// privilege, a backup lock this server does not know (1064/1235, only for that
+/// statement), a connection limit, or a lock not granted in time (1205, or 1317 after
+/// the watchdog's KILL QUERY; TF-STATUS-185).
+fn mysql_snapshot_fallback_reason(err: &mysql::Error, backup_lock_statement: bool) -> Option<&'static str> {
+    let mysql::Error::MySqlError(server_error) = err else {
+        return None;
+    };
+    match server_error.code {
+        1044 | 1045 | 1142 | 1227 => Some("privilege"),
+        1064 | 1235 if backup_lock_statement => Some("unsupported"),
+        1040 | 1203 | 1226 => Some("connection_limit"),
+        1205 | 1317 => Some("lock_timeout"),
+        _ => None,
+    }
+}
+
+/// The log line when the automatic chain moves on to the next method.
+fn mysql_snapshot_fallback_message(reason: &str) -> &'static str {
+    match reason {
+        "privilege" => "잠금 권한이 없어 다음 방법으로 내보냅니다.",
+        "unsupported" => "서버가 백업 잠금을 지원하지 않아 다음 방법으로 내보냅니다.",
+        "connection_limit" => "동시 연결 수 제한 때문에 다음 방법으로 내보냅니다.",
+        _ => "잠금을 제때 얻지 못해 다음 방법으로 내보냅니다.",
+    }
+}
+
+/// Why one snapshot method could not start. `reason` is set when a later method of
+/// the automatic chain can still work.
+struct SnapshotFailure {
+    message: String,
+    reason: Option<&'static str>,
+    /// The coordinator, still holding LOCK INSTANCE FOR BACKUP, when only the global
+    /// read lock failed and the table-lock retry keeps it.
+    backup_locked: Option<mysql::PooledConn>,
+}
+
+impl SnapshotFailure {
+    fn new(message: String, reason: Option<&'static str>) -> Self {
+        Self { message, reason, backup_locked: None }
+    }
+}
+
+impl From<String> for SnapshotFailure {
+    fn from(message: String) -> Self {
+        Self::new(message, None)
+    }
+}
+
+/// How the coordinator lines the workers' snapshots up.
+enum SnapshotLock {
+    /// parallel_strict: LOCK INSTANCE FOR BACKUP (held until the export ends), then a
+    /// brief FTWRL. With `keep_backup_lock` a failed FTWRL hands the backup-locked
+    /// coordinator back for the table-lock retry.
+    Global { keep_backup_lock: bool },
+    /// parallel_table_lock: a brief LOCK TABLES ... READ on the export scope, on a
+    /// coordinator that may already hold the backup lock.
+    Tables { lock_sql: String, backup_locked: Option<mysql::PooledConn> },
+}
+
+/// A snapshot session; the raw mysql error keeps its code for the fallback chain.
+fn mysql_snapshot_connection(endpoint: &Endpoint) -> Result<mysql::PooledConn, SnapshotFailure> {
+    mysql::Pool::new(mysql_opts(endpoint))
+        .and_then(|pool| pool.get_conn())
+        .map_err(|err| {
+            let suffix = tls_error_suffix(classify_mysql_error(endpoint, &err));
+            SnapshotFailure::new(
+                format!("mysql connection error: {err}{suffix}"),
+                mysql_snapshot_fallback_reason(&err, false),
+            )
+        })
+}
+
+/// Workers the account's connection limit leaves room for. A strict snapshot holds
+/// the workers plus a coordinator and its watchdog; `own_sessions` counts this probe,
+/// which closes before the snapshot opens. 0 means unlimited.
+fn mysql_connection_budget(threads: usize, max_user_connections: u64, own_sessions: u64) -> usize {
+    if max_user_connections == 0 {
+        return threads;
+    }
+    let room = max_user_connections.saturating_sub(own_sessions + 1);
+    threads.min(usize::try_from(room).unwrap_or(usize::MAX)).max(1)
+}
+
+/// `threads`, lowered to what `max_user_connections` allows. information_schema.PROCESSLIST
+/// lists the account's own sessions without the PROCESS privilege. When the probe fails the
+/// request is kept, and a limit hit later still moves the automatic chain on.
+fn mysql_threads_within_connection_limit(endpoint: &Endpoint, threads: usize) -> usize {
+    // ponytail: user-name match, refine per host if it misfires
+    let probe = mysql_connection(endpoint).and_then(|mut conn| {
+        conn.query_first::<(u64, u64), _>(
+            "SELECT @@session.max_user_connections, (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = SUBSTRING_INDEX(USER(), '@', 1))",
+        )
+        .map_err(|err| err.to_string())
+    });
+    match probe {
+        Ok(Some((max_user_connections, own_sessions))) => {
+            mysql_connection_budget(threads, max_user_connections, own_sessions)
+        }
+        _ => threads,
+    }
 }
 
 fn mysql_snapshot_worker_setup_sql() -> [&'static str; 3] {
@@ -65,11 +252,13 @@ fn mysql_snapshot_worker_setup_sql() -> [&'static str; 3] {
     ]
 }
 
+/// The backup lock comes first: an account without BACKUP_ADMIN then fails before
+/// FTWRL has blocked every write on the server (B13).
 fn mysql_snapshot_coordinator_sql() -> [&'static str; 4] {
     [
         "SET SESSION lock_wait_timeout=2",
-        "FLUSH TABLES WITH READ LOCK",
         "LOCK INSTANCE FOR BACKUP",
+        "FLUSH TABLES WITH READ LOCK",
         "UNLOCK TABLES",
     ]
 }
@@ -128,85 +317,108 @@ struct MysqlSharedSnapshot {
 }
 
 impl MysqlSharedSnapshot {
-    /// 모든 워커가 동일 시점 스냅샷을 공유한다. `table_lock_sql`이 없으면(parallel_strict)
-    /// 짧은 글로벌 read lock(FTWRL) + LOCK INSTANCE FOR BACKUP을 쓰고, 있으면
-    /// (parallel_table_lock) export 대상 테이블만 LOCK TABLES ... READ로 잠깐 막은 뒤
-    /// 즉시 해제한다(덤프 중에는 락을 들고 있지 않음). 권한이 없으면 privilege marker로 실패한다.
-    fn acquire(
-        endpoint: &Endpoint,
-        worker_count: usize,
-        table_lock_sql: Option<String>,
-    ) -> Result<Self, String> {
+    /// 모든 워커가 동일 시점 스냅샷을 공유한다. parallel_strict는 LOCK INSTANCE FOR BACKUP 후
+    /// 짧은 글로벌 read lock(FTWRL)을, parallel_table_lock은 export 대상 테이블만
+    /// LOCK TABLES ... READ로 잠깐 막은 뒤 즉시 해제한다(덤프 중에는 락을 들고 있지 않음).
+    /// 권한이 없으면 privilege marker로 실패한다. Every error path releases the backup lock,
+    /// except the one `SnapshotLock::Global { keep_backup_lock: true }` hands back.
+    fn acquire(endpoint: &Endpoint, worker_count: usize, lock: SnapshotLock) -> Result<Self, SnapshotFailure> {
         let started = Instant::now();
-        let mut coordinator = mysql_connection(endpoint)?;
-        let control = mysql_connection(endpoint)?;
-        let mut workers = (0..worker_count.max(1))
-            .map(|_| mysql_connection(endpoint))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (table_lock_sql, keep_backup_lock, backup_locked) = match lock {
+            SnapshotLock::Global { keep_backup_lock } => (None, keep_backup_lock, None),
+            SnapshotLock::Tables { lock_sql, backup_locked } => (Some(lock_sql), false, backup_locked),
+        };
+        let mut holds_backup_lock = backup_locked.is_some();
+        let mut coordinator = match backup_locked {
+            Some(coordinator) => coordinator,
+            None => mysql_snapshot_connection(endpoint)?,
+        };
+        let mut workers = Vec::new();
+        let mut global_lock_failed = false;
         let [timezone_sql, isolation_sql, snapshot_sql] = mysql_snapshot_worker_setup_sql();
-        for worker in &mut workers {
-            worker.query_drop(timezone_sql)
-                .map_err(|err| format!("mysql snapshot timezone setup failed: {err}"))?;
-            worker
-                .query_drop(isolation_sql)
-                .map_err(|err| format!("mysql snapshot isolation setup failed: {err}"))?;
-        }
-
-        let [timeout_sql, global_lock_sql, backup_lock_sql, unlock_tables_sql] =
+        let [timeout_sql, backup_lock_sql, global_lock_sql, unlock_tables_sql] =
             mysql_snapshot_coordinator_sql();
-        coordinator
-            .query_drop(timeout_sql)
-            .map_err(|err| format!("mysql snapshot lock timeout setup failed: {err}"))?;
-        let lock_sql = table_lock_sql.as_deref().unwrap_or(global_lock_sql);
-        if let Err(err) = mysql_lock_with_watchdog(&mut coordinator, control, lock_sql)? {
-            return Err(if table_lock_sql.is_some() {
-                mysql_parallel_privilege_error(&err, "LOCK_TABLES").unwrap_or_else(|| {
-                    format!(
-                        "mysql consistent snapshot could not acquire table read locks within 2 seconds: {err}"
-                    )
-                })
+        let setup_result = (|| -> Result<(), SnapshotFailure> {
+            let control = mysql_snapshot_connection(endpoint)?;
+            for _ in 0..worker_count.max(1) {
+                let mut worker = mysql_snapshot_connection(endpoint)?;
+                worker.query_drop(timezone_sql)
+                    .map_err(|err| format!("mysql snapshot timezone setup failed: {err}"))?;
+                worker
+                    .query_drop(isolation_sql)
+                    .map_err(|err| format!("mysql snapshot isolation setup failed: {err}"))?;
+                workers.push(worker);
+            }
+            coordinator
+                .query_drop(timeout_sql)
+                .map_err(|err| format!("mysql snapshot lock timeout setup failed: {err}"))?;
+            if let Some(lock_sql) = &table_lock_sql {
+                if let Err(err) = mysql_lock_with_watchdog(&mut coordinator, control, lock_sql)? {
+                    return Err(SnapshotFailure::new(
+                        mysql_parallel_privilege_error(&err, "LOCK_TABLES").unwrap_or_else(|| {
+                            format!(
+                                "mysql consistent snapshot could not acquire table read locks within 2 seconds: {err}"
+                            )
+                        }),
+                        mysql_snapshot_fallback_reason(&err, false),
+                    ));
+                }
             } else {
-                mysql_parallel_privilege_error(&err, "FLUSH_TABLES_OR_RELOAD").unwrap_or_else(|| {
-                    format!(
-                        "mysql consistent snapshot could not acquire the brief global read lock within 2 seconds: {err}"
+                coordinator.query_drop(backup_lock_sql).map_err(|err| {
+                    SnapshotFailure::new(
+                        mysql_parallel_privilege_error(&err, "BACKUP_ADMIN").unwrap_or_else(|| {
+                            format!(
+                                "mysql backup lock failed; BACKUP_ADMIN is required for a safe online export: {err}"
+                            )
+                        }),
+                        mysql_snapshot_fallback_reason(&err, true),
                     )
-                })
-            });
-        }
-
-        let setup_result = (|| -> Result<(), String> {
+                })?;
+                holds_backup_lock = true;
+                if let Err(err) = mysql_lock_with_watchdog(&mut coordinator, control, global_lock_sql)? {
+                    global_lock_failed = true;
+                    return Err(SnapshotFailure::new(
+                        mysql_parallel_privilege_error(&err, "FLUSH_TABLES_OR_RELOAD").unwrap_or_else(|| {
+                            format!(
+                                "mysql consistent snapshot could not acquire the brief global read lock within 2 seconds: {err}"
+                            )
+                        }),
+                        mysql_snapshot_fallback_reason(&err, false),
+                    ));
+                }
+            }
             for worker in &mut workers {
                 worker.query_drop(snapshot_sql).map_err(|err| {
                     format!("mysql worker consistent snapshot start failed: {err}")
                 })?;
             }
-            if table_lock_sql.is_none() {
-                coordinator.query_drop(backup_lock_sql).map_err(|err| {
-                    mysql_parallel_privilege_error(&err, "BACKUP_ADMIN").unwrap_or_else(|| {
-                        format!(
-                            "mysql backup lock failed; BACKUP_ADMIN is required for a safe online export: {err}"
-                        )
-                    })
-                })?;
-            }
             coordinator
                 .query_drop(unlock_tables_sql)
                 .map_err(|err| format!("mysql snapshot read lock release failed: {err}"))?;
+            if table_lock_sql.is_some() && holds_backup_lock {
+                // Leaving LOCK TABLES mode releases the backup lock as well; take it back for the
+                // rest of the export. DDL in the moment between is caught by the drift check.
+                holds_backup_lock = coordinator.query_drop(backup_lock_sql).is_ok();
+            }
             Ok(())
         })();
-        if let Err(err) = setup_result {
+        if let Err(mut failure) = setup_result {
             let _ = coordinator.query_drop("UNLOCK TABLES");
-            let _ = coordinator.query_drop("UNLOCK INSTANCE");
             for worker in &mut workers {
                 let _ = worker.query_drop("ROLLBACK");
             }
-            return Err(err);
+            if global_lock_failed && keep_backup_lock && failure.reason.is_some() {
+                failure.backup_locked = Some(coordinator);
+            } else if holds_backup_lock {
+                let _ = coordinator.query_drop("UNLOCK INSTANCE");
+            }
+            return Err(failure);
         }
 
         Ok(Self {
-            // The backup lock (strict) is held until the export ends; table locks are
-            // already released, so that coordinator is closed here.
-            coordinator: table_lock_sql.is_none().then_some(coordinator),
+            // The backup lock is held until the export ends; without it the coordinator
+            // closes here (table locks are already released).
+            coordinator: holds_backup_lock.then_some(coordinator),
             workers,
             setup_ms: started.elapsed().as_millis().max(1) as u64,
         })
@@ -614,7 +826,7 @@ struct DumpRunOptions {
     selected_tables: Vec<String>,
     data_format: String,
     compression: String,
-    mysql_snapshot_mode: MysqlSnapshotMode,
+    mysql_snapshot: MysqlSnapshotRequest,
     /// Explicit "table data only (incomplete)" choice: proceed although the scope
     /// contains objects the dump cannot preserve (they are omitted with warnings).
     allow_incomplete: bool,
@@ -666,20 +878,24 @@ fn parse_dump_run_options(request: &Request) -> Result<DumpRunOptions, String> {
     if !matches!(compression.as_str(), "none" | "zstd") {
         return Err(format!("unsupported dump compression: {compression}"));
     }
-    let mysql_snapshot_mode = match request
-        .payload
-        .get("mysql_snapshot_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("parallel_strict")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "parallel_strict" => MysqlSnapshotMode::ParallelStrict,
-        "parallel_table_lock" => MysqlSnapshotMode::ParallelTableLock,
-        "parallel_unsynchronized" => MysqlSnapshotMode::ParallelUnsynchronized,
-        "parallel_no_backup_lock" => MysqlSnapshotMode::ParallelNoBackupLock,
-        "single_connection" => MysqlSnapshotMode::SingleConnection,
-        other => return Err(format!("unsupported mysql_snapshot_mode: {other}")),
+    let text = |key: &str, default: &str| {
+        request.payload.get(key).and_then(Value::as_str).unwrap_or(default).to_ascii_lowercase()
+    };
+    // An absent mode still means parallel_strict (older callers).
+    let mode = text("mysql_snapshot_mode", "parallel_strict");
+    let mysql_snapshot = if mode == "auto" {
+        let fallback = text("mysql_snapshot_fallback", "single_connection");
+        match MysqlSnapshotMode::from_request_value(&fallback) {
+            Some(fallback @ (MysqlSnapshotMode::SingleConnection | MysqlSnapshotMode::ParallelUnsynchronized)) => {
+                MysqlSnapshotRequest::Auto { fallback }
+            }
+            _ => return Err(format!("unsupported mysql_snapshot_fallback: {fallback}")),
+        }
+    } else {
+        MysqlSnapshotRequest::Fixed(
+            MysqlSnapshotMode::from_request_value(&mode)
+                .ok_or_else(|| format!("unsupported mysql_snapshot_mode: {mode}"))?,
+        )
     };
     Ok(DumpRunOptions {
         output_dir,
@@ -689,7 +905,7 @@ fn parse_dump_run_options(request: &Request) -> Result<DumpRunOptions, String> {
         selected_tables,
         data_format,
         compression,
-        mysql_snapshot_mode,
+        mysql_snapshot,
         allow_incomplete: request
             .payload
             .get("allow_incomplete")
@@ -730,6 +946,8 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     schema: NormalizedSchema,
     table_manifests: Vec<DumpTableManifest>,
     options: &DumpRunOptions,
+    // The method that actually ran (never "auto"); PostgreSQL ignores it.
+    mysql_snapshot_policy: &str,
     output_path: &Path,
     full_export: bool,
     export_warnings: Vec<String>,
@@ -762,10 +980,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     };
     let views_count = views.len();
     let (snapshot_policy, mut strict_export, mut manifest_warnings) =
-        dump_manifest_consistency_metadata(
-            &endpoint.engine,
-            options.mysql_snapshot_mode.policy_label(),
-        );
+        dump_manifest_consistency_metadata(&endpoint.engine, mysql_snapshot_policy);
     if !export_warnings.is_empty() {
         strict_export = false;
         manifest_warnings.extend(export_warnings);
@@ -873,6 +1088,113 @@ fn mysql_non_transactional_objects(endpoint: &Endpoint, schema: &NormalizedSchem
         .collect())
 }
 
+/// B1: information_schema lists only what the account may see, so without these
+/// grants a dump looks complete while it lacks triggers, routines, events or tables
+/// the account cannot see. Returns the object kinds the grants do not prove visible;
+/// `granted(privilege, on_database)` answers for `*.*`, or also for the export
+/// database. Routines and events, like the table list, are only in scope for a full
+/// export.
+fn mysql_unproven_visibility(mut granted: impl FnMut(&str, bool) -> bool, full_export: bool) -> Vec<&'static str> {
+    let mut unproven = Vec::new();
+    if !granted("TRIGGER", true) {
+        unproven.push("triggers (TRIGGER)");
+    }
+    if full_export {
+        if !granted("SELECT", true) {
+            unproven.push("tables (SELECT on the whole database)");
+        }
+        let sees_routines = granted("SELECT", false)
+            || granted("SHOW_ROUTINE", false)
+            || ["EXECUTE", "CREATE ROUTINE", "ALTER ROUTINE"].into_iter().any(|privilege| granted(privilege, true));
+        if !sees_routines {
+            unproven.push("routines (SHOW_ROUTINE, global SELECT or EXECUTE)");
+        }
+        if !granted("EVENT", true) {
+            unproven.push("events (EVENT)");
+        }
+    }
+    unproven
+}
+
+/// The manifest warning for B1, or None when the account's own grants prove that it
+/// sees every object in scope. Grants through roles or partial revokes cannot prove it.
+fn mysql_visibility_warning(endpoint: &Endpoint, full_export: bool) -> Option<String> {
+    let database = endpoint_schema(endpoint);
+    let unproven = match mysql_connection(endpoint) {
+        Ok(mut conn) => mysql_unproven_visibility(
+            |privilege, on_database| {
+                crate::import::import_preview::mysql_grants_allow(&mut conn, privilege, on_database.then_some(database.as_str()))
+                    == Some(true)
+            },
+            full_export,
+        ),
+        Err(err) => return Some(format!("{WARNING_VISIBILITY_UNPROVEN} the privilege check failed ({err})")),
+    };
+    (!unproven.is_empty()).then(|| format!("{WARNING_VISIBILITY_UNPROVEN} {}", unproven.join(", ")))
+}
+
+/// Tries the requested snapshot methods in order (one for a fixed mode, the chain for
+/// auto) and returns the first that starts. A failure moves on only when a later
+/// method can still work; each skipped method is recorded in `fallbacks`.
+fn acquire_mysql_snapshot<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    tables: &[NormalizedTable],
+    request: MysqlSnapshotRequest,
+    threads: usize,
+    request_id: &Option<String>,
+    fallbacks: &mut Vec<Value>,
+    emit: &mut F,
+) -> Result<(MysqlSnapshotMode, MysqlSharedSnapshot), String> {
+    let attempts = request.attempts();
+    let mut backup_locked = None;
+    for (index, &mode) in attempts.iter().enumerate() {
+        let has_next = index + 1 < attempts.len();
+        let workers = if mode.forces_single_thread() { 1 } else { threads };
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "snapshot",
+            "message": mode.preparing_message()
+        }));
+        let attempt = match mode {
+            MysqlSnapshotMode::ParallelStrict => MysqlSharedSnapshot::acquire(
+                endpoint,
+                workers,
+                SnapshotLock::Global {
+                    keep_backup_lock: attempts.get(index + 1) == Some(&MysqlSnapshotMode::ParallelTableLock),
+                },
+            ),
+            MysqlSnapshotMode::ParallelTableLock => MysqlSharedSnapshot::acquire(
+                endpoint,
+                workers,
+                SnapshotLock::Tables {
+                    lock_sql: mysql_table_lock_sql(&endpoint.database, tables),
+                    backup_locked: backup_locked.take(),
+                },
+            ),
+            _ => MysqlSharedSnapshot::acquire_lock_free(endpoint, workers).map_err(SnapshotFailure::from),
+        };
+        match attempt {
+            Ok(snapshot) => return Ok((mode, snapshot)),
+            Err(mut failure) => match failure.reason {
+                Some(reason) if has_next => {
+                    backup_locked = failure.backup_locked.take();
+                    fallbacks.push(json!({"mode": mode.as_str(), "reason": reason}));
+                    emit(json!({
+                        "event": "phase",
+                        "request_id": request_id,
+                        "phase": "snapshot",
+                        "message": mysql_snapshot_fallback_message(reason),
+                        "detail": failure.message
+                    }));
+                }
+                _ => return Err(failure.message),
+            },
+        }
+    }
+    Err("mysql snapshot request named no method".to_string())
+}
+
 #[cfg(test)]
 fn dump_run<F: FnMut(Value)>(request: &Request, emit: F) -> Result<Value, String> {
     dump_run_with_refusal(request, emit, &mut None)
@@ -894,10 +1216,6 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     // before snapshot acquisition; it is not MVCC state. Restoring its captured
     // value and then explicit keys lets MySQL retain max(captured, MAX(id) + 1).
     let inspection = inspect_live(&endpoint)?;
-    let mut export_warnings: Vec<String> = inspection.unsupported_objects.iter()
-        .filter(|object| !object.starts_with("view:"))
-        .map(|object| format!("{WARNING_OBJECT_NOT_EXPORTED} {object}"))
-        .collect();
     let mut schema = inspection.schema;
     if !options.selected_tables.is_empty() {
         let selected: BTreeSet<String> = options.selected_tables.iter().cloned().collect();
@@ -925,78 +1243,48 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         *refusal_slot = Some(refusal);
         return Err(message);
     }
+    // Only objects inside the export scope make this dump incomplete (C5).
+    let mut export_warnings: Vec<String> = scoped_omitted_objects(&inspection.unsupported_objects, &schema, full_export)
+        .into_iter()
+        .map(|object| format!("{WARNING_OBJECT_NOT_EXPORTED} {object}"))
+        .collect();
+    if endpoint.engine == "mysql" {
+        export_warnings.extend(mysql_visibility_warning(&endpoint, full_export));
+    }
     prepare_dump_output_dir(output_path, options.overwrite)?;
 
-    let effective_threads = if endpoint.engine == "postgresql" || (endpoint.engine == "mysql"
-        && options.mysql_snapshot_mode.forces_single_thread())
-    {
-        1
-    } else {
-        options.threads
-    };
+    // The resolved method drives the worker count, the phase events, the manifest
+    // policy and the result, so `auto` is never recorded.
+    let mut snapshot_fallbacks = Vec::new();
+    let mut resolved_mode = None;
     let mut mysql_snapshot = if endpoint.engine == "mysql" {
+        let threads = mysql_threads_within_connection_limit(&endpoint, options.threads);
+        let (mode, snapshot) = acquire_mysql_snapshot(
+            &endpoint,
+            &schema.tables,
+            options.mysql_snapshot,
+            threads,
+            &request.request_id,
+            &mut snapshot_fallbacks,
+            &mut emit,
+        )?;
         emit(json!({
             "event": "phase",
             "request_id": request.request_id,
             "phase": "snapshot",
-            "message": match options.mysql_snapshot_mode {
-                MysqlSnapshotMode::SingleConnection =>
-                    "단일 연결 일관 스냅샷 준비 중 (관리 권한 불필요)",
-                MysqlSnapshotMode::ParallelNoBackupLock =>
-                    "락 없는 일관 스냅샷: 테이블 간 일관성을 위해 단일 워커로 전환 (관리 권한 불필요)",
-                MysqlSnapshotMode::ParallelStrict =>
-                    "공유 일관 스냅샷 준비 중 (쓰기 잠금은 최대 2초 내 획득 후 즉시 해제)",
-                MysqlSnapshotMode::ParallelTableLock =>
-                    "테이블 읽기 락 공유 스냅샷 준비 중 (내보낼 테이블의 쓰기를 최대 2초 대기시킨 뒤 즉시 해제)",
-                MysqlSnapshotMode::ParallelUnsynchronized =>
-                    "병렬 독립 스냅샷 준비 중 (락 없음, 테이블 간 시점 일관성 보장 안 함)",
-            }
-        }));
-        let snapshot = match options.mysql_snapshot_mode {
-            MysqlSnapshotMode::ParallelStrict => {
-                MysqlSharedSnapshot::acquire(&endpoint, effective_threads, None)?
-            }
-            MysqlSnapshotMode::ParallelTableLock => MysqlSharedSnapshot::acquire(
-                &endpoint,
-                effective_threads,
-                Some(mysql_table_lock_sql(&endpoint.database, &schema.tables)),
-            )?,
-            _ => MysqlSharedSnapshot::acquire_lock_free(&endpoint, effective_threads)?,
-        };
-        emit(json!({
-            "event": "phase",
-            "request_id": request.request_id,
-            "phase": "snapshot",
-            "message": match options.mysql_snapshot_mode {
-                MysqlSnapshotMode::SingleConnection => format!(
-                    "MySQL 단일 연결 일관 스냅샷 준비 완료: 1개 워커, {} ms",
-                    snapshot.setup_ms
-                ),
-                MysqlSnapshotMode::ParallelNoBackupLock => format!(
-                    "MySQL 단일 연결 일관 스냅샷 준비 완료 (병렬 요청을 안전한 단일 워커로 전환): {}개 워커, {} ms (덤프 후 DDL 변경 검사)",
-                    snapshot.workers.len(), snapshot.setup_ms
-                ),
-                MysqlSnapshotMode::ParallelStrict => format!(
-                    "MySQL 공유 일관 스냅샷 준비 완료: {}개 워커, {} ms (일반 쓰기 가능, DDL만 export 종료까지 제한)",
-                    snapshot.workers.len(), snapshot.setup_ms
-                ),
-                MysqlSnapshotMode::ParallelTableLock => format!(
-                    "MySQL 테이블 락 공유 일관 스냅샷 준비 완료: {}개 워커, {} ms (DDL 변경은 덤프 후 검사)",
-                    snapshot.workers.len(), snapshot.setup_ms
-                ),
-                MysqlSnapshotMode::ParallelUnsynchronized => format!(
-                    "MySQL 병렬 독립 스냅샷 준비 완료: {}개 워커, {} ms (테이블 간 시점 일관성 보장 안 함)",
-                    snapshot.workers.len(), snapshot.setup_ms
-                ),
-            },
-            "snapshot_policy": options.mysql_snapshot_mode.policy_label(),
+            "message": mode.ready_message(snapshot.workers.len(), snapshot.setup_ms),
+            "snapshot_policy": mode.policy_label(),
+            "mysql_snapshot_mode": mode.as_str(),
             "worker_count": snapshot.workers.len(),
+            "snapshot_fallbacks": snapshot_fallbacks,
             "setup_ms": snapshot.setup_ms
         }));
+        resolved_mode = Some(mode);
         Some(snapshot)
     } else {
         None
     };
+    let effective_threads = mysql_snapshot.as_ref().map_or(1, |snapshot| snapshot.workers.len());
 
     let mut postgres_snapshot = if endpoint.engine == "postgresql" {
         let mut adapter = LiveAdapter::connect(&endpoint)?;
@@ -1111,7 +1399,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         }
     };
 
-    if endpoint.engine == "mysql" && options.mysql_snapshot_mode.requires_ddl_drift_check() {
+    if resolved_mode.is_some_and(MysqlSnapshotMode::requires_ddl_drift_check) {
         let mut schema_after = inspect_live(&endpoint)?.schema;
         // before(schema)는 이미 selected 필터 + non-transactional(_contents_qcs 등 MEMORY) 제외를
         // 거친 실제 export 대상이다. after도 그 테이블 집합으로 맞춰야, 제외된 테이블이 after에만
@@ -1135,6 +1423,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         schema,
         table_manifests,
         &options,
+        resolved_mode.map_or("", MysqlSnapshotMode::policy_label),
         output_path,
         full_export,
         export_warnings,
@@ -1152,6 +1441,9 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         "format_version": manifest.format_version,
         "compression": manifest.compression,
         "snapshot_policy": manifest.snapshot_policy,
+        "mysql_snapshot_mode": resolved_mode.map(MysqlSnapshotMode::as_str),
+        "worker_count": effective_threads,
+        "snapshot_fallbacks": snapshot_fallbacks,
         "strict_export": manifest.strict_export,
         "manifest_warnings": manifest.manifest_warnings,
         "tables": manifest.tables.len(),
@@ -2516,7 +2808,7 @@ mod tests {
 
         let options = parse_dump_run_options(&request).unwrap();
 
-        assert_eq!(options.mysql_snapshot_mode, MysqlSnapshotMode::ParallelStrict);
+        assert_eq!(options.mysql_snapshot, MysqlSnapshotRequest::Fixed(MysqlSnapshotMode::ParallelStrict));
     }
 
     #[test]
@@ -2533,8 +2825,8 @@ mod tests {
         let options = parse_dump_run_options(&request).unwrap();
 
         assert_eq!(
-            options.mysql_snapshot_mode,
-            MysqlSnapshotMode::SingleConnection
+            options.mysql_snapshot,
+            MysqlSnapshotRequest::Fixed(MysqlSnapshotMode::SingleConnection)
         );
     }
 
@@ -2552,8 +2844,8 @@ mod tests {
         let options = parse_dump_run_options(&request).unwrap();
 
         assert_eq!(
-            options.mysql_snapshot_mode,
-            MysqlSnapshotMode::ParallelNoBackupLock
+            options.mysql_snapshot,
+            MysqlSnapshotRequest::Fixed(MysqlSnapshotMode::ParallelNoBackupLock)
         );
     }
 
@@ -2568,7 +2860,7 @@ mod tests {
                 request_id: None,
                 payload: json!({"output_dir": "C:/tmp/tunnelforge-dump", "mysql_snapshot_mode": value}),
             };
-            assert_eq!(parse_dump_run_options(&request).unwrap().mysql_snapshot_mode, expected);
+            assert_eq!(parse_dump_run_options(&request).unwrap().mysql_snapshot, MysqlSnapshotRequest::Fixed(expected));
         }
     }
 
@@ -2717,16 +3009,115 @@ mod tests {
     }
 
     #[test]
-    fn mysql_snapshot_lock_sequence_releases_global_lock_before_dumping() {
+    fn mysql_snapshot_lock_sequence_takes_backup_lock_before_ftwrl() {
+        // A RELOAD-only account now fails at the backup lock, before FTWRL blocks every
+        // write on the server (B13); the global read lock is released before dumping.
         assert_eq!(
             mysql_snapshot_coordinator_sql(),
             [
                 "SET SESSION lock_wait_timeout=2",
-                "FLUSH TABLES WITH READ LOCK",
                 "LOCK INSTANCE FOR BACKUP",
+                "FLUSH TABLES WITH READ LOCK",
                 "UNLOCK TABLES",
             ]
         );
+    }
+
+    fn snapshot_request(payload: Value) -> Result<MysqlSnapshotRequest, String> {
+        let mut payload = payload;
+        payload["output_dir"] = json!("C:/tmp/tunnelforge-dump");
+        parse_dump_run_options(&Request { command: "dump.run".into(), request_id: None, payload })
+            .map(|options| options.mysql_snapshot)
+    }
+
+    #[test]
+    fn auto_snapshot_tries_shared_locks_then_one_connection_or_the_explicit_toggle() {
+        use MysqlSnapshotMode::*;
+        let auto = snapshot_request(json!({"mysql_snapshot_mode": "AUTO"})).unwrap();
+        assert_eq!(auto, MysqlSnapshotRequest::Auto { fallback: SingleConnection });
+        assert_eq!(auto.attempts(), [ParallelStrict, ParallelTableLock, SingleConnection]);
+        let toggled = snapshot_request(json!({"mysql_snapshot_mode": "auto", "mysql_snapshot_fallback": "parallel_unsynchronized"})).unwrap();
+        assert_eq!(toggled.attempts(), [ParallelStrict, ParallelTableLock, ParallelUnsynchronized]);
+        for fallback in ["parallel_strict", "parallel_table_lock", "parallel_no_backup_lock", "auto", "x"] {
+            assert_eq!(
+                snapshot_request(json!({"mysql_snapshot_mode": "auto", "mysql_snapshot_fallback": fallback})).unwrap_err(),
+                format!("unsupported mysql_snapshot_fallback: {fallback}")
+            );
+        }
+        // The fallback field only belongs to auto; an absent mode stays strict.
+        assert_eq!(
+            snapshot_request(json!({"mysql_snapshot_fallback": "parallel_unsynchronized"})).unwrap(),
+            MysqlSnapshotRequest::Fixed(ParallelStrict)
+        );
+        assert_eq!(MysqlSnapshotRequest::Fixed(SingleConnection).attempts(), [SingleConnection]);
+    }
+
+    #[test]
+    fn manifest_never_records_auto() {
+        use MysqlSnapshotMode::*;
+        // Every mode a chain can resolve to is concrete; only those labels reach the manifest.
+        for fallback in [SingleConnection, ParallelUnsynchronized] {
+            for mode in (MysqlSnapshotRequest::Auto { fallback }).attempts() {
+                let (policy, _, _) = dump_manifest_consistency_metadata("mysql", mode.policy_label());
+                assert!(policy.starts_with("mysql_") && !policy.contains("auto"), "{policy}");
+                assert_eq!(MysqlSnapshotMode::from_request_value(mode.as_str()), Some(mode));
+            }
+        }
+        assert_eq!(MysqlSnapshotMode::from_request_value("auto"), None);
+    }
+
+    #[test]
+    fn auto_snapshot_fallback_reasons_follow_the_error_code() {
+        let error = |code| mysql::Error::MySqlError(mysql::MySqlError { state: "HY000".into(), message: "x".into(), code });
+        for (code, reason) in [
+            (1044_u16, "privilege"), (1045, "privilege"), (1142, "privilege"), (1227, "privilege"),
+            (1040, "connection_limit"), (1203, "connection_limit"), (1226, "connection_limit"),
+            (1205, "lock_timeout"), (1317, "lock_timeout"),
+        ] {
+            assert_eq!(mysql_snapshot_fallback_reason(&error(code), false), Some(reason), "{code}");
+            assert_eq!(mysql_snapshot_fallback_reason(&error(code), true), Some(reason), "{code}");
+        }
+        // An unknown backup-lock statement (MySQL 5.7, MariaDB) moves on; elsewhere 1064 is a bug.
+        for code in [1064_u16, 1235] {
+            assert_eq!(mysql_snapshot_fallback_reason(&error(code), true), Some("unsupported"));
+            assert_eq!(mysql_snapshot_fallback_reason(&error(code), false), None);
+        }
+        assert_eq!(mysql_snapshot_fallback_reason(&error(2013), false), None, "a lost connection stops the export");
+        for reason in ["privilege", "unsupported", "connection_limit", "lock_timeout"] {
+            assert!(!mysql_snapshot_fallback_message(reason).is_empty());
+        }
+    }
+
+    #[test]
+    fn auto_snapshot_clamps_workers_to_max_user_connections() {
+        assert_eq!(mysql_connection_budget(8, 0, 5), 8, "0 is unlimited");
+        assert_eq!(mysql_connection_budget(8, 20, 1), 8);
+        // The probe itself is one of own_sessions; the coordinator and its watchdog need two.
+        assert_eq!(mysql_connection_budget(8, 5, 1), 3);
+        assert_eq!(mysql_connection_budget(8, 5, 2), 2);
+        assert_eq!(mysql_connection_budget(8, 3, 1), 1);
+        assert_eq!(mysql_connection_budget(8, 2, 1), 1, "never below one worker");
+    }
+
+    #[test]
+    fn export_visibility_needs_grants_for_every_object_kind_in_scope() {
+        let unproven = |grants: &[(&str, bool)], full_export: bool| {
+            // (privilege, true) is a grant on the export database; (privilege, false) on *.*.
+            mysql_unproven_visibility(
+                |privilege, on_database| grants.iter().any(|&(granted, database_only)| granted == privilege && (on_database || !database_only)),
+                full_export,
+            )
+        };
+        let reader = [("SELECT", true), ("LOCK TABLES", true)];
+        assert_eq!(unproven(&reader, false), ["triggers (TRIGGER)"]);
+        assert_eq!(unproven(&reader, true).len(), 3, "triggers, routines and events");
+        let seer = [("SELECT", true), ("TRIGGER", true), ("EVENT", true), ("EXECUTE", true)];
+        assert!(unproven(&seer, true).is_empty());
+        let global = [("SELECT", false), ("TRIGGER", false), ("EVENT", false)];
+        assert!(unproven(&global, true).is_empty(), "global SELECT shows every routine");
+        let no_database_select = [("TRIGGER", true), ("SHOW_ROUTINE", false), ("EVENT", true)];
+        assert_eq!(unproven(&no_database_select, true), ["tables (SELECT on the whole database)"]);
+        assert!(unproven(&no_database_select, false).is_empty(), "a table subset names its own tables");
     }
 
     #[test]

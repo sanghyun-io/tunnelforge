@@ -347,9 +347,10 @@ fn mysql_table_lock_snapshot_needs_only_lock_tables_and_unsynchronized_is_not_st
         format!("CREATE TABLE {db}.child (id INT PRIMARY KEY, parent_id INT NOT NULL, FOREIGN KEY (parent_id) REFERENCES {db}.parent (id))"),
         format!("INSERT INTO {db}.parent VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
         format!("INSERT INTO {db}.child VALUES (10, 1), (11, 1), (12, 2), (13, 3)"),
-        // Minimum the dump needs plus LOCK TABLES; no RELOAD / BACKUP_ADMIN.
+        // Minimum the dump needs plus LOCK TABLES; no RELOAD / BACKUP_ADMIN. TRIGGER, EVENT and
+        // EXECUTE prove the account sees every object, so its full export stays strict (B1).
         format!("CREATE USER '{locker}'@'%' IDENTIFIED BY 'tf_local_test'"),
-        format!("GRANT SELECT, LOCK TABLES ON {db}.* TO '{locker}'@'%'"),
+        format!("GRANT SELECT, LOCK TABLES, TRIGGER, EVENT, EXECUTE ON {db}.* TO '{locker}'@'%'"),
         format!("CREATE USER '{plain}'@'%' IDENTIFIED BY 'tf_local_test'"),
         format!("GRANT SELECT ON {db}.* TO '{plain}'@'%'"),
     ] { admin.execute_sql(&sql).unwrap(); }
@@ -363,9 +364,9 @@ fn mysql_table_lock_snapshot_needs_only_lock_tables_and_unsynchronized_is_not_st
     let error_of = |events: &[Value]| events.iter().find(|e| e["event"] == "error").map(|e| e["message"].as_str().unwrap().to_string()).unwrap_or_else(|| panic!("{events:#?}"));
     let payload = |mode: &str, dir: &str| json!({"output_dir": out(dir), "threads": 4, "chunk_size": 1, "data_format": "jsonl", "mysql_snapshot_mode": mode});
 
-    // Strict needs global lock privileges the locker lacks.
+    // Strict needs global lock privileges the locker lacks; the backup lock is tried first.
     let events = dump_events(&as_user(locker), payload("parallel_strict", "strict"));
-    assert!(error_of(&events).starts_with("MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:FLUSH_TABLES_OR_RELOAD:"), "{events:#?}");
+    assert!(error_of(&events).starts_with("MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:BACKUP_ADMIN:"), "{events:#?}");
     // Without LOCK TABLES the table-lock mode reports its own marker.
     let events = dump_events(&as_user(plain), payload("parallel_table_lock", "denied"));
     assert!(error_of(&events).starts_with("MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:LOCK_TABLES:"), "{events:#?}");
@@ -425,4 +426,332 @@ fn mysql_table_lock_snapshot_needs_only_lock_tables_and_unsynchronized_is_not_st
     assert!(result["manifest_warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("without a shared lock")), "{result}");
     assert_eq!(result["rows_dumped"], 9);
     assert_eq!(snapshot_worker_count(&events), 4);
+}
+
+// ---------------------------------------------------------------- automatic snapshot (C4) and visibility (C5)
+
+fn mysql_root() -> Option<Endpoint> {
+    endpoints().into_iter().find(|endpoint| endpoint.engine == "mysql")
+}
+
+/// A throwaway database `db` (3 parent and 4 child rows) plus `{db}_block`, with `users` created
+/// before `setup` runs; the guard drops them all and the exports under `{temp}/{db}`.
+fn auto_fixture(root: &Endpoint, db: &str, users: &[&str], setup: &[String]) -> MysqlThrowaway {
+    let mut cleanup: Vec<String> = users.iter().map(|user| format!("DROP USER IF EXISTS '{user}'@'%'")).collect();
+    cleanup.extend([format!("DROP DATABASE IF EXISTS {db}"), format!("DROP DATABASE IF EXISTS {db}_block")]);
+    let guard = MysqlThrowaway { admin: root.clone(), cleanup, dirs: vec![std::env::temp_dir().join(db)] };
+    guard.clean();
+    let mut admin = LiveAdapter::connect(root).unwrap();
+    let base = [
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE DATABASE {db}_block"),
+        format!("CREATE TABLE {db}_block.blocker (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.parent (id INT PRIMARY KEY, name VARCHAR(20))"),
+        format!("CREATE TABLE {db}.child (id INT PRIMARY KEY, parent_id INT NOT NULL, FOREIGN KEY (parent_id) REFERENCES {db}.parent (id))"),
+        format!("INSERT INTO {db}.parent VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+        format!("INSERT INTO {db}.child VALUES (10, 1), (11, 1), (12, 2), (13, 3)"),
+    ];
+    let users = users.iter().map(|user| format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'"));
+    for sql in base.into_iter().chain(users).chain(setup.iter().cloned()) {
+        admin.execute_sql(&sql).unwrap();
+    }
+    guard
+}
+
+/// The grants that prove every object of `db` visible (B1), so a full export stays strict.
+fn sees_everything(user: &str, db: &str) -> String {
+    format!("GRANT SELECT, TRIGGER, EVENT, EXECUTE ON {db}.* TO '{user}'@'%'")
+}
+
+fn user_in(root: &Endpoint, user: &str, db: &str) -> Endpoint {
+    Endpoint { user: user.into(), database: db.into(), ..root.clone() }
+}
+
+fn auto_payload(db: &str, name: &str, extra: Value) -> Value {
+    let mut payload = json!({"output_dir": std::env::temp_dir().join(db).join(name), "threads": 4,
+        "chunk_size": 1, "data_format": "jsonl", "compression": "none", "mysql_snapshot_mode": "auto"});
+    for (key, value) in extra.as_object().unwrap() {
+        payload[key] = value.clone();
+    }
+    payload
+}
+
+fn result_of(events: &[Value]) -> Value {
+    events.iter().find(|e| e["event"] == "result").cloned().unwrap_or_else(|| panic!("{events:#?}"))
+}
+
+/// dump.run into `{temp}/{db}/{name}`; panics unless it succeeds.
+fn auto_export(endpoint: &Endpoint, db: &str, name: &str, extra: Value) -> (Vec<Value>, Value) {
+    let events = dump_events(endpoint, auto_payload(db, name, extra));
+    let result = result_of(&events);
+    (events, result)
+}
+
+fn manifest_of(db: &str, name: &str) -> Value {
+    serde_json::from_slice(&fs::read(std::env::temp_dir().join(db).join(name).join("_tunnelforge_dump.json")).unwrap()).unwrap()
+}
+
+/// The method that ran, the ones it skipped and its workers, as the result and the manifest say.
+fn assert_resolved(result: &Value, manifest: &Value, mode: &str, policy: &str, fallbacks: Value, workers: u64) {
+    assert_eq!(result["mysql_snapshot_mode"], mode, "{result}");
+    assert_eq!(result["snapshot_policy"], policy, "{result}");
+    assert_eq!(manifest["snapshot_policy"], policy, "the manifest records the method that ran");
+    assert_eq!(result["snapshot_fallbacks"], fallbacks, "{result}");
+    assert_eq!(result["worker_count"], workers, "{result}");
+}
+
+/// Whether a session of `user` holds LOCK INSTANCE FOR BACKUP right now.
+fn holds_backup_lock(root: &Endpoint, user: &str) -> bool {
+    let result = run(root, "query.execute", json!({"sql": format!(
+        "SELECT m.OWNER_THREAD_ID FROM performance_schema.metadata_locks m JOIN performance_schema.threads t ON t.THREAD_ID = m.OWNER_THREAD_ID WHERE m.OBJECT_TYPE = 'BACKUP LOCK' AND t.PROCESSLIST_USER = '{user}'"
+    )}));
+    result["rows"].as_array().is_some_and(|rows| !rows.is_empty())
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn manifest_never_records_auto() {
+    let Some(root) = mysql_root() else { return };
+    let db = "tf_auto_strict";
+    let _guard = auto_fixture(&root, db, &[], &[]);
+    let (_, result) = auto_export(&Endpoint { database: db.into(), ..root.clone() }, db, "strict", json!({}));
+    let manifest = manifest_of(db, "strict");
+    assert_resolved(&result, &manifest, "parallel_strict", "mysql_shared_consistent_snapshot", json!([]), 4);
+    assert_eq!(result["strict_export"], true, "{result}");
+    assert!(!manifest.to_string().contains("\"auto\""), "{manifest}");
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_snapshot_falls_back_to_table_lock_without_global_privileges() {
+    let Some(root) = mysql_root() else { return };
+    let (db, user) = ("tf_auto_table_lock", "tf_auto_locker");
+    let _guard = auto_fixture(&root, db, &[user], &[sees_everything(user, db), format!("GRANT LOCK TABLES ON {db}.* TO '{user}'@'%'")]);
+    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
+    assert_resolved(&result, &manifest_of(db, "auto"), "parallel_table_lock", "mysql_table_lock_shared_snapshot",
+        json!([{"mode": "parallel_strict", "reason": "privilege"}]), 4);
+    assert_eq!(result["strict_export"], true, "{result}");
+    assert_eq!(result["rows_dumped"], 7);
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_snapshot_falls_back_to_single_connection_without_lock_tables() {
+    let Some(root) = mysql_root() else { return };
+    let (db, user) = ("tf_auto_single", "tf_auto_plain");
+    let _guard = auto_fixture(&root, db, &[user], &[sees_everything(user, db)]);
+    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
+    assert_resolved(&result, &manifest_of(db, "auto"), "single_connection", "mysql_single_connection_consistent_snapshot",
+        json!([{"mode": "parallel_strict", "reason": "privilege"}, {"mode": "parallel_table_lock", "reason": "privilege"}]), 1);
+    assert_eq!(result["strict_export"], true, "one consistent transaction is a strict export: {result}");
+    assert_eq!(result["rows_dumped"], 7);
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_to_single_connection_uses_one_worker() {
+    let Some(root) = mysql_root() else { return };
+    let (db, user) = ("tf_auto_one_worker", "tf_auto_one");
+    let _guard = auto_fixture(&root, db, &[user], &[sees_everything(user, db)]);
+    let (events, result) = auto_export(&user_in(&root, user, db), db, "auto",
+        json!({"threads": 8, "mysql_snapshot_fallback": "single_connection"}));
+    assert_eq!(result["mysql_snapshot_mode"], "single_connection", "{result}");
+    assert_eq!(result["worker_count"], 1, "{result}");
+    assert_eq!(snapshot_worker_count(&events), 1, "the ready event names the resolved worker count");
+    let schedule = events.iter().find(|e| e["event"] == "dump_schedule").unwrap_or_else(|| panic!("{events:#?}"));
+    assert_eq!(schedule["threads"], 1, "{schedule}");
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_to_unsynchronized_writes_unsynchronized_policy_and_not_strict() {
+    let Some(root) = mysql_root() else { return };
+    let (db, user) = ("tf_auto_unsync", "tf_auto_unsync");
+    let _guard = auto_fixture(&root, db, &[user], &[sees_everything(user, db)]);
+    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({"mysql_snapshot_fallback": "parallel_unsynchronized"}));
+    let manifest = manifest_of(db, "auto");
+    assert_resolved(&result, &manifest, "parallel_unsynchronized", "mysql_parallel_unsynchronized_snapshots",
+        json!([{"mode": "parallel_strict", "reason": "privilege"}, {"mode": "parallel_table_lock", "reason": "privilege"}]), 4);
+    assert_eq!(result["strict_export"], false, "{result}");
+    assert_eq!(manifest["strict_export"], false);
+    assert!(result["manifest_warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("without a shared lock")), "{result}");
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_snapshot_takes_backup_lock_before_ftwrl() {
+    let Some(root) = mysql_root() else { return };
+    let (db, reloader, backuper) = ("tf_auto_order", "tf_auto_reload", "tf_auto_backup");
+    let mut setup = Vec::new();
+    for (user, global) in [(reloader, "RELOAD"), (backuper, "BACKUP_ADMIN")] {
+        setup.extend([sees_everything(user, db), format!("GRANT LOCK TABLES ON {db}.* TO '{user}'@'%'"), format!("GRANT {global} ON *.* TO '{user}'@'%'")]);
+    }
+    let _guard = auto_fixture(&root, db, &[reloader, backuper], &setup);
+    // A write lock elsewhere on the server makes any FTWRL wait out its 2 seconds.
+    let mut blocker = LiveAdapter::connect(&root).unwrap();
+    blocker.execute_sql(&format!("LOCK TABLES {db}_block.blocker WRITE")).unwrap();
+
+    // RELOAD-only (B13): the backup lock is refused before FTWRL could block the server, so the
+    // skip is a privilege, not a lock timeout.
+    let (_, result) = auto_export(&user_in(&root, reloader, db), db, "reload", json!({}));
+    assert_resolved(&result, &manifest_of(db, "reload"), "parallel_table_lock", "mysql_table_lock_shared_snapshot",
+        json!([{"mode": "parallel_strict", "reason": "privilege"}]), 4);
+    blocker.execute_sql("UNLOCK TABLES").unwrap();
+
+    // BACKUP_ADMIN-only: FTWRL is refused after the backup lock, which the table-lock method keeps.
+    let mut held = false;
+    let mut events = Vec::new();
+    let mut request = auto_payload(db, "backup", json!({}));
+    request["endpoint"] = serde_json::to_value(user_in(&root, backuper, db)).unwrap();
+    handle_request_streaming(Request { command: "dump.run".into(), request_id: None, payload: request }, |event| {
+        if !held && event["event"] == "row_progress" {
+            held = holds_backup_lock(&root, backuper);
+        }
+        events.push(event);
+    });
+    let result = result_of(&events);
+    assert_resolved(&result, &manifest_of(db, "backup"), "parallel_table_lock", "mysql_table_lock_shared_snapshot",
+        json!([{"mode": "parallel_strict", "reason": "privilege"}]), 4);
+    assert!(held, "the table-lock export keeps the backup lock it already had");
+    assert!(!holds_backup_lock(&root, backuper), "the backup lock ends with the export");
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_snapshot_moves_on_when_the_global_lock_times_out() {
+    // TF-STATUS-185: a busy server cannot give FTWRL in 2 seconds; the export takes the next
+    // consistent method instead of failing.
+    let Some(root) = mysql_root() else { return };
+    let db = "tf_auto_busy";
+    let _guard = auto_fixture(&root, db, &[], &[]);
+    let mut blocker = LiveAdapter::connect(&root).unwrap();
+    blocker.execute_sql(&format!("LOCK TABLES {db}_block.blocker WRITE")).unwrap();
+    let mut held = false;
+    let mut events = Vec::new();
+    let mut request = auto_payload(db, "busy", json!({}));
+    request["endpoint"] = serde_json::to_value(Endpoint { database: db.into(), ..root.clone() }).unwrap();
+    handle_request_streaming(Request { command: "dump.run".into(), request_id: None, payload: request }, |event| {
+        if !held && event["event"] == "row_progress" {
+            held = holds_backup_lock(&root, &root.user);
+        }
+        events.push(event);
+    });
+    blocker.execute_sql("UNLOCK TABLES").unwrap();
+    let result = result_of(&events);
+    assert_resolved(&result, &manifest_of(db, "busy"), "parallel_table_lock", "mysql_table_lock_shared_snapshot",
+        json!([{"mode": "parallel_strict", "reason": "lock_timeout"}]), 4);
+    assert_eq!(result["strict_export"], true, "{result}");
+    assert_eq!(result["rows_dumped"], 7);
+    assert!(held, "the backup lock taken before FTWRL stays for the table-lock export");
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_snapshot_table_lock_timeout_falls_to_one_connection_never_unsynchronized() {
+    let Some(root) = mysql_root() else { return };
+    let (db, user) = ("tf_auto_lock_wait", "tf_auto_waiter");
+    let _guard = auto_fixture(&root, db, &[user], &[sees_everything(user, db), format!("GRANT LOCK TABLES ON {db}.* TO '{user}'@'%'")]);
+    // An open write transaction makes LOCK TABLES ... READ wait out its 2 seconds.
+    let mut holder = LiveAdapter::connect(&Endpoint { database: db.into(), ..root.clone() }).unwrap();
+    for sql in ["START TRANSACTION", "INSERT INTO parent VALUES (9, 'open')"] {
+        holder.execute_sql(sql).unwrap();
+    }
+    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
+    holder.execute_sql("ROLLBACK").unwrap();
+    assert_resolved(&result, &manifest_of(db, "auto"), "single_connection", "mysql_single_connection_consistent_snapshot",
+        json!([{"mode": "parallel_strict", "reason": "privilege"}, {"mode": "parallel_table_lock", "reason": "lock_timeout"}]), 1);
+    assert_eq!(result["strict_export"], true, "{result}");
+    assert_eq!(result["rows_dumped"], 7, "the open transaction stays outside the snapshot");
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn too_many_connections_advances_chain() {
+    let Some(root) = mysql_root() else { return };
+    let (db, user) = ("tf_auto_capped", "tf_auto_capped");
+    // Two sessions: the shared-lock methods need a coordinator, its watchdog and a worker.
+    let _guard = auto_fixture(&root, db, &[user], &[
+        sees_everything(user, db),
+        format!("GRANT LOCK TABLES ON {db}.* TO '{user}'@'%'"),
+        format!("ALTER USER '{user}'@'%' WITH MAX_USER_CONNECTIONS 2"),
+    ]);
+    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
+    assert_resolved(&result, &manifest_of(db, "auto"), "single_connection", "mysql_single_connection_consistent_snapshot",
+        json!([{"mode": "parallel_strict", "reason": "connection_limit"}, {"mode": "parallel_table_lock", "reason": "connection_limit"}]), 1);
+    assert_eq!(result["rows_dumped"], 7);
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn auto_snapshot_clamps_workers_to_max_user_connections() {
+    let Some(root) = mysql_root() else { return };
+    let (db, user) = ("tf_auto_clamped", "tf_auto_clamped");
+    // Five sessions: the probe counts itself, the coordinator and its watchdog take two, three
+    // are left. The strict method works first time, so no closing session races the limit.
+    let _guard = auto_fixture(&root, db, &[user], &[
+        sees_everything(user, db),
+        format!("GRANT RELOAD, BACKUP_ADMIN ON *.* TO '{user}'@'%'"),
+        format!("ALTER USER '{user}'@'%' WITH MAX_USER_CONNECTIONS 5"),
+    ]);
+    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({"threads": 8}));
+    assert_resolved(&result, &manifest_of(db, "auto"), "parallel_strict", "mysql_shared_consistent_snapshot", json!([]), 3);
+    assert_eq!(result["rows_dumped"], 7);
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn export_without_trigger_privilege_is_not_strict() {
+    let Some(root) = mysql_root() else { return };
+    let (db, blind, seer) = ("tf_export_visibility", "tf_export_blind", "tf_export_seer");
+    let _guard = auto_fixture(&root, db, &[blind, seer], &[
+        format!("CREATE TRIGGER {db}.parent_trg BEFORE INSERT ON {db}.parent FOR EACH ROW SET NEW.name = UPPER(NEW.name)"),
+        format!("GRANT SELECT, LOCK TABLES ON {db}.* TO '{blind}'@'%'"),
+        sees_everything(seer, db),
+    ]);
+    let single = |tables: Value| json!({"tables": tables, "mysql_snapshot_mode": "single_connection"});
+    let visibility = |result: &Value| result["manifest_warnings"].as_array().unwrap().iter()
+        .filter_map(Value::as_str).find(|w| w.starts_with("The export account's privileges do not prove")).map(str::to_string);
+
+    // The blind account cannot see the trigger, so nothing refuses; the dump must not claim completeness.
+    let (_, result) = auto_export(&user_in(&root, blind, db), db, "blind_parent", single(json!(["parent"])));
+    assert_eq!(result["strict_export"], false, "{result}");
+    assert_eq!(manifest_of(db, "blind_parent")["strict_export"], false);
+    assert!(visibility(&result).is_some_and(|w| w.contains("TRIGGER") && !w.contains("EVENT")), "{result}");
+    // A full export also cannot prove routines and events.
+    let (_, result) = auto_export(&user_in(&root, blind, db), db, "blind_full", single(Value::Null));
+    assert!(visibility(&result).is_some_and(|w| w.contains("TRIGGER") && w.contains("routines") && w.contains("EVENT")), "{result}");
+    assert_eq!(result["strict_export"], false);
+
+    // The account that sees everything is refused for the trigger and strict without it.
+    let events = dump_events(&user_in(&root, seer, db), auto_payload(db, "seer_parent", single(json!(["parent"]))));
+    assert!(refusal_objects(&events).contains(&"trigger:parent:parent_trg".to_string()), "{events:#?}");
+    let (_, result) = auto_export(&user_in(&root, seer, db), db, "seer_child", single(json!(["child"])));
+    assert_eq!(result["strict_export"], true, "{result}");
+    assert_eq!(visibility(&result), None);
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn export_warnings_exclude_out_of_scope_objects() {
+    let Some(root) = mysql_root() else { return };
+    let db = "tf_export_scoped";
+    let _guard = auto_fixture(&root, db, &[], &[
+        format!("CREATE TRIGGER {db}.parent_trg BEFORE INSERT ON {db}.parent FOR EACH ROW SET NEW.name = UPPER(NEW.name)"),
+        format!("CREATE FUNCTION {db}.scoped_fn() RETURNS INT DETERMINISTIC RETURN 1"),
+        format!("CREATE EVENT {db}.scoped_ev ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1"),
+    ]);
+    let in_db = Endpoint { database: db.into(), ..root.clone() };
+    let warnings = |result: &Value| result["manifest_warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+    // The parent's trigger, the routine and the event are not part of a child-only dump.
+    let (_, result) = auto_export(&in_db, db, "child", json!({"tables": ["child"]}));
+    assert_eq!(warnings(&result), Vec::<String>::new());
+    assert_eq!(result["strict_export"], true, "{result}");
+
+    // Opting out of the parent's trigger warns about that trigger only.
+    let (_, result) = auto_export(&in_db, db, "parent", json!({"tables": ["parent"], "allow_incomplete": true}));
+    let warnings = warnings(&result);
+    assert_eq!(result["strict_export"], false, "{result}");
+    assert!(warnings.iter().any(|w| w.contains("trigger:parent:parent_trg")), "{warnings:?}");
+    assert!(!warnings.iter().any(|w| w.contains("scoped_fn") || w.contains("scoped_ev")), "{warnings:?}");
 }

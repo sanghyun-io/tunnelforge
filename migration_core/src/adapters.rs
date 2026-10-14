@@ -930,6 +930,7 @@ pub(crate) const WARNING_UNSYNCHRONIZED_SNAPSHOTS: &str = "Workers used independ
 pub(crate) const WARNING_VIEWS_OUTSIDE_SNAPSHOT: &str = "View definitions were collected outside the table data snapshot";
 pub(crate) const WARNING_OBJECT_NOT_EXPORTED: &str = "Object not exported:";
 pub(crate) const WARNING_NON_TRANSACTIONAL_EXCLUDED: &str = "Non-transactional tables excluded from export:";
+pub(crate) const WARNING_VISIBILITY_UNPROVEN: &str = "The export account's privileges do not prove it sees every object, so some may be missing:";
 
 pub(crate) fn dump_manifest_consistency_metadata(
     engine: &str,

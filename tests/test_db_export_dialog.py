@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from src.exporters.rust_dump_exporter import RustDumpConfig
+from src.exporters.rust_dump_exporter import RustDumpConfig, describe_snapshot_method
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 from src.ui.dialogs.db_export_dialog import (
@@ -429,8 +429,16 @@ def test_new_export_strings_have_english_translations(monkeypatch):
             _SNAPSHOT_LABELS["parallel_table_lock"],
             _SNAPSHOT_LABELS["parallel_unsynchronized"],
             " · 불완전 Export(일부 객체 제외)",
-            "MySQL 테이블 락 공유 스냅샷",
-            "MySQL 병렬 독립 스냅샷 · 시점 일관성 미보장",
+        ]
+        korean += [
+            describe_snapshot_method({"mysql_snapshot_mode": mode, "worker_count": 3, "snapshot_fallbacks": [{"reason": reason}]}, 8)
+            for mode in ("parallel_strict", "parallel_table_lock", "single_connection", "parallel_unsynchronized")
+            for reason in ("privilege", "unsupported", "connection_limit", "lock_timeout")
+        ]
+        # The core's log lines when the automatic choice moves on (dump.rs mysql_snapshot_fallback_message).
+        korean += [
+            f"{reason} 다음 방법으로 내보냅니다."
+            for reason in ("잠금 권한이 없어", "서버가 백업 잠금을 지원하지 않아", "동시 연결 수 제한 때문에", "잠금을 제때 얻지 못해")
         ]
         i18n.set_language("en")
         translated = {text: i18n.translate_text(text) for text in korean}
