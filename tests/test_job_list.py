@@ -221,17 +221,21 @@ def make_import():
 def test_import_run_is_recorded_as_partial_with_table_counts(history):
     dialog = make_import()
     try:
-        dialog._job_id = job_recording.begin_import_job(dialog, "C:/dumps/app", "app_restore", "safe", 4)
+        dialog._job_id = job_recording.begin_import_job(dialog, "app_restore", "safe", 4)
         running = only(history)
         assert running.kind == jh.KIND_IMPORT and running.status == jh.STATUS_RUNNING
         assert running.mode == "safe · 스레드 4" and running.target == "app_restore" and running.profile_name == "Prod"
+        assert running.report_path == "", "every attempt writes a new report; the core names it once the run starts"
+        report = "C:/dumps/app/_tunnelforge_import_report_1760000000000000000_42_0.json"
+        dialog.on_raw_output(json.dumps({"event": "import_report", "status": "running", "report_path": report}))
+        assert only(history).report_path == report, "a run that never finishes still points at its own report"
         dialog.import_results = {"a": {"status": "done"}, "b": {"status": "error"}, "c": {"status": "blocked"}}
         dialog.last_import_mode = "replace"
         dialog.on_finished(False, "table b failed: duplicate key")
         done = only(history)
         assert done.status == jh.STATUS_PARTIAL and "duplicate key" in done.error_summary
         assert done.details["tables_done"] == 1 and done.details["tables_failed"] == 1 and done.details["tables_not_run"] == 1
-        assert done.report_path.replace("\\", "/") == "C:/dumps/app/_tunnelforge_import_report.json"
+        assert done.report_path == report
     finally:
         dialog.close()
 
@@ -240,7 +244,7 @@ def test_import_completed_and_cancelled(history):
     for cancelled, expected in ((False, jh.STATUS_COMPLETED), (True, jh.STATUS_CANCELLED)):
         dialog = make_import()
         try:
-            dialog._job_id = job_recording.begin_import_job(dialog, "C:/d", "app", "replace", 1)
+            dialog._job_id = job_recording.begin_import_job(dialog, "app", "replace", 1)
             dialog.import_results = {"a": {"status": "done"}}
             dialog.last_import_mode = "replace"
             dialog._cancel_requested = cancelled

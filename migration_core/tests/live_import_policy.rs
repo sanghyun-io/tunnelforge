@@ -389,7 +389,7 @@ fn postgres_failed_view_reports_partial_import_after_table_data_is_restored() {
     admin.batch_execute(&format!("UPDATE {schema}.items SET value='changed'")).unwrap();
     let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode":"replace"}));
     let result = imported.iter().find(|event| event["event"] == "result").unwrap();
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
     let value: String = admin.query_one(&format!("SELECT value FROM {schema}.items WHERE id=1"), &[]).unwrap().get(0);
     admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
@@ -472,10 +472,12 @@ fn mysql_server_ddl_probe_rejects_before_original_table_is_dropped() {
     let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     manifest["schema"]["tables"][0]["columns"][1]["type"] = json!("DECIMAL(100,2)");
     std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    // An earlier attempt's report: this attempt writes its own and leaves that one as it was.
     std::fs::write(output.join("_tunnelforge_import_report.json"), b"{\"success\":true}").unwrap();
     let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace"}));
     let original = conn.query_first::<u64,_>(format!("SELECT value FROM {table} WHERE id=1"));
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
+    let earlier = std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap();
     conn.query_drop(format!("DROP TABLE IF EXISTS {table}")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
     assert!(!success(&imported));
@@ -483,6 +485,7 @@ fn mysql_server_ddl_probe_rejects_before_original_table_is_dropped() {
     assert_eq!(report["success"], false);
     assert_eq!(report["phase"], "dump_import_ddl_preflight");
     assert_eq!(report["dropped_tables"], json!([]));
+    assert_eq!(earlier, b"{\"success\":true}", "the import overwrote an earlier attempt's report");
 }
 
 #[test]
@@ -506,9 +509,11 @@ fn mysql_import_failure_persists_confirmed_changes_and_unattempted_tables() {
     std::fs::write(chunk,bytes).unwrap();
     table["chunk_sha256"]["chunk_000001.jsonl"] = json!(format!("{:x}",Sha256::digest(bytes)));
     std::fs::write(path,serde_json::to_vec(&manifest).unwrap()).unwrap();
+    // An earlier attempt's report: this attempt writes its own and leaves that one as it was.
     std::fs::write(output.join("_tunnelforge_import_report.json"), b"{\"success\":true}").unwrap();
     let imported = run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
+    let earlier = std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap();
     let untouched = conn.query_first::<u64,_>(format!("SELECT value FROM {} WHERE id=1", tables[2]));
     for table in &tables { conn.query_drop(format!("DROP TABLE IF EXISTS {table}")).unwrap(); }
     std::fs::remove_dir_all(output).unwrap();
@@ -516,6 +521,7 @@ fn mysql_import_failure_persists_confirmed_changes_and_unattempted_tables() {
     assert_eq!(report["success"],false);
     assert_eq!(report["status"],"failed");
     assert_eq!(report["phase"],"dump_import_data");
+    assert_eq!(earlier, b"{\"success\":true}", "the import overwrote an earlier attempt's report");
     // mysqldump처럼 테이블마다 DROP→CREATE: 실패 이후 테이블은 원본을 유지한다.
     assert_eq!(report["dropped_tables"],json!([tables[0],tables[1]]));
     assert_eq!(report["dropped_not_restored_tables"],json!([tables[1]]));
@@ -551,7 +557,7 @@ fn mysql_replace_refuses_surviving_fk_bound_to_post_load_index_before_any_drop()
     conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, code VARCHAR(20), CONSTRAINT fk_{child} FOREIGN KEY(code) REFERENCES {parent}(code)) ENGINE=InnoDB")).unwrap();
     conn.query_drop(format!("INSERT INTO {child} VALUES(7,'a')")).unwrap();
     let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
     let parent_row = conn.query_first::<String,_>(format!("SELECT code FROM {parent} WHERE id=1"));
     conn.query_drop(format!("DROP TABLE {child}")).unwrap();
     conn.query_drop(format!("DROP TABLE IF EXISTS {parent}")).unwrap();
@@ -670,7 +676,7 @@ fn postgres_post_load_failure_persists_restored_data_and_incomplete_finalization
     table["chunk_sha256"]["chunk_000001.jsonl"]=json!(format!("{:x}",Sha256::digest(bytes)));
     std::fs::write(path,serde_json::to_vec(&manifest).unwrap()).unwrap();
     let imported=run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace"}));
-    let report:Value=serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report=import_report_file(&imported);
     let rows:i64=admin.query_one(&format!("SELECT COUNT(*) FROM {schema}.items"),&[]).unwrap().get(0);
     admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
@@ -1035,8 +1041,14 @@ fn mysql_replace_refuses_a_kept_child_whose_parent_column_is_not_in_the_dump() {
     assert!(error["message"].as_str().unwrap().contains("incompatible_surviving_fk"), "{error}");
 }
 
-fn import_report_file(output: &std::path::Path) -> Value {
-    serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap()
+/// The report file this import attempt named in its `import_report` events.
+fn import_report_file(imported: &[Value]) -> Value {
+    serde_json::from_slice(&std::fs::read(import_report(imported)["report_path"].as_str().unwrap()).unwrap()).unwrap()
+}
+
+/// Whether the dump folder holds any import report: the old single one or one per attempt.
+fn any_import_report(output: &std::path::Path) -> bool {
+    std::fs::read_dir(output).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().starts_with("_tunnelforge_import_report"))
 }
 
 /// `action:status` of the import's database/schema creation events, in order.
@@ -1069,14 +1081,16 @@ fn replace_into_missing_database_creates_it() {
     assert!(success(&exported), "{exported:?}");
     let created = Endpoint { database: created_db.clone(), ..endpoint.clone() };
     let first = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace", "threads": 1}));
-    let first_report = import_report_file(&output);
+    let first_report = import_report_file(&first);
     let rows: Vec<(u64, u64)> = root.query(format!("SELECT c.id, p.id FROM {created_db}.child c JOIN {created_db}.parent p ON p.id = c.parent_id ORDER BY c.id")).unwrap_or_default();
     // The database exists now, so this import replaces its tables as usual.
     let second = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace", "threads": 1}));
     // A failure after the CREATE keeps the new database.
     let failed = import_with_rewritten_chunk(&Endpoint { database: failed_db.clone(), ..endpoint.clone() }, &output, "child",
         b"{\"id\":\"not-an-integer\",\"parent_id\":1}\n{\"id\":11,\"parent_id\":2}\n");
-    let failed_report = import_report_file(&output);
+    let failed_report = import_report_file(&failed);
+    // Each attempt keeps its own report: the later ones did not overwrite the first.
+    let first_report_kept = import_report_file(&first);
     let failed_db_kept = mysql_database_exists(&mut root, &failed_db);
     for db in [&source_db, &created_db, &failed_db] {
         root.query_drop(format!("DROP DATABASE IF EXISTS {db}")).unwrap();
@@ -1092,6 +1106,7 @@ fn replace_into_missing_database_creates_it() {
         assert_eq!(report["namespace_creation_outcome_unknown"], false, "{report}");
     }
     assert_eq!(namespace_changes(&first), ["create_database:started", "create_database:completed"]);
+    assert_eq!(first_report_kept, first_report);
     assert_eq!(import_report(&first)["target"]["schema"], created_db.as_str());
 
     assert!(success(&second), "{second:?}");
@@ -1135,7 +1150,7 @@ fn replace_into_missing_schema_creates_it() {
     // A missing PostgreSQL database is never created.
     let missing_db = unique("tf_pg_missing_db");
     let refused = run("dump.import", json!({"target": Endpoint { database: missing_db.clone(), ..created.clone() }, "input_dir": output, "mode": "replace"}));
-    let refused_report = import_report_file(&output);
+    let refused_report = import_report_file(&refused);
     let databases: i64 = admin.query_one("SELECT COUNT(*) FROM pg_database WHERE datname=$1", &[&missing_db]).unwrap().get(0);
     admin.batch_execute(&format!("DROP SCHEMA IF EXISTS {created_schema} CASCADE; DROP SCHEMA {source_schema} CASCADE")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
@@ -1173,7 +1188,7 @@ fn failed_create_is_journaled_as_outcome_unknown() {
     assert!(success(&exported), "{exported:?}");
     let scoped = Endpoint { user: user.into(), database: missing_db.clone(), ..endpoint.clone() };
     let imported = run("dump.import", json!({"target": scoped, "input_dir": output, "mode": "replace", "threads": 1}));
-    let report = import_report_file(&output);
+    let report = import_report_file(&imported);
     let created = mysql_database_exists(&mut root, &missing_db);
     root.query_drop(format!("DROP DATABASE {source_db}")).unwrap();
     root.query_drop(format!("DROP DATABASE IF EXISTS {missing_db}")).unwrap();
@@ -1250,7 +1265,7 @@ fn mysql_preview_leaves_target_unchanged() {
     let result = preview(&target, &output);
     let after = state(&mut root);
     let probes = mysql_probe_tables(&mut root, &db);
-    let report_written = output.join("_tunnelforge_import_report.json").exists();
+    let report_written = any_import_report(&output);
     root.query_drop(format!("DROP DATABASE {db}")).unwrap();
     std::fs::remove_dir_all(&output).unwrap();
     assert_eq!(before, after, "the preview changed the target");
@@ -1415,7 +1430,7 @@ fn postgres_preview_leaves_target_unchanged() {
     let before = state(&mut admin);
     let result = preview(&endpoint, &output);
     let after = state(&mut admin);
-    let report_written = output.join("_tunnelforge_import_report.json").exists();
+    let report_written = any_import_report(&output);
     admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
     std::fs::remove_dir_all(&output).unwrap();
     assert_eq!(before, after, "the preview changed the target");

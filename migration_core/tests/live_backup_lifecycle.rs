@@ -167,7 +167,7 @@ fn fixture_with(base: &Endpoint, promote: bool, view: bool, target_only: bool) -
     let restored = result(call("dump.import", json!({"connection": original, "target": original, "input_dir": dir, "mode": "safe", "threads": 1})));
     assert_eq!(restored["success"], true, "{restored}");
     let restore_id = restored["restore_id"].as_str().unwrap().to_string();
-    let report_path = dir.join("_tunnelforge_import_report.json");
+    let report_path = PathBuf::from(restored["report_path"].as_str().unwrap());
     if promote {
         let planned = result(call("dump.promote", json!({"endpoint": original, "action": "plan", "report_path": report_path, "restore_id": restore_id})));
         assert_eq!(planned["can_promote"], true, "{planned}");
@@ -401,6 +401,33 @@ fn failed_copy_is_cleaned_only_while_it_holds_what_its_import_makes() {
         assert_eq!(applied["status"], "cleaned", "{applied}");
         assert!(!fx.exists(&candidate));
         assert_eq!(fx.scalar("SELECT value FROM parents WHERE id=1"), "original");
+        fx.finish();
+    }
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn a_second_safe_restore_keeps_the_first_report_and_both_restores_are_listed() {
+    for base in endpoints() {
+        let fx = fixture(&base, true);
+        let first_report = std::fs::read(&fx.report_path).unwrap();
+        // The same dump restored again: before each attempt had its own report, this erased the first one.
+        let again = result(call("dump.import", json!({"connection": fx.original, "target": fx.original, "input_dir": fx.dir, "mode": "safe", "threads": 1})));
+        assert_eq!(again["success"], true, "{again}");
+        let second_id = again["restore_id"].as_str().unwrap().to_string();
+        assert_ne!(PathBuf::from(again["report_path"].as_str().unwrap()), fx.report_path);
+        assert_eq!(std::fs::read(&fx.report_path).unwrap(), first_report, "the second restore overwrote the first one's report");
+        let listed = fx.list();
+        let ids: Vec<&str> = listed["backups"].as_array().unwrap().iter().filter_map(|b| b["restore_id"].as_str()).collect();
+        assert!(ids.contains(&fx.restore_id.as_str()) && ids.contains(&second_id.as_str()), "{listed}");
+        assert!(fx.exists(&fx.backup_namespace()), "the promoted restore's backup is no longer found");
+        // The second candidate is checked against its own report, not the first restore's.
+        let candidate = format!("tf_restore_{second_id}");
+        let plan = result(backups(&fx.original, &fx.dir, "cleanup_plan", json!({"restore_id": second_id, "target": "candidate"})));
+        assert_eq!(plan["can_cleanup"], true, "{plan}");
+        let applied = result(backups(&fx.original, &fx.dir, "cleanup_apply", json!({"restore_id": second_id, "target": "candidate", "plan_digest": plan["plan_digest"], "confirmed": true})));
+        assert_eq!(applied["status"], "cleaned", "{applied}");
+        assert!(!fx.exists(&candidate));
         fx.finish();
     }
 }

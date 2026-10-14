@@ -330,7 +330,7 @@ pub(crate) fn promote(
     candidate: &Endpoint,
     planned: &PromotionPlan,
     confirmed_digest: &str,
-    report_dir: &Path,
+    report_path: &Path,
 ) -> Result<Value, String> {
     if confirmed_digest != planned.plan_digest
         || digest(planned)? != planned.plan_digest
@@ -344,10 +344,7 @@ pub(crate) fn promote(
     if inventory_digest(&fresh)? != inventory_digest(planned)? {
         return Err("promotion inventory changed after review".into());
     }
-    let verified = crate::import::safe_restore::load_verified_plan(
-        &dump_import_report_path(report_dir)?,
-        original,
-    )?;
+    let verified = crate::import::safe_restore::load_verified_plan(report_path, original)?;
     if verified.restore_id != planned.restore_id || verified.candidate != *candidate {
         return Err("verified candidate differs from promotion plan".into());
     }
@@ -359,6 +356,7 @@ pub(crate) fn promote(
     {
         return Err("invalid promotion attempt nonce".into());
     }
+    let report_dir = report_path.parent().ok_or("report directory is missing")?;
     let journal_dir = report_dir.join(format!(
         "promotion-postgres-{}-{}",
         planned.restore_id, planned.attempt_nonce
@@ -1186,6 +1184,10 @@ mod tests {
         );
         (original, candidate, prepared, dir)
     }
+    /// The safe restore's own report, which the promotion reads.
+    fn report(prepared: &Value) -> std::path::PathBuf {
+        prepared["report_path"].as_str().unwrap().into()
+    }
     fn cleanup(
         base: &Endpoint,
         original: &Endpoint,
@@ -1243,7 +1245,7 @@ mod tests {
             prepared["restore_id"].as_str().unwrap(),
         )
         .unwrap();
-        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &dir).unwrap();
+        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(result["status"], "promoted", "{result:#?}");
         let values = run(
             "query.execute",
@@ -1303,7 +1305,7 @@ mod tests {
             prepared["restore_id"].as_str().unwrap(),
         )
         .unwrap();
-        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &dir).unwrap();
+        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(result["status"], "failed_original_unchanged", "{result:#?}");
         assert_eq!(db.row_count("items").unwrap(), 2);
         assert_eq!(db.row_count("source_view").unwrap(), 2);
@@ -1348,7 +1350,7 @@ mod tests {
             .unwrap()
             .execute_sql("UPDATE items SET value='tampered'")
             .unwrap();
-        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &dir).unwrap();
+        let result = promote(&original, &candidate, &planned, &planned.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(result["status"], "failed_original_unchanged", "{result:#?}");
         let values = run(
             "query.execute",
@@ -1408,7 +1410,7 @@ mod tests {
             original.clone(),
             candidate.clone(),
             planned.clone(),
-            dir.clone(),
+            report(&prepared),
         );
         let worker = std::thread::spawn(move || promote(&a, &b, &p, &p.plan_digest, &path));
         let mut admin = connect(&base).unwrap();
@@ -1472,7 +1474,7 @@ mod tests {
             original.clone(),
             candidate.clone(),
             planned.clone(),
-            dir.clone(),
+            report(&prepared),
         );
         let worker = std::thread::spawn(move || promote(&a, &b, &p, &p.plan_digest, &path));
         let mut admin = connect(&base).unwrap();
@@ -1524,13 +1526,13 @@ mod tests {
             qualified(&first.original_schema, "items")
         ))
         .unwrap();
-        let failed = promote(&original, &candidate, &first, &first.plan_digest, &dir).unwrap();
+        let failed = promote(&original, &candidate, &first, &first.plan_digest, &report(&prepared)).unwrap();
         held.rollback().unwrap();
         assert_eq!(failed["status"], "failed_original_unchanged", "{failed:#?}");
         let journal = std::path::PathBuf::from(failed["report_path"].as_str().unwrap());
         let old_bytes = std::fs::read(&journal).unwrap();
         assert!(
-            promote(&original, &candidate, &first, &first.plan_digest, &dir).is_err(),
+            promote(&original, &candidate, &first, &first.plan_digest, &report(&prepared)).is_err(),
             "consumed plan replayed"
         );
         let fresh = plan(&original, &candidate, restore_id).unwrap();
@@ -1538,7 +1540,7 @@ mod tests {
             fresh.plan_digest, first.plan_digest,
             "fresh retry needs independent consent digest"
         );
-        let completed = promote(&original, &candidate, &fresh, &fresh.plan_digest, &dir).unwrap();
+        let completed = promote(&original, &candidate, &fresh, &fresh.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(completed["status"], "promoted", "{completed:#?}");
         assert_eq!(
             std::fs::read(journal).unwrap(),

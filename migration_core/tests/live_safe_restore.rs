@@ -214,7 +214,7 @@ fn safe_restore_stages_verified_candidate_and_never_changes_original_on_failure(
                 assert_eq!(result["candidate_retained"], true);
             }
             let report: Value = serde_json::from_slice(
-                &std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap(),
+                &std::fs::read(result["report_path"].as_str().unwrap()).unwrap(),
             )
             .unwrap();
             assert_eq!(report["original_unchanged"], true);
