@@ -22,6 +22,8 @@ from src.exporters.rust_dump_exporter import _is_operation_scoped_import_error
          "LOAD_FAILED:PG-23505"),
         (None, "export failed for table `ERROR 12345 (ABCDE): x`", None),
         (None, "mysql connection error: TLS required (error_code=tls_unavailable)", "TLS_UNAVAILABLE"),
+        (None, "target_create_failed: the target database secret_db does not exist and could not be created; no target "
+               "tables were changed: MySqlError { ERROR 1044 (42000): Access denied }", "TARGET_CREATE_FAILED:MYSQL-1044"),
         ("unsupported_objects", "dump.run refused: objects secret_view", "UNSUPPORTED_OBJECTS"),
         (None, "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:RELOAD:denied", "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED"),
         (None, "mysql connection error: MySqlError { ERROR 1045 (28000): Access denied for user 'secret'@'host' }", "MYSQL-1045"),

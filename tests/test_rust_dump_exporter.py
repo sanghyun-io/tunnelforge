@@ -1055,6 +1055,36 @@ class TestRustDumpImporter:
         assert "broken_view" in msg
         assert "생성 실패" in msg
 
+    @pytest.mark.parametrize(("engine", "created", "expected"), [
+        ("mysql", True, "새 DB app을 만들어 넣었습니다"),
+        ("postgresql", True, "새 스키마 app을 만들어 넣었습니다"),
+        ("mysql", False, None),
+    ])
+    def test_import_dump_names_a_target_namespace_the_core_created(self, tmp_path, engine, created, expected):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        (dump_dir / '0001_users').mkdir(parents=True)
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            json.dumps({"format": "tunnelforge-dump", "format_version": 3, "source_engine": engine,
+                        "database": "app", "source_schema": "app",
+                        "tables": [{"name": "users", "path": "0001_users", "rows": 0, "chunks": 0}]}),
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                return {"success": True, "tables": 1, "rows_imported": 0, "namespace_created": created}
+
+        config = RustDumpConfig('localhost', 3306, 'root', 'password', engine=engine)
+        success, msg, _results = RustDumpImporter(config, facade=FakeFacade()).import_dump(str(dump_dir), import_mode='replace')
+
+        assert success is True
+        if expected:
+            assert msg.endswith("\n" + expected)
+        else:
+            assert "만들어 넣었습니다" not in msg
+
     def test_import_dump_reports_cross_engine_skipped_views(self, tmp_path):
         """크로스 엔진 import 시 건너뛴 View 개수가 메시지에 표시됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter

@@ -511,6 +511,7 @@ _OPERATION_SCOPED_IMPORT_CODES = (
     "target_dependency_preflight_failed:",
     "ddl_preflight_failed:",
     "preflight_surviving_fk:",
+    "target_create_failed:",
 )
 
 
@@ -677,6 +678,9 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += f" (View {len(views_failed)}개 생성 실패: {failed_names})"
             if views_skipped:
                 message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
+            if import_mode != "safe" and result.get("namespace_created") is True:
+                kind = "스키마" if self.config.engine == "postgresql" else "DB"
+                message += f"\n새 {kind} {final_target_schema}을 만들어 넣었습니다"
             for warning in (result.get("verification") or {}).get("warnings", []) or []:
                 warning_line = f"Import warning: {warning}"
                 message += "\n" + warning_line

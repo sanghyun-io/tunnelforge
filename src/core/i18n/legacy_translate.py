@@ -199,6 +199,7 @@ _EN_TEXT_TRANSLATIONS = {
     "원본 데이터를 유지한 테이블(미실행): {}": "Original data kept (not started): {}",
     "원본 테이블에서 제거된 외래 키: {}": "Foreign keys removed from original tables: {}",
     "다시 연결한 외래 키: {}": "Foreign keys linked again: {}",
+    "이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): {}": "Created by this import (left in place): {}",
     " 외 {}개": " and {} more",
     "완전 재생성 Import (이전 모드 · 교체와 동일)": "Recreate Import (legacy alias of Replace)",
     "전체 교체 Import와 동일하게 선택한 테이블만 삭제 후 재생성합니다. 데이터베이스 전체를 삭제하는 모드가 아닙니다.": "Like Replace Import, drops and recreates only selected tables. Does not delete the whole database.",

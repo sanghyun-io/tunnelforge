@@ -1673,7 +1673,13 @@ def test_replace_failure_details_name_lost_and_untouched_tables():
     details = _replace_failure_details(audit)
     assert "원본 테이블에서 제거된 외래 키" not in details
     assert "다시 연결한 외래 키: items.fk_items_orders" in details
+    assert "새로 만든 대상" not in details
     assert _replace_failure_details({}) == ""
+    # A database the import created is named, so the user knows it was left in place.
+    created = {}
+    _capture_import_audit(created, {"event": "import_report", "namespace_created": True,
+                                    "target": {"engine": "mysql", "schema": "new_db"}})
+    assert _replace_failure_details(created) == "이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): new_db"
 
 
 def test_import_unknown_original_namespace_requires_explicit_ui_selection(monkeypatch, tmp_path):

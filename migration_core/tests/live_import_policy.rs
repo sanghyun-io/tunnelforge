@@ -1024,3 +1024,156 @@ fn mysql_replace_refuses_a_kept_child_whose_parent_column_is_not_in_the_dump() {
     let error = imported.iter().find(|event| event["event"] == "error").unwrap();
     assert!(error["message"].as_str().unwrap().contains("incompatible_surviving_fk"), "{error}");
 }
+
+fn import_report_file(output: &std::path::Path) -> Value {
+    serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap()
+}
+
+/// `action:status` of the import's database/schema creation events, in order.
+fn namespace_changes(imported: &[Value]) -> Vec<String> {
+    imported.iter()
+        .filter(|event| event["event"] == "target_change" && event["action"].as_str().is_some_and(|action| action.starts_with("create_")))
+        .map(|event| format!("{}:{}", event["action"].as_str().unwrap(), event["status"].as_str().unwrap_or("")))
+        .collect()
+}
+
+fn mysql_database_exists(conn: &mut mysql::PooledConn, name: &str) -> bool {
+    conn.exec_first::<u64, _, _>("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", (name,)).unwrap().unwrap() > 0
+}
+
+#[test]
+fn replace_into_missing_database_creates_it() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (source_db, created_db, failed_db) = (unique("tf_create_src"), unique("tf_create_new"), unique("tf_create_fail"));
+    for sql in [
+        format!("CREATE DATABASE {source_db}"),
+        format!("CREATE TABLE {source_db}.parent (id INT PRIMARY KEY, label VARCHAR(20))"),
+        format!("CREATE TABLE {source_db}.child (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY (parent_id) REFERENCES {source_db}.parent (id))"),
+        format!("INSERT INTO {source_db}.parent VALUES (1,'a'),(2,'b')"),
+        format!("INSERT INTO {source_db}.child VALUES (10,1),(11,2)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let output = std::env::temp_dir().join(unique("tf_create_missing"));
+    let source = Endpoint { database: source_db.clone(), ..endpoint.clone() };
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "data_format": "jsonl", "compression": "none", "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    let created = Endpoint { database: created_db.clone(), ..endpoint.clone() };
+    let first = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace", "threads": 1}));
+    let first_report = import_report_file(&output);
+    let rows: Vec<(u64, u64)> = root.query(format!("SELECT c.id, p.id FROM {created_db}.child c JOIN {created_db}.parent p ON p.id = c.parent_id ORDER BY c.id")).unwrap_or_default();
+    // The database exists now, so this import replaces its tables as usual.
+    let second = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace", "threads": 1}));
+    // A failure after the CREATE keeps the new database.
+    let failed = import_with_rewritten_chunk(&Endpoint { database: failed_db.clone(), ..endpoint.clone() }, &output, "child",
+        b"{\"id\":\"not-an-integer\",\"parent_id\":1}\n{\"id\":11,\"parent_id\":2}\n");
+    let failed_report = import_report_file(&output);
+    let failed_db_kept = mysql_database_exists(&mut root, &failed_db);
+    for db in [&source_db, &created_db, &failed_db] {
+        root.query_drop(format!("DROP DATABASE IF EXISTS {db}")).unwrap();
+    }
+    std::fs::remove_dir_all(output).unwrap();
+
+    assert!(success(&first), "{first:?}");
+    assert_eq!(rows, vec![(10, 1), (11, 2)]);
+    let result = first.iter().find(|event| event["event"] == "result").unwrap();
+    assert_eq!(result["namespace_created"], true, "{result}");
+    for report in [&first_report, import_report(&first)] {
+        assert_eq!(report["namespace_created"], true, "{report}");
+        assert_eq!(report["namespace_creation_outcome_unknown"], false, "{report}");
+    }
+    assert_eq!(namespace_changes(&first), ["create_database:started", "create_database:completed"]);
+
+    assert!(success(&second), "{second:?}");
+    assert_eq!(second.iter().find(|event| event["event"] == "result").unwrap()["namespace_created"], false);
+    assert!(namespace_changes(&second).is_empty());
+
+    assert_failed_on(&failed, "child");
+    assert!(failed_db_kept, "the database created for the failed import was dropped");
+    assert_eq!(failed_report["namespace_created"], true, "{failed_report}");
+    assert_eq!(failed_report["data_loaded_tables"], json!(["parent"]), "{failed_report}");
+}
+
+#[test]
+fn replace_into_missing_schema_creates_it() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let (source_schema, created_schema) = (unique("tf_pg_create_src"), unique("tf_pg_create_new"));
+    let source = Endpoint {
+        engine: "postgresql".into(), host: host.clone(), port: 5432,
+        user: "postgres".into(), password: "tf_local_test".into(), database: "tf_test".into(),
+        schema: Some(source_schema.clone()),
+        tls: Default::default(),
+    };
+    let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test")
+        .dbname("tf_test").connect(postgres::NoTls).unwrap();
+    admin.batch_execute(&format!(
+        "CREATE SCHEMA {source_schema}; CREATE TABLE {source_schema}.parent(id INT PRIMARY KEY);
+         CREATE TABLE {source_schema}.child(id INT PRIMARY KEY, parent_id INT REFERENCES {source_schema}.parent(id));
+         INSERT INTO {source_schema}.parent VALUES(1),(2); INSERT INTO {source_schema}.child VALUES(10,1),(11,2)"
+    )).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_create_missing"));
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "data_format": "jsonl", "threads": 1}));
+    assert!(success(&exported), "{exported:?}");
+    let created = Endpoint { schema: Some(created_schema.clone()), ..source.clone() };
+    let imported = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace"}));
+    let rows = admin.query_one(&format!("SELECT COUNT(*) FROM {created_schema}.child c JOIN {created_schema}.parent p ON p.id=c.parent_id"), &[])
+        .ok().map(|row| row.get::<_, i64>(0));
+    // A missing PostgreSQL database is never created.
+    let missing_db = unique("tf_pg_missing_db");
+    let refused = run("dump.import", json!({"target": Endpoint { database: missing_db.clone(), ..created.clone() }, "input_dir": output, "mode": "replace"}));
+    let refused_report = import_report_file(&output);
+    let databases: i64 = admin.query_one("SELECT COUNT(*) FROM pg_database WHERE datname=$1", &[&missing_db]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS {created_schema} CASCADE; DROP SCHEMA {source_schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+
+    assert!(success(&imported), "{imported:?}");
+    assert_eq!(rows, Some(2));
+    assert_eq!(imported.iter().find(|event| event["event"] == "result").unwrap()["namespace_created"], true);
+    assert_eq!(import_report(&imported)["namespace_created"], true);
+    assert_eq!(namespace_changes(&imported), ["create_schema:started", "create_schema:completed"]);
+
+    assert!(!success(&refused), "{refused:?}");
+    assert_eq!(databases, 0);
+    assert_eq!(refused_report["namespace_created"], false, "{refused_report}");
+    assert_eq!(refused_report["namespace_creation_outcome_unknown"], false, "{refused_report}");
+    assert!(namespace_changes(&refused).is_empty());
+}
+
+#[test]
+fn failed_create_is_journaled_as_outcome_unknown() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (source_db, missing_db, user) = (unique("tf_nocreate_src"), unique("tf_nocreate_new"), "tf_import_nocreate");
+    for sql in [
+        format!("DROP USER IF EXISTS '{user}'@'%'"),
+        format!("CREATE DATABASE {source_db}"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        // No CREATE privilege outside this database.
+        format!("GRANT ALL ON {source_db}.* TO '{user}'@'%'"),
+        format!("CREATE TABLE {source_db}.items (id INT PRIMARY KEY)"),
+        format!("INSERT INTO {source_db}.items VALUES (1)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let output = std::env::temp_dir().join(unique("tf_nocreate"));
+    let source = Endpoint { database: source_db.clone(), ..endpoint.clone() };
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    let scoped = Endpoint { user: user.into(), database: missing_db.clone(), ..endpoint.clone() };
+    let imported = run("dump.import", json!({"target": scoped, "input_dir": output, "mode": "replace", "threads": 1}));
+    let report = import_report_file(&output);
+    let created = mysql_database_exists(&mut root, &missing_db);
+    root.query_drop(format!("DROP DATABASE {source_db}")).unwrap();
+    root.query_drop(format!("DROP DATABASE IF EXISTS {missing_db}")).unwrap();
+    root.query_drop(format!("DROP USER '{user}'@'%'")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+
+    assert!(!success(&imported));
+    let error = imported.iter().find(|event| event["event"] == "error").unwrap()["message"].as_str().unwrap();
+    assert!(error.contains("target_create_failed") && error.contains(&missing_db), "{error}");
+    assert!(!created, "the denied CREATE DATABASE created {missing_db}");
+    for report in [&report, import_report(&imported)] {
+        assert_eq!(report["namespace_creation_outcome_unknown"], true, "{report}");
+        assert_eq!(report["namespace_created"], false, "{report}");
+        assert_eq!(report["phase"], "dump_import_create_namespace", "{report}");
+        assert_eq!(report["dropped_tables"], json!([]), "{report}");
+    }
+    assert_eq!(namespace_changes(&imported), ["create_database:started"]);
+}

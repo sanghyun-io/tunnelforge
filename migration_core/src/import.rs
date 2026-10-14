@@ -146,6 +146,9 @@ struct ImportJournal {
     restored_foreign_keys: Vec<String>,
     rows_imported: u64,
     chunks_imported: u64,
+    /// Set just before CREATE DATABASE/SCHEMA and cleared only once it succeeded.
+    namespace_creation_outcome_unknown: bool,
+    namespace_created: bool,
     safe_context: Option<Value>,
 }
 
@@ -163,6 +166,8 @@ impl ImportJournal {
             "failed_tables": failed, "unattempted_tables": unattempted,
             "pending_drop_table": self.pending_drop,
             "drop_outcome_unknown": self.pending_drop.is_some(),
+            "namespace_creation_outcome_unknown": self.namespace_creation_outcome_unknown,
+            "namespace_created": self.namespace_created,
             "current_table": self.current_table, "error": error,
             "rows_imported": self.rows_imported, "chunks_imported": self.chunks_imported,
             "post_load_completed": false,
@@ -212,6 +217,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         load_attempted: BTreeSet::new(), dropped: Vec::new(), loaded: Vec::new(),
         current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), restored_foreign_keys: Vec::new(),
         rows_imported: 0, chunks_imported: 0,
+        namespace_creation_outcome_unknown: false, namespace_created: false,
         safe_context,
     };
     // Replacing a prior success report is a prerequisite for starting a new attempt.
@@ -219,6 +225,10 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
     let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
     emit(json!({"event":"import_report", "request_id":request.request_id, "status":"running", "report_path":report_path, "target":journal.target}));
     let result = dump_import_attempt(request, &mut journal, |event| emit(event))
+        .map(|mut result| {
+            if journal.safe_context.is_none() { result["namespace_created"] = json!(journal.namespace_created); }
+            result
+        })
         .map_err(|error| redact_endpoint_secret(&error, &endpoint));
     let mut report = match &result {
         Ok(result) => {
@@ -242,7 +252,8 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         return Err(match result { Err(original) => format!("{original}; failure report could not be persisted: {error}"), Ok(_) => format!("Import data was applied, but its completion report could not be persisted: {error}") });
     }
     let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
-    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed"] {
+    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed",
+        "namespace_creation_outcome_unknown", "namespace_created", "target"] {
         summary[key] = report[key].clone();
     }
     emit(summary);
@@ -360,6 +371,10 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             .cloned()
             .collect(),
     };
+    // A safe restore's candidate import runs in the namespace the safe restore created.
+    if journal.safe_context.is_none() {
+        create_missing_target_namespace(&endpoint, journal, request.request_id.clone(), &mut emit)?;
+    }
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
@@ -518,6 +533,37 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             emit(event);
         },
     )
+}
+
+/// Creates the target MySQL database or PostgreSQL schema when it is missing (a missing PostgreSQL
+/// database still fails to connect). A namespace created here is kept if the import fails later.
+fn create_missing_target_namespace<F: FnMut(Value)>(
+    endpoint: &Endpoint, journal: &mut ImportJournal, request_id: Option<String>, emit: &mut F,
+) -> Result<(), String> {
+    let mut admin = safe_restore::maintenance_connection(endpoint)?;
+    if safe_restore::target_namespace_exists(&mut admin, endpoint)? {
+        return Ok(());
+    }
+    let (name, kind, action) = if endpoint.engine == "mysql" {
+        (endpoint.database.clone(), "database", "create_database")
+    } else {
+        (endpoint_schema(endpoint), "schema", "create_schema")
+    };
+    let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
+    let event = |status: &str| json!({"event":"target_change", "request_id":request_id, "phase":"dump_import_create_namespace",
+        "action":action, "status":status, "namespace":name, "report_path":report_path});
+    journal.phase = "dump_import_create_namespace".into();
+    journal.namespace_creation_outcome_unknown = true;
+    journal.checkpoint()?;
+    emit(event("started"));
+    let context = classified_import_error("target_create_failed",
+        &format!("the target {kind} {name} does not exist and could not be created; no target tables were changed"), None);
+    safe_restore::create_namespace(&mut admin, endpoint, &name, &context)?;
+    journal.namespace_created = true;
+    journal.namespace_creation_outcome_unknown = false;
+    journal.checkpoint()?;
+    emit(event("completed"));
+    Ok(())
 }
 
 /// Builds every selected table under an owned probe name before any target table is dropped. The

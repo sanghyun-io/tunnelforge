@@ -69,6 +69,9 @@ def _capture_import_audit(audit: dict, event: dict):
                     "restored_foreign_keys"):
             if isinstance(event.get(key), list):
                 audit[key] = event[key]
+        target = event.get("target")
+        if event.get("namespace_created") is True and isinstance(target, dict) and isinstance(target.get("schema"), str):
+            audit["created_namespace"] = target["schema"]
 
     if str(event.get("event", "")).startswith("safe_restore") or event.get("candidate_target"):
         for key in ("original_target", "candidate_target"):
@@ -115,6 +118,8 @@ def _replace_failure_details(audit: dict) -> str:
         lines.append(translate_text("원본 테이블에서 제거된 외래 키: {}").format(_names_preview(unlinked)))
     if restored:
         lines.append(translate_text("다시 연결한 외래 키: {}").format(_names_preview(restored)))
+    if audit.get("created_namespace"):
+        lines.append(translate_text("이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): {}").format(audit["created_namespace"]))
     return "\n".join(lines)
 
 

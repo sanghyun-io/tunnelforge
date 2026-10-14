@@ -255,30 +255,8 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             &manifest.schema,
         )?;
 
-        let mut maintenance = original.clone();
-        if original.engine == "mysql" {
-            maintenance.database = "information_schema".into();
-            maintenance.schema = None;
-        }
-        let mut admin = LiveAdapter::connect(&maintenance)?;
-        let namespace_exists = match &mut admin {
-            LiveAdapter::MySql(conn) => {
-                conn.exec_first::<u64, _, _>(
-                    "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?",
-                    (&original.database,),
-                )
-                .map_err(|e| e.to_string())?
-                .unwrap_or(0)
-                    > 0
-            }
-            LiveAdapter::PostgreSql(client) => client
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
-                    &[&endpoint_schema(&original)],
-                )
-                .map_err(|e| e.to_string())?
-                .get::<_, bool>(0),
-        };
+        let mut admin = maintenance_connection(&original)?;
+        let namespace_exists = target_namespace_exists(&mut admin, &original)?;
         state["namespace_existed"] = json!(namespace_exists);
         state["cutover_pending"] = json!(namespace_exists);
         let original_inspection = if namespace_exists {
@@ -360,7 +338,8 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         state["phase"] = json!("safe_restore_create_candidate");
         state["candidate_creation_outcome_unknown"] = json!(true);
         write_dump_import_report(path, &state)?;
-        create_candidate(&mut admin, &original, &name)?;
+        create_namespace(&mut admin, &original, &name,
+            "safe candidate creation failed (existing namespaces are never reused)")?;
         state["namespace_created"] = json!(true);
         state["candidate_created"] = json!(true);
         state["candidate_retained"] = json!(true);
@@ -497,10 +476,45 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
     Ok(state)
 }
 
-fn create_candidate(
+/// A connection that works while the target namespace is missing: MySQL connects to
+/// information_schema, PostgreSQL to the target database (a missing schema fails only later).
+pub(crate) fn maintenance_connection(original: &Endpoint) -> Result<LiveAdapter, String> {
+    let mut maintenance = original.clone();
+    if original.engine == "mysql" {
+        maintenance.database = "information_schema".into();
+        maintenance.schema = None;
+    }
+    LiveAdapter::connect(&maintenance)
+}
+
+pub(crate) fn target_namespace_exists(admin: &mut LiveAdapter, original: &Endpoint) -> Result<bool, String> {
+    Ok(match admin {
+        LiveAdapter::MySql(conn) => {
+            conn.exec_first::<u64, _, _>(
+                "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?",
+                (&original.database,),
+            )
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0)
+                > 0
+        }
+        LiveAdapter::PostgreSql(client) => client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
+                &[&endpoint_schema(original)],
+            )
+            .map_err(|e| e.to_string())?
+            .get::<_, bool>(0),
+    })
+}
+
+/// CREATE DATABASE (MySQL, with the original's or the server's character set) or CREATE SCHEMA
+/// (PostgreSQL). A failure reads `{context}: {server error}`.
+pub(crate) fn create_namespace(
     adapter: &mut LiveAdapter,
     original: &Endpoint,
     name: &str,
+    context: &str,
 ) -> Result<(), String> {
     if let LiveAdapter::MySql(conn) = adapter {
         let defaults:Option<(String,String)>=conn.exec_first("SELECT DEFAULT_CHARACTER_SET_NAME,DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?",(&original.database,)).map_err(|e|e.to_string())?;
@@ -517,14 +531,13 @@ fn create_candidate(
             quote_ident("mysql", &charset),
             quote_ident("mysql", &collation)
         ))
-        .map_err(|e| {
-            format!("safe candidate creation failed (existing namespaces are never reused): {e}")
-        })
+        .map_err(|e| format!("{context}: {e}"))
     } else {
         adapter.execute_sql(&format!(
             "CREATE SCHEMA {}",
             quote_ident("postgresql", name)
         ))
+        .map_err(|e| format!("{context}: {e}"))
     }
 }
 

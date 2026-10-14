@@ -32,6 +32,7 @@ RUST_CORE_CODES = frozenset({
     "safe_restore_content_invalid",
     "safe_restore_content_mismatch",
     "safe_restore_content_read_failed",
+    "target_create_failed",
     "target_dependency_preflight_failed",
     "target_not_empty",
     "tls_unavailable",

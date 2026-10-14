@@ -36,6 +36,18 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | `replace` | Like mysqldump: each selected dump table is dropped, recreated, loaded and finished (its secondary indexes, PostgreSQL unique indexes/comments/sequences) one table at a time; each FK is added as soon as both of its tables are done (a parent outside the dump counts as done), and views follow at the end. Existing selected-table data is lost. A failure leaves at most the table in progress missing, partially loaded or unfinished; tables already replaced are complete, and tables not yet reached keep their original data; an FK such a table lost when its parent was replaced is linked again after the failure if that parent was reloaded (otherwise it stays reported as removed). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
 
+A `replace` (or `recreate`) import into a MySQL database or PostgreSQL schema
+that does not exist creates it first, after the dump checks and before any table
+work; MySQL uses the server's default character set and collation. This needs
+the CREATE privilege for that database (MySQL) or on the database (PostgreSQL).
+The import report records `namespace_creation_outcome_unknown: true` before the
+CREATE and `namespace_created: true` only after it succeeded, so a failed CREATE
+stays reported as of unknown outcome; `target_change` events (`create_database`
+or `create_schema`, status `started` then `completed`) bracket it. A namespace
+created this way is not dropped when the import fails later; the result and the
+failure report carry `namespace_created`. A missing PostgreSQL database is never
+created: the import fails to connect.
+
 The former `merge` mode (append rows to existing tables) was removed. A request
 with `mode` or `import_mode` set to `merge`, or to any value not listed above, is
 refused as `import_plan_invalid` before anything is written, including the
