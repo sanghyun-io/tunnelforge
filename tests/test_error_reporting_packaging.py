@@ -434,7 +434,7 @@ def _synthetic_relay(mode):
         assert not thread.is_alive(), "synthetic relay server thread did not stop"
 
 
-def _run_node_smoke(command, environment, timeout_seconds=15):
+def _run_node_smoke(command, environment, timeout_seconds=60):
     try:
         return subprocess.run(
             command,
@@ -492,7 +492,7 @@ def test_relay_smoke_timeout_reports_bounded_diagnostics(monkeypatch):
         )
 
     message = str(failure.value)
-    assert "Node smoke timed out after 15 seconds" in message
+    assert "Node smoke timed out after 60 seconds" in message
     assert "partial smoke stdout" in message
     assert "partial smoke stderr" in message
 

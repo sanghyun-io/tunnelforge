@@ -113,6 +113,8 @@ function expectFixedError(status, body, expectedStatus, code, retryable) {
 
 async function main() {
   const { origin, mode, loopback } = configuration();
+  // A timed-out run that printed this got as far as its first request.
+  console.log(`mode=${mode} smoke started`);
   const healthResponse = await request(`${origin}/health`);
   const health = await responseJson(healthResponse);
   exactKeys(health, ["service", "schema", "mode"], "health response");
