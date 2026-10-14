@@ -63,6 +63,21 @@ fn mysql_real_schema_replace_overwrite_children_safe_restore_and_reexport() {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_clean(&import(&mysql(&host, "root", &db), &dir, "replace"), "fresh replace");
 
+        // Safe restore into the existing database, then switch.
+        let safe = import(&mysql(&host, "root", &db), &dir, "safe");
+        let restored = result(&safe).clone();
+        assert!(restored["success"] == true && restored["verified"] == true, "safe restore: {restored}");
+        let promote = |action: &str, extra: Value| {
+            let mut payload = json!({"action": action, "restore_id": restored["restore_id"], "report_path": restored["report_path"], "target": mysql(&host, "root", &db)});
+            payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            run("dump.promote", payload)
+        };
+        let plan = promote("plan", json!({}));
+        let plan = result(&plan).clone();
+        assert!(plan["success"] == true && plan["can_promote"] == true, "promote plan: {plan}");
+        let confirm = promote("confirm", json!({"plan_digest": plan["plan_digest"], "overwrite_confirmed": true}));
+        assert_eq!(result(&confirm)["status"], "promoted", "{}", result(&confirm));
+
         // Target-only children on every single-column primary key, typed like the parent.
         let parents: Vec<(String, String, String, Option<String>, Option<String>)> = root.exec(
             "SELECT k.TABLE_NAME, k.COLUMN_NAME, c.COLUMN_TYPE, c.CHARACTER_SET_NAME, c.COLLATION_NAME \
@@ -80,20 +95,15 @@ fn mysql_real_schema_replace_overwrite_children_safe_restore_and_reexport() {
         let kept: u64 = root.exec_first("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND CONSTRAINT_NAME LIKE 'zz\\_fk\\_%'", (&db,)).unwrap().unwrap();
         assert_eq!(kept as usize, parents.len(), "target-only children must keep their FKs");
 
-        // Safe restore into the existing database, then switch.
-        let safe = import(&mysql(&host, "root", &db), &dir, "safe");
-        let restored = result(&safe).clone();
-        assert!(restored["success"] == true && restored["verified"] == true, "safe restore: {restored}");
-        let promote = |action: &str, extra: Value| {
-            let mut payload = json!({"action": action, "restore_id": restored["restore_id"], "report_path": restored["report_path"], "target": mysql(&host, "root", &db)});
-            payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            run("dump.promote", payload)
-        };
-        let plan = promote("plan", json!({}));
-        let plan = result(&plan).clone();
-        assert!(plan["success"] == true && plan["can_promote"] == true, "promote plan: {plan}");
-        let confirm = promote("confirm", json!({"plan_digest": plan["plan_digest"], "overwrite_confirmed": true}));
-        assert_eq!(result(&confirm)["status"], "promoted", "{}", result(&confirm));
+        // The children are linked to the dump, so a safe restore stops before making a copy.
+        let linked = import(&mysql(&host, "root", &db), &dir, "safe");
+        let linked = result(&linked).clone();
+        assert!(linked["status"] == "failed_original_untouched" && linked["candidate_created"] == false, "linked safe restore: {linked}");
+        let stops = |code: &str, prefix: &str| linked["copy_blockers"].as_array().into_iter().flatten()
+            .filter(|item| item["code"] == code && item["table"].as_str().is_some_and(|name| name.starts_with(prefix))).count();
+        assert_eq!(stops("linked_target_only", "zz_child_"), parents.len(), "{linked}");
+        // The first switch kept the old view definitions under alias names; they stop it too.
+        assert!(stops("saved_view_alias", "tf_p_") > 0, "{linked}");
 
         // Export what was imported and load it into an empty database.
         let out = std::env::temp_dir().join(unique("tf_real_export"));

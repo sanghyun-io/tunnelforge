@@ -154,6 +154,11 @@ pub(crate) fn plan(
     plan_inner(original, candidate, restore_id, true)
 }
 
+/// Tables outside the dump whose FKs to a replaced parent this plan would drop and add again.
+pub(crate) fn repointed_tables(planned: &PromotionPlan) -> Vec<String> {
+    planned.incoming.iter().map(|key| key.table.clone()).collect::<BTreeSet<_>>().into_iter().collect()
+}
+
 fn plan_inner(
     original: &Endpoint,
     candidate: &Endpoint,

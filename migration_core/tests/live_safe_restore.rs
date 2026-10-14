@@ -192,14 +192,8 @@ fn safe_restore_stages_verified_candidate_and_never_changes_original_on_failure(
             if defect == "none" || defect == "target_only" {
                 assert_eq!(result["success"], true, "{engine}/{defect}: {result:?}");
                 assert_eq!(result["verified"], true);
-                assert_eq!(
-                    result["status"],
-                    if defect == "none" {
-                        "ready_for_switch"
-                    } else {
-                        "ready_for_review"
-                    }
-                );
+                // An unlinked target-only table is left alone by the swap and blocks nothing.
+                assert_eq!(result["status"], "ready_for_switch", "{engine}/{defect}: {result:?}");
                 let mut fresh = LiveAdapter::connect(&candidate).unwrap();
                 assert_eq!(fresh.row_count("parents").unwrap(), 1);
                 assert_eq!(fresh.row_count("children").unwrap(), 1);
@@ -404,4 +398,172 @@ fn mysql_safe_restore_preserves_security_words_in_view_names_and_body_literals()
     admin.execute_sql(&format!("DROP DATABASE {}",candidate.database)).unwrap();
     admin.execute_sql(&format!("DROP DATABASE {name}")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
+}
+
+fn namespace_kind(engine: &str) -> &'static str {
+    if engine == "mysql" { "DATABASE" } else { "SCHEMA" }
+}
+
+fn drop_namespace(admin: &mut LiveAdapter, engine: &str, name: &str) {
+    let cascade = if engine == "mysql" { "" } else { " CASCADE" };
+    admin.execute_sql(&format!("DROP {} IF EXISTS {name}{cascade}", namespace_kind(engine))).unwrap();
+}
+
+/// A new namespace holding `parents` (one row), and its dump. Returns (admin, original, name, dump).
+fn exported_namespace(engine: &str) -> Option<(LiveAdapter, Endpoint, String, std::path::PathBuf)> {
+    let base = endpoint(engine)?;
+    let mut admin = LiveAdapter::connect(&base).unwrap();
+    let name = unique();
+    admin.execute_sql(&format!("CREATE {} {name}", namespace_kind(engine))).unwrap();
+    let mut original = base.clone();
+    if engine == "mysql" {
+        original.database = name.clone();
+    } else {
+        original.schema = Some(name.clone());
+    }
+    let mut db = LiveAdapter::connect(&original).unwrap();
+    db.execute_sql("CREATE TABLE parents(id INT PRIMARY KEY, value VARCHAR(40))").unwrap();
+    db.execute_sql("INSERT INTO parents VALUES(1,'dump')").unwrap();
+    let output = std::env::temp_dir().join(unique());
+    let exported = run("dump.run", json!({"source":original,"output_dir":output,"data_format":"jsonl","compression":"none","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(!exported.iter().any(|e| e["event"] == "error"), "{exported:?}");
+    Some((admin, original, name, output))
+}
+
+fn safe_import(original: &Endpoint, output: &std::path::Path) -> Value {
+    let events = run("dump.import", json!({"target":original,"input_dir":output,"mode":"safe","threads":1}));
+    events.into_iter().find(|e| e["event"] == "result").expect("result event")
+}
+
+fn first_value(endpoint: &Endpoint, sql: &str) -> Value {
+    let events = run("query.execute", json!({"connection":endpoint,"sql":sql}));
+    let rows = events.iter().find_map(|e| e["rows"].as_array().cloned()).unwrap_or_else(|| panic!("{sql}: {events:?}"));
+    rows[0].as_object().unwrap().values().next().unwrap().clone()
+}
+
+fn restore_namespaces(engine: &str, endpoint: &Endpoint) -> Value {
+    let sql = if engine == "mysql" {
+        "SELECT COUNT(*) AS n FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'tf\\_restore\\_%'"
+    } else {
+        "SELECT COUNT(*)::text AS n FROM pg_namespace WHERE nspname LIKE 'tf\\_restore\\_%'"
+    };
+    first_value(endpoint, sql)
+}
+
+#[test]
+fn unlinked_target_only_reaches_ready_for_switch() {
+    for engine in ["mysql", "postgresql"] {
+        let Some((mut admin, original, name, output)) = exported_namespace(engine) else { continue };
+        let mut db = LiveAdapter::connect(&original).unwrap();
+        db.execute_sql("CREATE TABLE notes(id INT PRIMARY KEY, note VARCHAR(20))").unwrap();
+        db.execute_sql("INSERT INTO notes VALUES(1,'kept')").unwrap();
+        db.execute_sql("CREATE VIEW notes_view AS SELECT id, note FROM notes").unwrap();
+        let result = safe_import(&original, &output);
+        if let Some(candidate) = result["candidate_target"][if engine == "mysql" { "database" } else { "schema" }].as_str() {
+            if candidate != name {
+                drop_namespace(&mut admin, engine, candidate);
+            }
+        }
+        drop_namespace(&mut admin, engine, &name);
+        std::fs::remove_dir_all(output).unwrap();
+        assert_eq!(result["success"], true, "{engine}: {result}");
+        assert_eq!(result["status"], "ready_for_switch", "{engine}: {result}");
+        assert_eq!(result["ready_for_switch"], true, "{engine}: {result}");
+        assert_eq!(result["blockers"], json!([]), "{engine}: {result}");
+        assert_eq!(result["target_only_tables"], json!(["notes"]), "{engine}: {result}");
+        assert_eq!(result["target_only_views"], json!(["notes_view"]), "{engine}: {result}");
+    }
+}
+
+#[test]
+fn linked_target_only_table_stops_before_copy() {
+    for engine in ["mysql", "postgresql"] {
+        for link in ["child_fk", "view", "dump_child_fk"] {
+            let Some((mut admin, original, name, output)) = exported_namespace(engine) else { continue };
+            let mut db = LiveAdapter::connect(&original).unwrap();
+            let outside = match link {
+                // A target-only table referencing a dump table.
+                "child_fk" => {
+                    db.execute_sql("CREATE TABLE notes(id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_notes FOREIGN KEY(parent_id) REFERENCES parents(id))").unwrap();
+                    db.execute_sql("INSERT INTO notes VALUES(1,1)").unwrap();
+                    "notes"
+                }
+                // A target-only view reading a dump table.
+                "view" => {
+                    db.execute_sql("CREATE VIEW parent_notes AS SELECT id FROM parents").unwrap();
+                    "parent_notes"
+                }
+                // A dump table referencing a target table the dump does not have.
+                _ => {
+                    db.execute_sql("CREATE TABLE owners(id INT PRIMARY KEY)").unwrap();
+                    db.execute_sql("ALTER TABLE parents ADD COLUMN owner_id INT").unwrap();
+                    db.execute_sql("ALTER TABLE parents ADD CONSTRAINT fk_owner FOREIGN KEY(owner_id) REFERENCES owners(id)").unwrap();
+                    "owners"
+                }
+            };
+            let copies_before = restore_namespaces(engine, &original);
+            let preview = run("dump.import_preview", json!({"target":original,"input_dir":output,"threads":1}));
+            let preview = preview.into_iter().find(|e| e["event"] == "result").unwrap_or_else(|| panic!("{engine}/{link}: no preview result"));
+            let result = safe_import(&original, &output);
+            let copies_after = restore_namespaces(engine, &original);
+            let rows = db.row_count("parents").unwrap();
+            drop_namespace(&mut admin, engine, &name);
+            std::fs::remove_dir_all(output).unwrap();
+            let stops = |blockers: &Value| blockers.as_array().into_iter().flatten()
+                .any(|item| item["code"] == "linked_target_only" && item["table"] == outside);
+            assert!(stops(&preview["copy_blockers"]), "{engine}/{link}: preview {preview}");
+            assert_eq!(result["success"], false, "{engine}/{link}: {result}");
+            assert_eq!(result["status"], "failed_original_untouched", "{engine}/{link}: {result}");
+            assert_eq!(result["candidate_created"], false, "{engine}/{link}: {result}");
+            assert_eq!(result["error_code"], "copy_refused", "{engine}/{link}: {result}");
+            assert!(stops(&result["copy_blockers"]), "{engine}/{link}: {result}");
+            assert_eq!(copies_before, copies_after, "{engine}/{link}: a copy was made");
+            assert_eq!(rows, 1, "{engine}/{link}: the original changed");
+        }
+    }
+}
+
+#[test]
+fn unlinked_target_only_table_survives_unrebuilt() {
+    for engine in ["mysql", "postgresql"] {
+        let Some((mut admin, original, name, output)) = exported_namespace(engine) else { continue };
+        let mut db = LiveAdapter::connect(&original).unwrap();
+        db.execute_sql("CREATE TABLE notes(id INT PRIMARY KEY, note VARCHAR(20))").unwrap();
+        db.execute_sql("INSERT INTO notes VALUES(1,'kept'),(2,'also kept')").unwrap();
+        db.execute_sql("UPDATE parents SET value='live'").unwrap();
+        let identity = if engine == "mysql" {
+            format!("SELECT CAST(TABLE_ID AS CHAR) AS id FROM information_schema.INNODB_TABLES WHERE NAME='{name}/notes'")
+        } else {
+            format!("SELECT '{name}.notes'::regclass::oid::text AS id")
+        };
+        let before = first_value(&original, &identity);
+        let restored = safe_import(&original, &output);
+        let promote = |extra: Value| {
+            let mut payload = json!({"endpoint":original,"report_path":restored["report_path"],"restore_id":restored["restore_id"]});
+            payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            run("dump.promote", payload).into_iter().find(|e| e["event"] == "result" || e["event"] == "error").unwrap()
+        };
+        let planned = promote(json!({"action":"plan"}));
+        let done = promote(json!({"action":"confirm","overwrite_confirmed":true,"plan_digest":planned["plan_digest"]}));
+        let after = first_value(&original, &identity);
+        let kept = db.row_count("notes").unwrap();
+        let value = first_value(&original, "SELECT value FROM parents WHERE id=1");
+        let mut leftovers = vec![format!("tf_restore_{}", restored["restore_id"].as_str().unwrap_or_default())];
+        for key in ["backup_namespace", "clone_database"] {
+            if let Some(namespace) = done[key].as_str() {
+                leftovers.push(namespace.to_string());
+            }
+        }
+        for namespace in leftovers.iter().chain([&name]) {
+            assert!(namespace.starts_with("tf_"), "{namespace}");
+            drop_namespace(&mut admin, engine, namespace);
+        }
+        std::fs::remove_dir_all(output).unwrap();
+        assert_eq!(restored["status"], "ready_for_switch", "{engine}: {restored}");
+        assert_eq!(planned["can_promote"], true, "{engine}: {planned}");
+        assert_eq!(done["status"], "promoted", "{engine}: {done}");
+        assert_eq!(value, "dump", "{engine}: the dump table was not swapped in");
+        assert_eq!(before, after, "{engine}: the target-only table was rebuilt");
+        assert_eq!(kept, 2, "{engine}: the target-only table lost rows");
+    }
 }

@@ -122,7 +122,9 @@ when the account has no database-wide DROP grant (the DDL probe drops its own
 tables), and on PostgreSQL `external_parent_missing` (MySQL adds such an FK with
 `foreign_key_checks=0`). `copy_blockers` are what `safe` refuses on top of that
 (`legacy_bit_unverifiable`, `cross_engine`, and `partial_table_filter` when the
-request carries a `tables` filter; a partial export is not refused). `warnings`
+request carries a `tables` filter; a partial export is not refused), plus, for an
+existing same-engine target, the target checks `safe` runs before making a copy
+(see below). `warnings`
 (`{code, detail}`) map the manifest's texts to `unsynchronized_snapshot`,
 `views_outside_snapshot`, `omitted_object` or `source_dump_warning`, and add
 `not_strict`, `legacy_timezone`, `legacy_dump`, `create_privilege_unproven`,
@@ -146,6 +148,32 @@ existing namespace. Unsupported replacement plans leave the verified candidate
 available without changing the original. Partial table filters and cross-engine
 safe restoration are currently refused; use the explicit migration workflow for
 cross-engine changes.
+
+Into an existing namespace, `safe` stops before it makes a copy (and before it
+reads the chunks) when the later swap could not go through. The result is
+`failed_original_untouched` with `candidate_created: false`,
+`error_code: "copy_refused"` and `copy_blockers` (`{code, table, detail}`), the
+same list `dump.import_preview` returns:
+
+| Code | Stops when |
+| --- | --- |
+| `copy_create_privilege_missing` | MySQL: the account cannot create `tf_restore_*`, `tf_backup_*` and `tf_promote_*` databases; PostgreSQL: it has no CREATE on the database. |
+| `metadata_visibility_unproven` | MySQL: no direct global SELECT, SHOW VIEW and PROCESS grants (roles and partial revokes count as unproven). |
+| `target_routines`, `target_events` | The target namespace has stored routines (PostgreSQL: functions) or MySQL events. |
+| `target_triggers` | MySQL: a dump table has a trigger in the target; PostgreSQL: any table in the schema has one. |
+| `linked_target_only` | A table or view outside the dump is linked to a dump table or view: an FK in either direction (from the target catalog or the dump's own FK definitions) or a view reading one, in this or another schema. |
+| `saved_view_alias` | The linked object is an old view definition an earlier MySQL swap kept (`tf_p_<nonce>_oldv<i>`); clean it up first (`target: "view_aliases"` below). |
+| `view_dependencies_unknown` | MySQL older than 8.0.13: views over the target cannot be listed. |
+
+A linked table or view is never rebuilt from its SHOW CREATE text to keep it
+(TF-STATUS-173): the run stops instead. Tables and views outside the dump that are
+not linked to it do not block: the swap leaves them, their triggers and their
+other objects where they are, so such a restore reaches `ready_for_switch`. As a
+second guard, `dump.promote` refuses a plan that would rebuild such an object
+(MySQL) or move a target-only table's FK to the new parent (PostgreSQL), and a
+stored plan that would. A request with `verify_only: true` (the scheduled
+restore rehearsal, which only verifies and cleans up the copy) skips these target
+checks.
 
 Supported MySQL replacement uses write locks and one atomic multi-object RENAME;
 PostgreSQL replacement uses locks and a transaction. Both recheck dependencies and
@@ -172,7 +200,7 @@ never deleted.
 | `list` | Journal status, backup namespace, ownership proof, table count and estimated rows, cutover verdict, candidate namespace. MySQL saved view aliases are reported as "not views over backup data". |
 | `reconcile` | Compares an unknown/pending journal with live identities (MySQL InnoDB table ids, PostgreSQL relation OIDs): `promoted`, `not_promoted` or `undeterminable`. Report-only; retry and cleanup stay blocked unless the result is `promoted`. |
 | `cleanup_plan` | Read-only preview of exactly what would be dropped, with blockers. |
-| `cleanup_apply` | Requires `confirmed: true` and the digest of a plan reviewed just before; every check is re-derived from the live objects, then one owned namespace is dropped. |
+| `cleanup_apply` | Requires `confirmed: true` and the digest of a plan reviewed just before; every check is re-derived from the live objects, then one owned namespace (or, for `view_aliases`, the listed views) is dropped. |
 
 Cleanup of a backup requires all of: recorded ownership (identities match the
 journal and the namespace holds exactly the recorded tables), no object outside it
@@ -182,11 +210,16 @@ right after the commit; a journal without a fingerprint is refused), and a
 confirmed promotion. MySQL additionally needs proven global SELECT/SHOW
 VIEW/PROCESS visibility. A candidate (`tf_restore_<id>` only, never the restore
 destination itself) is removable when unpromoted and still proven identical to its
-verification, or, after promotion, when it holds only objects the promotion plan
+verification; after a failed restore (no plan or attempt recorded), when it holds
+only the dump's tables and views and leftover `tf_probe_` tables; or, after
+promotion, when it holds only objects the promotion plan
 recorded (PostgreSQL: the candidate's own views; MySQL: the recorded replacement
 views, after the recorded temporary `tf_promote_` clone database, which is a separate
-`target: "clone"` cleanup, is gone). Original objects and namespaces without a
-journal are never dropped.
+`target: "clone"` cleanup, is gone). After a confirmed MySQL promotion,
+`target: "view_aliases"` drops the saved old-view aliases (`tf_p_<nonce>_oldv<i>`)
+the journal records, while each still holds the definition it saved and no view
+uses it and no routine, trigger or event mentions it; the active views are not
+touched. Original objects and namespaces without a journal are never dropped.
 
 Guided recovery (`rollback_plan` / `rollback_apply`) is the inverse of the
 promotion: one atomic multi-object RENAME (MySQL) or one transaction (PostgreSQL)

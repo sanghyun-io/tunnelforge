@@ -51,8 +51,8 @@ def make_importer(tmp_path, restored_rows=None, verified=True, unchanged=True, o
         def __init__(self, config, facade=None):
             FakeImporter.seen["config"] = config
 
-        def import_dump(self, input_dir, target_schema, threads, import_mode, raw_output_callback):
-            FakeImporter.seen.update(mode=import_mode, target=target_schema)
+        def import_dump(self, input_dir, target_schema, threads, import_mode, raw_output_callback, verify_only=False):
+            FakeImporter.seen.update(mode=import_mode, target=target_schema, verify_only=verify_only)
             report = tmp_path / "import_report.json"
             rows = restored_rows if restored_rows is not None else {"parent": 2, "child": 3}
             report.write_text(json.dumps({"verification": {"actual_row_counts": rows,
@@ -139,6 +139,8 @@ def test_the_restore_runs_in_safe_mode_against_the_existing_target_namespace(env
     env.build().run(schedule(), env.backup, conn(port=3307))
     seen = env.holder.importer.seen
     assert seen["mode"] == "safe" and seen["target"] == "rehearsal"
+    # A rehearsal never swaps the copy in, so the swap's own checks must not stop it.
+    assert seen["verify_only"] is True
 
 
 def test_row_count_mismatch_fails_but_the_candidate_is_still_cleaned(env):

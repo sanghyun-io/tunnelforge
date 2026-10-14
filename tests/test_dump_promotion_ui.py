@@ -89,6 +89,22 @@ def test_confirmed_unchanged_refusal_preserves_failure_details(promotion_dialog,
     assert "차단" in promotion_dialog.label_status.text()
 
 
+def test_verify_in_copy_stop_shows_the_coded_reason(promotion_dialog, monkeypatch):
+    from src.exporters.rust_dump_exporter import describe_copy_blockers
+
+    shown = []
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", lambda parent, title, text: shown.append((title, text)))
+    promotion_dialog._report_error_anonymously = MagicMock()
+    promotion_dialog.last_import_mode = "safe"
+    reason = "\n".join(["복사본을 만들기 전에 멈췄습니다. 원본은 그대로입니다.",
+                        *describe_copy_blockers([{"code": "linked_target_only", "table": "notes", "detail": "notes.fk references users"}])])
+    promotion_dialog.on_finished(False, reason)
+    title, text = shown[-1]
+    assert title == "안전 복원 실패" and text.startswith("안전 복원 실패 · 원본 미변경")
+    assert "복사본을 만들기 전에 멈췄습니다" in text
+    assert "덤프에 없는 테이블이나 뷰가" in text and text.endswith(": notes")
+
+
 def test_cancelled_pending_promotion_cannot_start_later(promotion_dialog, monkeypatch):
     callbacks = []
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QTimer.singleShot", lambda delay, callback: callbacks.append(callback))

@@ -175,7 +175,7 @@ class RestoreRehearsal:
             importer = RustDumpImporter(config, facade=facade)
             ok, message, _ = importer.import_dump(
                 backup_dir, target_schema=schedule.rehearsal_schema, threads=4, import_mode="safe",
-                raw_output_callback=capture)
+                raw_output_callback=capture, verify_only=True)
             error = "" if ok else f"후보 복원 실패: {message}"
             facts.restore_id = str(state.get("restore_id") or "")
             facts.status = str(state.get("status") or "")

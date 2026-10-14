@@ -173,6 +173,22 @@ def test_destructive_actions_are_separated_and_need_a_selection():
         dialog.close()
 
 
+def test_leftover_old_views_are_previewed_as_their_own_cleanup_target(monkeypatch):
+    dialog = _dialog()
+    dialog._request = MagicMock()
+    texts = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: texts.append(box.text()))
+    try:
+        dialog._on_list(True, "", {"backups": [ENTRY]})
+        dialog.table.selectRow(0)
+        dialog.btn_cleanup_view_aliases.click()
+        assert dialog._request.call_args[0][0]["target"] == "view_aliases"
+        dialog._confirm_cleanup({"target": "view_aliases", "will_delete": ["app.tf_p_1_oldv0"], "tables": [{"name": "tf_p_1_oldv0"}]})
+        assert "app.tf_p_1_oldv0" in texts[0] and "rows" not in texts[0]
+    finally:
+        dialog.close()
+
+
 def test_request_shows_loading_disables_actions_and_delivers_after_the_thread_ends(monkeypatch):
     from src.ui.dialogs import backup_lifecycle_dialog
 

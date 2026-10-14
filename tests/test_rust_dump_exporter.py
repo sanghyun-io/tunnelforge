@@ -1174,6 +1174,41 @@ class TestRustDumpImporter:
         else:
             assert "만들어 넣었습니다" not in msg
 
+    def test_verify_in_copy_stop_shows_each_coded_reason(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        dump_dir.mkdir()
+        (dump_dir / '_tunnelforge_dump.json').write_text(json.dumps({
+            "format": "tunnelforge-dump", "format_version": 5, "source_engine": "mysql", "database": "app",
+            "tables": [{"name": "users", "path": "0001_users", "rows": 0, "chunks": 0}]}), encoding='utf-8')
+        payloads = []
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                payloads.append(payload)
+                return {"success": False, "status": "failed_original_untouched", "original_unchanged": True,
+                        "candidate_created": False, "error_code": "copy_refused",
+                        "message": "Safe restore failed; original database was not changed. verify-in-copy stopped",
+                        "copy_blockers": [
+                            {"code": "linked_target_only", "table": "notes", "detail": "notes.fk references users"},
+                            {"code": "linked_target_only", "table": "notes_view", "detail": "view notes_view reads users"},
+                            {"code": "metadata_visibility_unproven", "table": None, "detail": "grants"},
+                            {"code": "something_new", "table": None, "detail": "later core"},
+                        ]}
+
+        importer = RustDumpImporter(RustDumpConfig('localhost', 3306, 'root', 'password'), facade=FakeFacade())
+        success, message, _results = importer.import_dump(str(dump_dir), import_mode='safe')
+        importer.import_dump(str(dump_dir), import_mode='safe', verify_only=True)
+
+        assert success is False
+        lines = message.splitlines()
+        assert lines[0] == "복사본을 만들기 전에 멈췄습니다. 원본은 그대로입니다."
+        assert lines[1].startswith("- 덤프에 없는 테이블이나 뷰가") and lines[1].endswith(": notes, notes_view")
+        assert "SELECT, SHOW VIEW, PROCESS" in lines[2]
+        assert lines[3] == "- 복사본에서 검증할 수 없는 대상입니다 (something_new)"
+        assert "verify_only" not in payloads[0] and payloads[1]["verify_only"] is True
+
     def test_import_dump_reports_cross_engine_skipped_views(self, tmp_path):
         """크로스 엔진 import 시 건너뛴 View 개수가 메시지에 표시됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter

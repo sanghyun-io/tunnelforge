@@ -40,6 +40,13 @@ impl EnginePlan {
             Self::Postgres(plan) => crate::safe_promote_postgres::summary(plan),
         }
     }
+
+    fn linked_outside_dump(&self) -> Vec<String> {
+        match self {
+            Self::MySql(plan) => crate::safe_promote_mysql::rebuilt_outside_dump(plan),
+            Self::Postgres(plan) => crate::safe_promote_postgres::repointed_tables(plan),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -258,6 +265,16 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
             .map(EnginePlan::Postgres),
             _ => return Err("unsupported promotion engine".into()),
         };
+        // Tables and views outside the dump stay as they are (rule 3): a swap that would have to
+        // rebuild them (MySQL) or move their FKs to the new parents (PostgreSQL) stops instead.
+        let engine_plan = engine_plan.and_then(|plan| {
+            let linked = plan.linked_outside_dump();
+            if linked.is_empty() {
+                Ok(plan)
+            } else {
+                Err(format!("tables or views outside the dump are linked to it by an FK or a view and would have to be changed by the swap: {}", linked.join(", ")))
+            }
+        });
         let engine_plan = match engine_plan {
             Ok(plan) => plan,
             Err(blocker) => {
@@ -318,6 +335,10 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
             .unwrap_or("");
         if confirmed.is_empty() || confirmed != digest(&stored)? {
             return Err("promotion plan changed; review and confirm a fresh plan".into());
+        }
+        // A plan stored by an older version may still rebuild them.
+        if !stored.engine_plan.linked_outside_dump().is_empty() {
+            return Err("this plan would change tables or views outside the dump; it is no longer carried out".into());
         }
         let report_dir = report_path.parent().ok_or("report directory is missing")?;
         emit(json!({"event":"phase","request_id":request.request_id,

@@ -523,6 +523,38 @@ IMPORT_PREVIEW_CAPABILITY = "dump.import_preview"
 _UNKNOWN_TARGET_MESSAGE = "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요."
 _MISSING_MANIFEST_MESSAGE = "TunnelForge Rust dump manifest를 찾을 수 없습니다."
 
+# Core copy_blockers codes: why "먼저 복사본에서 검증하고 교체" stops before making a copy.
+_COPY_BLOCKER_MESSAGES = {
+    "partial_table_filter": "덤프의 일부 테이블만 넣을 때는 복사본에서 검증할 수 없습니다",
+    "legacy_bit_unverifiable": "이전 버전에서 만든 덤프라 BIT 열 값을 검증할 수 없습니다. 이 버전으로 다시 Export하세요",
+    "cross_engine": "다른 종류의 DB에서 만든 덤프는 복사본에서 검증할 수 없습니다",
+    "copy_create_privilege_missing": "이 계정은 복사본과 백업을 둘 DB를 새로 만들 권한이 없습니다",
+    "metadata_visibility_unproven": "이 계정은 서버 전체를 조회하는 권한(SELECT, SHOW VIEW, PROCESS)이 없어 대상에 연결된 것을 모두 확인할 수 없습니다",
+    "target_routines": "대상에 저장 프로시저나 함수가 있어 교체할 때 함께 옮길 수 없습니다",
+    "target_events": "대상에 예약 이벤트가 있어 교체할 때 함께 옮길 수 없습니다",
+    "target_triggers": "덤프 테이블에 트리거가 있어 교체할 때 함께 옮길 수 없습니다",
+    "linked_target_only": "덤프에 없는 테이블이나 뷰가 외래 키나 뷰로 덤프 테이블과 이어져 있어, 그대로 둔 채 교체할 수 없습니다",
+    "saved_view_alias": "이전 교체에서 남긴 옛 뷰가 있습니다. 작업 목록 > 백업 관리에서 먼저 정리하세요",
+    "view_dependencies_unknown": "대상의 뷰가 어떤 테이블을 읽는지 확인할 수 없습니다 (MySQL 8.0.13 이상 필요)",
+}
+_COPY_STOPPED_MESSAGE = "복사본을 만들기 전에 멈췄습니다. 원본은 그대로입니다."
+
+
+def describe_copy_blockers(blockers: object) -> List[str]:
+    """One Korean line per copy_blockers code, naming the tables or views it concerns."""
+    grouped: Dict[str, List[str]] = {}
+    for item in blockers if isinstance(blockers, list) else []:
+        if isinstance(item, dict):
+            names = grouped.setdefault(str(item.get("code") or ""), [])
+            if item.get("table") and str(item["table"]) not in names:
+                names.append(str(item["table"]))
+    lines = []
+    for code, names in grouped.items():
+        sentence = _COPY_BLOCKER_MESSAGES.get(code) or f"복사본에서 검증할 수 없는 대상입니다 ({code})"
+        shown = ", ".join(names[:10]) + (f" … (+{len(names) - 10})" if len(names) > 10 else "")
+        lines.append(f"- {sentence}" + (f": {shown}" if names else ""))
+    return lines
+
 
 class RustDumpImporter(_RustDumpClientBase):
     """Rust DB Core backed dump importer."""
@@ -646,7 +678,10 @@ class RustDumpImporter(_RustDumpClientBase):
         metadata_callback: Optional[Callable[[dict], None]] = None,
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
         use_source_timezone: bool = True,
+        verify_only: bool = False,
     ) -> Tuple[bool, str, dict]:
+        """``verify_only`` (safe mode): the copy is only verified, never swapped in, so the core
+        skips the checks that guard the swap."""
         import_results: dict = {}
         try:
             manifest_path = Path(input_dir) / "_tunnelforge_dump.json"
@@ -673,12 +708,15 @@ class RustDumpImporter(_RustDumpClientBase):
                 if table_status_callback:
                     table_status_callback(table, "pending", "")
 
+            final_target_schema = target_schema or source_schema
             payload = self._import_payload(
-                input_dir, target_schema or source_schema, threads, timezone_sql, use_source_timezone,
+                input_dir, final_target_schema, threads, timezone_sql, use_source_timezone,
             )
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, import_results
             payload["mode"] = import_mode
+            if verify_only:
+                payload["verify_only"] = True
             if retry_tables:
                 payload["tables"] = retry_tables
 
@@ -708,6 +746,9 @@ class RustDumpImporter(_RustDumpClientBase):
                         and result.get("verified") is True and result.get("original_unchanged") is True
                         and result.get("cutover_pending") is (not new_target) and candidate.get("database")
                         and (self.config.engine != "postgresql" or candidate.get("schema"))):
+                    stops = describe_copy_blockers(result.get("copy_blockers"))
+                    if stops:
+                        return False, "\n".join([_COPY_STOPPED_MESSAGE, *stops]), import_results
                     return False, "안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다. 원본과 복원 대상의 상태를 보고서에서 확인하세요.", import_results
 
             for table in tables_to_import:
