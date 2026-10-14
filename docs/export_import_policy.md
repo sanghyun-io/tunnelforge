@@ -145,23 +145,37 @@ takes their place and the rest of the preview is still returned. `warnings`
 
 Core failures and preview items carry stable codes: the leading `code:` of an
 error (`code: table: ...` when it names a table), an error event's `error_code`
-or `(error_code=...)`, and a preview item's `code`. The application words each
-code as one plain Korean sentence (`CORE_CODE_SENTENCES` in
-`rust_dump_exporter.py`), prefixed with the table name when there is one; a test
-fails when the core emits a code without a sentence. The Import failure window
-shows that sentence (after a failed table, as the first cause above the table
-counts) and keeps the core's own text behind its "자세히" button. Without a known
-code, a failed table is reported as an unclassified cause with the text behind
-"자세히"; any other failure text is shown as it is.
+or `(error_code=...)`, and a preview item's `code`. A failed table is
+`load_failed: table: ...` whether its DROP, its CREATE or its row load failed; a
+row-load error that already has a code (`export_invalid` for a bad chunk) keeps
+it. The application words each code as one plain Korean sentence
+(`CORE_CODE_SENTENCES` in `rust_dump_exporter.py`), prefixed with the table name
+when there is one; a test scans the core's import sources and fails on a code
+without a sentence. A code is taken only at the start of a failure text (after
+the importer's own prefix) or after `; additionally: `, never from a path or
+server text inside it. When the core joins several failures, each code is
+worded, and a text that says the Import report could not be persisted adds that
+the report was not saved.
+
+The Import failure window shows those sentences (after a failed table, as the
+cause above the table counts) and keeps the core's own text behind its "자세히"
+button, which opens it beside the window. Without a known code, a failed table
+is reported as an unclassified cause with the text behind "자세히"; any other
+failure text is shown as it is.
 
 A failed or refused `safe` restore arrives as a `success: false` result with
 status `failed_original_untouched`, not as an error. Its `error` and `blockers`
-are passed through as the failure message, so the window names the core's
-reason. A restore that stopped before making a copy (`copy_refused`, below)
-is shown instead as the `copy_refused` sentence followed by one line per
-`copy_blockers` code with the objects it names; the core's own text opens from
-"자세히", and a code without a sentence gets a general line that points to the
-report. `no_tables` is coded as well.
+are passed through as the failure message (its `message` instead when the final
+report could not be written, since only `message` says so), so the window names
+the core's reason. When the copy was already made, the window names it and says
+it was left in place; without an existing target the copy is the requested
+target itself and may be only partly loaded. A restore that stopped before
+making a copy (`copy_refused`, below) is shown instead as the `copy_refused`
+sentence followed by one sentence per `copy_blockers` code with the objects it
+names; the core's own text opens from "자세히", and a code without a sentence
+gets a general line that points to the report. The other refusals before a
+copy are coded as well: `dump_invalid`, `spatial_unsupported` (checked after the
+copy refusals, so a cross-engine dump is refused as such) and `no_tables`.
 
 ### Safe restoration and destination names
 

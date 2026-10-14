@@ -518,7 +518,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
                     }
                     emit(event);
                 },
-            )?;
+            ).map_err(|err| table_load_error(&table.name, err))?;
             rows_imported += table_rows;
             chunks_imported += table_chunks;
             imported_rows_by_table.insert(table.name.clone(), table_rows);
@@ -1093,6 +1093,15 @@ pub(crate) fn check_mysql_spatial_import(manifest: &DumpManifest, selected: &BTr
         return Err(format!("this dump was written before format version 5 and stored MySQL spatial values as text, which corrupted them: {}; re-export the database with this version", spatial.join(", ")));
     }
     Ok(())
+}
+
+/// A failed row load names its table under `load_failed`, like a failed CREATE, unless the
+/// error already carries a code (`export_invalid` for a bad chunk, `load_failed` for a BIT value).
+fn table_load_error(table: &str, err: String) -> String {
+    let coded = err.split_once(": ").is_some_and(|(code, _)| {
+        code.contains('_') && code.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    });
+    if coded { err } else { dump_import_ddl_error("load_rows", table, &err) }
 }
 
 fn import_table_rows<F: FnMut(Value)>(
@@ -2698,6 +2707,23 @@ mod tests {
         assert!(!is_mysql_local_infile_disabled_error(
             "mysql LOAD DATA error: duplicate key"
         ));
+    }
+
+    #[test]
+    fn a_failed_row_load_names_its_table_under_load_failed() {
+        for raw in [
+            "mysql insert error: MySqlError { ERROR 1406 (22001): Data too long for column 'name' at row 1 }",
+            "mysql LOAD DATA error: MySqlError { ERROR 1062 (23000): Duplicate entry '1' for key 'PRIMARY' }",
+            "MySqlError { ERROR 1406 (22001): Data too long for column 'name' at row 1 }",
+            "import data validation failed: 1 MySQL warnings: 1265: Data truncated for column 'kind' at row 1",
+        ] {
+            let error = table_load_error("orders", raw.into());
+            assert!(error.starts_with("load_failed: orders: load_rows failed: ") && error.ends_with(raw), "{error}");
+        }
+        // An error that carries its own code keeps it.
+        for coded in ["export_invalid: orders: chunk 1 sha256 mismatch", "load_failed: orders: BIT column flags: bad"] {
+            assert_eq!(table_load_error("orders", coded.into()), coded);
+        }
     }
 
     #[test]

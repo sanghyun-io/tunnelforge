@@ -84,7 +84,8 @@ def _capture_import_audit(audit: dict, event: dict):
         for key in ("original_target", "candidate_target"):
             if isinstance(event.get(key), dict):
                 audit[key] = restore_target_connection_info(event[key])
-        for key in ("verified", "original_unchanged", "cutover_pending", "ready_for_switch", "namespace_existed", "namespace_created"):
+        for key in ("verified", "original_unchanged", "cutover_pending", "ready_for_switch", "namespace_existed",
+                    "namespace_created", "candidate_created"):
             if isinstance(event.get(key), bool):
                 audit[key] = event[key]
         if isinstance(event.get("status"), str):
@@ -133,6 +134,20 @@ def _replace_failure_details(audit: dict) -> str:
     if audit.get("namespace_outcome_unknown"):
         lines.append(translate_text("새 대상을 만들었는지 확인하지 못함: {}").format(audit["namespace_outcome_unknown"]))
     return "\n".join(lines)
+
+
+def _safe_copy_left(audit: dict) -> str:
+    """The copy a failed verify-in-copy left in place; it is never removed automatically."""
+    if audit.get("candidate_created") is not True:
+        return ""
+    candidate = audit.get("candidate_target") or {}
+    name = str(candidate.get("database") or "?")
+    if candidate.get("engine") == "postgresql":
+        name += "." + str(candidate.get("schema") or "?")
+    if audit.get("namespace_existed") is False:
+        # The copy is the requested target itself, under its own name.
+        return translate_text("이번 복원에서 새로 만든 대상(일부만 들어갔을 수 있음, 지우지 않고 남겨 둠): {}").format(name)
+    return translate_text("이번 복원에서 만든 복사본(지우지 않고 남겨 둠): {}").format(name)
 
 
 def _promotion_review_text(plan: dict, profile: dict) -> str:
@@ -1676,7 +1691,9 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         ):
             success = False
             message = "안전 복원의 검증 결과가 없습니다. 원본과 새 대상의 상태를 보고서에서 확인하세요."
-        message = sanitize_local_diagnostic(message)
+        # Line by line: the sanitizer writes a newline as a literal backslash-n, and the
+        # failure window lists one reason per line.
+        message = "\n".join(sanitize_local_diagnostic(line) for line in str(message).splitlines())
         # 로그 기록
         self.import_end_time = datetime.now()
         self.import_success = success
@@ -1777,7 +1794,9 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 if self.last_import_mode == "safe":
                     # A stop before the copy arrives as plain sentences; the core's own text is its error.
                     core_text = str(self.import_audit.get("error") or "")
-                    self._show_failure("안전 복원 실패", self.label_status.text() + "\n\n" + (cause or message),
+                    text = self.label_status.text() + "\n\n" + (cause or message)
+                    copy_left = _safe_copy_left(self.import_audit)
+                    self._show_failure("안전 복원 실패", f"{text}\n\n{copy_left}" if copy_left else text,
                                        message if cause else ("" if core_text in message else core_text))
                 else:
                     details = _replace_failure_details(getattr(self, "import_audit", {}))
@@ -1810,10 +1829,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         box.setTextFormat(Qt.TextFormat.PlainText)
         box.setWindowTitle(title)
         box.setText(text)
-        box.setStandardButtons(QMessageBox.StandardButton.Close)
-        # Not setDetailedText: its "Show Details..." button is never translated.
+        # Not a standard button or setDetailedText: their Qt texts are never translated.
+        box.addButton(translate_text("닫기"), QMessageBox.ButtonRole.RejectRole)
         more = box.addButton(translate_text("자세히"), QMessageBox.ButtonRole.ActionRole)
-        box.buttonClicked.connect(lambda button: button == more and QMessageBox.information(self, title, details))
+        more.clicked.disconnect()  # QMessageBox closes on any of its buttons; this one keeps the window open.
+        more.clicked.connect(lambda: QMessageBox.information(self, title, details))
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box.open()
 

@@ -207,16 +207,17 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         if !string_list(request.payload.get("tables")).is_empty() {
             return Err(copy_stop(&mut state, &[partial_filter_refusal()]));
         }
-        let manifest = read_dump_manifest(path)?;
+        let manifest = read_dump_manifest(path).map_err(|err| classified_import_error("dump_invalid", &err, None))?;
         state["dump_manifest_sha256"] = json!(sha256_file(&path.join("_tunnelforge_dump.json"))?);
         if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
-            return Err("unsupported dump manifest format".into());
+            return Err(classified_import_error("dump_invalid", "unsupported dump manifest format", None));
         }
-        crate::import::check_mysql_spatial_import(&manifest, &Default::default(), &original.engine)?;
         let refusals = copy_refusals(&manifest, &original.engine, false);
         if !refusals.is_empty() {
             return Err(copy_stop(&mut state, &refusals));
         }
+        crate::import::check_mysql_spatial_import(&manifest, &Default::default(), &original.engine)
+            .map_err(|err| classified_import_error("spatial_unsupported", &err, None))?;
         if manifest.tables.is_empty() {
             return Err(classified_import_error("no_tables", "safe restore found no tables", None));
         }
@@ -225,7 +226,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         if !matches!(format.as_str(), "jsonl" | "tsv")
             || !matches!(compression.as_str(), "none" | "zstd")
         {
-            return Err("unsupported dump format or compression".into());
+            return Err(classified_import_error("dump_invalid", "unsupported dump format or compression", None));
         }
         super::validate_import_metadata(&manifest, &BTreeSet::new(), &original.engine)?;
         let timezone = super::import_timezone_sql(
@@ -1206,15 +1207,38 @@ mod tests {
     fn a_refused_safe_restore_names_its_code() {
         let dir = std::env::temp_dir().join(format!("tf-safe-refused-{}-{}", std::process::id(), current_unix_seconds()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Refused before the manifest is read or the target is reached (port 1 has no server).
-        let payload = json!({"input_dir": dir.to_string_lossy(), "tables": ["users"],
-            "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "u", "password": "secret-value", "database": "app"}});
-        let result = run(&Request { command: "dump.import".into(), request_id: None, payload }, |_| {}).unwrap();
+        // Every refusal comes before the target is reached (port 1 has no server).
+        let refusal = |engine: &str, tables: Value, manifest: Option<Value>| {
+            if let Some(manifest) = manifest {
+                std::fs::write(dir.join("_tunnelforge_dump.json"), manifest.to_string()).unwrap();
+            }
+            let payload = json!({"input_dir": dir.to_string_lossy(), "tables": tables, "target": {"engine": engine,
+                "host": "127.0.0.1", "port": 1, "user": "u", "password": "secret-value", "database": "app", "schema": "app"}});
+            let result = run(&Request { command: "dump.import".into(), request_id: None, payload }, |_| {}).unwrap();
+            assert_eq!(result["status"], "failed_original_untouched", "{result}");
+            let code = result["error"].as_str().unwrap().split(": ").next().unwrap().to_string();
+            if code == "copy_refused" {
+                assert_eq!(result["cutover_pending"], false, "nothing was made, so no switch is waiting: {result}");
+            }
+            (code, result["copy_blockers"][0]["code"].as_str().unwrap_or("").to_string())
+        };
+        let manifest = |source_engine: &str, format_version: u32, tables: Value| json!({
+            "format": "tunnelforge-dump", "format_version": format_version, "source_engine": source_engine, "database": "app",
+            "schema": {"tables": tables}, "chunk_size": 1000, "created_unix_seconds": 0, "tables": []});
+        let spatial = json!([{"name": "places", "columns": [{"name": "pos", "type": "point"}]}]);
+        let refusals = [
+            refusal("mysql", json!(["users"]), None),
+            refusal("mysql", json!([]), Some(manifest("mysql", 5, json!([])))),
+            refusal("mysql", json!([]), Some(manifest("postgresql", 5, json!([])))),
+            // The copy refusal wins over the spatial one, which a same-engine dump still gets.
+            refusal("postgresql", json!([]), Some(manifest("mysql", 5, spatial.clone()))),
+            refusal("mysql", json!([]), Some(manifest("mysql", 4, spatial))),
+        ];
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(result["status"], "failed_original_untouched");
-        assert!(result["error"].as_str().unwrap().starts_with("copy_refused: "), "{result}");
-        assert_eq!(result["copy_blockers"][0]["code"], "partial_table_filter", "{result}");
-        assert_eq!(result["cutover_pending"], false, "nothing was made, so no switch is waiting: {result}");
+        let expected = [("copy_refused", "partial_table_filter"), ("no_tables", ""), ("copy_refused", "cross_engine"),
+            ("copy_refused", "cross_engine"), ("spatial_unsupported", "")];
+        let actual = refusals.iter().map(|(code, blocker)| (code.as_str(), blocker.as_str())).collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -527,17 +527,16 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 CORE_CODE_SENTENCES = {
     **CONNECTION_ERROR_MESSAGES,
     # Import errors
-    "load_failed": "테이블을 만들거나 데이터를 넣다가 서버 오류로 멈췄습니다.",
+    "load_failed": "이 테이블을 지우고 다시 만들거나 데이터를 넣는 중에 멈췄습니다.",
     "ddl_preflight_failed": "대상에 테이블을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "ddl_probe_cleanup_failed": "확인용으로 잠시 만든 테이블을 지우지 못했습니다. 원래 테이블은 바뀌지 않았습니다.",
     "incompatible_surviving_fk": "덤프에 없는 대상 테이블의 외래 키가 새 테이블과 맞지 않아 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "target_dependency_preflight_failed": "대상의 다른 객체가 테이블에 기대고 있어 교체할 수 없습니다. 대상 테이블은 바뀌지 않았습니다.",
-    "target_create_failed": "대상 DB(스키마)가 없거나 이 계정에 보이지 않고, 새로 만들지도 못했습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "target_create_failed": "대상 DB(스키마)가 없거나 이 계정에 보이지 않아 새로 만들려 했지만 오류로 멈췄습니다. 대상 테이블은 바뀌지 않았습니다.",
     "post_load_validation_failed": "데이터를 넣은 뒤 행 수를 확인하거나 인덱스·외래 키를 만들다가 멈췄습니다.",
     "import_plan_invalid": "요청한 Import 설정이나 제약 조건 이름 때문에 시작할 수 없습니다.",
     "export_invalid": "덤프 파일이 온전하지 않거나 이 대상에 만들 수 없는 테이블이 있습니다.",
     "view_target_invalid": "덤프의 뷰 정의를 그대로 만들 수 없습니다.",
-    "target_not_empty": "대상 테이블에 이미 데이터가 있습니다.",
     # Verify-in-copy
     "safe_promotion": "검증한 복사본을 원래 이름으로 바꾸지 못했습니다.",
     "safe_restore_content_invalid": "복사본을 검증하다가 덤프에서 읽을 수 없는 값을 만났습니다.",
@@ -582,22 +581,16 @@ CORE_CODE_SENTENCES = {
     "create_privilege_unproven": "대상 DB(스키마)가 없는데 이 계정이 만들 수 있는지 권한 목록으로는 알 수 없습니다.",
     "drop_privilege_unproven": "이 계정이 대상 테이블을 지울 수 있는지 권한 목록으로는 알 수 없습니다.",
     "view_dependencies_unknown": "교체할 테이블을 쓰는 뷰를 확인하지 못했습니다(MySQL 8.0.13 이상 필요).",
-    # Export and SQL editor
-    "unsupported_objects": "덤프에 담을 수 없는 객체가 있어 내보내기를 시작하지 않았습니다.",
-    "mysql_parallel_snapshot_privilege_required": "같은 시점으로 나눠 내보내는 데 필요한 권한이 없습니다.",
-    "connection_busy": "이 연결에서 다른 쿼리가 실행 중입니다. 끝난 뒤 다시 시도하세요.",
-    "explain_refused": "이 문장의 실행 계획을 볼 수 없습니다.",
-    "export_requires_read_only": "데이터를 바꾸는 쿼리는 파일로 저장할 수 없습니다.",
-    "export_session_in_transaction": "진행 중인 트랜잭션이 있어 파일로 저장할 수 없습니다.",
-    "multiple_result_sets_unsupported": "결과를 여러 개 돌려주는 문장은 지원하지 않습니다.",
-    "query_cancelled": "쿼리를 취소했습니다.",
-    "query_timeout": "쿼리가 제한 시간을 넘겨 취소되었습니다.",
-    "read_only_session": "읽기 전용 연결에서는 데이터를 바꿀 수 없습니다.",
 }
+_REPORT_NOT_SAVED = "Import 보고서를 저장하지 못했습니다. 보고서 내용은 최신이 아닙니다."
 
-# A known `code:`, plus the scope of `code: name: ...` when it is one word (classified_import_error).
+# A known `code:` where the core puts one: at the start (after the importer's own prefix) or after
+# "; additionally: ", so code text inside a path or a server message is not taken. The scope of
+# `code: name: ...` is kept when it is one word (classified_import_error).
 _CORE_CODE_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9_])(" + "|".join(map(re.escape, CORE_CODE_SENTENCES)) + r")\s*:(?:\s*([^\s:]+):\s)?",
+    r"(?:^\s*(?:Rust DB Core import 오류: |Import 오류: |Safe restore failed; original database was not changed\. )?"
+    r"|; additionally: )"
+    r"(" + "|".join(map(re.escape, CORE_CODE_SENTENCES)) + r")\s*:(?:\s*([^\s:]+):\s)?",
     re.IGNORECASE,
 )
 _TRAILING_CORE_CODE = re.compile(r"\(error_code=([a-z_]+)\)")
@@ -613,13 +606,16 @@ def describe_core_code(code: object, name: object = "") -> Optional[str]:
 
 
 def describe_core_failure(message: object) -> Optional[str]:
-    """The sentence for the first core code in a failure text; None when it carries none."""
+    """The sentences for the core codes in a failure text; None when it carries none."""
     text = str(message or "")
-    match = _CORE_CODE_TOKEN.search(text)
-    if match:
-        return describe_core_code(match.group(1), match.group(2) or "")
-    trailing = _TRAILING_CORE_CODE.search(text)
-    return describe_core_code(trailing.group(1)) if trailing else None
+    found = [describe_core_code(match.group(1), match.group(2) or "") for match in _CORE_CODE_TOKEN.finditer(text)]
+    if not found and (trailing := _TRAILING_CORE_CODE.search(text)):
+        found = [describe_core_code(trailing.group(1))]
+    sentences = list(dict.fromkeys(sentence for sentence in found if sentence))
+    # Only beside a code sentence: an uncoded text keeps the core's own wording, which says so.
+    if sentences and "could not be persisted" in text:
+        sentences.append(translate_text(_REPORT_NOT_SAVED))
+    return " ".join(sentences) or None
 
 
 IMPORT_PREVIEW_CAPABILITY = "dump.import_preview"
@@ -824,14 +820,16 @@ class RustDumpImporter(_RustDumpClientBase):
 
             if import_mode == "safe":
                 candidate = restore_target_connection_info(result.get("candidate_target"))
-                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "restore_id", "report_path", "plan_digest")}
+                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "candidate_created", "restore_id", "report_path", "plan_digest")}
                 state.update(event="safe_restore_ready", candidate_target=candidate,
                              original_target=restore_target_connection_info(result.get("original_target")))
                 if raw_output_callback:
                     raw_output_callback(json.dumps(state, ensure_ascii=False))
                 if result.get("status") == "failed_original_untouched":
                     # A refused or failed safe restore is a result, not an error: keep the core's reason.
-                    reason = str(result.get("error") or result.get("message") or "")
+                    # A failed final report write keeps the first error and says so only in `message`.
+                    reason = str((result.get("message") if result.get("report_write_failed") else result.get("error"))
+                                 or result.get("message") or "")
                     self.last_error_code = classify_error_code(result.get("error_code"), reason)
                     stops = describe_copy_blockers(result.get("copy_blockers"))
                     if stops:
