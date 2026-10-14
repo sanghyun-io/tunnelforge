@@ -109,13 +109,12 @@ target-only views over replaced tables, from
 tables (`triggers_dropped`), and the dump's `strict_export`, `snapshot_policy`
 and `source_timezone`. When the namespace is missing, every table is under
 `create` and `target.can_create` says whether the account may create it (`null`
-when its grants cannot tell, for example with roles or partial revokes). The
-import does not create a missing namespace yet, so the preview then also
-reports `namespace_missing`.
+when its grants cannot tell, for example with roles or partial revokes); the
+replace import creates it.
 
 `blockers` (`{code, table, detail}`) are what the import refuses before its first
 DROP: `dump_invalid`, `untranslatable_table`, `spatial_unsupported`,
-`temporal_unsupported`, `no_tables`, `namespace_missing`, the PostgreSQL
+`temporal_unsupported`, `no_tables`, the PostgreSQL
 dependents above (`drop_privilege_missing`, `dependent_view`,
 `target_only_fk_child`, `dependent_object`), `check_name_collision`,
 `name_collision`, `create_privilege_missing`, on MySQL `drop_privilege_missing`

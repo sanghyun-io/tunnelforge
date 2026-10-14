@@ -105,9 +105,8 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let can_create = if exists { None } else { can_create_namespace(&mut admin, endpoint)? };
     drop(admin);
     if !exists {
+        // The replace import creates a missing namespace, so only the privilege matters.
         let kind = if engine == "mysql" { "database" } else { "schema" };
-        // dump.import does not create the namespace yet: it stops at its connection or DDL probe.
-        blockers.push(issue("namespace_missing", None, format!("the {kind} {schema} does not exist and the import does not create it")));
         match can_create {
             Some(false) => blockers.push(issue("create_privilege_missing", None,
                 format!("the {kind} {schema} does not exist and this account cannot create it"))),

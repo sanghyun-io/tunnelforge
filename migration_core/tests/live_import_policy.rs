@@ -1286,7 +1286,7 @@ fn mysql_preview_classifies_replace_create_untouched() {
     assert_eq!(missing["target"]["can_create"], true, "root can create databases");
     assert_eq!(missing["replace"], json!([]));
     assert_eq!(sorted(&missing["create"]), ["child", "parent"]);
-    assert_eq!(codes(&missing["blockers"]), ["namespace_missing"], "{missing}");
+    assert_eq!(missing["blockers"], json!([]), "{missing}");
     assert_eq!(created, 0, "the preview created the missing database");
 }
 
@@ -1482,7 +1482,7 @@ fn postgres_preview_blocks_a_missing_external_parent() {
     assert_eq!(missing["target"]["exists"], false);
     assert_eq!(missing["target"]["can_create"], true);
     assert_eq!(missing["create"], json!(["child"]));
-    assert_eq!(codes(&missing["blockers"]), ["namespace_missing", "external_parent_missing"], "{missing}");
+    assert_eq!(codes(&missing["blockers"]), ["external_parent_missing"], "{missing}");
     assert!(!created, "the preview created the missing schema");
 }
 
