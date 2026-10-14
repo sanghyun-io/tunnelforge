@@ -212,13 +212,8 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             return Err("unsupported dump manifest format".into());
         }
         crate::import::check_mysql_spatial_import(&manifest, &Default::default(), &original.engine)?;
-        if manifest.format_version < 4 && manifest.source_engine == "mysql"
-            && manifest.schema.tables.iter().any(|table| table.columns.iter().any(|column| mysql_bit_width(&column.type_name).is_some()))
-        {
-            return Err("safe restore cannot verify BIT columns from a dump written before format version 4 (their values were stored as raw bytes); re-export the database with this version, or use the advanced replace import".into());
-        }
-        if manifest.source_engine != original.engine {
-            return Err("safe restore currently verifies same-engine dumps only; use the explicit cross-engine migration workflow".into());
+        if let Some((_, reason)) = copy_refusals(&manifest, &original.engine).into_iter().next() {
+            return Err(reason);
         }
         if manifest.tables.is_empty() {
             return Err("safe restore found no tables".into());
@@ -245,7 +240,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         validate_dump_import_manifest_strictness(&manifest.tables, strict, &format, &compression)?;
         emit(
             json!({"event":"phase","request_id":request.request_id,"phase":"safe_restore_validation",
-            "message":"안전 복원: 원본을 유지한 채 덤프 무결성을 검증합니다."}),
+            "message":"복사본 검증: 원본은 그대로 두고 덤프 무결성을 확인합니다."}),
         );
         validate_dump_manifest_chunks(
             path,
@@ -474,6 +469,20 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
     state["request_id"] = json!(request.request_id);
     state["command"] = json!("dump.import");
     Ok(state)
+}
+
+/// What verify-in-copy refuses before it creates a copy, as `(code, reason)`.
+pub(super) fn copy_refusals(manifest: &DumpManifest, engine: &str) -> Vec<(&'static str, String)> {
+    let mut refusals = Vec::new();
+    if manifest.format_version < 4 && manifest.source_engine == "mysql"
+        && manifest.schema.tables.iter().any(|table| table.columns.iter().any(|column| mysql_bit_width(&column.type_name).is_some()))
+    {
+        refusals.push(("legacy_bit_unverifiable", "safe restore cannot verify BIT columns from a dump written before format version 4 (their values were stored as raw bytes); re-export the database with this version".into()));
+    }
+    if manifest.source_engine != engine {
+        refusals.push(("cross_engine", "safe restore currently verifies same-engine dumps only; use the explicit cross-engine migration workflow".into()));
+    }
+    refusals
 }
 
 /// A connection that works while the target namespace is missing: MySQL connects to

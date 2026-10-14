@@ -886,6 +886,87 @@ class TestRustDumpImporter:
         assert facade.payload["timezone_sql"] == "SET SESSION time_zone = '+09:00'"
         assert facade.payload["strict_manifest"] is True
 
+    @staticmethod
+    def _preview_facade(capabilities):
+        class FakeFacade:
+            def __init__(self):
+                self.commands = []
+
+            def hello(self):
+                self.commands.append("service.hello")
+                return {"capabilities": capabilities}
+
+            def import_dump(self, payload, on_event=None):
+                self.commands.append("dump.import")
+                self.import_payload = payload
+                return {"success": True, "tables": 1, "rows_imported": 1}
+
+            def preview_import(self, payload):
+                self.commands.append("dump.import_preview")
+                self.preview_payload = payload
+                return {"dry_run": True, "replace": ["users"], "blockers": []}
+
+        return FakeFacade()
+
+    def _write_dump(self, tmp_path):
+        dump_dir = tmp_path / 'dump'
+        dump_dir.mkdir()
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":3,"database":"app","source_engine":"mysql",'
+            '"tables":[{"name":"users","path":"0001_users","rows":0,"chunks":0}]}',
+            encoding='utf-8',
+        )
+        return str(dump_dir)
+
+    @pytest.mark.parametrize("import_mode", ["replace", "safe"])
+    def test_preview_payload_is_import_payload_without_mode(self, tmp_path, import_mode):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = self._write_dump(tmp_path)
+        facade = self._preview_facade(["dump.import", "dump.import_preview"])
+        importer = RustDumpImporter(RustDumpConfig('localhost', 3306, 'root', 'password'), facade=facade)
+        options = dict(target_schema="other", threads=4, timezone_sql="SET SESSION time_zone = '+09:00'",
+                       use_source_timezone=False)
+
+        ok, message, preview = importer.preview_import(dump_dir, **options)
+        importer.import_dump(dump_dir, import_mode=import_mode, **options)
+
+        assert ok is True and message == ""
+        assert preview == {"dry_run": True, "replace": ["users"], "blockers": []}
+        assert "mode" not in facade.preview_payload
+        assert facade.preview_payload == {key: value for key, value in facade.import_payload.items() if key != "mode"}
+        assert facade.preview_payload["target"]["database"] == "other"
+
+    def test_preview_refused_without_core_capability(self, tmp_path):
+        """A core built before the preview would not know the command; nothing is sent to it."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        facade = self._preview_facade(["dump.run", "dump.import"])
+        importer = RustDumpImporter(RustDumpConfig('localhost', 3306, 'root', 'password'), facade=facade)
+
+        ok, message, preview = importer.preview_import(self._write_dump(tmp_path))
+
+        assert ok is False and preview == {}
+        assert "미리보기를 지원하지 않습니다" in message
+        assert facade.commands == ["service.hello"]
+
+    def test_preview_failure_is_returned_not_raised(self, tmp_path):
+        from src.core.db_core_service import DbCoreServiceError
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        facade = self._preview_facade(["dump.import_preview"])
+
+        def refuse(payload):
+            raise DbCoreServiceError("connection refused", error_code="connection_failed")
+
+        facade.preview_import = refuse
+        importer = RustDumpImporter(RustDumpConfig('localhost', 3306, 'root', 'password'), facade=facade)
+
+        ok, message, preview = importer.preview_import(self._write_dump(tmp_path))
+
+        assert ok is False and preview == {}
+        assert "connection refused" in message
+
     def test_import_dump_preserves_classified_core_error(self, tmp_path):
         """Rust classified error code/scope가 Python import 메시지에 보존된다"""
         from src.core.db_core_service import DbCoreServiceError

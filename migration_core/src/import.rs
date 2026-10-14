@@ -14,6 +14,8 @@ use crate::*;
 pub(crate) mod safe_restore;
 #[path = "safe_restore_digest.rs"]
 pub(crate) mod safe_restore_digest;
+#[path = "import_preview.rs"]
+pub(crate) mod import_preview;
 
 /// MySQL `LOAD DATA LOCAL`이 비활성화됐을 때 반환되는 에러 코드(ERROR 3948) 매칭 토큰.
 const MYSQL_ERR_LOCAL_INFILE_DISABLED: &str = "3948";
@@ -46,6 +48,21 @@ fn validate_import_metadata(
     selected: &BTreeSet<String>,
     target_engine: &str,
 ) -> Result<BTreeMap<String, String>, String> {
+    let (ddls, untranslatable) = import_table_ddls(manifest, selected, target_engine)?;
+    if !untranslatable.is_empty() {
+        let reasons = untranslatable.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>();
+        return Err(classified_import_error("export_invalid",
+            &format!("{} tables cannot be created on {target_engine}: {}", reasons.len(), reasons.join("; ")), None));
+    }
+    Ok(ddls)
+}
+
+/// The DDL of every selected table, plus `(table, reason)` for each table the target cannot take.
+fn import_table_ddls(
+    manifest: &DumpManifest,
+    selected: &BTreeSet<String>,
+    target_engine: &str,
+) -> Result<(BTreeMap<String, String>, Vec<(String, String)>), String> {
     let invalid = |message: String| classified_import_error("export_invalid", &message, None);
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
@@ -97,37 +114,84 @@ fn validate_import_metadata(
                 }
             }
             if let Err(reason) = validate_target_foreign_key_actions(definition, target_engine) {
-                untranslatable.push(reason);
+                untranslatable.push((table.name.clone(), reason));
                 continue;
             }
             match generate_table_ddl(definition, &manifest.source_engine, target_engine) {
                 Some(ddl) => { ddls.insert(table.name.clone(), ddl); }
-                None => untranslatable.push(format!("cannot generate DDL for table {}", table.name)),
+                None => untranslatable.push((table.name.clone(), format!("cannot generate DDL for table {}", table.name))),
             }
         }
     }
-    if !untranslatable.is_empty() {
-        return Err(invalid(format!("{} tables cannot be created on {target_engine}: {}", untranslatable.len(), untranslatable.join("; "))));
+    Ok((ddls, untranslatable))
+}
+
+/// The manifest's (data_format, compression), refusing what this build cannot read.
+fn supported_dump_format(manifest: &DumpManifest) -> Result<(String, String), String> {
+    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
+        return Err("unsupported dump manifest format".to_string());
     }
-    Ok(ddls)
+    let data_format = manifest.data_format.to_ascii_lowercase();
+    if !matches!(data_format.as_str(), "jsonl" | "tsv") {
+        return Err(format!("unsupported dump data_format: {data_format}"));
+    }
+    let compression = manifest.compression.to_ascii_lowercase();
+    if !matches!(compression.as_str(), "none" | "zstd") {
+        return Err(format!("unsupported dump compression: {compression}"));
+    }
+    Ok((data_format, compression))
+}
+
+/// Cross-engine temporal types the target cannot store, as `(table, "table.column: problem")`.
+fn cross_engine_temporal_refusals(manifest: &DumpManifest, tables: &[DumpTableManifest], target_engine: &str) -> Vec<(String, String)> {
+    if manifest.source_engine == target_engine {
+        return Vec::new();
+    }
+    let source_engine = manifest.source_engine.as_str();
+    manifest.schema.tables.iter().filter(|table| tables.iter().any(|selected| selected.name == table.name))
+        .flat_map(|table| table.columns.iter().filter_map(move |column| match temporal_type_problem(source_engine, &column.type_name) {
+            Some((true, problem)) => Some((table.name.clone(), format!("{}.{}: {problem}", table.name, column.name))),
+            _ => None,
+        }))
+        .collect()
 }
 
 fn source_dump_warnings(manifest: &DumpManifest) -> Vec<String> {
+    coded_source_dump_warnings(manifest).into_iter().map(|(_, warning)| warning).collect()
+}
+
+/// The source dump's warnings, each with a stable code the application words for the user.
+fn coded_source_dump_warnings(manifest: &DumpManifest) -> Vec<(&'static str, String)> {
     let mut warnings = manifest.manifest_warnings.iter()
-        .map(|warning| format!("source dump: {warning}")).collect::<Vec<_>>();
+        .map(|warning| (manifest_warning_code(warning), format!("source dump: {warning}"))).collect::<Vec<_>>();
     if manifest.snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot" {
-        warnings.push("legacy source dump used independent snapshots; cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
+        warnings.push(("unsynchronized_snapshot", "legacy source dump used independent snapshots; cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into()));
     }
     if manifest.snapshot_policy == "mysql_parallel_unsynchronized_snapshots" {
-        warnings.push("source dump was exported by parallel workers with independent snapshots and no shared lock (explicit opt-in); cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
+        warnings.push(("unsynchronized_snapshot", "source dump was exported by parallel workers with independent snapshots and no shared lock (explicit opt-in); cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into()));
     }
     if !manifest.strict_export {
-        warnings.push("source dump is not marked strict; its recorded fidelity and consistency limitations remain after import".into());
+        warnings.push(("not_strict", "source dump is not marked strict; its recorded fidelity and consistency limitations remain after import".into()));
     }
     if manifest.source_timezone.is_none() {
-        warnings.push("legacy source dump does not record its source timezone; timestamp interpretation follows the selected import timezone or target server default".into());
+        warnings.push(("legacy_timezone", "legacy source dump does not record its source timezone; timestamp interpretation follows the selected import timezone or target server default".into()));
     }
     warnings
+}
+
+/// Export writes these texts into the manifest (`dump.rs`, `adapters.rs`).
+fn manifest_warning_code(warning: &str) -> &'static str {
+    if warning.contains("independent snapshots") {
+        "unsynchronized_snapshot"
+    } else if warning.contains("outside the table data snapshot") {
+        "views_outside_snapshot"
+    } else if warning.starts_with("Object not exported:") || warning.starts_with("Non-transactional tables excluded") {
+        "omitted_object"
+    } else if warning.contains("visibility") {
+        "visibility_unproven"
+    } else {
+        "source_dump_warning"
+    }
 }
 
 struct ImportJournal {
@@ -277,18 +341,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
-    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
-        return Err("unsupported dump manifest format".to_string());
-    }
+    let (data_format, compression) = supported_dump_format(&manifest)?;
     let legacy_bit_text = manifest.format_version < 4 && manifest.source_engine == "mysql";
-    let data_format = manifest.data_format.to_ascii_lowercase();
-    if !matches!(data_format.as_str(), "jsonl" | "tsv") {
-        return Err(format!("unsupported dump data_format: {data_format}"));
-    }
-    let compression = manifest.compression.to_ascii_lowercase();
-    if !matches!(compression.as_str(), "none" | "zstd") {
-        return Err(format!("unsupported dump compression: {compression}"));
-    }
 
     let selected_tables = string_list(request.payload.get("tables"));
     let selected: BTreeSet<String> = selected_tables.into_iter().collect();
@@ -333,17 +387,10 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         "tables": tables.len(),
     }));
     // Cross-engine imports refuse temporal types and values the target cannot store before anything changes.
-    if manifest.source_engine != endpoint.engine {
-        let source_engine = manifest.source_engine.as_str();
-        let refused = manifest.schema.tables.iter().filter(|table| tables.iter().any(|selected| selected.name == table.name))
-            .flat_map(|table| table.columns.iter().filter_map(move |column| match temporal_type_problem(source_engine, &column.type_name) {
-                Some((true, problem)) => Some(format!("{}.{}: {problem}", table.name, column.name)),
-                _ => None,
-            }))
-            .collect::<Vec<_>>();
-        if !refused.is_empty() {
-            return Err(format!("{}; leave these tables out or convert the columns in the source and export again", refused.join("; ")));
-        }
+    let refused = cross_engine_temporal_refusals(&manifest, &tables, &endpoint.engine);
+    if !refused.is_empty() {
+        let refused = refused.into_iter().map(|(_, problem)| problem).collect::<Vec<_>>();
+        return Err(format!("{}; leave these tables out or convert the columns in the source and export again", refused.join("; ")));
     }
     let source_engine = manifest.source_engine.clone();
     let temporal_check = move |column: &NormalizedColumn, text: &str| temporal_value_problem(&source_engine, &column.type_name, text);
@@ -589,6 +636,9 @@ fn probe_import_ddl(
 /// A foreign key of a table the import keeps, referencing a table the import replaces.
 pub(crate) struct SurvivingForeignKey {
     label: String,
+    /// `schema.table` when the child lives in another schema.
+    child: String,
+    constraint: String,
     parent: String,
     /// (the child column's type, the parent column it references)
     columns: Vec<(String, String)>,
@@ -622,7 +672,9 @@ fn surviving_foreign_keys(adapter: &mut LiveAdapter, schema: &str, import_schema
         let id = (child_schema.clone(), child.clone(), constraint.clone());
         if current.as_ref() != Some(&id) {
             let child = if same_schema { child } else { format!("{child_schema}.{child}") };
-            keys.push(SurvivingForeignKey { label: format!("{child}.{constraint} -> {parent}"), parent: parent.clone(), columns: Vec::new() });
+            keys.push(SurvivingForeignKey {
+                label: format!("{child}.{constraint} -> {parent}"), child, constraint, parent: parent.clone(), columns: Vec::new(),
+            });
             current = Some(id);
         }
         let definition = match (charset, collation) {
@@ -876,9 +928,23 @@ fn import_target_table_exists(adapter: &mut LiveAdapter, schema: &str, table: &s
 /// DROP TABLE cannot replace a view (or any other non-table object) that has a dump table's name,
 /// so refuse before any target table changes.
 fn refuse_non_table_name_collisions(adapter: &mut LiveAdapter, schema: &str, import_schema: &NormalizedSchema) -> Result<(), String> {
+    let collisions = non_table_name_collisions(adapter, schema, import_schema)?;
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    let collisions = collisions.iter().map(|(name, kind)| format!("{name} ({kind})")).collect::<Vec<_>>();
+    Err(classified_import_error(
+        "ddl_preflight_failed",
+        &format!("target objects that are not tables already use these names; no target tables were changed: {}", collisions.join(", ")),
+        None,
+    ))
+}
+
+/// Target objects other than tables that use a dump table's name, as `(name, kind)`.
+fn non_table_name_collisions(adapter: &mut LiveAdapter, schema: &str, import_schema: &NormalizedSchema) -> Result<Vec<(String, String)>, String> {
     let names = import_schema.tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
     let inspect_error = |err: &dyn std::fmt::Display| format!("target object inspection failed: {err}");
-    let collisions: Vec<String> = match adapter {
+    Ok(match adapter {
         LiveAdapter::MySql(conn) => {
             let rows: Vec<(String, String)> = conn.exec(
                 "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_TYPE<>'BASE TABLE'",
@@ -887,51 +953,76 @@ fn refuse_non_table_name_collisions(adapter: &mut LiveAdapter, schema: &str, imp
             // Case-insensitive like lower_case_table_names servers; a false refusal is safe.
             rows.into_iter()
                 .filter(|(name, _)| names.iter().any(|table| table.eq_ignore_ascii_case(name)))
-                .map(|(name, kind)| format!("{name} ({kind})"))
                 .collect()
         }
         LiveAdapter::PostgreSql(client) => client.query(
             "SELECT c.relname, CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'S' THEN 'SEQUENCE' WHEN 'c' THEN 'TYPE' ELSE 'INDEX' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind NOT IN ('r','p') ORDER BY 1",
             &[&schema, &names],
         ).map_err(|err| inspect_error(&err))?
-            .iter().map(|row| format!("{} ({})", row.get::<_, String>(0), row.get::<_, String>(1))).collect(),
-    };
-    if collisions.is_empty() {
-        return Ok(());
-    }
-    Err(classified_import_error(
-        "ddl_preflight_failed",
-        &format!("target objects that are not tables already use these names; no target tables were changed: {}", collisions.join(", ")),
-        None,
-    ))
+            .iter().map(|row| (row.get(0), row.get(1))).collect(),
+    })
 }
 
 fn validate_postgres_drop_dependencies(adapter: &mut LiveAdapter, schema: &str, tables: &[DumpTableManifest]) -> Result<(), String> {
-    let LiveAdapter::PostgreSql(client)=adapter else { return Ok(()); };
-    let names=tables.iter().map(|table|table.name.clone()).collect::<Vec<_>>();
-    let fail=|detail:String|classified_import_error("target_dependency_preflight_failed",&format!("PostgreSQL target dependencies prevent replacement; no target tables were changed. Use safe restore. {detail}"),None);
-    let views=client.query(
-        "SELECT DISTINCT vn.nspname,v.relname FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid JOIN pg_class v ON v.oid=r.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_class source ON source.oid=d.refobjid JOIN pg_namespace sn ON sn.oid=source.relnamespace WHERE d.classid='pg_rewrite'::regclass AND d.refclassid='pg_class'::regclass AND v.relkind IN ('v','m') AND v.oid<>source.oid AND sn.nspname=$1 AND source.relname=ANY($2::text[])",
-        &[&schema,&names],
-    ).map_err(|err|fail(format!("Dependency inspection failed: {err}")))?;
-    if !views.is_empty() {
-        let names=views.iter().map(|row|format!("{}.{}",row.get::<_,String>(0),row.get::<_,String>(1))).collect::<Vec<_>>();
-        return Err(fail(format!("Dependent views: {}",names.join(", "))));
+    let LiveAdapter::PostgreSql(client) = adapter else { return Ok(()); };
+    let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
+    let fail = |detail: String| classified_import_error("target_dependency_preflight_failed",
+        &format!("PostgreSQL target dependencies prevent replacement; no target tables were changed. {detail}"), None);
+    let dependents = postgres_drop_dependents(client, schema, &names).map_err(fail)?;
+    if dependents.is_empty() {
+        return Ok(());
     }
-    let planned=tables.iter().map(|table|table.name.as_str()).collect::<BTreeSet<_>>();
-    let keys=client.query(
-        "SELECT child_ns.nspname,child.relname,parent.relname,c.conname FROM pg_constraint c JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace child_ns ON child_ns.oid=child.relnamespace JOIN pg_class parent ON parent.oid=c.confrelid JOIN pg_namespace parent_ns ON parent_ns.oid=parent.relnamespace WHERE c.contype='f' AND parent_ns.nspname=$1 AND parent.relname=ANY($2::text[])",
-        &[&schema,&names],
-    ).map_err(|err|fail(format!("Foreign key inspection failed: {err}")))?;
-    for row in keys {
-        let child_schema:String=row.get(0);let child:String=row.get(1);let parent:String=row.get(2);let constraint:String=row.get(3);
-        // Import-set children lose this FK just before the parent is replaced
-        // (replace_target_table); only target-only children would block DROP.
-        if child_schema!=schema || !planned.contains(child.as_str()) {
-            return Err(fail(format!("Target-only foreign key {child_schema}.{child}.{constraint} references {parent}")));
+    Err(fail(dependents.into_iter().map(|(_, _, detail)| detail).collect::<Vec<_>>().join("; ")))
+}
+
+/// Everything that would make DROP TABLE of the import set fail, as `(code, dumped table, detail)`.
+/// Import-set children in the same schema are not listed: their FK is dropped just before the
+/// parent is replaced (replace_target_table).
+fn postgres_drop_dependents(client: &mut postgres::Client, schema: &str, names: &[String]) -> Result<Vec<(&'static str, String, String)>, String> {
+    let mut dependents = Vec::new();
+    for row in client.query(
+        "SELECT DISTINCT vn.nspname,v.relname,source.relname FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid JOIN pg_class v ON v.oid=r.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_class source ON source.oid=d.refobjid JOIN pg_namespace sn ON sn.oid=source.relnamespace WHERE d.classid='pg_rewrite'::regclass AND d.refclassid='pg_class'::regclass AND v.relkind IN ('v','m') AND v.oid<>source.oid AND sn.nspname=$1 AND source.relname=ANY($2::text[]) ORDER BY 3,1,2",
+        &[&schema, &names],
+    ).map_err(|err| format!("Dependency inspection failed: {err}"))? {
+        dependents.push(("dependent_view", row.get(2), format!("Dependent view {}.{}", row.get::<_, String>(0), row.get::<_, String>(1))));
+    }
+    let planned = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    // Partition clones (conparentid<>0) go away with their root constraint.
+    for row in client.query(
+        "SELECT child_ns.nspname,child.relname,parent.relname,c.conname FROM pg_constraint c JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace child_ns ON child_ns.oid=child.relnamespace JOIN pg_class parent ON parent.oid=c.confrelid JOIN pg_namespace parent_ns ON parent_ns.oid=parent.relnamespace WHERE c.contype='f' AND c.conparentid=0 AND parent_ns.nspname=$1 AND parent.relname=ANY($2::text[]) ORDER BY 3,1,2,4",
+        &[&schema, &names],
+    ).map_err(|err| format!("Foreign key inspection failed: {err}"))? {
+        let (child_schema, child, parent, constraint): (String, String, String, String) = (row.get(0), row.get(1), row.get(2), row.get(3));
+        if child_schema != schema || !planned.contains(child.as_str()) {
+            let detail = format!("Target-only foreign key {child_schema}.{child}.{constraint} references {parent}");
+            dependents.push(("target_only_fk_child", parent, detail));
         }
     }
-    Ok(())
+    // Any other object outside the import set that depends on something DROP TABLE removes with
+    // the table (an owned sequence used by another table's default, a column of the table's row
+    // type, an inheriting table, a policy or function body naming it). Views and FKs, with the
+    // triggers an FK creates, are listed above.
+    for row in client.query(
+        "WITH RECURSIVE dropped(classid, objid, root) AS (
+            SELECT 'pg_class'::regclass::oid, c.oid, c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+             WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','p')
+            UNION
+            SELECT d.classid, d.objid, p.root FROM pg_depend d JOIN dropped p ON p.classid=d.refclassid AND p.objid=d.refobjid
+             WHERE d.deptype IN ('a','i'))
+         SELECT DISTINCT p.root, pg_describe_object(d.classid,d.objid,d.objsubid), pg_describe_object(d.refclassid,d.refobjid,d.refobjsubid)
+         FROM pg_depend d JOIN dropped p ON p.classid=d.refclassid AND p.objid=d.refobjid
+         WHERE d.deptype='n'
+           AND NOT EXISTS (SELECT 1 FROM dropped x WHERE x.classid=d.classid AND x.objid=d.objid)
+           AND NOT EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_class v ON v.oid=r.ev_class WHERE d.classid='pg_rewrite'::regclass AND r.oid=d.objid AND v.relkind IN ('v','m'))
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE d.classid='pg_constraint'::regclass AND k.oid=d.objid AND k.contype='f')
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_constraint k ON k.oid=t.tgconstraint WHERE d.classid='pg_trigger'::regclass AND t.oid=d.objid AND k.contype='f')
+         ORDER BY 1,2,3",
+        &[&schema, &names],
+    ).map_err(|err| format!("Dependency inspection failed: {err}"))? {
+        let (table, dependent, referenced): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+        dependents.push(("dependent_object", table, format!("{dependent} depends on {referenced}")));
+    }
+    Ok(dependents)
 }
 
 /// 단일 테이블의 데이터를 적재한다. MySQL TSV fast-path(LOAD DATA / 병렬 / fallback)와
@@ -2265,7 +2356,10 @@ mod tests {
     fn ddl_probe_recreates_kept_children_before_their_parent_and_names_the_offender() {
         use crate::adapters::test_support::schema as sample_schema;
         let schema = sample_schema();
-        let kept = [SurvivingForeignKey { label: "orders.fk_user -> users".into(), parent: "users".into(), columns: vec![("bigint unsigned".into(), "id".into())] }];
+        let kept = [SurvivingForeignKey {
+            label: "orders.fk_user -> users".into(), child: "orders".into(), constraint: "fk_user".into(),
+            parent: "users".into(), columns: vec![("bigint unsigned".into(), "id".into())],
+        }];
         let mut statements = Vec::new();
         let err = run_owned_ddl_probe(&schema, "mysql", "mysql", &kept, "p", |_| Ok(()), |sql| {
             statements.push(sql.to_string());

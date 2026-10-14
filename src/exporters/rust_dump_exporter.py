@@ -519,8 +519,73 @@ def _is_operation_scoped_import_error(message: str) -> bool:
     return message.lstrip().startswith(_OPERATION_SCOPED_IMPORT_CODES)
 
 
+IMPORT_PREVIEW_CAPABILITY = "dump.import_preview"
+_UNKNOWN_TARGET_MESSAGE = "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요."
+_MISSING_MANIFEST_MESSAGE = "TunnelForge Rust dump manifest를 찾을 수 없습니다."
+
+
 class RustDumpImporter(_RustDumpClientBase):
     """Rust DB Core backed dump importer."""
+
+    def _import_payload(
+        self,
+        input_dir: str,
+        target_schema: str,
+        threads: int,
+        timezone_sql: Optional[str],
+        use_source_timezone: bool,
+    ) -> Optional[dict]:
+        """The dump.import payload without its mode; None when the target namespace is unknown."""
+        if not target_schema:
+            return None
+        payload = {
+            "target": self._endpoint(target_schema).to_payload(),
+            "input_dir": input_dir,
+            "threads": max(1, int(threads)),
+            "strict_manifest": True,
+            "use_source_timezone": use_source_timezone,
+        }
+        if timezone_sql:
+            payload["timezone_sql"] = timezone_sql
+        return payload
+
+    def preview_import(
+        self,
+        input_dir: str,
+        target_schema: Optional[str] = None,
+        threads: int = DEFAULT_DUMP_THREADS,
+        timezone_sql: Optional[str] = None,
+        use_source_timezone: bool = True,
+    ) -> Tuple[bool, str, dict]:
+        """What a replace import would do, read from the target without changing it.
+
+        Nothing is sent to a core whose ``service.hello`` does not list ``dump.import_preview``.
+        """
+        try:
+            manifest_path = Path(input_dir) / "_tunnelforge_dump.json"
+            if not manifest_path.exists():
+                return False, _MISSING_MANIFEST_MESSAGE, {}
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload = self._import_payload(
+                input_dir,
+                target_schema or dump_original_namespace(manifest, self.config.engine),
+                threads,
+                timezone_sql,
+                use_source_timezone,
+            )
+            if payload is None:
+                return False, _UNKNOWN_TARGET_MESSAGE, {}
+            if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):
+                return False, "이 Rust DB Core는 Import 미리보기를 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요.", {}
+            return True, "", self.facade.preview_import(payload)
+        except DbCoreServiceError as exc:
+            self._remember_error_code(exc)
+            return False, f"Rust DB Core import 미리보기 오류: {exc}", {}
+        except Exception as exc:
+            self._remember_error_code(exc)
+            return False, f"Import 미리보기 오류: {exc}", {}
+        finally:
+            _shutdown_owned_facade(self.facade, self._owns_facade)
 
     def _analyze_dump_metadata(self, dump_dir: str) -> Optional[Dict]:
         manifest_path = Path(dump_dir) / "_tunnelforge_dump.json"
@@ -586,7 +651,7 @@ class RustDumpImporter(_RustDumpClientBase):
         try:
             manifest_path = Path(input_dir) / "_tunnelforge_dump.json"
             if not manifest_path.exists():
-                return False, "TunnelForge Rust dump manifest를 찾을 수 없습니다.", import_results
+                return False, _MISSING_MANIFEST_MESSAGE, import_results
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             source_schema = dump_original_namespace(manifest, self.config.engine)
@@ -608,20 +673,12 @@ class RustDumpImporter(_RustDumpClientBase):
                 if table_status_callback:
                     table_status_callback(table, "pending", "")
 
-            final_target_schema = target_schema or source_schema
-            if not final_target_schema:
-                return False, "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요.", import_results
-
-            payload = {
-                "target": self._endpoint(final_target_schema).to_payload(),
-                "input_dir": input_dir,
-                "mode": import_mode,
-                "threads": max(1, int(threads)),
-                "strict_manifest": True,
-                "use_source_timezone": use_source_timezone,
-            }
-            if timezone_sql:
-                payload["timezone_sql"] = timezone_sql
+            payload = self._import_payload(
+                input_dir, target_schema or source_schema, threads, timezone_sql, use_source_timezone,
+            )
+            if payload is None:
+                return False, _UNKNOWN_TARGET_MESSAGE, import_results
+            payload["mode"] = import_mode
             if retry_tables:
                 payload["tables"] = retry_tables
 
