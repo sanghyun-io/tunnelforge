@@ -352,7 +352,11 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
 - `auto` moves to the next method only when a later one can still work: a missing
   privilege (1044/1045/1142/1227), a backup lock the server does not know
   (1064/1235, on `LOCK INSTANCE` only), a connection limit (1040/1203/1226), or a
-  lock not granted within 2 seconds (1205, or the watchdog's KILL; TF-STATUS-185).
+  lock not granted within 2 seconds (1205, the watchdog's KILL, or 1213 when the
+  lock wait was picked as a deadlock victim; TF-STATUS-185).
+  A snapshot connection refused by the account's own limit (1203/1226) is tried once
+  more after 250 ms, because the sessions the previous method just closed can still
+  count against it for a moment.
   A lock timeout therefore falls to the table lock and then to one connection,
   never on its own to the unsynchronized mode. Any other error fails the export.
   When the backup lock was taken and only FTWRL failed, the table-lock method keeps
@@ -362,7 +366,12 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
 - The worker count is `max(1, min(threads, max_user_connections - own_sessions - 1))`
   when `@@session.max_user_connections` is set; `own_sessions` are the account's
   rows in `information_schema.PROCESSLIST` (no PROCESS privilege needed, matched by
-  user name). This applies to every MySQL mode.
+  user name: `USER()` up to its last `@`, since a name may hold `@` itself). This
+  applies to every MySQL mode.
+- `service.hello` lists `dump.run.mysql_snapshot_auto` when `dump.run` takes
+  `auto`. The application checks it before sending `auto` and otherwise stops with
+  a Korean sentence asking for the core shipped with the app, instead of an older
+  core's `unsupported mysql_snapshot_mode: auto`.
 - The method that ran drives the worker count, the phase events, the manifest
   policy and the result. The `dump.run` result and the snapshot phase event carry
   `mysql_snapshot_mode` (resolved), `worker_count` and `snapshot_fallbacks`
@@ -463,16 +472,25 @@ refusal instead of silently producing an incomplete backup. Import behavior is
 unchanged. Objects this inspection does not detect (for example MySQL
 partitioning, PostgreSQL extensions, rules or privileges) are not reported.
 
-MySQL lists triggers, routines, events and tables only to accounts allowed to
-see them, so a narrow account would get a dump that looks complete while it
-lacks them (B1). Before export the core reads the account's own grants
-(`SHOW GRANTS`): TRIGGER for every export, and for a full export also SELECT on
-the whole database (the table list), SHOW_ROUTINE, global SELECT, or EXECUTE /
-CREATE ROUTINE / ALTER ROUTINE (routines), and EVENT. Anything not proven, grants
-through roles or partial revokes, or a failed check sets `strict_export=false`
-with the persistent warning `The export account's privileges do not prove it
-sees every object, so some may be missing: ...`, which Import reports as
-`visibility_unproven`. PostgreSQL is not probed yet.
+MySQL lists triggers, routines, events, tables and columns only to accounts
+allowed to see them, so a narrow account would get a dump that looks complete
+while it lacks them (B1); a replace import of a table dumped without some columns
+would recreate it without them. Before export the core reads the account's own
+grants once (`SHOW GRANTS`): TRIGGER and SELECT for every export, and for a full
+export also SHOW_ROUTINE, global SELECT, or EXECUTE / CREATE ROUTINE / ALTER
+ROUTINE (routines), and EVENT. A full export needs TRIGGER and SELECT on the whole
+database (the table list); a table subset may also hold them on each exported
+table (`GRANT SELECT ON db.t`), but a column grant (`GRANT SELECT (id) ON db.t`)
+never counts, since it shows only those columns. Anything not proven, grants
+through roles, a partial revoke of the privilege on the export database (one on
+another database, such as `mysql.*`, does not count), or a failed check sets
+`strict_export=false` with the persistent warning `The export account's
+privileges do not prove it sees every object, so some may be missing: ...`, which
+Import reports as `visibility_unproven`. PostgreSQL is not probed yet.
+
+The application shows each manifest warning of a finished export as its Korean
+sentence (the same one Import uses for that code, with the omitted object's name
+for `omitted_object`); the core's own text stays in the raw output and the log.
 
 A successful table transfer does not certify complete database backup fidelity.
 No new signing/notarization requirement or external database dump tool is

@@ -21,8 +21,50 @@ class TestRustDumpChecker:
         exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
         success, message = exporter.export_full_schema("app", str(tmp_path), progress_callback=progress.append)
         assert success
-        assert any("Object not exported: trigger:audit" in line for line in progress)
-        assert "Object not exported: trigger:audit" in message
+        line = "Export 경고: 내보낼 때 일부 객체가 빠졌습니다. (trigger:audit)"
+        assert line in progress
+        assert message.endswith("\n" + line)
+
+    def test_export_warnings_are_shown_in_korean_and_kept_raw_in_the_raw_output(self, tmp_path):
+        from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES, RustDumpConfig, RustDumpExporter
+
+        visibility = "The export account's privileges do not prove it sees every object, so some may be missing: triggers (TRIGGER)"
+        result = {"event": "result", "success": True, "tables": 1, "rows_dumped": 1, "manifest_warnings": [
+            visibility, "Workers used independent snapshots without a shared lock", "Something new: x"]}
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                on_event(result)
+                return result
+
+        raw, progress = [], []
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=FakeFacade())
+        success, message = exporter.export_full_schema(
+            "app", str(tmp_path), progress_callback=progress.append, raw_output_callback=raw.append
+        )
+
+        assert success
+        assert progress[-3:] == [
+            f"Export 경고: {CORE_CODE_SENTENCES['visibility_unproven']}",
+            f"Export 경고: {CORE_CODE_SENTENCES['unsynchronized_snapshot']}",
+            f"Export 경고: {CORE_CODE_SENTENCES['source_dump_warning']} (Something new: x)",
+        ]
+        assert message.endswith("\n".join(progress[-3:]))
+        assert "privileges do not prove" not in message
+        assert any(visibility in line for line in raw), "the core's own text stays in the raw output"
+
+    def test_manifest_warning_prefixes_follow_the_core(self):
+        import re
+        from pathlib import Path
+        from src.exporters.rust_dump_exporter import _MANIFEST_WARNING_CODES
+
+        source = (Path(__file__).resolve().parents[1] / "migration_core" / "src" / "adapters.rs").read_text(encoding="utf-8")
+        core = re.findall(r'pub\(crate\) const WARNING_\w+: &str = "([^"]+)";', source)
+        assert core
+        for text in core:
+            assert any(text.startswith(prefix) for prefix, _ in _MANIFEST_WARNING_CODES), text
+        for prefix, _ in _MANIFEST_WARNING_CODES:
+            assert any(text.startswith(prefix) for text in core), prefix
 
     def test_check_installation_success(self):
         """Rust DB Core 확인 성공 테스트"""
@@ -350,9 +392,10 @@ class TestRustDumpExporter:
 
     @pytest.mark.parametrize("fallback", [None, "single_connection", "parallel_unsynchronized"])
     def test_exporter_sends_auto_snapshot_mode_and_fallback(self, tmp_path, fallback):
-        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+        from src.exporters.rust_dump_exporter import MYSQL_SNAPSHOT_AUTO_CAPABILITY, RustDumpConfig, RustDumpExporter
 
         facade = MagicMock()
+        facade.hello.return_value = {"capabilities": ["dump.run", MYSQL_SNAPSHOT_AUTO_CAPABILITY]}
         facade.run_dump.return_value = {"success": True, "tables": 1, "rows_dumped": 2}
         facade.inspect_schema.return_value = {"tables": []}
         exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
@@ -380,6 +423,31 @@ class TestRustDumpExporter:
         assert success is False
         assert "unsupported mysql_snapshot_fallback" in message
         facade.run_dump.assert_not_called()
+
+    @pytest.mark.parametrize("capabilities", [["dump.run", "dump.import"], None])
+    def test_auto_snapshot_is_not_sent_to_a_core_that_does_not_list_it(self, tmp_path, capabilities):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class OlderCore:
+            ran = False
+
+            def hello(self):
+                return {"capabilities": capabilities}
+
+            def run_dump(self, payload, on_event=None):
+                self.ran = True
+                raise AssertionError("an older core refuses every auto export in English")
+
+        facade = OlderCore()
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+
+        success, message = exporter.export_full_schema("app", str(tmp_path / "dump"), mysql_snapshot_mode="auto")
+        assert (success, message) == (
+            False, "이 Rust DB Core는 내보내기 방법 자동 선택을 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."
+        )
+        assert exporter.export_tables("app", ["t"], str(tmp_path / "part"), include_fk_parents=False,
+                                      mysql_snapshot_mode="auto")[0] is False
+        assert not facade.ran
 
     @pytest.mark.parametrize("result, threads, expected", [
         (
@@ -416,10 +484,13 @@ class TestRustDumpExporter:
         ({"snapshot_policy": "postgresql_repeatable_read_snapshot", "worker_count": 1}, 8, ""),
     ])
     def test_export_message_names_the_method_actually_used(self, tmp_path, result, threads, expected):
-        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter, describe_snapshot_method
+        from src.exporters.rust_dump_exporter import (
+            MYSQL_SNAPSHOT_AUTO_CAPABILITY, RustDumpConfig, RustDumpExporter, describe_snapshot_method,
+        )
 
         assert describe_snapshot_method(result, threads) == expected
         facade = MagicMock()
+        facade.hello.return_value = {"capabilities": [MYSQL_SNAPSHOT_AUTO_CAPABILITY]}
         facade.run_dump.return_value = {"success": True, "tables": 2, "rows_dumped": 5, **result}
         exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
 

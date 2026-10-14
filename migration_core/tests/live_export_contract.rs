@@ -500,6 +500,20 @@ fn assert_resolved(result: &Value, manifest: &Value, mode: &str, policy: &str, f
     assert_eq!(result["worker_count"], workers, "{result}");
 }
 
+/// The snapshot ready event names the method the result reports, and one log line per
+/// skipped method says why, in order.
+fn assert_snapshot_events(events: &[Value], result: &Value, skipped: &[&str]) {
+    let snapshot = |e: &&Value| e["event"] == "phase" && e["phase"] == "snapshot";
+    let ready = events.iter().filter(snapshot).rfind(|e| e.get("worker_count").is_some()).unwrap_or_else(|| panic!("{events:#?}"));
+    assert_eq!(ready["mysql_snapshot_mode"], result["mysql_snapshot_mode"], "{ready}");
+    assert_eq!(ready["snapshot_fallbacks"], result["snapshot_fallbacks"], "{ready}");
+    let lines: Vec<&str> = events.iter().filter(snapshot).filter(|e| e.get("detail").is_some()).filter_map(|e| e["message"].as_str()).collect();
+    assert_eq!(lines, skipped, "{events:#?}");
+}
+
+const NO_LOCK_PRIVILEGE: &str = "잠금 권한이 없어 다음 방법으로 내보냅니다.";
+const LOCK_NOT_IN_TIME: &str = "잠금을 제때 얻지 못해 다음 방법으로 내보냅니다.";
+
 /// Whether a session of `user` holds LOCK INSTANCE FOR BACKUP right now.
 fn holds_backup_lock(root: &Endpoint, user: &str) -> bool {
     let result = run(root, "query.execute", json!({"sql": format!(
@@ -540,9 +554,10 @@ fn auto_snapshot_falls_back_to_single_connection_without_lock_tables() {
     let Some(root) = mysql_root() else { return };
     let (db, user) = ("tf_auto_single", "tf_auto_plain");
     let _guard = auto_fixture(&root, db, &[user], &[sees_everything(user, db)]);
-    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
+    let (events, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
     assert_resolved(&result, &manifest_of(db, "auto"), "single_connection", "mysql_single_connection_consistent_snapshot",
         json!([{"mode": "parallel_strict", "reason": "privilege"}, {"mode": "parallel_table_lock", "reason": "privilege"}]), 1);
+    assert_snapshot_events(&events, &result, &[NO_LOCK_PRIVILEGE, NO_LOCK_PRIVILEGE]);
     assert_eq!(result["strict_export"], true, "one consistent transaction is a strict export: {result}");
     assert_eq!(result["rows_dumped"], 7);
 }
@@ -656,10 +671,11 @@ fn auto_snapshot_table_lock_timeout_falls_to_one_connection_never_unsynchronized
     for sql in ["START TRANSACTION", "INSERT INTO parent VALUES (9, 'open')"] {
         holder.execute_sql(sql).unwrap();
     }
-    let (_, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
+    let (events, result) = auto_export(&user_in(&root, user, db), db, "auto", json!({}));
     holder.execute_sql("ROLLBACK").unwrap();
     assert_resolved(&result, &manifest_of(db, "auto"), "single_connection", "mysql_single_connection_consistent_snapshot",
         json!([{"mode": "parallel_strict", "reason": "privilege"}, {"mode": "parallel_table_lock", "reason": "lock_timeout"}]), 1);
+    assert_snapshot_events(&events, &result, &[NO_LOCK_PRIVILEGE, LOCK_NOT_IN_TIME]);
     assert_eq!(result["strict_export"], true, "{result}");
     assert_eq!(result["rows_dumped"], 7, "the open transaction stays outside the snapshot");
 }
@@ -685,9 +701,10 @@ fn too_many_connections_advances_chain() {
 #[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
 fn auto_snapshot_clamps_workers_to_max_user_connections() {
     let Some(root) = mysql_root() else { return };
-    let (db, user) = ("tf_auto_clamped", "tf_auto_clamped");
+    // The '@' in the name: USER() is `tf_auto@clamped@host`, so the probe must cut at the last one.
+    let (db, user) = ("tf_auto_clamped", "tf_auto@clamped");
     // Five sessions: the probe counts itself, the coordinator and its watchdog take two, three
-    // are left. The strict method works first time, so no closing session races the limit.
+    // are left. Miscounting the probe would ask for four workers and miss the strict method.
     let _guard = auto_fixture(&root, db, &[user], &[
         sees_everything(user, db),
         format!("GRANT RELOAD, BACKUP_ADMIN ON *.* TO '{user}'@'%'"),
@@ -728,6 +745,36 @@ fn export_without_trigger_privilege_is_not_strict() {
     let (_, result) = auto_export(&user_in(&root, seer, db), db, "seer_child", single(json!(["child"])));
     assert_eq!(result["strict_export"], true, "{result}");
     assert_eq!(visibility(&result), None);
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn table_subset_export_needs_select_on_each_whole_table() {
+    // B1: information_schema shows a column-granted account only those columns, so its dump of
+    // the table would lack the others; a replace import would then drop them.
+    let Some(root) = mysql_root() else { return };
+    let (db, tabled, columned) = ("tf_export_column_grants", "tf_export_tabled", "tf_export_columned");
+    let _guard = auto_fixture(&root, db, &[tabled, columned], &[
+        format!("GRANT SELECT, TRIGGER ON {db}.parent TO '{tabled}'@'%'"),
+        format!("GRANT TRIGGER ON {db}.parent TO '{columned}'@'%'"),
+        format!("GRANT SELECT (id) ON {db}.parent TO '{columned}'@'%'"),
+    ]);
+    let single = json!({"tables": ["parent"], "mysql_snapshot_mode": "single_connection"});
+    let visibility = |result: &Value| result["manifest_warnings"].as_array().unwrap().iter()
+        .filter_map(Value::as_str).find(|w| w.starts_with("The export account's privileges do not prove")).map(str::to_string);
+
+    // A table grant covers every column of that table.
+    let (_, result) = auto_export(&user_in(&root, tabled, db), db, "tabled", single.clone());
+    assert_eq!(result["strict_export"], true, "{result}");
+    assert_eq!(visibility(&result), None);
+
+    // A column grant never proves the table complete; an export that runs at all says so.
+    let events = dump_events(&user_in(&root, columned, db), auto_payload(db, "columned", single));
+    if let Some(result) = events.iter().find(|e| e["event"] == "result") {
+        assert_eq!(result["strict_export"], false, "{result}");
+        assert!(visibility(result).is_some_and(|w| w.contains("columns")), "{result}");
+        assert_eq!(manifest_of(db, "columned")["strict_export"], false);
+    }
 }
 
 #[test]

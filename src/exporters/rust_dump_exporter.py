@@ -42,6 +42,11 @@ MYSQL_SNAPSHOT_MODES = frozenset({
 })
 # Where "auto" ends when no shared lock works; unsynchronized only by explicit choice.
 MYSQL_SNAPSHOT_FALLBACKS = frozenset({"single_connection", "parallel_unsynchronized"})
+# service.hello lists it when dump.run takes "auto"; an older core would refuse every export.
+MYSQL_SNAPSHOT_AUTO_CAPABILITY = "dump.run.mysql_snapshot_auto"
+_AUTO_SNAPSHOT_UNSUPPORTED = (
+    "이 Rust DB Core는 내보내기 방법 자동 선택을 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."
+)
 _ONE_CONNECTION_MODES = frozenset({"single_connection", "parallel_no_backup_lock"})
 
 # How the completion line names the MySQL method that ran (the core's resolved
@@ -359,6 +364,10 @@ class RustDumpExporter(_RustDumpClientBase):
             )
         if mysql_snapshot_fallback not in MYSQL_SNAPSHOT_FALLBACKS:
             raise ValueError(f"unsupported mysql_snapshot_fallback: {mysql_snapshot_fallback}")
+        if normalized_snapshot_mode == "auto" and MYSQL_SNAPSHOT_AUTO_CAPABILITY not in (
+            self.facade.hello().get("capabilities") or []
+        ):
+            return False, _AUTO_SNAPSHOT_UNSUPPORTED
         effective_threads = (
             1 if normalized_snapshot_mode == "single_connection"
             else max(1, int(threads))
@@ -408,12 +417,15 @@ class RustDumpExporter(_RustDumpClientBase):
         method = describe_snapshot_method(result, effective_threads)
         if method:
             message += f" · {method}"
-        warnings = [str(warning) for warning in result.get("manifest_warnings", [])]
-        for warning in warnings:
+        # The core's own wording stays in the raw output (the result event) and the log.
+        lines = []
+        for warning in result.get("manifest_warnings", []):
+            logger.info("Export manifest warning: %s", warning)
+            lines.append(f"Export 경고: {describe_manifest_warning(str(warning))}")
             if callbacks.progress:
-                callbacks.progress(f"Export warning: {warning}")
-        if warnings:
-            message += "\n" + "\n".join(f"Export warning: {warning}" for warning in warnings)
+                callbacks.progress(lines[-1])
+        if lines:
+            message += "\n" + "\n".join(lines)
         return True, message
 
     def export_full_schema(
@@ -624,7 +636,7 @@ CORE_CODE_SENTENCES = {
     "unsynchronized_snapshot": "덤프의 테이블들이 같은 시점에 내보내지지 않아 서로 맞지 않을 수 있습니다.",
     "views_outside_snapshot": "뷰 정의는 테이블 데이터와 같은 시점에 담기지 않았습니다.",
     "omitted_object": "내보낼 때 일부 객체가 빠졌습니다.",
-    "visibility_unproven": "내보낸 계정의 권한으로는 트리거, 저장 프로시저·함수, 예약 이벤트, 테이블이 모두 보였는지 알 수 없어 덤프에 빠진 것이 있을 수 있습니다.",
+    "visibility_unproven": "내보낸 계정의 권한으로는 트리거, 저장 프로시저·함수, 예약 이벤트, 테이블과 열이 모두 보였는지 알 수 없어 덤프에 빠진 것이 있을 수 있습니다.",
     "source_dump_warning": "덤프를 만들 때 남긴 경고가 있습니다.",
     "not_strict": "이 덤프는 완전한 백업으로 표시되어 있지 않습니다. 내보낼 때의 한계가 그대로 남습니다.",
     "legacy_timezone": "예전 덤프라 시간대가 기록되어 있지 않습니다. 고른 시간대나 대상 서버 기본값으로 시간을 읽습니다.",
@@ -654,6 +666,29 @@ def describe_core_code(code: object, name: object = "") -> Optional[str]:
         return None
     sentence = translate_text(sentence)
     return f"{name}: {sentence}" if name else sentence
+
+
+# How the core's manifest warnings begin (adapters.rs WARNING_*) and the code Import gives
+# them (import.rs manifest_warning_code).
+_MANIFEST_WARNING_CODES = (
+    ("Workers used independent snapshots", "unsynchronized_snapshot"),
+    ("View definitions were collected outside the table data snapshot", "views_outside_snapshot"),
+    ("Object not exported:", "omitted_object"),
+    ("Non-transactional tables excluded from export:", "omitted_object"),
+    ("The export account's privileges do not prove it sees every object", "visibility_unproven"),
+)
+
+
+def describe_manifest_warning(warning: str) -> str:
+    """The sentence for one manifest warning; an omitted object keeps its name and an unknown
+    warning its text, e.g. "내보낼 때 일부 객체가 빠졌습니다. (trigger:orders:trg)"."""
+    code, detail = "source_dump_warning", warning
+    for prefix, known in _MANIFEST_WARNING_CODES:
+        if warning.startswith(prefix):
+            code, detail = known, (warning[len(prefix):].strip() if known == "omitted_object" else "")
+            break
+    sentence = describe_core_code(code)
+    return f"{sentence} ({detail})" if detail else sentence
 
 
 def describe_core_failure(message: object) -> Optional[str]:

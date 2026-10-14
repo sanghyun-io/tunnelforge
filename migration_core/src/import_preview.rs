@@ -264,39 +264,85 @@ fn can_create_namespace(admin: &mut LiveAdapter, endpoint: &Endpoint) -> Result<
 }
 
 pub(crate) fn mysql_grants_allow(conn: &mut mysql::PooledConn, privilege: &str, database: Option<&str>) -> Option<bool> {
-    let grants: Vec<String> = conn.query("SHOW GRANTS FOR CURRENT_USER").ok()?;
-    // With partial_revokes on, `%` and `_` in database grants are plain characters. Servers
-    // before 8.0.16 have no such variable and always treat them as wildcards.
-    let wildcards = conn.query_first::<i64, _>("SELECT @@global.partial_revokes").ok().flatten() != Some(1);
-    let folds = mysql_folds_table_names(conn).ok()?;
-    let fold = |text: &str| if folds { text.to_lowercase() } else { text.to_string() };
-    let grants = grants.iter().map(|grant| fold(grant)).collect::<Vec<_>>();
-    grants_allow(&grants, privilege, database.map(fold).as_deref(), wildcards)
+    let level = if database.is_some() { GrantLevel::Database } else { GrantLevel::Global };
+    MysqlGrants::load(conn)?.allow(privilege, database, level)
 }
 
-/// Whether SHOW GRANTS gives `privilege` on `*.*`, or on a database pattern matching `database`.
-/// None when a partial revoke, or a role whose grants are not listed, could change the answer.
-fn grants_allow(grants: &[String], privilege: &str, database: Option<&str>, wildcards: bool) -> Option<bool> {
+/// Where a grant has to sit to answer the question.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GrantLevel<'a> {
+    /// `*.*` only. A partial revoke on the database still counts against it.
+    Global,
+    /// `*.*`, or a database pattern matching the database.
+    Database,
+    /// Also `database`.`table` itself; column grants never count.
+    Table(&'a str),
+}
+
+/// The current account's SHOW GRANTS, read once and then asked without the server.
+pub(crate) struct MysqlGrants {
+    pub(crate) lines: Vec<String>,
+    /// With partial_revokes on, `%` and `_` in database grants are plain characters.
+    pub(crate) wildcards: bool,
+    /// lower_case_table_names: names are compared folded.
+    pub(crate) folds: bool,
+}
+
+impl MysqlGrants {
+    pub(crate) fn load(conn: &mut mysql::PooledConn) -> Option<Self> {
+        let lines: Vec<String> = conn.query("SHOW GRANTS FOR CURRENT_USER").ok()?;
+        // Servers before 8.0.16 have no such variable and always treat them as wildcards.
+        let wildcards = conn.query_first::<i64, _>("SELECT @@global.partial_revokes").ok().flatten() != Some(1);
+        let folds = mysql_folds_table_names(conn).ok()?;
+        let lines = lines.iter().map(|line| if folds { line.to_lowercase() } else { line.clone() }).collect();
+        Some(Self { lines, wildcards, folds })
+    }
+
+    pub(crate) fn allow(&self, privilege: &str, database: Option<&str>, level: GrantLevel) -> Option<bool> {
+        let fold = |text: &str| if self.folds { text.to_lowercase() } else { text.to_string() };
+        let table = match level { GrantLevel::Table(table) => fold(table), _ => String::new() };
+        let level = if let GrantLevel::Table(_) = level { GrantLevel::Table(&table) } else { level };
+        grants_allow(&self.lines, privilege, database.map(fold).as_deref(), level, self.wildcards)
+    }
+}
+
+/// Whether SHOW GRANTS gives `privilege` at `level` for `database`. None when a partial revoke
+/// of it on that database (any database when none is named), or a role whose grants are not
+/// listed, could change the answer.
+fn grants_allow(grants: &[String], privilege: &str, database: Option<&str>, level: GrantLevel, wildcards: bool) -> Option<bool> {
     let (mut granted, mut roles) = (false, false);
+    let on_database = |pattern: &str| database.is_some_and(|database| grant_pattern_matches(pattern, database, wildcards));
     for grant in grants {
         let grant = grant.trim();
         let upper = grant.to_ascii_uppercase();
-        if upper.starts_with("REVOKE ") {
-            return None;
-        }
-        if !upper.starts_with("GRANT ") {
+        let revoke = upper.starts_with("REVOKE ");
+        if !revoke && !upper.starts_with("GRANT ") {
             continue;
         }
         let Some(on) = upper.find(" ON ") else {
-            roles = true;
+            roles |= !revoke;
             continue;
         };
-        let Some(to) = upper[on..].find(" TO ").map(|offset| on + offset) else { continue };
-        let scope = grant[on + 4..to].trim();
-        let applies = scope == "*.*" || database.is_some_and(|database| {
-            scope.strip_suffix(".*").is_some_and(|pattern| grant_pattern_matches(pattern, database, wildcards))
-        });
-        granted |= applies && upper[6..on].split(',').map(str::trim).any(|name| name == "ALL PRIVILEGES" || name == privilege);
+        let Some(end) = upper[on..].find(if revoke { " FROM " } else { " TO " }).map(|offset| on + offset) else { continue };
+        let scope = grant[on + 4..end].trim();
+        let lists = upper[if revoke { 7 } else { 6 }..on].split(',').map(str::trim)
+            .any(|name| name == "ALL PRIVILEGES" || name == privilege);
+        if revoke {
+            // Partial revokes are database-level; one on another database leaves the answer alone.
+            if lists && (database.is_none() || scope.strip_suffix(".*").is_some_and(on_database)) {
+                return None;
+            }
+            continue;
+        }
+        let applies = scope == "*.*" || match level {
+            GrantLevel::Global => false,
+            GrantLevel::Database => scope.strip_suffix(".*").is_some_and(on_database),
+            // A table grant names the database literally, never as a pattern.
+            GrantLevel::Table(table) => scope.strip_suffix(".*").is_some_and(on_database) || database.is_some_and(|database| {
+                scope == format!("{}.{}", quote_ident("mysql", database), quote_ident("mysql", table))
+            }),
+        };
+        granted |= applies && lists;
     }
     if granted { Some(true) } else if roles { None } else { Some(false) }
 }
@@ -324,30 +370,70 @@ mod tests {
 
     #[test]
     fn grants_decide_create_and_system_user_or_say_they_cannot() {
+        use GrantLevel::{Database, Global};
         let grants = |lines: &[&str]| lines.iter().map(|line| line.to_string()).collect::<Vec<_>>();
         let global = grants(&["GRANT SELECT, CREATE, DROP ON *.* TO `u`@`%`"]);
-        assert_eq!(grants_allow(&global, "CREATE", Some("anything"), true), Some(true));
-        assert_eq!(grants_allow(&global, "SYSTEM_USER", None, true), Some(false));
+        assert_eq!(grants_allow(&global, "CREATE", Some("anything"), Database, true), Some(true));
+        assert_eq!(grants_allow(&global, "SYSTEM_USER", None, Global, true), Some(false));
         let scoped = grants(&["GRANT USAGE ON *.* TO `u`@`%`", "GRANT ALL PRIVILEGES ON `app\\_%`.* TO `u`@`%`"]);
-        assert_eq!(grants_allow(&scoped, "CREATE", Some("app_new"), true), Some(true));
-        assert_eq!(grants_allow(&scoped, "CREATE", Some("appXnew"), true), Some(false), "an escaped _ is literal");
-        assert_eq!(grants_allow(&scoped, "CREATE", Some("other"), true), Some(false));
-        assert_eq!(grants_allow(&scoped, "SYSTEM_USER", None, true), Some(false), "a database grant never gives a global privilege");
-        assert_eq!(grants_allow(&grants(&["GRANT CREATE VIEW, CREATE ROUTINE ON *.* TO `u`@`%`"]), "CREATE", Some("app"), true), Some(false));
-        assert_eq!(grants_allow(&grants(&["GRANT APPLICATION_PASSWORD_ADMIN,SYSTEM_USER ON *.* TO `root`@`%`"]), "SYSTEM_USER", None, true), Some(true));
-        assert_eq!(grants_allow(&grants(&["GRANT USAGE ON *.* TO `u`@`%`", "GRANT `dba`@`%` TO `u`@`%`"]), "CREATE", Some("app"), true), None);
-        assert_eq!(grants_allow(&grants(&["GRANT CREATE ON *.* TO `u`@`%`", "REVOKE CREATE ON `app`.* FROM `u`@`%`"]), "CREATE", Some("app"), true), None);
-        assert_eq!(grants_allow(&grants(&["GRANT DROP ON `app`.`orders` TO `u`@`%`"]), "DROP", Some("app"), true), Some(false), "a table grant is not database-wide");
+        assert_eq!(grants_allow(&scoped, "CREATE", Some("app_new"), Database, true), Some(true));
+        assert_eq!(grants_allow(&scoped, "CREATE", Some("appXnew"), Database, true), Some(false), "an escaped _ is literal");
+        assert_eq!(grants_allow(&scoped, "CREATE", Some("other"), Database, true), Some(false));
+        assert_eq!(grants_allow(&scoped, "SYSTEM_USER", None, Global, true), Some(false), "a database grant never gives a global privilege");
+        assert_eq!(grants_allow(&scoped, "CREATE", Some("app_new"), Global, true), Some(false), "nor a server-wide one");
+        assert_eq!(grants_allow(&grants(&["GRANT CREATE VIEW, CREATE ROUTINE ON *.* TO `u`@`%`"]), "CREATE", Some("app"), Database, true), Some(false));
+        assert_eq!(grants_allow(&grants(&["GRANT APPLICATION_PASSWORD_ADMIN,SYSTEM_USER ON *.* TO `root`@`%`"]), "SYSTEM_USER", None, Global, true), Some(true));
+        assert_eq!(grants_allow(&grants(&["GRANT USAGE ON *.* TO `u`@`%`", "GRANT `dba`@`%` TO `u`@`%`"]), "CREATE", Some("app"), Database, true), None);
+        assert_eq!(grants_allow(&grants(&["GRANT DROP ON `app`.`orders` TO `u`@`%`"]), "DROP", Some("app"), Database, true), Some(false), "a table grant is not database-wide");
         assert!(grant_pattern_matches("`a``b`", "a`b", true));
         assert!(grant_pattern_matches("`tf_test`", "tf-test", true), "an unescaped _ matches any character, as in MySQL");
     }
 
     #[test]
+    fn only_a_partial_revoke_of_the_privilege_on_the_database_leaves_grants_unproven() {
+        use GrantLevel::{Database, Global};
+        let grants = |revoke: &str| vec!["GRANT SELECT, CREATE, TRIGGER ON *.* TO `u`@`%`".to_string(), revoke.to_string()];
+        let on_app = grants("REVOKE CREATE ON `app`.* FROM `u`@`%`");
+        assert_eq!(grants_allow(&on_app, "CREATE", Some("app"), Database, false), None);
+        assert_eq!(grants_allow(&on_app, "CREATE", Some("app"), Global, false), None, "the revoke narrows *.* for app too");
+        assert_eq!(grants_allow(&on_app, "CREATE", None, Global, false), None, "no database named: any revoke of it counts");
+        assert_eq!(grants_allow(&on_app, "SELECT", Some("app"), Database, false), Some(true), "another privilege is not revoked");
+        let elsewhere = grants("REVOKE SELECT, CREATE ON `other`.* FROM `u`@`%`");
+        assert_eq!(grants_allow(&elsewhere, "SELECT", Some("app"), Database, false), Some(true));
+        assert_eq!(grants_allow(&elsewhere, "SELECT", Some("app"), Global, false), Some(true));
+        let all = grants("REVOKE ALL PRIVILEGES ON `app`.* FROM `u`@`%`");
+        assert_eq!(grants_allow(&all, "TRIGGER", Some("app"), Database, false), None);
+        assert_eq!(grants_allow(&all, "TRIGGER", Some("other"), Database, false), Some(true));
+    }
+
+    #[test]
+    fn table_grants_count_only_for_that_table_and_column_grants_never() {
+        use GrantLevel::{Database, Table};
+        let grants = vec![
+            "GRANT USAGE ON *.* TO `u`@`%`".to_string(),
+            "GRANT SELECT, TRIGGER ON `app`.`users` TO `u`@`%`".to_string(),
+            "GRANT SELECT (`id`, `name`), INSERT ON `app`.`orders` TO `u`@`%`".to_string(),
+            "GRANT SELECT ON `app_x`.`odd``name` TO `u`@`%`".to_string(),
+        ];
+        assert_eq!(grants_allow(&grants, "SELECT", Some("app"), Table("users"), true), Some(true));
+        assert_eq!(grants_allow(&grants, "TRIGGER", Some("app"), Table("users"), true), Some(true));
+        assert_eq!(grants_allow(&grants, "SELECT", Some("app"), Database, true), Some(false), "a table grant is not database-wide");
+        assert_eq!(grants_allow(&grants, "SELECT", Some("app"), Table("orders"), true), Some(false), "some columns only");
+        assert_eq!(grants_allow(&grants, "INSERT", Some("app"), Table("orders"), true), Some(true));
+        assert_eq!(grants_allow(&grants, "SELECT", Some("other"), Table("users"), true), Some(false));
+        assert_eq!(grants_allow(&grants, "SELECT", Some("appXx"), Table("odd`name"), true), Some(false), "a table grant's database is no pattern");
+        assert_eq!(grants_allow(&grants, "SELECT", Some("app_x"), Table("odd`name"), true), Some(true));
+        let folded = MysqlGrants { lines: grants.iter().map(|line| line.to_lowercase()).collect(), wildcards: true, folds: true };
+        assert_eq!(folded.allow("SELECT", Some("APP"), Table("Users")), Some(true), "lower_case_table_names folds both sides");
+    }
+
+    #[test]
     fn partial_revokes_make_grant_wildcards_plain_characters() {
+        use GrantLevel::Database;
         let grants = vec!["GRANT ALL PRIVILEGES ON `app_%`.* TO `u`@`%`".to_string()];
-        assert_eq!(grants_allow(&grants, "CREATE", Some("app_new"), true), Some(true));
-        assert_eq!(grants_allow(&grants, "CREATE", Some("app_new"), false), Some(false));
-        assert_eq!(grants_allow(&grants, "CREATE", Some("app_%"), false), Some(true));
+        assert_eq!(grants_allow(&grants, "CREATE", Some("app_new"), Database, true), Some(true));
+        assert_eq!(grants_allow(&grants, "CREATE", Some("app_new"), Database, false), Some(false));
+        assert_eq!(grants_allow(&grants, "CREATE", Some("app_%"), Database, false), Some(true));
         assert!(grant_pattern_matches("`app\\_%`", "app_%", false), "an escape still names the character itself");
         assert!(!grant_pattern_matches("`tf_test`", "tf-test", false));
     }

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use crate::*;
+use crate::import::import_preview::{GrantLevel, MysqlGrants};
 
 /// dump.run / dump.import 요청에 threads가 명시되지 않았을 때 사용하는 기본 워커 수.
 pub(crate) const DEFAULT_DUMP_THREADS: usize = 8;
@@ -143,8 +144,9 @@ impl MysqlSnapshotRequest {
 
 /// Codes after which a later method of the automatic chain can still work: a missing
 /// privilege, a backup lock this server does not know (1064/1235, only for that
-/// statement), a connection limit, or a lock not granted in time (1205, or 1317 after
-/// the watchdog's KILL QUERY; TF-STATUS-185).
+/// statement), a connection limit, or a lock not granted in time (1205, 1317 after
+/// the watchdog's KILL QUERY, or 1213 when the lock wait was chosen as a deadlock
+/// victim; TF-STATUS-185).
 fn mysql_snapshot_fallback_reason(err: &mysql::Error, backup_lock_statement: bool) -> Option<&'static str> {
     let mysql::Error::MySqlError(server_error) = err else {
         return None;
@@ -153,7 +155,7 @@ fn mysql_snapshot_fallback_reason(err: &mysql::Error, backup_lock_statement: boo
         1044 | 1045 | 1142 | 1227 => Some("privilege"),
         1064 | 1235 if backup_lock_statement => Some("unsupported"),
         1040 | 1203 | 1226 => Some("connection_limit"),
-        1205 | 1317 => Some("lock_timeout"),
+        1205 | 1213 | 1317 => Some("lock_timeout"),
         _ => None,
     }
 }
@@ -201,17 +203,19 @@ enum SnapshotLock {
     Tables { lock_sql: String, backup_locked: Option<mysql::PooledConn> },
 }
 
-/// A snapshot session; the raw mysql error keeps its code for the fallback chain.
+/// A snapshot session; the raw mysql error keeps its code for the fallback chain. The
+/// account's limit is tried twice: sessions the previous method (or a probe) just
+/// closed may count against it for a moment after they quit.
 fn mysql_snapshot_connection(endpoint: &Endpoint) -> Result<mysql::PooledConn, SnapshotFailure> {
-    mysql::Pool::new(mysql_opts(endpoint))
-        .and_then(|pool| pool.get_conn())
-        .map_err(|err| {
-            let suffix = tls_error_suffix(classify_mysql_error(endpoint, &err));
-            SnapshotFailure::new(
-                format!("mysql connection error: {err}{suffix}"),
-                mysql_snapshot_fallback_reason(&err, false),
-            )
+    mysql_conn_raw(endpoint)
+        .or_else(|err| match &err {
+            mysql::Error::MySqlError(server_error) if matches!(server_error.code, 1203 | 1226) => {
+                thread::sleep(Duration::from_millis(250));
+                mysql_conn_raw(endpoint)
+            }
+            _ => Err(err),
         })
+        .map_err(|err| SnapshotFailure::new(mysql_conn_error(endpoint, &err), mysql_snapshot_fallback_reason(&err, false)))
 }
 
 /// Workers the account's connection limit leaves room for. A strict snapshot holds
@@ -230,9 +234,10 @@ fn mysql_connection_budget(threads: usize, max_user_connections: u64, own_sessio
 /// request is kept, and a limit hit later still moves the automatic chain on.
 fn mysql_threads_within_connection_limit(endpoint: &Endpoint, threads: usize) -> usize {
     // ponytail: user-name match, refine per host if it misfires
+    // USER() is `name@host` and a name may hold '@' itself, so the host starts after the last one.
     let probe = mysql_connection(endpoint).and_then(|mut conn| {
         conn.query_first::<(u64, u64), _>(
-            "SELECT @@session.max_user_connections, (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = SUBSTRING_INDEX(USER(), '@', 1))",
+            "SELECT @@session.max_user_connections, (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = LEFT(USER(), CHAR_LENGTH(USER()) - CHAR_LENGTH(SUBSTRING_INDEX(USER(), '@', -1)) - 1))",
         )
         .map_err(|err| err.to_string())
     });
@@ -431,7 +436,7 @@ impl MysqlSharedSnapshot {
     fn acquire_lock_free(endpoint: &Endpoint, worker_count: usize) -> Result<Self, String> {
         let started = Instant::now();
         let mut workers = (0..worker_count.max(1))
-            .map(|_| mysql_connection(endpoint))
+            .map(|_| mysql_snapshot_connection(endpoint).map_err(|failure| failure.message))
             .collect::<Result<Vec<_>, _>>()?;
         for worker in &mut workers {
             for sql in mysql_snapshot_worker_setup_sql() {
@@ -1089,27 +1094,35 @@ fn mysql_non_transactional_objects(endpoint: &Endpoint, schema: &NormalizedSchem
 }
 
 /// B1: information_schema lists only what the account may see, so without these
-/// grants a dump looks complete while it lacks triggers, routines, events or tables
-/// the account cannot see. Returns the object kinds the grants do not prove visible;
-/// `granted(privilege, on_database)` answers for `*.*`, or also for the export
-/// database. Routines and events, like the table list, are only in scope for a full
-/// export.
-fn mysql_unproven_visibility(mut granted: impl FnMut(&str, bool) -> bool, full_export: bool) -> Vec<&'static str> {
+/// grants a dump looks complete while it lacks triggers, routines, events, tables or
+/// columns the account cannot see. Returns the object kinds `grants` do not prove
+/// visible in `database`. A full export needs them database-wide; a table subset may
+/// hold SELECT and TRIGGER table by table (a column grant shows only its columns).
+/// Routines and events, like the table list, are only in scope for a full export.
+fn mysql_unproven_visibility(grants: Option<&MysqlGrants>, database: &str, tables: &[&str], full_export: bool) -> Vec<&'static str> {
+    let granted = |privilege: &str, level: GrantLevel| {
+        grants.and_then(|grants| grants.allow(privilege, Some(database), level)) == Some(true)
+    };
+    let in_scope = |privilege: &str| if full_export {
+        granted(privilege, GrantLevel::Database)
+    } else {
+        tables.iter().all(|&table| granted(privilege, GrantLevel::Table(table)))
+    };
     let mut unproven = Vec::new();
-    if !granted("TRIGGER", true) {
+    if !in_scope("TRIGGER") {
         unproven.push("triggers (TRIGGER)");
     }
+    if !in_scope("SELECT") {
+        unproven.push(if full_export { "tables (SELECT on the whole database)" } else { "columns (SELECT on each exported table)" });
+    }
     if full_export {
-        if !granted("SELECT", true) {
-            unproven.push("tables (SELECT on the whole database)");
-        }
-        let sees_routines = granted("SELECT", false)
-            || granted("SHOW_ROUTINE", false)
-            || ["EXECUTE", "CREATE ROUTINE", "ALTER ROUTINE"].into_iter().any(|privilege| granted(privilege, true));
+        let sees_routines = granted("SELECT", GrantLevel::Global)
+            || granted("SHOW_ROUTINE", GrantLevel::Global)
+            || ["EXECUTE", "CREATE ROUTINE", "ALTER ROUTINE"].into_iter().any(|privilege| granted(privilege, GrantLevel::Database));
         if !sees_routines {
             unproven.push("routines (SHOW_ROUTINE, global SELECT or EXECUTE)");
         }
-        if !granted("EVENT", true) {
+        if !granted("EVENT", GrantLevel::Database) {
             unproven.push("events (EVENT)");
         }
     }
@@ -1117,19 +1130,14 @@ fn mysql_unproven_visibility(mut granted: impl FnMut(&str, bool) -> bool, full_e
 }
 
 /// The manifest warning for B1, or None when the account's own grants prove that it
-/// sees every object in scope. Grants through roles or partial revokes cannot prove it.
-fn mysql_visibility_warning(endpoint: &Endpoint, full_export: bool) -> Option<String> {
-    let database = endpoint_schema(endpoint);
-    let unproven = match mysql_connection(endpoint) {
-        Ok(mut conn) => mysql_unproven_visibility(
-            |privilege, on_database| {
-                crate::import::import_preview::mysql_grants_allow(&mut conn, privilege, on_database.then_some(database.as_str()))
-                    == Some(true)
-            },
-            full_export,
-        ),
+/// sees every object in scope. Grants through roles, or a partial revoke on the export
+/// database, cannot prove it. SHOW GRANTS is read once.
+fn mysql_visibility_warning(endpoint: &Endpoint, tables: &[&str], full_export: bool) -> Option<String> {
+    let grants = match mysql_connection(endpoint) {
+        Ok(mut conn) => MysqlGrants::load(&mut conn),
         Err(err) => return Some(format!("{WARNING_VISIBILITY_UNPROVEN} the privilege check failed ({err})")),
     };
+    let unproven = mysql_unproven_visibility(grants.as_ref(), &endpoint_schema(endpoint), tables, full_export);
     (!unproven.is_empty()).then(|| format!("{WARNING_VISIBILITY_UNPROVEN} {}", unproven.join(", ")))
 }
 
@@ -1249,7 +1257,8 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         .map(|object| format!("{WARNING_OBJECT_NOT_EXPORTED} {object}"))
         .collect();
     if endpoint.engine == "mysql" {
-        export_warnings.extend(mysql_visibility_warning(&endpoint, full_export));
+        let tables: Vec<&str> = schema.tables.iter().map(|table| table.name.as_str()).collect();
+        export_warnings.extend(mysql_visibility_warning(&endpoint, &tables, full_export));
     }
     prepare_dump_output_dir(output_path, options.overwrite)?;
 
@@ -3072,7 +3081,7 @@ mod tests {
         for (code, reason) in [
             (1044_u16, "privilege"), (1045, "privilege"), (1142, "privilege"), (1227, "privilege"),
             (1040, "connection_limit"), (1203, "connection_limit"), (1226, "connection_limit"),
-            (1205, "lock_timeout"), (1317, "lock_timeout"),
+            (1205, "lock_timeout"), (1213, "lock_timeout"), (1317, "lock_timeout"),
         ] {
             assert_eq!(mysql_snapshot_fallback_reason(&error(code), false), Some(reason), "{code}");
             assert_eq!(mysql_snapshot_fallback_reason(&error(code), true), Some(reason), "{code}");
@@ -3101,23 +3110,35 @@ mod tests {
 
     #[test]
     fn export_visibility_needs_grants_for_every_object_kind_in_scope() {
-        let unproven = |grants: &[(&str, bool)], full_export: bool| {
-            // (privilege, true) is a grant on the export database; (privilege, false) on *.*.
-            mysql_unproven_visibility(
-                |privilege, on_database| grants.iter().any(|&(granted, database_only)| granted == privilege && (on_database || !database_only)),
-                full_export,
-            )
+        // SHOW GRANTS lines of an account on the export database `app`; `tables` empty is a full export.
+        let unproven = |lines: &[&str], tables: &[&str]| {
+            let grants = MysqlGrants { lines: lines.iter().map(|line| line.to_string()).collect(), wildcards: true, folds: false };
+            mysql_unproven_visibility(Some(&grants), "app", tables, tables.is_empty())
         };
-        let reader = [("SELECT", true), ("LOCK TABLES", true)];
-        assert_eq!(unproven(&reader, false), ["triggers (TRIGGER)"]);
-        assert_eq!(unproven(&reader, true).len(), 3, "triggers, routines and events");
-        let seer = [("SELECT", true), ("TRIGGER", true), ("EVENT", true), ("EXECUTE", true)];
-        assert!(unproven(&seer, true).is_empty());
-        let global = [("SELECT", false), ("TRIGGER", false), ("EVENT", false)];
-        assert!(unproven(&global, true).is_empty(), "global SELECT shows every routine");
-        let no_database_select = [("TRIGGER", true), ("SHOW_ROUTINE", false), ("EVENT", true)];
-        assert_eq!(unproven(&no_database_select, true), ["tables (SELECT on the whole database)"]);
-        assert!(unproven(&no_database_select, false).is_empty(), "a table subset names its own tables");
+        let reader = ["GRANT SELECT, LOCK TABLES ON `app`.* TO `u`@`%`"];
+        assert_eq!(unproven(&reader, &["users"]), ["triggers (TRIGGER)"]);
+        assert_eq!(unproven(&reader, &[]).len(), 3, "triggers, routines and events");
+        assert!(unproven(&["GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `app`.* TO `u`@`%`"], &[]).is_empty());
+        assert!(unproven(&["GRANT SELECT, TRIGGER, EVENT ON *.* TO `u`@`%`"], &[]).is_empty(), "global SELECT shows every routine");
+        let no_database_select = ["GRANT SHOW_ROUTINE ON *.* TO `u`@`%`", "GRANT TRIGGER, EVENT ON `app`.* TO `u`@`%`"];
+        assert_eq!(unproven(&no_database_select, &[]), ["tables (SELECT on the whole database)"]);
+        assert_eq!(unproven(&no_database_select, &["users"]), ["columns (SELECT on each exported table)"],
+            "every export needs SELECT: a visible table may still hide columns");
+
+        // A table subset may be granted table by table; a column grant shows only its columns.
+        let by_table = ["GRANT USAGE ON *.* TO `u`@`%`", "GRANT SELECT, TRIGGER ON `app`.`users` TO `u`@`%`",
+            "GRANT SELECT (`id`, `name`), TRIGGER ON `app`.`orders` TO `u`@`%`"];
+        assert!(unproven(&by_table, &["users"]).is_empty());
+        assert_eq!(unproven(&by_table, &["users", "orders"]), ["columns (SELECT on each exported table)"]);
+        assert_eq!(unproven(&by_table, &["users", "audit"]), ["triggers (TRIGGER)", "columns (SELECT on each exported table)"]);
+        assert_eq!(unproven(&by_table, &[]).len(), 4, "a full export needs the whole database");
+
+        // Only a partial revoke on the export database leaves visibility unproven.
+        let everything = "GRANT SELECT, TRIGGER, EVENT ON *.* TO `u`@`%`";
+        assert!(unproven(&[everything, "REVOKE SELECT ON `mysql`.* FROM `u`@`%`"], &[]).is_empty());
+        assert_eq!(unproven(&[everything, "REVOKE SELECT ON `app`.* FROM `u`@`%`"], &[]),
+            ["tables (SELECT on the whole database)", "routines (SHOW_ROUTINE, global SELECT or EXECUTE)"]);
+        assert_eq!(mysql_unproven_visibility(None, "app", &["users"], false).len(), 2, "unreadable grants prove nothing");
     }
 
     #[test]
