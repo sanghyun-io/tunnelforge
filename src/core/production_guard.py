@@ -41,6 +41,15 @@ class Environment(Enum):
         return cls.UNKNOWN
 
 
+# Import 전 확인 창(ImportPlanDialog)의 환경 이름
+ENV_NAMES = {
+    Environment.PRODUCTION: "운영 환경",
+    Environment.STAGING: "스테이징 환경",
+    Environment.DEVELOPMENT: "개발 환경",
+    Environment.UNKNOWN: "미분류 환경",
+}
+
+
 # SchemaConfirmDialog 스타일 상수 (ENV_COLORS와 별개로 중립적인 UI 색상)
 _NEUTRAL_BG = "#f8f9fa"
 _NEUTRAL_BORDER = "#dee2e6"

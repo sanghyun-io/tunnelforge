@@ -50,13 +50,14 @@ STATUS_COLORS = {
 REOPEN_WITH_SETTINGS = (jh.KIND_EXPORT_FULL, jh.KIND_EXPORT_TABLES)
 # Import 보고서가 있는 Dump 폴더에 복원/전환 저널이 남는다 → 그 폴더로 백업 관리를 연다.
 BACKUP_KINDS = (jh.KIND_IMPORT,)
-# 저널은 안전 복원(덮어쓰기 포함) Import 에만 남는다. mode 는 Import 모드 표시 텍스트로 시작한다.
-BACKUP_MODE_PREFIXES = ("안전 복원", "덮어쓰기")
+# 저널은 복사본을 만든 Import 에만 남는다. 예전 기록의 mode 는 "안전 복원"/"덮어쓰기"로 시작하고,
+# 지금 기록은 결과에서 정한 " · 복사본 검증"을 담는다 (job_recording.import_job_label).
+BACKUP_MODE_MARKERS = ("안전 복원", "덮어쓰기", "· 복사본 검증")
 
 
 def has_backup_journal(record: Optional[JobRecord]) -> bool:
     return bool(record and record.kind in BACKUP_KINDS and record.report_path
-                and (record.mode or "").startswith(BACKUP_MODE_PREFIXES))
+                and any(marker in (record.mode or "") for marker in BACKUP_MODE_MARKERS))
 
 
 def format_duration(seconds: Optional[int]) -> str:

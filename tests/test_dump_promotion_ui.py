@@ -1,12 +1,12 @@
 import json
 from unittest.mock import MagicMock
 import pytest
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from src.core.db_core_service import DbCoreFacade
 from src.exporters.rust_dump_exporter import RustDumpConfig
 from src.ui.workers.rust_dump_worker import RustDumpWorker
-from src.ui.dialogs.db_import_dialog import RustDumpImportDialog, _promotion_review_text
+from src.ui.dialogs.db_import_dialog import RustDumpImportDialog
 
 
 @pytest.fixture
@@ -14,13 +14,24 @@ def promotion_dialog(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
     dialog = RustDumpImportDialog()
+    dialog._test_app = app  # keep the QApplication alive
     dialog.restore_config = RustDumpConfig("localhost", 3306, "operator", "secret")
     dialog.import_audit.update(restore_id="id1", report_path="report.json", verified=True,
-        original_unchanged=True, original_target={"engine": "mysql", "host": "localhost", "port": 3306, "database": "original"})
+        original_unchanged=True, original_target={"engine": "mysql", "host": "localhost", "port": 3306, "database": "original"},
+        candidate_target={"engine": "mysql", "host": "localhost", "port": 3306, "database": "tf_restore_1"})
     dialog._start_promotion = MagicMock()
-    dialog._confirm_promotion_guard = MagicMock(return_value=True)
     yield dialog
     dialog.close()
+
+
+def _stop_window(dialog):
+    boxes = [box for box in dialog.findChildren(QMessageBox) if box.isVisible()]
+    assert len(boxes) == 1
+    return boxes[0]
+
+
+def _visible_log(dialog):
+    return "\n".join(dialog.txt_log.item(index).text() for index in range(dialog.txt_log.count()))
 
 
 def test_promotion_facade_uses_explicit_command_and_confirmation_payload():
@@ -44,30 +55,6 @@ def test_promotion_worker_runs_dedicated_facade_and_returns_plan(monkeypatch):
     runner.facade.client.shutdown.assert_called_once()
 
 
-def test_promotion_requires_explicit_yes_and_preserves_plan_digest(promotion_dialog, monkeypatch):
-    question = MagicMock(return_value=QMessageBox.StandardButton.No)
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", question)
-    plan = {"can_promote": True, "plan_digest": "reviewed-digest"}
-    promotion_dialog._confirm_promotion(plan)
-    assert question.call_args.args[-1] == QMessageBox.StandardButton.No
-    promotion_dialog._start_promotion.assert_not_called()
-    question.return_value = QMessageBox.StandardButton.Yes
-    promotion_dialog._confirm_promotion(plan)
-    payload = promotion_dialog._start_promotion.call_args.args[0]
-    assert payload["action"] == "confirm"
-    assert payload["plan_digest"] == "reviewed-digest" and payload["overwrite_confirmed"] is True
-    assert payload["target"]["database"] == "original"
-    promotion_dialog._confirm_promotion_guard.assert_called_once_with(plan)
-
-
-def test_blocked_promotion_never_asks_to_overwrite(promotion_dialog, monkeypatch):
-    question = MagicMock()
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", question)
-    promotion_dialog._confirm_promotion({"can_promote": False, "plan_digest": "d", "blockers": ["incoming FK"]})
-    question.assert_not_called()
-    promotion_dialog._start_promotion.assert_not_called()
-
-
 def test_failed_cutover_does_not_claim_original_unchanged(promotion_dialog, monkeypatch):
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", lambda *args: None)
     promotion_dialog._promotion_action = "confirm"
@@ -75,11 +62,14 @@ def test_failed_cutover_does_not_claim_original_unchanged(promotion_dialog, monk
     assert promotion_dialog.import_audit["original_unchanged"] is None
     assert promotion_dialog.import_audit["restore_status"] == "promotion_outcome_unknown"
     assert promotion_dialog.import_success is False
-    assert "미확인" in promotion_dialog.label_status.text()
+    assert promotion_dialog.label_status.text() == "교체 결과를 확인하지 못했습니다 · 원본·백업·복사본 상태를 확인하세요"
+    box = _stop_window(promotion_dialog)
+    assert box.windowTitle() == "교체 결과를 확인하지 못했습니다" and "connection lost" not in box.text()
 
 
 def test_confirmed_unchanged_refusal_preserves_failure_details(promotion_dialog, monkeypatch):
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", lambda *args: None)
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
     promotion_dialog._promotion_action = "confirm"
     promotion_dialog._on_promotion_finished(False, "stale plan", {
         "status": "failed_original_unchanged", "original_unchanged": True,
@@ -87,7 +77,13 @@ def test_confirmed_unchanged_refusal_preserves_failure_details(promotion_dialog,
     })
     assert promotion_dialog.import_audit["original_unchanged"] is True
     assert promotion_dialog.import_audit["promotion_result"]["phase"] == "validation"
-    assert "차단" in promotion_dialog.label_status.text()
+    # The original is known to be unchanged: the one stop window, which says the copy is kept and where to clean it up.
+    box = _stop_window(promotion_dialog)
+    assert box.text().startswith("복사본 tf_restore_1에 넣고 검증했지만 다음 이유로 교체하지 않았습니다.")
+    assert "교체 직전에 다시 확인해 보니 교체를 막는 조건이 있었습니다." in box.text() and "stale plan" not in box.text()
+    assert "'복원 백업 관리'에서 정리" in box.text()
+    assert promotion_dialog.label_status.text() == "교체하지 않았습니다 · 원본은 그대로입니다"
+    assert "stale plan" in _visible_log(promotion_dialog)
 
 
 def test_verify_in_copy_stop_shows_the_coded_reason(promotion_dialog, monkeypatch):
@@ -101,7 +97,7 @@ def test_verify_in_copy_stop_shows_the_coded_reason(promotion_dialog, monkeypatc
                         *describe_copy_blockers([{"code": "linked_target_only", "table": "notes", "detail": "notes.fk references users"}])])
     promotion_dialog.on_finished(False, reason)
     title, text = shown[-1]
-    assert title == "안전 복원 실패" and text.startswith("안전 복원 실패 · 원본 미변경")
+    assert title == "Import 실패" and text.startswith("Import 실패 · 원본은 그대로입니다")
     assert "복사본을 만들기 전에 멈췄습니다" in text
     assert "덤프에 없는 테이블이나 뷰가" in text and text.endswith(" (notes)")
     # The core's own text, from its safe_restore_failed event, opens from '자세히'.
@@ -134,112 +130,134 @@ def test_cancelled_pending_promotion_cannot_start_later(promotion_dialog, monkey
     promotion_dialog.worker.isRunning.return_value = False
 
 
-def test_import_worker_and_convenience_api_default_to_safe(monkeypatch):
+def test_import_mode_is_required_by_the_worker_and_the_api(monkeypatch):
+    """No caller falls into replace or safe by accident: the mode has no default anywhere."""
     from src.exporters import rust_dump_exporter
+    with pytest.raises(TypeError):
+        rust_dump_exporter.RustDumpImporter.import_dump(MagicMock(), "dump")
     runner = MagicMock()
-    runner.import_dump.return_value = (True, "ready", {})
     monkeypatch.setattr(rust_dump_exporter, "RustDumpImporter", lambda config: runner)
-    rust_dump_exporter.import_dump("localhost", 3306, "u", "p", "dump")
-    assert runner.import_dump.call_args.kwargs["import_mode"] == "safe"
+    with pytest.raises(TypeError):
+        rust_dump_exporter.import_dump("localhost", 3306, "u", "p", "dump")
+    rust_dump_exporter.import_dump("localhost", 3306, "u", "p", "dump", import_mode="replace")
+    assert runner.import_dump.call_args.kwargs["import_mode"] == "replace"
+
     monkeypatch.setattr("src.ui.workers.rust_dump_worker.RustDumpImporter", lambda config: runner)
-    RustDumpWorker("import", RustDumpConfig("localhost", 3306, "u", "p"), input_dir="dump").run()
-    assert runner.import_dump.call_args.args[3] == "safe"
+    runner.import_dump.reset_mock()
+    finished = []
+    worker = RustDumpWorker("import", RustDumpConfig("localhost", 3306, "u", "p"), input_dir="dump")
+    worker.finished.connect(lambda *result: finished.append(result))
+    worker.run()
+    runner.import_dump.assert_not_called()
+    assert finished and finished[0][0] is False
+    runner.import_dump.return_value = (True, "ready", {})
+    RustDumpWorker("import", RustDumpConfig("localhost", 3306, "u", "p"), input_dir="dump", import_mode="safe").run()
+    assert runner.import_dump.call_args.kwargs["import_mode"] == "safe"
 
 
-def test_review_summary_labels_unknown_data_and_counts_without_forged_lines():
-    text = _promotion_review_text({
-        "original_target": {"database": "original"}, "candidate_target": {"database": "candidate"},
-        "backup_namespace": "backup", "summary": {"data_not_compared": ["sample"],
-            "row_counts": {"sample": {"original": None, "candidate": 3}}, "schema_changed_tables": ["sample"]},
-    }, {"name": "profile\nforged"})
-    assert "sample: 미확인 / 3" in text
-    assert "행 수만으로 데이터 일치를 보장하지 않습니다." in text
-    assert "\nforged" not in text
-
-
-def test_overwrite_mode_runs_safe_restore_after_one_confirmation(monkeypatch, tmp_path):
-    app = QApplication.instance() or QApplication([])
+def test_verify_in_copy_runs_safe_restore_after_one_confirmation(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    from tests.test_db_import_dialog import _NOTHING_OVERWRITTEN, _fake_plan_dialog, _fake_workers, _imports, _write_dump
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
-    question = MagicMock(return_value=QMessageBox.StandardButton.No)
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", question)
-    dialog = RustDumpImportDialog()
-    dialog.input_dir.setText(str(tmp_path))
-    dialog.radio_overwrite.setChecked(True)
-    dialog._confirm_production_guard = MagicMock(return_value=True)
-    dialog._begin_error_report_operation = MagicMock()
-    assert dialog._get_selected_import_mode() == "overwrite"
-    dialog.do_import()
-    assert question.call_args.args[1] == "덮어쓰기 확인"
-    assert question.call_args.args[-1] == QMessageBox.StandardButton.No
-    dialog._begin_error_report_operation.assert_not_called()
-    assert dialog.worker is None
-    dialog.close()
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
+    created = _fake_workers(monkeypatch, preview={**_NOTHING_OVERWRITTEN, "replace": ["users"], "create": []})
+    shown = _fake_plan_dialog(monkeypatch, accept=True)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "staging"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.chk_verify_copy.setChecked(True)
+        dialog.do_import()
+        assert len(shown) == 1 and shown[0]["plan"]["verify"] is True
+        assert "먼저 복사본에서 검증" in shown[0]["toggles"]
+        assert [worker.kwargs["import_mode"] for worker in _imports(created)] == ["safe"]
+    finally:
+        dialog._job_id = None
+        dialog.close()
 
 
-def test_overwrite_mode_swaps_a_clean_plan_without_the_review_dialog(promotion_dialog):
-    promotion_dialog._auto_overwrite = True
+def test_verify_in_copy_swaps_a_clean_plan_without_asking_again(promotion_dialog, monkeypatch):
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
     promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
-    promotion_dialog._review_promotion_plan = MagicMock()
     promotion_dialog._promotion_action = "plan"
     plan = {"success": True, "can_promote": True, "plan_digest": "verified-digest", "blockers": []}
     promotion_dialog._on_promotion_finished(True, "planned", plan)
-    promotion_dialog._review_promotion_plan.assert_not_called()
     payload = promotion_dialog._start_promotion.call_args.args[0]
     assert payload["action"] == "confirm"
     assert payload["plan_digest"] == "verified-digest" and payload["overwrite_confirmed"] is True
     assert payload["target"]["database"] == "original"
-    assert promotion_dialog._auto_overwrite is False  # one shot
-
-
-@pytest.mark.parametrize("restore_status, plan", [
-    ("ready_for_review", {"can_promote": True, "plan_digest": "d", "blockers": []}),
-    ("ready_for_switch", {"can_promote": False, "plan_digest": "d", "blockers": ["incoming FK"]}),
-    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": ["view dependency"]}),
-    ("ready_for_switch", {"can_promote": True, "plan_digest": "", "blockers": []}),
-])
-def test_overwrite_mode_falls_back_to_review_when_the_swap_needs_a_decision(promotion_dialog, restore_status, plan):
-    promotion_dialog._auto_overwrite = True
-    promotion_dialog.import_audit["restore_status"] = restore_status
-    promotion_dialog._review_promotion_plan = MagicMock()
-    promotion_dialog._promotion_action = "plan"
-    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, **plan})
-    promotion_dialog._review_promotion_plan.assert_called_once()
-    promotion_dialog._start_promotion.assert_not_called()
-
-
-def test_safe_mode_still_reviews_every_plan(promotion_dialog):
-    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
-    promotion_dialog._review_promotion_plan = MagicMock()
-    promotion_dialog._promotion_action = "plan"
-    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, "can_promote": True, "plan_digest": "d"})
-    promotion_dialog._review_promotion_plan.assert_called_once()
-    promotion_dialog._start_promotion.assert_not_called()
-
-
-def test_overwrite_flag_is_cleared_when_the_auto_plan_fails(promotion_dialog, monkeypatch):
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", MagicMock())
-    promotion_dialog._auto_overwrite = True
-    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
-    promotion_dialog._review_promotion_plan = MagicMock()
-    promotion_dialog._promotion_action = "plan"
-    promotion_dialog._on_promotion_finished(False, "core unavailable", {})
-    assert promotion_dialog._auto_overwrite is False
-    # A later manual review click must show the review dialog, not swap.
-    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, "can_promote": True, "plan_digest": "d"})
-    promotion_dialog._review_promotion_plan.assert_called_once()
-    promotion_dialog._start_promotion.assert_not_called()
-
-
-def test_auto_overwrite_records_the_operator_authorization(promotion_dialog):
-    promotion_dialog._auto_overwrite = True
-    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
-    promotion_dialog._promotion_action = "plan"
-    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, "can_promote": True, "plan_digest": "d"})
     assert promotion_dialog.import_audit["operator_choice"] == "overwrite_confirmed_before_import"
 
 
-def test_overwrite_radio_is_locked_with_the_other_modes(promotion_dialog):
+_RECHECK = "교체 직전에 다시 확인해 보니 교체를 막는 조건이 있었습니다. 아래 실행 로그에서 확인하세요."
+
+
+@pytest.mark.parametrize("restore_status, plan, reason", [
+    ("ready_for_review", {"can_promote": True, "plan_digest": "d", "blockers": []}, _RECHECK),
+    ("ready_for_switch", {"can_promote": False, "plan_digest": "d", "blockers": ["incoming FK"]}, _RECHECK),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": ["view dependency"]}, _RECHECK),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "", "blockers": []}, _RECHECK),
+    ("ready_for_switch", {"can_promote": False, "plan_digest": "d", "blockers": ["x"],
+                          "copy_blockers": [{"code": "target_triggers", "table": "users", "detail": "trg"}]},
+     "대상 테이블에 트리거가 있어 교체할 수 없습니다. (users)"),
+    # The target changed after the copy was made: copy_blockers alone stop the swap.
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": [],
+                          "copy_blockers": [{"code": "target_triggers", "table": "users", "detail": "trg"}]},
+     "대상 테이블에 트리거가 있어 교체할 수 없습니다. (users)"),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": [],
+                          "copy_blockers": [{"code": "brand_new_code", "table": "users", "detail": "x"}]},
+     "교체를 막는 조건이 있습니다. 아래 실행 로그에서 확인하세요. (users)"),
+])
+def test_verify_in_copy_not_clean_shows_one_stop_window(promotion_dialog, monkeypatch, restore_status, plan, reason):
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
+    promotion_dialog.import_audit["restore_status"] = restore_status
+    promotion_dialog._promotion_action = "plan"
+    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, **plan})
+    promotion_dialog._start_promotion.assert_not_called()
+    box = _stop_window(promotion_dialog)
+    assert sorted(button.text() for button in box.buttons()) == ["닫기", "복원 백업 관리"]
+    assert box.text().startswith("복사본 tf_restore_1에 넣고 검증했지만 다음 이유로 교체하지 않았습니다.")
+    assert reason in box.text() and "원본은 그대로입니다" in box.text()
+    assert "incoming FK" not in box.text() and "view dependency" not in box.text()  # raw core text stays in the log
+    for raw in plan["blockers"]:
+        assert f"교체 차단: {raw}" in _visible_log(promotion_dialog)  # the log the window points to shows it
+
+
+def test_failed_swap_plan_stops_and_explains_without_swapping(promotion_dialog, monkeypatch):
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
+    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
+    promotion_dialog._promotion_action = "plan"
+    promotion_dialog._on_promotion_finished(False, "core unavailable", {})
+    promotion_dialog._start_promotion.assert_not_called()
+    assert _RECHECK in _stop_window(promotion_dialog).text()
+    assert any("core unavailable" in entry for entry in promotion_dialog.log_entries)
+    assert "core unavailable" in _visible_log(promotion_dialog)
+
+
+def test_cancelled_swap_plan_shows_no_window(promotion_dialog, monkeypatch):
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
+    promotion_dialog._promotion_action = "plan"
+    promotion_dialog._cancel_requested = True
+    promotion_dialog._on_promotion_finished(False, "작업이 취소되었습니다.", {})
+    assert [box for box in promotion_dialog.findChildren(QMessageBox) if box.isVisible()] == []
+    assert promotion_dialog.label_status.text() == "⏹ 교체 확인을 중지했습니다 · 원본은 그대로입니다"
+
+
+def test_advanced_toggles_are_locked_while_running(promotion_dialog):
+    toggles = (promotion_dialog.chk_other_name, promotion_dialog.chk_verify_copy, promotion_dialog.spin_threads,
+               promotion_dialog.input_dir, promotion_dialog.btn_browse)
     promotion_dialog.set_ui_enabled(False)
-    assert all(not button.isEnabled() for button in promotion_dialog.btn_import_mode.buttons())
+    assert all(not widget.isEnabled() for widget in (*toggles, promotion_dialog.chk_timezone, promotion_dialog.combo_timezone))
     promotion_dialog.set_ui_enabled(True)
-    assert promotion_dialog.radio_overwrite.isEnabled()
+    assert all(widget.isEnabled() for widget in toggles)
+    assert not promotion_dialog.chk_timezone.isEnabled()  # no dump chosen: nothing says the dump lacks a timezone
+
+
+def test_the_plan_dialog_is_a_real_qdialog_subclass():
+    from src.core.production_guard import SchemaConfirmDialog
+    from src.ui.dialogs.import_plan_dialog import ImportPlanDialog
+    assert issubclass(ImportPlanDialog, SchemaConfirmDialog) and issubclass(ImportPlanDialog, QDialog)

@@ -104,13 +104,20 @@ def test_rollback_apply_needs_confirmation_and_reviewed_digest():
     finally:
         dialog.close()
 
-def test_import_dialog_backup_management_carries_registered_tls(monkeypatch):
+def test_job_list_backup_management_carries_registered_tls(monkeypatch, tmp_path):
+    """Backups are managed from the job list (the Import dialog no longer has the button)."""
+    import json
     from types import SimpleNamespace
+    from unittest.mock import MagicMock
 
     from src.core import connection_trust as ct
-    from src.ui.dialogs import db_import_dialog
-    from src.ui.dialogs.db_import_dialog import RustDumpImportDialog
+    from src.core import job_history as jh
+    from src.ui.dialogs import backup_lifecycle_dialog
+    from src.ui.main_window import TunnelManagerUI
 
+    report = tmp_path / "_tunnelforge_import_report.json"
+    report.write_text(json.dumps({"original_target": {"engine": "mysql", "host": "127.0.0.1", "port": 13306,
+                                                      "database": "d"}}), encoding="utf-8")
     ct.clear_registered_tls()
     ct.register_endpoint_tls("127.0.0.1", 13306, ct.TlsPolicy("verify_full", "ca.pem", "db.internal"))
     captured = {}
@@ -125,14 +132,14 @@ def test_import_dialog_backup_management_carries_registered_tls(monkeypatch):
         def exec(self):
             pass
 
-    monkeypatch.setattr(db_import_dialog, "BackupLifecycleDialog", FakeDialog)
-    dummy = SimpleNamespace(
-        import_audit={"original_target": {"engine": "mysql", "host": "127.0.0.1", "port": 13306, "database": "d"},
-                      "report_path": "C:/dump/_tunnelforge_import_report.json"},
-        restore_config=SimpleNamespace(user="u", password="p"),
+    monkeypatch.setattr(backup_lifecycle_dialog, "BackupLifecycleDialog", FakeDialog)
+    window = SimpleNamespace(
+        config_mgr=MagicMock(load_config=lambda: {"tunnels": [{"id": "prof-1"}]}, get_tunnel_credentials=lambda tid: ("u", "p")),
+        _ensure_tunnel_running=lambda tunnel, prompt: True,
     )
     try:
-        RustDumpImportDialog.open_backup_lifecycle(dummy)
+        TunnelManagerUI.open_job_backups(window, jh.JobRecord(id="1", kind=jh.KIND_IMPORT, profile_id="prof-1",
+                                                             report_path=str(report)))
     finally:
         ct.clear_registered_tls()
     assert captured["endpoint"]["tls"]["mode"] == "verify_full"

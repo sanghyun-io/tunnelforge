@@ -575,7 +575,7 @@ CORE_CODE_SENTENCES = {
     "views_outside_snapshot": "뷰 정의는 테이블 데이터와 같은 시점에 담기지 않았습니다.",
     "omitted_object": "내보낼 때 일부 객체가 빠졌습니다.",
     "source_dump_warning": "덤프를 만들 때 남긴 경고가 있습니다.",
-    "not_strict": "이 덤프는 완전한 백업으로 표시되어 있지 않습니다. 내보낼 때의 한계가 그대로 남습니다.",
+    "not_strict": "이 덤프는 내보낼 때 일부를 담지 못했거나, 다 담았는지 확인하지 못했습니다. 이유는 '자세히'에 있습니다.",
     "legacy_timezone": "예전 덤프라 시간대가 기록되어 있지 않습니다. 고른 시간대나 대상 서버 기본값으로 시간을 읽습니다.",
     "legacy_dump": "예전 형식 덤프라 일부 파일의 무결성 정보가 없습니다.",
     "create_privilege_unproven": "대상 DB(스키마)가 없는데 이 계정이 만들 수 있는지 권한 목록으로는 알 수 없습니다.",
@@ -588,7 +588,8 @@ _REPORT_NOT_SAVED = "Import 보고서를 저장하지 못했습니다. 보고서
 # "; additionally: ", so code text inside a path or a server message is not taken. The scope of
 # `code: name: ...` is kept when it is one word (classified_import_error).
 _CORE_CODE_TOKEN = re.compile(
-    r"(?:^\s*(?:Rust DB Core import 오류: |Import 오류: |Safe restore failed; original database was not changed\. )?"
+    r"(?:^\s*(?:Rust DB Core import (?:미리보기 )?오류: |Import (?:미리보기 )?오류: "
+    r"|Safe restore failed; original database was not changed\. )?"
     r"|; additionally: )"
     r"(" + "|".join(map(re.escape, CORE_CODE_SENTENCES)) + r")\s*:(?:\s*([^\s:]+):\s)?",
     re.IGNORECASE,
@@ -623,10 +624,13 @@ _UNKNOWN_TARGET_MESSAGE = "원본 스키마를 확정할 수 없습니다. 대�
 _MISSING_MANIFEST_MESSAGE = "TunnelForge Rust dump manifest를 찾을 수 없습니다."
 
 _UNKNOWN_COPY_BLOCKER = "복사본에서 검증할 수 없는 다른 이유가 있습니다. Import 보고서에서 확인하세요."
+_UNVERIFIED_COPY_MESSAGE = "복사본 검증 결과를 확인할 수 없습니다. 원본과 복사본의 상태를 Import 보고서에서 확인하세요."
 
 
-def describe_copy_blockers(blockers: object) -> List[str]:
-    """One line per copy_blockers code (why verify-in-copy stopped), naming the tables or views it concerns."""
+def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKER) -> List[str]:
+    """One line per copy_blockers code (why verify-in-copy stopped), naming the tables or views it concerns.
+
+    Preview ``blockers`` share the shape; ``unknown`` words a code without a sentence."""
     grouped: Dict[str, List[str]] = {}
     for item in blockers if isinstance(blockers, list) else []:
         if isinstance(item, dict):
@@ -635,7 +639,7 @@ def describe_copy_blockers(blockers: object) -> List[str]:
                 names.append(str(item["table"]))
     lines = []
     for code, names in grouped.items():
-        sentence = translate_text(CORE_CODE_SENTENCES.get(code) or _UNKNOWN_COPY_BLOCKER)
+        sentence = translate_text(CORE_CODE_SENTENCES.get(code) or unknown)
         shown = ", ".join(names[:10]) + (f" … (+{len(names) - 10})" if len(names) > 10 else "")
         lines.append(f"- {sentence}" + (f" ({shown})" if names else ""))
     return lines
@@ -693,7 +697,7 @@ class RustDumpImporter(_RustDumpClientBase):
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, {}
             if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):
-                return False, "이 Rust DB Core는 Import 미리보기를 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요.", {}
+                return False, "Import 엔진이 이 버전보다 오래되어 실행 전 확인을 할 수 없습니다. TunnelForge를 다시 설치하세요.", {}
             return True, "", self.facade.preview_import(payload)
         except DbCoreServiceError as exc:
             self._remember_error_code(exc)
@@ -752,7 +756,8 @@ class RustDumpImporter(_RustDumpClientBase):
         input_dir: str,
         target_schema: Optional[str] = None,
         threads: int = DEFAULT_DUMP_THREADS,
-        import_mode: str = "safe",
+        *,
+        import_mode: str,
         timezone_sql: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -765,8 +770,9 @@ class RustDumpImporter(_RustDumpClientBase):
         use_source_timezone: bool = True,
         verify_only: bool = False,
     ) -> Tuple[bool, str, dict]:
-        """``verify_only`` (safe mode): the copy is only verified, never swapped in, so the core
-        skips the checks that guard the swap."""
+        """``import_mode`` is ``replace`` (the dialog's default) or ``safe`` (verify in a copy first); it has
+        no default, so no caller falls into either one by accident. ``verify_only`` (safe mode): the copy is
+        only verified, never swapped in, so the core skips the checks that guard the swap."""
         import_results: dict = {}
         try:
             manifest_path = Path(input_dir) / "_tunnelforge_dump.json"
@@ -841,7 +847,7 @@ class RustDumpImporter(_RustDumpClientBase):
                         and result.get("verified") is True and result.get("original_unchanged") is True
                         and result.get("cutover_pending") is (not new_target) and candidate.get("database")
                         and (self.config.engine != "postgresql" or candidate.get("schema"))):
-                    return False, "안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다. 원본과 복원 대상의 상태를 보고서에서 확인하세요.", import_results
+                    return False, _UNVERIFIED_COPY_MESSAGE, import_results
 
             for table in tables_to_import:
                 import_results[table] = {"status": "done", "message": ""}
@@ -852,11 +858,11 @@ class RustDumpImporter(_RustDumpClientBase):
             message = f"Rust DB Core import 완료: {len(tables_to_import)}개 테이블, {rows:,} rows"
             if import_mode == "safe":
                 candidate_name = candidate.get("schema") if self.config.engine == "postgresql" else candidate.get("database")
-                message = f"안전 복원 검증 완료: {candidate_name}. 원본 미변경 · 전환 대기."
+                message = f"복사본 {candidate_name}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다."
                 if new_target:
-                    message = f"요청한 새 대상 복원·검증 완료: {candidate_name}. 기존 대상 변경 없음."
+                    message = f"새 대상 {candidate_name}을 만들어 넣고 검증했습니다."
                 if result.get("status") == "ready_for_review":
-                    message += " 전환 전 추가 검토가 필요합니다."
+                    message += " 교체 전에 따로 확인할 것이 있습니다."
                     for blocker in result.get("blockers") or []:
                         message += f"\n{blocker}"
             if views_imported:
@@ -947,7 +953,8 @@ def import_dump(
     input_dir: str,
     target_schema: Optional[str] = None,
     threads: int = DEFAULT_DUMP_THREADS,
-    import_mode: str = "safe",
+    *,
+    import_mode: str,
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
     engine: str = "mysql",

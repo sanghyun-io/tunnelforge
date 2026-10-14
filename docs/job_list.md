@@ -9,7 +9,7 @@ failure reason and record deletion. Storage is `job_history.json` in the app-sup
 | --- | --- |
 | profile id / name, target | connection profile and the database/schema names (migration: `source (engine) -> target (engine)`) |
 | kind | `export_full`, `export_tables`, `import`, `promote`, `migration_preflight`, `migration_run`, `migration_resume` |
-| mode | the mode that ran (snapshot mode, compression, threads, import mode, "incomplete export"); when an Export privilege fallback or incomplete choice re-ran it, the finished record shows the mode of that last run |
+| mode | the mode that ran (snapshot mode, compression, threads, "incomplete export"); when an Export privilege fallback or incomplete choice re-ran it, the finished record shows the mode of that last run. Import: `Import · 덤프 테이블 교체`, set from the result: ` · 복사본 검증` as soon as a copy was made, also on the running record (only these records, and older "안전 복원"/"덮어쓰기" ones, open backup management; without a saved profile or saved credentials it asks for the DB account), ` · 새 DB 생성` (PostgreSQL: ` · 새 스키마 생성`) when the run created the database, ` · 대상 {name}` for another name |
 | status | `completed`, `partial` (some tables loaded and some failed, or an explicit incomplete export that left out the listed objects), `failed`, `cancelled`, `running`, `interrupted` (the app ended while the job ran) |
 | error summary, report/log path, small counts | error text with URI credentials, `password=...`, `-p...` masked, max 400 characters |
 

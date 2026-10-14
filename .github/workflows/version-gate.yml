@@ -158,6 +158,11 @@ jobs:
         env:
           TF_MYSQL_PORT: "3307"
         run: |
+          for attempt in 1 2 3 4 5; do
+            docker pull -q mysql:8.0 && break
+            if [ "$attempt" = 5 ]; then exit 1; fi
+            sleep $((attempt * 20))
+          done
           docker run -d --name tf-ci-my80 -p 127.0.0.1:3307:3306 -e MYSQL_ROOT_PASSWORD=tf_local_test -e MYSQL_ROOT_HOST=% -e MYSQL_DATABASE=tf_test --tmpfs /var/lib/mysql mysql:8.0
           for attempt in $(seq 1 90); do
             docker exec tf-ci-my80 mysql -h127.0.0.1 -uroot -ptf_local_test -e 'SELECT 1' >/dev/null 2>&1 && break
@@ -329,6 +334,17 @@ jobs:
 
       - name: Build tunnelforge-core (Rust)
         run: cargo build --manifest-path migration_core/Cargo.toml
+
+      # Docker Hub answers "toomanyrequests" now and then; pull with backoff before any run.
+      - name: Pull database images
+        run: |
+          for image in mysql:8.0 mysql:8.4 postgres:13 postgres:18.4; do
+            for attempt in 1 2 3 4 5; do
+              docker pull -q "$image" && break
+              if [ "$attempt" = 5 ]; then exit 1; fi
+              sleep $((attempt * 20))
+            done
+          done
 
       - name: Start live test servers
         run: |

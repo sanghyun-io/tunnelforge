@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from src.core.job_history import (
     KIND_EXPORT_FULL, KIND_EXPORT_TABLES, KIND_IMPORT, KIND_MIGRATION_PREFLIGHT, KIND_MIGRATION_RESUME,
     KIND_MIGRATION_RUN, KIND_PROMOTE, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PARTIAL,
-    job_begin, job_finish, job_report_path,
+    job_begin, job_finish, job_update_running,
 )
 
 DUMP_MANIFEST_NAME = "_tunnelforge_dump.json"
@@ -87,13 +87,42 @@ def finish_export_job(dialog, success: bool, message: str) -> None:
 
 # ------------------------------------------------------------------ import
 
-def begin_import_job(dialog, target: str, import_mode: str, threads: int) -> Optional[str]:
+IMPORT_LABEL = "Import · 덤프 테이블 교체"
+# 작업 목록이 백업 관리를 여는 표시 (job_list_dialog.BACKUP_MODE_MARKERS).
+COPY_SUFFIX = " · 복사본 검증"
+
+
+def made_copy(audit: Dict[str, Any]) -> bool:
+    """복사본(교체 뒤에는 백업)이 남은 Import: 복원 백업 관리로 정리한다. 없던 대상에 바로 넣은 것은 복사본이 아니다."""
+    return audit.get("candidate_created") is True and audit.get("namespace_existed") is not False
+
+
+def import_job_label(audit: Dict[str, Any], other_name: str = "", engine: str = "") -> str:
+    """작업 목록의 Import 실행 모드. 고른 설정이 아니라 실제로 일어난 일로 정한다."""
+    label = IMPORT_LABEL
+    if made_copy(audit):
+        label += COPY_SUFFIX
+    elif audit.get("restore_status") == "completed_new_target" or audit.get("created_namespace"):
+        # '덮어쓰기'는 쓰지 않는다: BACKUP_MODE_MARKERS 에 걸려 모든 기록에 백업 관리가 켜진다.
+        label += " · 새 스키마 생성" if engine == "postgresql" else " · 새 DB 생성"
+    if other_name:
+        label += f" · 대상 {other_name}"
+    return label
+
+
+def _import_label(dialog) -> str:
+    context = getattr(dialog, "last_import_context", None) or {}
+    return import_job_label(getattr(dialog, "import_audit", None) or {}, str(context.get("other_name") or ""),
+                            str(context.get("engine") or ""))
+
+
+def begin_import_job(dialog, target: str) -> Optional[str]:
     # 보고서는 실행마다 새 파일이라 Core 가 이름을 알려 줄 때 기록한다 (record_import_report).
     try:
         profile = getattr(dialog, "tunnel_config", None) or {}
         context = {"profile_id": profile.get("id"), "profile_name": profile.get("name")}
         return job_begin(
-            KIND_IMPORT, target=target, mode=f"{import_mode} · 스레드 {threads}",
+            KIND_IMPORT, target=target, mode=_import_label(dialog),
             **_profile(context, getattr(dialog, "connection_info", "")),
         )
     except Exception:
@@ -101,8 +130,11 @@ def begin_import_job(dialog, target: str, import_mode: str, threads: int) -> Opt
 
 
 def record_import_report(dialog) -> None:
-    """Core 가 이번 실행의 보고서 파일을 알려 주면 실행 중인 기록에 바로 남긴다."""
-    job_report_path(getattr(dialog, "_job_id", None), str((getattr(dialog, "import_audit", None) or {}).get("report_path") or ""))
+    """Core 가 보고서 파일을 알려 주거나 복사본을 만들면 실행 중인 기록에 바로 남긴다.
+    앱이 도중에 꺼져도(interrupted) 그 기록에서 복원 백업 관리를 열 수 있다."""
+    job_update_running(getattr(dialog, "_job_id", None),
+                       report_path=str((getattr(dialog, "import_audit", None) or {}).get("report_path") or ""),
+                       mode=_import_label(dialog))
 
 
 def import_status(success: bool, cancelled: bool, done: int, errors: int) -> str:
@@ -122,6 +154,7 @@ def finish_import_job(dialog, success: bool, message: str, done: int, errors: in
         audit = getattr(dialog, "import_audit", {}) or {}
         report = audit.get("report_path") or ""
         job_finish(job_id, status, error="" if success else message, report_path=str(report),
+                   mode=_import_label(dialog),
                    details={"tables_done": done, "tables_failed": errors, "tables_not_run": blocked,
                             "restore_status": str(audit.get("restore_status") or "")})
     except Exception:

@@ -703,7 +703,8 @@ def test_import_dump_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
             input_dir,
             target_schema=None,
             threads=8,
-            import_mode="replace",
+            *,
+            import_mode,
             progress_callback=None,
             table_chunk_progress_callback=None,
         ):
@@ -947,7 +948,7 @@ class TestRustDumpImporter:
         ok, message, preview = importer.preview_import(self._write_dump(tmp_path))
 
         assert ok is False and preview == {}
-        assert "미리보기를 지원하지 않습니다" in message
+        assert "실행 전 확인을 할 수 없습니다" in message and "Rust DB Core" not in message
         assert facade.commands == ["service.hello"]
 
     def test_preview_failure_is_returned_not_raised(self, tmp_path):
@@ -1091,6 +1092,7 @@ class TestRustDumpImporter:
 
         success, message, results = importer.import_dump(
             str(dump_dir),
+            import_mode='replace',
             table_status_callback=lambda *event: status_events.append(event),
         )
 

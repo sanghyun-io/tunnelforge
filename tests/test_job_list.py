@@ -221,10 +221,10 @@ def make_import():
 def test_import_run_is_recorded_as_partial_with_table_counts(history):
     dialog = make_import()
     try:
-        dialog._job_id = job_recording.begin_import_job(dialog, "app_restore", "safe", 4)
+        dialog._job_id = job_recording.begin_import_job(dialog, "app_restore")
         running = only(history)
         assert running.kind == jh.KIND_IMPORT and running.status == jh.STATUS_RUNNING
-        assert running.mode == "safe · 스레드 4" and running.target == "app_restore" and running.profile_name == "Prod"
+        assert running.mode == "Import · 덤프 테이블 교체" and running.target == "app_restore" and running.profile_name == "Prod"
         assert running.report_path == "", "every attempt writes a new report; the core names it once the run starts"
         report = "C:/dumps/app/_tunnelforge_import_report_1760000000000000000_42_0.json"
         dialog.on_raw_output(json.dumps({"event": "import_report", "status": "running", "report_path": report}))
@@ -244,7 +244,7 @@ def test_import_completed_and_cancelled(history):
     for cancelled, expected in ((False, jh.STATUS_COMPLETED), (True, jh.STATUS_CANCELLED)):
         dialog = make_import()
         try:
-            dialog._job_id = job_recording.begin_import_job(dialog, "app", "replace", 1)
+            dialog._job_id = job_recording.begin_import_job(dialog, "app")
             dialog.import_results = {"a": {"status": "done"}}
             dialog.last_import_mode = "replace"
             dialog._cancel_requested = cancelled
@@ -275,8 +275,7 @@ def test_promotion_success_is_completed_and_plan_is_not_recorded(history):
     dialog = make_import()
     try:
         dialog._promotion_action = "plan"
-        dialog._review_promotion_plan = MagicMock()  # opens a modal review dialog
-        dialog._on_promotion_finished(True, "", {"status": "planned"})
+        dialog._on_promotion_finished(True, "", {"status": "planned"})  # not clean: a stop window, no job
         assert history.list() == []
         dialog._promotion_action = "confirm"
         dialog._promotion_job_id = job_recording.begin_promotion_job(dialog, {"target": {"database": "app"}})
@@ -545,30 +544,87 @@ def test_job_history_is_isolated_from_the_real_application_directory(tmp_path):
     assert not real.exists() or "isolation-check" not in real.read_text(encoding="utf-8")
 
 
-def test_overwrite_import_is_recorded_as_overwrite_with_the_dialog_label(history, monkeypatch, tmp_path):
-    started = {}
+def test_verify_in_copy_import_is_labeled_from_its_result_not_its_toggle(history, monkeypatch, tmp_path):
+    from tests.test_db_import_dialog import _fake_plan_dialog, _fake_workers, _imports, _write_dump
 
-    def fake_worker(task_type, config, **kwargs):
-        started.update(kwargs)
-        return idle_worker()
-
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", fake_worker)
-    monkeypatch.setattr(RustDumpImportDialog, "_confirm_production_guard", lambda *a: True)
+    created = _fake_workers(monkeypatch)
+    _fake_plan_dialog(monkeypatch, accept=True)
     connector = MagicMock(host="127.0.0.1", port=3306, user="root", password="pw", engine="mysql")
     connector.get_schemas.return_value = ["app"]
     dialog = RustDumpImportDialog(connector=connector, tunnel_config={"id": "prof-1", "name": "Prod"})
     try:
-        dialog.input_dir.setText(str(tmp_path))
-        dialog.chk_use_original.setChecked(False)
-        dialog.combo_target_schema.setEditable(True)
-        dialog.combo_target_schema.setCurrentText("app")
-        dialog.radio_overwrite.setChecked(True)
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.chk_other_name.setChecked(True)
+        dialog.combo_target_schema.setCurrentText("app_copy")
+        dialog.chk_verify_copy.setChecked(True)
         dialog.do_import()
-        assert started["import_mode"] == "safe"  # the core still runs a safe restore first
-        assert only(history).mode.startswith(dialog._get_import_mode_text("overwrite"))
+        assert _imports(created)[0].kwargs["import_mode"] == "safe"  # the core runs a verify-in-copy restore
+        assert only(history).mode == "Import · 덤프 테이블 교체 · 대상 app_copy"
+        # The target was missing, so the core made it directly: no copy, no backup.
+        dialog.import_audit.update(restore_status="completed_new_target", namespace_existed=False, namespace_created=True,
+                                   candidate_created=True, verified=True, original_unchanged=True, cutover_pending=False,
+                                   candidate_target={"engine": "mysql", "database": "app_copy"})
+        dialog.on_finished(True, "verified")
+        assert only(history).mode == "Import · 덤프 테이블 교체 · 새 DB 생성 · 대상 app_copy"
     finally:
         dialog._job_id = None
         dialog.close()
+
+
+@pytest.mark.parametrize("audit, label", [
+    ({}, "Import · 덤프 테이블 교체"),
+    ({"created_namespace": "app"}, "Import · 덤프 테이블 교체 · 새 DB 생성"),
+    ({"restore_status": "completed_new_target", "candidate_created": True, "namespace_existed": False},
+     "Import · 덤프 테이블 교체 · 새 DB 생성"),
+    # A copy was made: it (and after a swap, the backup) stays for backup management.
+    ({"restore_status": "ready_for_switch", "candidate_created": True, "namespace_existed": True},
+     "Import · 덤프 테이블 교체 · 복사본 검증"),
+    ({"restore_status": "promoted", "candidate_created": True, "namespace_existed": True,
+      "created_namespace": "tf_restore_1"}, "Import · 덤프 테이블 교체 · 복사본 검증"),
+    # A stop before the copy made nothing.
+    ({"restore_status": "failed_original_untouched", "candidate_created": False, "namespace_existed": True},
+     "Import · 덤프 테이블 교체"),
+])
+def test_job_label_from_result_status(audit, label):
+    assert job_recording.import_job_label(audit) == label
+    assert job_recording.import_job_label(audit, "other") == label + " · 대상 other"
+    assert job_list_dialog.has_backup_journal(jh.JobRecord(id="1", kind=jh.KIND_IMPORT, mode=label, report_path="r.json")) \
+        is ("복사본 검증" in label)
+
+
+def test_new_schema_label_on_postgresql_never_opens_backups():
+    label = job_recording.import_job_label({"created_namespace": "appdb.app"}, engine="postgresql")
+    assert label == "Import · 덤프 테이블 교체 · 새 스키마 생성"
+    assert not job_list_dialog.has_backup_journal(jh.JobRecord(id="1", kind=jh.KIND_IMPORT, mode=label, report_path="r"))
+
+
+def test_an_interrupted_verify_in_copy_run_still_opens_backup_management(history, monkeypatch, tmp_path):
+    """The app dies after the core made the copy: the record already carries the copy label and its report."""
+    from tests.test_db_import_dialog import _fake_plan_dialog, _fake_workers, _write_dump
+
+    _fake_workers(monkeypatch)
+    _fake_plan_dialog(monkeypatch, accept=True)
+    dialog = RustDumpImportDialog(tunnel_config={"id": "prof-1", "name": "Prod", "environment": "development"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.chk_verify_copy.setChecked(True)
+        dialog.do_import()
+        assert only(history).mode == "Import · 덤프 테이블 교체"
+        report = str(tmp_path / "dump" / "_tunnelforge_import_report_1_1_0.json")
+        dialog.on_raw_output(json.dumps({
+            "event": "safe_restore_target", "status": "preparing", "report_path": report, "candidate_created": True,
+            "namespace_existed": True, "original_target": {"engine": "mysql", "database": "app"},
+            "candidate_target": {"engine": "mysql", "database": "tf_restore_1"}}))
+        running = only(history)
+        assert running.status == jh.STATUS_RUNNING and running.report_path == report
+        assert running.mode == "Import · 덤프 테이블 교체 · 복사본 검증"
+    finally:
+        jh._ACTIVE_IDS.discard(dialog._job_id)
+        dialog._job_id = None  # the app "dies": the run is never finished
+        dialog.close()
+    jh.sweep_interrupted()
+    record = only(history)
+    assert record.status == jh.STATUS_INTERRUPTED and job_list_dialog.has_backup_journal(record)
 
 
 # ------------------------------------------------------------------ backup management entry point (sprint 2)
@@ -587,6 +643,10 @@ def test_backup_management_button_is_offered_for_import_records_with_a_report(hi
                                       report_path=report)
         import_job = history.begin(jh.KIND_IMPORT, target="app", mode="안전 복원: 새 대상에 복원·검증 · 스레드 4",
                                    report_path=report)
+        # Current records: the label says whether a copy was made.
+        copy_job = history.begin(jh.KIND_IMPORT, target="app", mode="Import · 덤프 테이블 교체 · 복사본 검증 · 대상 x",
+                                 report_path=report)
+        replace_job = history.begin(jh.KIND_IMPORT, target="app", mode="Import · 덤프 테이블 교체", report_path=report)
         dialog.reload()
 
         def row_of(job_id):
@@ -598,6 +658,10 @@ def test_backup_management_button_is_offered_for_import_records_with_a_report(hi
         assert opened == []
         select(dialog, row_of(overwrite_job))
         assert dialog.btn_backups.isEnabled() is True
+        select(dialog, row_of(copy_job))
+        assert dialog.btn_backups.isEnabled() is True
+        select(dialog, row_of(replace_job))
+        assert dialog.btn_backups.isEnabled() is False
         select(dialog, row_of(import_job))
         assert dialog.btn_backups.isEnabled() is True
         dialog.manage_backups_selected()
@@ -650,3 +714,18 @@ def test_main_window_opens_backup_management_from_the_report_and_profile_credent
     TunnelManagerUI.open_job_backups(window, jh.JobRecord(id="2", kind=jh.KIND_IMPORT, profile_id="prof-1",
                                                           report_path=str(tmp_path / "missing.json")))
     assert captured == {}, "no safe-restore report -> no dialog"
+
+    # A main-menu Import (no profile) and a profile without saved credentials ask for the account instead.
+    asked = []
+    window._ask_db_credentials = lambda endpoint: asked.append(endpoint) or ("typed", "secret")
+    TunnelManagerUI.open_job_backups(window, jh.JobRecord(id="3", kind=jh.KIND_IMPORT, report_path=str(report)))
+    assert asked == ["127.0.0.1:13306"] and ensured == ["prof-1"], "no profile: no tunnel to start"
+    assert (captured["endpoint"]["user"], captured["endpoint"]["password"]) == ("typed", "secret")
+    window.config_mgr.get_tunnel_credentials = lambda tid: ("", "")
+    captured.clear()
+    TunnelManagerUI.open_job_backups(window, record)
+    assert len(asked) == 2 and ensured == ["prof-1", "prof-1"] and captured["endpoint"]["user"] == "typed"
+    window._ask_db_credentials = lambda endpoint: ("", "")  # cancelled
+    captured.clear()
+    TunnelManagerUI.open_job_backups(window, record)
+    assert captured == {}

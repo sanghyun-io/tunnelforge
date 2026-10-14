@@ -119,12 +119,12 @@ def test_safe_import_requires_verified_candidate_and_reports_pending_switch(tmp_
         "candidate_target": {"engine": "mysql", "host": "localhost", "port": 3306, "database": "restore_candidate", "password": "never-copy"},
     }
     raw = []
-    success, message, _ = RustDumpImporter(build_rust_dump_config(connector), facade).import_dump(str(tmp_path), raw_output_callback=raw.append)
+    success, message, _ = RustDumpImporter(build_rust_dump_config(connector), facade).import_dump(str(tmp_path), import_mode="safe", raw_output_callback=raw.append)
     assert success is ready
     assert facade.import_dump.call_args.args[0]["mode"] == "safe"
     if ready:
         assert "restore_candidate" in message
-        assert "전환 대기" in message
+        assert "교체를 기다립니다" in message
         assert raw and "never-copy" not in raw[-1]
 
 
@@ -137,4 +137,4 @@ def test_safe_import_accepts_verified_requested_new_namespace(tmp_path):
         "candidate_target": {"engine": "mysql", "database": "requested"}}
     success, message, _ = RustDumpImporter(build_rust_dump_config(connector), facade).import_dump(str(tmp_path), import_mode="safe")
     assert success
-    assert "requested" in message and "전환 대기" not in message
+    assert "requested" in message and "교체를 기다립니다" not in message
