@@ -508,8 +508,9 @@ fn replace_import_survives_connection_loss_with_exact_or_honestly_failed_result(
     for endpoint in endpoints() {
         let list = scenarios(
             &endpoint,
-            &[(1, false, 0.45, "f", false), (1, true, 0.45, "g", false), (4, false, 0.3, "h", false)],
-            &[(1, false, 0.45, "m", true), (1, true, 0.45, "n", true), (4, false, 0.3, "o", true)],
+            // d, e and l came from the removed merge test: lost replies under 4 workers and a late loss.
+            &[(1, false, 0.45, "f", false), (1, true, 0.45, "g", false), (4, false, 0.3, "h", false), (4, true, 0.7, "d", false), (1, false, 0.85, "e", false)],
+            &[(1, false, 0.45, "m", true), (1, true, 0.45, "n", true), (4, false, 0.3, "o", true), (4, true, 0.7, "l", true)],
         );
         for (threads, drop_replies, fraction, tag, load_data) in list {
             run_import_fault(&endpoint, "replace", threads, drop_replies, fraction, tag, load_data);

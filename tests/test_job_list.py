@@ -484,19 +484,6 @@ def test_reopen_routes_export_with_settings_and_everything_else_without():
         launcher.open_cross_engine_migration.assert_called_once_with()
 
 
-def test_reopening_an_old_merge_import_record_opens_the_dialog_on_the_default_mode():
-    tunnels = [{"id": "prof-1", "name": "Prod"}]
-    window, launcher, reopen = make_window(tunnels)
-    old = jh.JobRecord(id="m", kind=jh.KIND_IMPORT, profile_id="prof-1", mode="데이터 추가 Import · 스레드 4")
-    reopen(window, old)
-    launcher.open_rust_dump_import.assert_called_once_with(tunnels[0])
-    dialog = RustDumpImportDialog()
-    try:
-        assert dialog._get_selected_import_mode() == "safe"
-    finally:
-        dialog.close()
-
-
 def test_reopen_for_a_deleted_profile_falls_back_to_the_generic_wizard():
     window, launcher, reopen = make_window([])
     reopen(window, jh.JobRecord(id="1", kind=jh.KIND_EXPORT_TABLES, profile_id="gone", rerun={"scope": "tables"}))

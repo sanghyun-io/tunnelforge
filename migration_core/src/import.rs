@@ -1283,6 +1283,11 @@ struct MysqlImportChunkContext<'a> {
     overall_rows_total: u64,
 }
 
+/// A table whose connection dropped is truncated and replayed at most once.
+fn may_restart_import_table(attempt: u32) -> bool {
+    attempt < 2
+}
+
 fn import_mysql_tsv_table<F: FnMut(Value)>(
     endpoint: &Endpoint,
     conn: &mut mysql::PooledConn,
@@ -1375,7 +1380,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         match retryable_table_error {
             None => return Ok((rows_imported, chunks_imported)),
             Some(err) => {
-                if table_attempt >= 2 {
+                if !may_restart_import_table(table_attempt) {
                     return Err(err);
                 }
                 emit(json!({
@@ -2399,18 +2404,31 @@ mod tests {
 
     #[test]
     fn merge_mode_is_rejected_before_any_report_is_written() {
-        for key in ["mode", "import_mode"] {
-            let dir = std::env::temp_dir().join(format!("tunnelforge-merge-removed-{}-{key}", std::process::id()));
+        // An unknown mode must never fall through to a destructive replace.
+        for (key, mode, expected) in [
+            ("mode", "merge", "merge import mode was removed"),
+            ("import_mode", "merge", "merge import mode was removed"),
+            ("mode", "MERGE", "unsupported dump import mode"),
+            ("mode", "append", "unsupported dump import mode"),
+            ("mode", "", "unsupported dump import mode"),
+        ] {
+            let dir = std::env::temp_dir().join(format!("tunnelforge-merge-removed-{}-{key}-{mode}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
-            let payload = json!({ "input_dir": dir.to_string_lossy(), key: "merge", "target": { "engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app" } });
+            let payload = json!({ "input_dir": dir.to_string_lossy(), key: mode, "target": { "engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app" } });
             let mut events = Vec::new();
             let err = dump_import(&Request { command: "dump.import".into(), request_id: None, payload }, |event| events.push(event)).unwrap_err();
             let report_written = dump_import_report_path(&dir).unwrap().exists();
             fs::remove_dir_all(&dir).unwrap();
-            assert!(err.starts_with("import_plan_invalid:") && err.contains("merge import mode was removed"), "{key}: {err}");
-            assert!(!report_written, "{key}: a refused mode must not leave an import report");
-            assert!(events.is_empty(), "{key}: {events:?}");
+            assert!(err.starts_with("import_plan_invalid:") && err.contains(expected), "{key}={mode}: {err}");
+            assert!(!report_written, "{key}={mode}: a refused mode must not leave an import report");
+            assert!(events.is_empty(), "{key}={mode}: {events:?}");
         }
+    }
+
+    #[test]
+    fn a_table_is_truncated_and_replayed_at_most_once() {
+        assert!(may_restart_import_table(1));
+        assert!(!may_restart_import_table(2));
     }
     
     

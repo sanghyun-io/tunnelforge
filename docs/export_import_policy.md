@@ -36,6 +36,11 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | `replace` | Like mysqldump: each selected dump table is dropped, recreated, loaded and finished (its secondary indexes, PostgreSQL unique indexes/comments/sequences) one table at a time; each FK is added as soon as both of its tables are done (a parent outside the dump counts as done), and views follow at the end. Existing selected-table data is lost. A failure leaves at most the table in progress missing, partially loaded or unfinished; tables already replaced are complete, and tables not yet reached keep their original data; an FK such a table lost when its parent was replaced is linked again after the failure if that parent was reloaded (otherwise it stays reported as removed). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
 
+The former `merge` mode (append rows to existing tables) was removed. A request
+with `mode` or `import_mode` set to `merge`, or to any value not listed above, is
+refused as `import_plan_invalid` before anything is written, including the
+import report.
+
 Target-only tables are preserved. A target-only FK referencing an imported parent
 requires the recreated parent to retain a compatible key/type contract, including
 children in other schemas. MySQL creates only the primary key and full-column

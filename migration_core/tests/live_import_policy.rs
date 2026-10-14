@@ -113,8 +113,13 @@ fn mysql_import_rejects_silent_value_coercion() {
         let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "replace", "threads": threads}));
         // Every exported value overflows the declared type, so no row may be stored.
         let rows: Vec<(u64, String)> = global.conn.query(format!("SELECT id,CAST(value AS CHAR) FROM {table} ORDER BY id")).unwrap();
-        if success(&imported) || !rows.is_empty() {
-            failures.push(format!("{source_type}->{target_type} {format} local_infile={local_infile} threads={threads}: success={} rows={rows:?}", success(&imported)));
+        // LOAD DATA LOCAL turns errors into warnings, so there only the warning guard can refuse;
+        // INSERT paths may be refused by strict mode itself (1406/1264/1265).
+        let error = imported.iter().find(|event| event["event"] == "error").map(|event| event["message"].to_string()).unwrap_or_default();
+        let guard = error.contains("import data validation failed");
+        let refused_for_data = guard || ["ERROR 1406", "ERROR 1264", "ERROR 1265"].iter().any(|code| error.contains(code));
+        if success(&imported) || !rows.is_empty() || !refused_for_data || (local_infile == 1 && !guard) {
+            failures.push(format!("{source_type}->{target_type} {format} local_infile={local_infile} threads={threads}: success={} rows={rows:?} error={error}", success(&imported)));
         }
         global.conn.query_drop(format!("DROP TABLE {table}")).unwrap();
         std::fs::remove_dir_all(output).unwrap();
@@ -182,6 +187,9 @@ fn mysql_legacy_enum_compatibility_never_allows_unrelated_coercion() {
         std::fs::remove_dir_all(output).unwrap();
         assert!(!success(&imported), "{format}: unrelated decimal truncation was accepted");
         assert!(ids.is_empty(), "{format}: mixed warning statement was not rolled back: {ids:?}");
+        // The decimal truncation is only a warning, so the guard must be what refused it.
+        let error = imported.iter().find(|event| event["event"] == "error").map(|event| event["message"].to_string()).unwrap_or_default();
+        assert!(error.contains("import data validation failed"), "{format}: refused for another reason: {error}");
     }
 }
 
