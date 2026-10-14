@@ -772,7 +772,6 @@ pub(crate) fn plan(
         hidden_views: hidden, saved_views: saved,
         warnings: vec![
             "Existing replaced-table writes before the cutover are intentionally superseded by the restored candidate.".into(),
-            "Target-only tables in the affected dependency component are copied while WRITE locks pause their readers and writers.".into(),
             "The backup namespace contains only replaced tables. Unrelated original tables remain active at their existing names.".into(),
             "Saved old-view aliases retain definitions in the original namespace and still reference active final table names. They are recovery-definition artifacts, not views over backup data; native definitions are recorded in the promotion journal.".into(),
             "A retained backup does not include application writes accepted after promotion; rollback must not discard those writes.".into(),
@@ -861,7 +860,7 @@ pub(crate) fn summary(plan: &PromotionPlan) -> Value {
         "views_replaced":plan.replacement_views.keys().collect::<Vec<_>>(),"schema_changed_tables":changed,
         "row_counts":row_counts,"data_changed_tables":data_changed,"data_not_compared":data_not_compared,
         "backup_namespace":plan.backup_database,"backup_view_aliases":plan.saved_views,
-        "lock_acquisition_timeout_seconds":2,"write_pause":"Affected readers and writers wait while target-only rows are refreshed and verified, then one atomic RENAME switches names.","warnings":plan.warnings})
+        "lock_acquisition_timeout_seconds":2,"write_pause":"Readers and writers of the replaced tables and views wait under WRITE locks while the candidate is checked once more, then one atomic RENAME switches names.","warnings":plan.warnings})
 }
 fn assert_plan_binding(
     original: &Endpoint,
@@ -1115,7 +1114,7 @@ fn validate_fks(
             .map_err(|e| error("validate staged FK graph", e))?;
         if count != Some(0) {
             return Err(format!(
-                "target-only rows are incompatible with restored parent: {}.{}",
+                "rows are incompatible with their restored parent: {}.{}",
                 fk.child, fk.name
             ));
         }
@@ -2099,9 +2098,10 @@ pub(crate) fn clone_unrecorded(endpoint: &Endpoint, plan: &PromotionPlan) -> Res
 }
 
 /// Tables and views outside the dump that this plan would rebuild from their SHOW CREATE text
-/// because an FK or a view links them to the dump (TF-STATUS-173).
-pub(crate) fn rebuilt_outside_dump(plan: &PromotionPlan) -> Vec<String> {
-    let views = plan.replacement_views.iter().filter(|(name, view)| plan.original_views.get(*name) == Some(*view)).map(|(name, _)| name);
+/// because an FK or a view links them to the dump (TF-STATUS-173). `target_only_views` are the
+/// original's views the dump does not have, as the restore listed them.
+pub(crate) fn rebuilt_outside_dump(plan: &PromotionPlan, target_only_views: &BTreeSet<String>) -> Vec<String> {
+    let views = plan.replacement_views.keys().filter(|name| target_only_views.contains(*name));
     plan.original_tables.keys().filter(|name| !plan.candidate_tables.contains_key(*name)).chain(views).cloned().collect()
 }
 
@@ -2767,11 +2767,13 @@ mod tests {
             "restore_id": "r", "digest": "", "original_database": "o", "candidate_database": "c", "host": "h", "port": 1,
             "server_uuid": "u", "nonce": "1", "backup_database": "tf_backup_1", "clone_database": "tf_promote_1",
             "original_tables": {"parent": table("parent"), "child": table("child")}, "candidate_tables": {"parent": table("parent")},
-            "original_views": {"dump_view": view("old"), "child_view": view("kept")},
-            "replacement_views": {"dump_view": view("new"), "child_view": view("kept")},
+            "original_views": {"dump_view": view("old"), "child_view": view("kept"), "version": view("select '1.2'")},
+            // A dump view with no table references has the same definition in the original and the copy.
+            "replacement_views": {"dump_view": view("new"), "child_view": view("kept"), "version": view("select '1.2'")},
             "original_fks": [], "candidate_fks": [], "hidden_views": {}, "saved_views": {}, "view_order": [], "warnings": [],
         })).unwrap();
-        assert_eq!(rebuilt_outside_dump(&plan), ["child", "child_view"]);
+        let target_only_views = ["child_view".to_string(), "unlinked_view".to_string()].into_iter().collect();
+        assert_eq!(rebuilt_outside_dump(&plan, &target_only_views), ["child", "child_view"]);
     }
 
     #[test]

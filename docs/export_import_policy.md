@@ -134,7 +134,8 @@ tables), and on PostgreSQL `external_parent_missing` (MySQL adds such an FK with
 (`legacy_bit_unverifiable`, `cross_engine`, and `partial_table_filter` when the
 request carries a `tables` filter; a partial export is not refused), plus, for an
 existing same-engine target, the target checks `safe` runs before making a copy
-(see below). `warnings`
+(see below); when those checks cannot run, one `copy_checks_unavailable` item
+takes their place and the rest of the preview is still returned. `warnings`
 (`{code, detail}`) map the manifest's texts to `unsynchronized_snapshot`,
 `views_outside_snapshot`, `omitted_object` or `source_dump_warning`, and add
 `not_strict`, `legacy_timezone`, `legacy_dump`, `create_privilege_unproven`,
@@ -156,9 +157,11 @@ code, a failed table is reported as an unclassified cause with the text behind
 A failed or refused `safe` restore arrives as a `success: false` result with
 status `failed_original_untouched`, not as an error. Its `error` and `blockers`
 are passed through as the failure message, so the window names the core's
-reason. The refusals before a copy is made are coded as well:
-`partial_table_filter`, `legacy_bit_unverifiable`, `cross_engine` and
-`no_tables`.
+reason. A restore that stopped before making a copy (`copy_refused`, below)
+is shown instead as the `copy_refused` sentence followed by one line per
+`copy_blockers` code with the objects it names; the core's own text opens from
+"자세히", and a code without a sentence gets a general line that points to the
+report. `no_tables` is coded as well.
 
 ### Safe restoration and destination names
 
@@ -182,28 +185,38 @@ cross-engine changes.
 Into an existing namespace, `safe` stops before it makes a copy (and before it
 reads the chunks) when the later swap could not go through. The result is
 `failed_original_untouched` with `candidate_created: false`,
+`cutover_pending: false`, an `error` that starts with `copy_refused:`,
 `error_code: "copy_refused"` and `copy_blockers` (`{code, table, detail}`), the
-same list `dump.import_preview` returns:
+same list `dump.import_preview` returns. A `tables` filter stops the run before
+the dump is read (`partial_table_filter`); `legacy_bit_unverifiable` and
+`cross_engine` stop it from the dump alone; the rest come from the target:
 
 | Code | Stops when |
 | --- | --- |
-| `copy_create_privilege_missing` | MySQL: the account cannot create `tf_restore_*`, `tf_backup_*` and `tf_promote_*` databases; PostgreSQL: it has no CREATE on the database. |
+| `copy_create_privilege_missing` | MySQL: the grants do not show that the account can create `tf_restore_*`, `tf_backup_*` and `tf_promote_*` databases (unreadable grants count as missing); PostgreSQL: it has no CREATE on the database. |
 | `metadata_visibility_unproven` | MySQL: no direct global SELECT, SHOW VIEW and PROCESS grants (roles and partial revokes count as unproven). |
-| `target_routines`, `target_events` | The target namespace has stored routines (PostgreSQL: functions) or MySQL events. |
+| `target_routines`, `target_events` | The target namespace has stored routines (PostgreSQL: functions) or MySQL events; the swap does not move them and cannot prove they still work afterwards. |
 | `target_triggers` | MySQL: a dump table has a trigger in the target; PostgreSQL: any table in the schema has one. |
-| `linked_target_only` | A table or view outside the dump is linked to a dump table or view: an FK in either direction (from the target catalog or the dump's own FK definitions) or a view reading one, in this or another schema. |
+| `linked_target_only` | A table or view outside the dump is linked to a dump table or view: an FK in either direction (from the target catalog or the dump's own FK definitions) or a view reading one, in this or another schema. On PostgreSQL, a dump view whose current definition reads a table outside the dump in the same schema does not count: the swap replaces that view in place and leaves the table alone. |
+| `external_parent_missing` | A dump table's own FK names a parent that is neither in the dump nor in the target. |
 | `saved_view_alias` | The linked object is an old view definition an earlier MySQL swap kept (`tf_p_<nonce>_oldv<i>`); clean it up first (`target: "view_aliases"` below). |
+| `previous_copy_leftover` | The linked object is in a `tf_restore_*`, `tf_backup_*` or `tf_promote_*` namespace an earlier restore left, e.g. the views a PostgreSQL candidate keeps after its swap (they stay bound to the tables it moved in); clean up that candidate or backup first. |
 | `view_dependencies_unknown` | MySQL older than 8.0.13: views over the target cannot be listed. |
 
 A linked table or view is never rebuilt from its SHOW CREATE text to keep it
 (TF-STATUS-173): the run stops instead. Tables and views outside the dump that are
-not linked to it do not block: the swap leaves them, their triggers and their
-other objects where they are, so such a restore reaches `ready_for_switch`. As a
-second guard, `dump.promote` refuses a plan that would rebuild such an object
-(MySQL) or move a target-only table's FK to the new parent (PostgreSQL), and a
-stored plan that would. A request with `verify_only: true` (the scheduled
-restore rehearsal, which only verifies and cleans up the copy) skips these target
-checks.
+not linked to it do not block: the swap leaves them and their other objects
+where they are (PostgreSQL re-creates only the dump's views; a trigger on any
+of its tables still stops the run, see `target_triggers`), so such a restore
+reaches `ready_for_switch`. As a second guard, `dump.promote`
+runs the same target checks again when it plans and before it confirms (links
+to the restore's own copy aside): a plan is `blocked` with the same
+`copy_blockers`, and a confirm whose target changed since review is refused. It
+also refuses a plan that would rebuild a table or view outside the dump (MySQL)
+or move a target-only table's FK to the new parent (PostgreSQL), and a stored
+plan that would. A request with `verify_only: true` (the scheduled restore
+rehearsal, which only verifies and cleans up the copy) skips these target checks;
+its report records `verify_only: true` and `dump.promote` refuses it.
 
 Supported MySQL replacement uses write locks and one atomic multi-object RENAME;
 PostgreSQL replacement uses locks and a transaction. Both recheck dependencies and
@@ -242,7 +255,9 @@ confirmed promotion. MySQL additionally needs proven global SELECT/SHOW
 VIEW/PROCESS visibility. A candidate (`tf_restore_<id>` only, never the restore
 destination itself) is removable when unpromoted and still proven identical to its
 verification; after a failed restore (no plan or attempt recorded), when it holds
-only the dump's tables and views and leftover `tf_probe_` tables; or, after
+only the dump's tables and views and leftover `tf_probe_` tables (any routine,
+event or trigger, or on PostgreSQL any function, explicit type or unowned
+sequence, blocks it); or, after
 promotion, when it holds only objects the promotion plan
 recorded (PostgreSQL: the candidate's own views; MySQL: the recorded replacement
 views, after the recorded temporary `tf_promote_` clone database, which is a separate

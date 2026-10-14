@@ -26,7 +26,7 @@ from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component
 from src.exporters.rust_dump_exporter import (
-    build_rust_dump_config, check_rust_dump, describe_core_failure, dump_original_namespace,
+    build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure, dump_original_namespace,
     restore_target_connection_info,
 )
 from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
@@ -91,7 +91,7 @@ def _capture_import_audit(audit: dict, event: dict):
             audit["restore_status"] = event["status"]
         if isinstance(event.get("blockers"), list):
             audit["blockers"] = event["blockers"]
-        for key in ("restore_id", "report_path", "plan_digest"):
+        for key in ("restore_id", "report_path", "plan_digest", "error"):
             if isinstance(event.get(key), str):
                 audit[key] = event[key]
 
@@ -1775,8 +1775,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 self._add_log("Import가 취소되었습니다.")
             else:
                 if self.last_import_mode == "safe":
+                    # A stop before the copy arrives as plain sentences; the core's own text is its error.
+                    core_text = str(self.import_audit.get("error") or "")
                     self._show_failure("안전 복원 실패", self.label_status.text() + "\n\n" + (cause or message),
-                                       message if cause else "")
+                                       message if cause else ("" if core_text in message else core_text))
                 else:
                     details = _replace_failure_details(getattr(self, "import_audit", {}))
                     if error_count > 0:
@@ -1956,6 +1958,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         safe_plan = _sanitized_rust_event(plan)
         self.import_audit["promotion_plan"] = {key: safe_plan.get(key) for key in (
             "plan_digest", "can_promote", "original_target", "candidate_target", "backup_namespace", "summary", "blockers")}
+        # The target changed since the copy was made: the same reasons a stop before the copy names.
+        stops = describe_copy_blockers(safe_plan.get("copy_blockers"))
+        if stops:
+            self.import_audit["promotion_plan"]["blockers"] = stops
 
     def _review_promotion_plan(self, plan: dict):
         self._remember_promotion_plan(plan)

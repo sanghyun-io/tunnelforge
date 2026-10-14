@@ -136,7 +136,7 @@ pub(crate) fn summary(planned: &PromotionPlan) -> Value {
     let views: BTreeSet<_> = planned
         .inventory
         .iter()
-        .filter(|o| o["kind"] == "v")
+        .filter(|o| namespace(o) == planned.candidate_schema && o["kind"] == "v")
         .map(|o| name(o).to_string())
         .collect();
     json!({"selected_tables":selected,"target_only_tables_preserved":extra,"views_replaced":views,
@@ -456,22 +456,13 @@ pub(crate) fn promote(
         ))
         .map_err(|e| e.to_string())?;
         // Existing views retain OIDs, ownership, grants and comments. Candidate
-        // definitions are deparsed by PostgreSQL and namespace-stripped lexically.
-        let source_views: BTreeSet<_> = planned
-            .inventory
-            .iter()
-            .filter(|o| namespace(o) == planned.candidate_schema && o["kind"] == "v")
-            .map(name)
-            .collect();
+        // definitions are deparsed by PostgreSQL and namespace-stripped lexically. Views
+        // outside the dump are left as they are; dump.promote refuses a swap while one of
+        // them reads a replaced table or view.
         let mut views: Vec<&Value> = planned
             .inventory
             .iter()
-            .filter(|o| {
-                o["kind"] == "v"
-                    && (namespace(o) == planned.candidate_schema
-                        || (namespace(o) == planned.original_schema
-                            && !source_views.contains(name(o))))
-            })
+            .filter(|o| o["kind"] == "v" && namespace(o) == planned.candidate_schema)
             .collect();
         while !views.is_empty() {
             let mut pending = Vec::new();
@@ -1221,9 +1212,10 @@ mod tests {
         db.execute_sql("CREATE TABLE extra(id INT PRIMARY KEY, item_id INT REFERENCES items(id))")
             .unwrap();
         db.execute_sql("INSERT INTO extra VALUES(9,1)").unwrap();
-        db.execute_sql("CREATE VIEW target_only_view AS SELECT value FROM items")
+        // Outside the dump and not reading it: the swap leaves it alone.
+        db.execute_sql("CREATE VIEW target_only_view AS SELECT item_id FROM extra")
             .unwrap();
-        db.execute_sql("COMMENT ON VIEW target_only_view IS 'retained view metadata'")
+        db.execute_sql("COMMENT ON VIEW source_view IS 'retained view metadata'")
             .unwrap();
         let mut application = connect(&original).unwrap();
         let cached = application
@@ -1245,11 +1237,17 @@ mod tests {
             prepared["restore_id"].as_str().unwrap(),
         )
         .unwrap();
+        assert_eq!(repointed_tables(&planned), ["extra"]);
         let result = promote(&original, &candidate, &planned, &planned.plan_digest, &report(&prepared)).unwrap();
         assert_eq!(result["status"], "promoted", "{result:#?}");
         let values = run(
             "query.execute",
-            json!({"connection":original,"sql":"SELECT value FROM target_only_view"}),
+            json!({"connection":original,"sql":"SELECT item_id FROM target_only_view"}),
+        );
+        assert_eq!(values["rows"], json!([{"item_id":1}]));
+        let values = run(
+            "query.execute",
+            json!({"connection":original,"sql":"SELECT value FROM source_view"}),
         );
         assert_eq!(values["rows"], json!([{"value":"restored"}]));
         assert_eq!(
@@ -1265,7 +1263,7 @@ mod tests {
                 "SELECT obj_description(to_regclass($1),'pg_class')",
                 &[&qualified(
                     original.schema.as_deref().unwrap(),
-                    "target_only_view",
+                    "source_view",
                 )],
             )
             .unwrap()

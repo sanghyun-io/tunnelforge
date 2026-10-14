@@ -394,6 +394,17 @@ fn failed_copy_is_cleaned_only_while_it_holds_what_its_import_makes() {
         assert_eq!(blocked["can_cleanup"], false, "{blocked}");
         assert!(blockers(&blocked).contains("stray"), "{}", blockers(&blocked));
         fx.admin.execute_sql(&format!("DROP TABLE {candidate}.stray")).unwrap();
+        // A routine is no table, but the import makes none either, so it blocks too.
+        let (create, drop) = if mysql {
+            (format!("CREATE PROCEDURE {candidate}.stray_routine() SELECT 1"), format!("DROP PROCEDURE {candidate}.stray_routine"))
+        } else {
+            (format!("CREATE FUNCTION {candidate}.stray_routine() RETURNS int LANGUAGE sql AS 'SELECT 1'"), format!("DROP FUNCTION {candidate}.stray_routine()"))
+        };
+        fx.admin.execute_sql(&create).unwrap();
+        let blocked = fx.cleanup_plan("candidate");
+        assert_eq!(blocked["can_cleanup"], false, "{blocked}");
+        assert!(blockers(&blocked).contains("stray_routine"), "{}", blockers(&blocked));
+        fx.admin.execute_sql(&drop).unwrap();
         let plan = fx.cleanup_plan("candidate");
         assert_eq!(plan["can_cleanup"], true, "{plan}");
         assert_eq!(plan["will_delete"], json!([candidate]));
@@ -409,7 +420,8 @@ fn failed_copy_is_cleaned_only_while_it_holds_what_its_import_makes() {
 #[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
 fn a_second_safe_restore_keeps_the_first_report_and_both_restores_are_listed() {
     for base in endpoints() {
-        let fx = fixture(&base, true);
+        // Without a view: a swap with views leaves old views that stop the next restore (tested below).
+        let fx = fixture_with(&base, true, false, false);
         let first_report = std::fs::read(&fx.report_path).unwrap();
         // The same dump restored again: before each attempt had its own report, this erased the first one.
         let again = result(call("dump.import", json!({"connection": fx.original, "target": fx.original, "input_dir": fx.dir, "mode": "safe", "threads": 1})));
@@ -566,6 +578,16 @@ fn promoted_candidate_leftovers_are_cleaned_only_when_recorded() {
     for base in endpoints() {
         let mut fx = fixture_with(&base, true, true, false);
         let candidate = format!("tf_restore_{}", fx.restore_id);
+        // The swap's leftover views still read the restored tables, so the next restore stops until
+        // they are cleaned: MySQL's saved old views, PostgreSQL's copy that keeps its views.
+        let (target, dir) = (fx.original.clone(), fx.dir.clone());
+        let again = move || result(call("dump.import", json!({"target": target, "input_dir": dir, "mode": "safe", "threads": 1})));
+        let stopped = again();
+        assert_eq!(stopped["status"], "failed_original_untouched", "{stopped}");
+        assert_eq!(stopped["error_code"], "copy_refused", "{stopped}");
+        let (code, prefix) = if fx.mysql() { ("saved_view_alias", "tf_p_".to_string()) } else { ("previous_copy_leftover", format!("{candidate}.")) };
+        assert!(stopped["copy_blockers"].as_array().unwrap().iter()
+            .any(|item| item["code"] == code && item["table"].as_str().is_some_and(|table| table.starts_with(&prefix))), "{stopped}");
         if fx.mysql() {
             // MySQL also leaves the promotion's temporary clone database; it references the candidate.
             let blocked = fx.cleanup_plan("candidate");
@@ -610,6 +632,12 @@ fn promoted_candidate_leftovers_are_cleaned_only_when_recorded() {
         let applied = result(backups(&fx.original, &fx.dir, "cleanup_apply", json!({"restore_id": fx.restore_id, "target": "candidate", "plan_digest": plan["plan_digest"], "confirmed": true})));
         assert_eq!(applied["status"], "cleaned", "{applied}");
         assert!(!fx.exists(&candidate));
+        // With the leftovers gone the next restore goes through.
+        let passed = again();
+        if let Some(id) = passed["restore_id"].as_str() {
+            fx.drop_ns(&format!("tf_restore_{id}"));
+        }
+        assert_eq!(passed["status"], "ready_for_switch", "{passed}");
         fx.finish();
     }
 }

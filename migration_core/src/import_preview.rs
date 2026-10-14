@@ -102,8 +102,11 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let can_create = if exists { None } else { can_create_namespace(&mut admin, endpoint)? };
     // A cross-engine dump is already refused as a whole.
     if exists && manifest.source_engine == engine {
-        copy_blockers.extend(super::safe_restore::target_copy_refusals(&mut admin, endpoint, &manifest)?.into_iter()
-            .map(|(code, table, detail)| issue(code, table.as_deref(), detail)));
+        // Only verify-in-copy needs these checks, so a failed one does not fail the preview.
+        match super::safe_restore::target_copy_refusals(&mut admin, endpoint, &manifest) {
+            Ok(refusals) => copy_blockers.extend(refusals.into_iter().map(|(code, table, detail)| issue(code, table.as_deref(), detail))),
+            Err(error) => copy_blockers.push(issue("copy_checks_unavailable", None, error)),
+        }
     }
     drop(admin);
     if !exists {

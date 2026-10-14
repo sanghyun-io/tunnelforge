@@ -1,6 +1,7 @@
 //! Consent and persisted-plan boundary shared by engine-specific safe cutovers.
 use crate::import::safe_restore::{
-    load_verified_plan, reverify_candidate, VerifiedSafeRestorePlan,
+    load_verified_plan, maintenance_connection, reverify_candidate, target_copy_refusals, Refusal,
+    VerifiedSafeRestorePlan,
 };
 use crate::*;
 use serde::{Deserialize, Serialize};
@@ -41,9 +42,13 @@ impl EnginePlan {
         }
     }
 
-    fn linked_outside_dump(&self) -> Vec<String> {
+    /// `report` is the restore's report, which lists the target's views outside the dump.
+    fn linked_outside_dump(&self, report: &Value) -> Vec<String> {
         match self {
-            Self::MySql(plan) => crate::safe_promote_mysql::rebuilt_outside_dump(plan),
+            Self::MySql(plan) => {
+                let target_only_views = string_list(report.get("target_only_views")).into_iter().collect();
+                crate::safe_promote_mysql::rebuilt_outside_dump(plan, &target_only_views)
+            }
             Self::Postgres(plan) => crate::safe_promote_postgres::repointed_tables(plan),
         }
     }
@@ -211,6 +216,9 @@ fn load_restore(
             .ok_or("safe restore report_path is required")?,
     );
     let verified = load_verified_plan(&report_path, credentials)?;
+    if verified.report.get("verify_only") == Some(&Value::Bool(true)) {
+        return Err("this copy was made by a restore rehearsal, which skips the checks a swap needs; restore again to swap".into());
+    }
     validate_prior_outcome(&verified.report)?;
     if request.payload.get("restore_id").and_then(Value::as_str)
         != Some(verified.restore_id.as_str())
@@ -223,6 +231,18 @@ fn load_restore(
     check_user_namespace(&verified.original)?;
     check_user_namespace(&verified.candidate)?;
     Ok((report_path, verified))
+}
+
+/// The checks verify-in-copy ran before making the copy, run again: the target may have changed
+/// since. Links to this restore's own copy do not count.
+fn target_refusals(verified: &VerifiedSafeRestorePlan) -> Result<Vec<Refusal>, String> {
+    let manifest = read_dump_manifest(&verified.input_path)?;
+    let mut admin = maintenance_connection(&verified.original)?;
+    let own = format!("{}.", endpoint_schema(&verified.candidate));
+    Ok(target_copy_refusals(&mut admin, &verified.original, &manifest)?
+        .into_iter()
+        .filter(|(_, object, _)| !object.as_deref().is_some_and(|object| object.starts_with(&own)))
+        .collect())
 }
 
 fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String> {
@@ -250,6 +270,15 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
     reverify_candidate(&verified)?;
 
     if action == "plan" {
+        let refusals = target_refusals(&verified)?;
+        if !refusals.is_empty() {
+            let detail = |text: &str| redact_endpoint_secret(text, &credentials);
+            return Ok(json!({"success":true,"can_promote":false,"status":"blocked",
+                "original_unchanged":true,"cutover_pending":true,
+                "original_target":original,"candidate_target":candidate,
+                "blockers":refusals.iter().map(|(_, _, text)| detail(text)).collect::<Vec<_>>(),
+                "copy_blockers":refusals.iter().map(|(code, table, text)| json!({"code":code,"table":table,"detail":detail(text)})).collect::<Vec<_>>()}));
+        }
         let engine_plan = match verified.original.engine.as_str() {
             "mysql" => crate::safe_promote_mysql::plan(
                 &verified.original,
@@ -268,7 +297,7 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
         // Tables and views outside the dump stay as they are (rule 3): a swap that would have to
         // rebuild them (MySQL) or move their FKs to the new parents (PostgreSQL) stops instead.
         let engine_plan = engine_plan.and_then(|plan| {
-            let linked = plan.linked_outside_dump();
+            let linked = plan.linked_outside_dump(&verified.report);
             if linked.is_empty() {
                 Ok(plan)
             } else {
@@ -287,7 +316,11 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
             }
         };
         let backup = engine_plan.backup_namespace().to_string();
-        let summary = engine_plan.summary();
+        let mut summary = engine_plan.summary();
+        if let EnginePlan::MySql(_) = &engine_plan {
+            // The MySQL plan covers only the dump's tables; the restore listed the others it keeps.
+            summary["target_only_tables_preserved"] = verified.report["target_only_tables"].clone();
+        }
         let stored = StoredPlan {
             restore_id: verified.restore_id.clone(),
             restore_digest: verified.plan_digest.clone(),
@@ -337,8 +370,13 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
             return Err("promotion plan changed; review and confirm a fresh plan".into());
         }
         // A plan stored by an older version may still rebuild them.
-        if !stored.engine_plan.linked_outside_dump().is_empty() {
+        if !stored.engine_plan.linked_outside_dump(&verified.report).is_empty() {
             return Err("this plan would change tables or views outside the dump; it is no longer carried out".into());
+        }
+        let refusals = target_refusals(&verified)?;
+        if !refusals.is_empty() {
+            let details = refusals.iter().map(|(_, _, text)| text.as_str()).collect::<Vec<_>>();
+            return Err(format!("the target changed after the plan was reviewed: {}", details.join("; ")));
         }
         let report_dir = report_path.parent().ok_or("report directory is missing")?;
         emit(json!({"event":"phase","request_id":request.request_id,

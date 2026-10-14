@@ -214,23 +214,44 @@ fn failed_copy(entry: &Entry) -> bool {
         && entry.report.as_ref().is_some_and(|report| report["status"] == "failed_original_untouched" && report["verified"] != true)
 }
 
-/// Tables and views in a failed copy that its import does not make: neither a dump table or view
-/// nor a leftover DDL probe.
+/// Objects in a failed copy that its import does not make: anything but the dump's tables and
+/// views and leftover DDL probes. The import makes no routines, events, triggers, types or
+/// unowned sequences, so each one is a stray.
 fn copy_strays(credentials: &Endpoint, input_dir: &Path, namespace: &str) -> Result<Vec<String>, String> {
     let manifest = read_dump_manifest(input_dir)?;
     let mut adapter = LiveAdapter::connect(credentials)?;
-    let (fold, present): (bool, Vec<String>) = match &mut adapter {
-        LiveAdapter::MySql(conn) => (mysql_folds_table_names(conn)?, conn
-            .exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (namespace,))
-            .map_err(|e| e.to_string())?),
-        LiveAdapter::PostgreSql(client) => (false, client
-            .query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f')", &[&namespace])
-            .map_err(|e| e.to_string())?.iter().map(|row| row.get(0)).collect()),
+    let (fold, present, others): (bool, Vec<String>, Vec<String>) = match &mut adapter {
+        LiveAdapter::MySql(conn) => {
+            let mut others = Vec::new();
+            for sql in [
+                "SELECT CONCAT('routine ', ROUTINE_NAME) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=?",
+                "SELECT CONCAT('event ', EVENT_NAME) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=?",
+                "SELECT CONCAT('trigger ', TRIGGER_NAME) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=?",
+            ] {
+                others.extend(conn.exec::<String, _, _>(sql, (namespace,)).map_err(|e| e.to_string())?);
+            }
+            (mysql_folds_table_names(conn)?, conn
+                .exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (namespace,))
+                .map_err(|e| e.to_string())?, others)
+        }
+        LiveAdapter::PostgreSql(client) => {
+            let mut query = |sql: &str| -> Result<Vec<String>, String> {
+                Ok(client.query(sql, &[&namespace]).map_err(|e| e.to_string())?.iter().map(|row| row.get(0)).collect())
+            };
+            let present = query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f')")?;
+            let mut others = query("SELECT 'function ' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1")?;
+            // A table's row type and every array type depend internally on what they belong to.
+            others.extend(query("SELECT 'type ' || t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname=$1 \
+                AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_type'::regclass AND d.objid=t.oid AND d.deptype='i')")?);
+            others.extend(query("SELECT 'sequence ' || s.relname FROM pg_class s JOIN pg_namespace n ON n.oid=s.relnamespace WHERE n.nspname=$1 AND s.relkind='S' \
+                AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=s.oid AND d.refclassid='pg_class'::regclass AND d.deptype IN ('a','i'))")?);
+            (false, present, others)
+        }
     };
     let key = |name: &str| if fold { name.to_lowercase() } else { name.to_string() };
     let made = manifest.tables.iter().map(|table| key(&table.name))
         .chain(manifest.views.iter().map(|view| key(&view.name))).collect::<std::collections::BTreeSet<_>>();
-    Ok(present.into_iter().filter(|name| !made.contains(&key(name)) && !name.starts_with("tf_probe_")).collect())
+    Ok(present.into_iter().filter(|name| !made.contains(&key(name)) && !name.starts_with("tf_probe_")).chain(others).collect())
 }
 
 fn created_unix(entry: &Entry) -> Option<u64> {

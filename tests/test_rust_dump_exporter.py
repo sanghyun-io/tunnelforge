@@ -1189,7 +1189,8 @@ class TestRustDumpImporter:
                 payloads.append(payload)
                 return {"success": False, "status": "failed_original_untouched", "original_unchanged": True,
                         "candidate_created": False, "error_code": "copy_refused",
-                        "message": "Safe restore failed; original database was not changed. verify-in-copy stopped",
+                        "error": "copy_refused: verify-in-copy stopped before making a copy: notes.fk references users",
+                        "message": "Safe restore failed; original database was not changed. copy_refused: verify-in-copy stopped",
                         "copy_blockers": [
                             {"code": "linked_target_only", "table": "notes", "detail": "notes.fk references users"},
                             {"code": "linked_target_only", "table": "notes_view", "detail": "view notes_view reads users"},
@@ -1204,9 +1205,11 @@ class TestRustDumpImporter:
         assert success is False
         lines = message.splitlines()
         assert lines[0] == "복사본을 만들기 전에 멈췄습니다. 원본은 그대로입니다."
-        assert lines[1].startswith("- 덤프에 없는 테이블이나 뷰가") and lines[1].endswith(": notes, notes_view")
+        assert lines[1].startswith("- 덤프에 없는 테이블이나 뷰가") and lines[1].endswith(" (notes, notes_view)")
         assert "SELECT, SHOW VIEW, PROCESS" in lines[2]
-        assert lines[3] == "- 복사본에서 검증할 수 없는 대상입니다 (something_new)"
+        # A code this version does not know: no code in the sentence, the report has the detail.
+        assert lines[3] == "- 복사본에서 검증할 수 없는 다른 이유가 있습니다. Import 보고서에서 확인하세요."
+        assert "something_new" not in message and "verify-in-copy" not in message
         assert "verify_only" not in payloads[0] and payloads[1]["verify_only"] is True
 
     def test_import_dump_reports_cross_engine_skipped_views(self, tmp_path):
@@ -1723,7 +1726,10 @@ def test_every_code_the_core_can_emit_has_a_korean_sentence():
         # The (code, ...) tuples that feed the preview's blockers and warnings.
         emitted.update(re.findall(r'push\(\(\s*"([a-z_]+)"', source))
         emitted.update(re.findall(r'"error_code"\s*:\s*"([a-z_]+)"', source))
+        if path.name == "safe_restore.rs":  # the (code, object, detail) refusals behind copy_blockers
+            emitted.update(re.findall(r'\(\s*"([a-z_]+)",\s*(?:None|Some\()', source))
         for body in re.findall(r"fn manifest_warning_code\b.*?\n\}", source, re.DOTALL):
             emitted.update(re.findall(r'"([a-z_]+)"', body))
     assert {"load_failed", "dependent_object", "views_outside_snapshot", "partial_table_filter", "no_tables"} <= emitted
+    assert {"copy_refused", "copy_checks_unavailable", "target_events", "linked_target_only", "previous_copy_leftover"} <= emitted
     assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []

@@ -203,14 +203,17 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
     }
     emit(json!({"event":"import_report", "request_id":request.request_id, "status":"running", "report_path":report_path}));
     let outcome = (|| -> Result<Value, String> {
-        let filtered = !string_list(request.payload.get("tables")).is_empty();
+        // Refused before the manifest is read.
+        if !string_list(request.payload.get("tables")).is_empty() {
+            return Err(copy_stop(&mut state, &[partial_filter_refusal()]));
+        }
         let manifest = read_dump_manifest(path)?;
         state["dump_manifest_sha256"] = json!(sha256_file(&path.join("_tunnelforge_dump.json"))?);
         if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
             return Err("unsupported dump manifest format".into());
         }
         crate::import::check_mysql_spatial_import(&manifest, &Default::default(), &original.engine)?;
-        let refusals = copy_refusals(&manifest, &original.engine, filtered);
+        let refusals = copy_refusals(&manifest, &original.engine, false);
         if !refusals.is_empty() {
             return Err(copy_stop(&mut state, &refusals));
         }
@@ -240,11 +243,16 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         // Checked before the chunks are read, so a run that cannot swap stops at once. A rehearsal
         // (`verify_only`) never swaps, so only the copy itself has to work.
         let swap_intended = request.payload.get("verify_only") != Some(&Value::Bool(true));
+        if !swap_intended {
+            // dump.promote refuses such a copy.
+            state["verify_only"] = json!(true);
+        }
         let namespace_exists = {
             let mut admin = maintenance_connection(&original)?;
             let exists = target_namespace_exists(&mut admin, &original)?;
             let refusals = if exists && swap_intended { target_copy_refusals(&mut admin, &original, &manifest)? } else { Vec::new() };
             if !refusals.is_empty() {
+                state["namespace_existed"] = json!(true);
                 return Err(copy_stop(&mut state, &refusals));
             }
             exists
@@ -478,13 +486,17 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
 }
 
 /// Why verify-in-copy will not start: `(code, the table or other object it concerns, detail)`.
-pub(super) type Refusal = (&'static str, Option<String>, String);
+pub(crate) type Refusal = (&'static str, Option<String>, String);
+
+fn partial_filter_refusal() -> Refusal {
+    ("partial_table_filter", None, "safe restore requires the complete dump; partial table filters are not supported".into())
+}
 
 /// What verify-in-copy refuses from the dump and the request alone.
 pub(super) fn copy_refusals(manifest: &DumpManifest, engine: &str, filtered: bool) -> Vec<Refusal> {
     let mut refusals = Vec::new();
     if filtered {
-        refusals.push(("partial_table_filter", None, "safe restore requires the complete dump; partial table filters are not supported".into()));
+        refusals.push(partial_filter_refusal());
     }
     if manifest.format_version < 4 && manifest.source_engine == "mysql"
         && manifest.schema.tables.iter().any(|table| table.columns.iter().any(|column| mysql_bit_width(&column.type_name).is_some()))
@@ -500,16 +512,19 @@ pub(super) fn copy_refusals(manifest: &DumpManifest, engine: &str, filtered: boo
 /// Records on the result why verify-in-copy stopped before making a copy; returns the error text.
 fn copy_stop(state: &mut Value, refusals: &[Refusal]) -> String {
     state["error_code"] = json!("copy_refused");
+    // Nothing was made, so no switch is waiting.
+    state["cutover_pending"] = json!(false);
+    state["ready_for_switch"] = json!(false);
     state["copy_blockers"] = json!(refusals.iter()
         .map(|(code, table, detail)| json!({"code": code, "table": table, "detail": detail})).collect::<Vec<_>>());
     let details = refusals.iter().map(|(_, _, detail)| detail.as_str()).collect::<Vec<_>>();
-    format!("verify-in-copy stopped before making a copy: {}", details.join("; "))
+    classified_import_error("copy_refused", &format!("verify-in-copy stopped before making a copy: {}", details.join("; ")), None)
 }
 
 /// What verify-in-copy refuses on an existing target, read before any copy is made: what the swap
 /// would refuse later, and every table or view outside the dump that an FK or a view links to it.
 /// The swap could keep such an object only by rebuilding it (TF-STATUS-173), so the run stops.
-pub(super) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint, manifest: &DumpManifest) -> Result<Vec<Refusal>, String> {
+pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint, manifest: &DumpManifest) -> Result<Vec<Refusal>, String> {
     fn inspect(err: impl std::fmt::Display) -> String {
         format!("verify-in-copy target inspection failed: {err}")
     }
@@ -518,28 +533,28 @@ pub(super) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
     /// (view schema, view, schema, the table or view it reads)
     type ViewLink = (String, String, String, String);
     let schema = endpoint_schema(original);
+    let postgres = matches!(admin, LiveAdapter::PostgreSql(_));
     let mut refusals: Vec<Refusal> = Vec::new();
-    let (fold, foreign_keys, views): (bool, Vec<ForeignKeyLink>, Vec<ViewLink>) = match admin {
+    let (fold, present, foreign_keys, views): (bool, Vec<String>, Vec<ForeignKeyLink>, Vec<ViewLink>) = match admin {
         LiveAdapter::MySql(conn) => {
             let missing = ["tf_restore_", "tf_backup_", "tf_promote_"].into_iter()
                 .filter(|prefix| super::import_preview::mysql_grants_allow(conn, "CREATE", Some(&format!("{prefix}0"))) != Some(true))
                 .map(|prefix| format!("{prefix}*")).collect::<Vec<_>>();
             if !missing.is_empty() {
                 refusals.push(("copy_create_privilege_missing", None,
-                    format!("this account cannot create the databases verify-in-copy uses ({})", missing.join(", "))));
+                    format!("this account cannot be shown to create the databases verify-in-copy uses ({})", missing.join(", "))));
             }
             let grants: Vec<String> = conn.query("SHOW GRANTS FOR CURRENT_USER").map_err(inspect)?;
             if !crate::safe_promote_mysql::has_complete_metadata_grants(&grants) {
                 refusals.push(("metadata_visibility_unproven", None,
                     "verify-in-copy needs direct global SELECT, SHOW VIEW and PROCESS grants (no roles or partial revokes) to see every object that depends on the target".into()));
             }
-            for (sql, code, kind) in [
-                ("SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=? ORDER BY 1", "target_routines", "stored routine"),
-                ("SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? ORDER BY 1", "target_events", "event"),
-            ] {
-                let names: Vec<String> = conn.exec(sql, (&schema,)).map_err(inspect)?;
-                refusals.extend(names.into_iter().map(|name| (code, Some(name.clone()), format!("the target has the {kind} {name}, which the swap cannot carry over"))));
-            }
+            let routines: Vec<String> = conn.exec("SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=? ORDER BY 1", (&schema,)).map_err(inspect)?;
+            refusals.extend(routines.into_iter().map(|name| ("target_routines", Some(name.clone()),
+                format!("the target has the stored routine {name}; the swap cannot prove it still works afterwards"))));
+            let events: Vec<String> = conn.exec("SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? ORDER BY 1", (&schema,)).map_err(inspect)?;
+            refusals.extend(events.into_iter().map(|name| ("target_events", Some(name.clone()),
+                format!("the target has the event {name}; the swap cannot prove it still works afterwards"))));
             let fold = mysql_folds_table_names(conn)?;
             let dumped = manifest.tables.iter().map(|table| if fold { table.name.to_lowercase() } else { table.name.clone() }).collect::<BTreeSet<_>>();
             // The MySQL swap moves only tables in the dump, so only their triggers stop it.
@@ -549,6 +564,7 @@ pub(super) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
             refusals.extend(triggers.into_iter()
                 .filter(|(table, _)| dumped.contains(&if fold { table.to_lowercase() } else { table.clone() }))
                 .map(|(table, name)| ("target_triggers", Some(table.clone()), format!("table {table} has the trigger {name}, which the swap cannot carry over"))));
+            let present: Vec<String> = conn.exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (&schema,)).map_err(inspect)?;
             let foreign_keys: Vec<ForeignKeyLink> = conn.exec(
                 "SELECT DISTINCT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE \
                  WHERE REFERENCED_TABLE_NAME IS NOT NULL AND (TABLE_SCHEMA=? OR REFERENCED_TABLE_SCHEMA=?)", (&schema, &schema),
@@ -563,7 +579,7 @@ pub(super) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
                     Vec::new()
                 }
             };
-            (fold, foreign_keys, views)
+            (fold, present, foreign_keys, views)
         }
         LiveAdapter::PostgreSql(client) => {
             let can_create: bool = client.query_one("SELECT has_database_privilege(current_database(), 'CREATE')", &[]).map_err(inspect)?.get(0);
@@ -574,13 +590,15 @@ pub(super) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
             let mut query = |sql: &str| client.query(sql, &[&schema]).map_err(inspect);
             for row in query("SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 ORDER BY 1")? {
                 let name: String = row.get(0);
-                refusals.push(("target_routines", Some(name.clone()), format!("the target has the function {name}, which the swap cannot carry over")));
+                refusals.push(("target_routines", Some(name.clone()), format!("the target has the function {name}; the swap cannot prove it still works afterwards")));
             }
             // The PostgreSQL swap refuses a trigger anywhere in the schema.
             for row in query("SELECT c.relname, t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND NOT t.tgisinternal ORDER BY 1, 2")? {
                 let (table, name): (String, String) = (row.get(0), row.get(1));
                 refusals.push(("target_triggers", Some(table.clone()), format!("table {table} has the trigger {name}, which the swap cannot carry over")));
             }
+            let present = query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f')")?
+                .iter().map(|row| row.get(0)).collect();
             let foreign_keys: Vec<ForeignKeyLink> = query(
                 "SELECT cn.nspname, c.relname, k.conname, pn.nspname, p.relname FROM pg_constraint k \
                  JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace cn ON cn.oid=c.relnamespace \
@@ -595,48 +613,68 @@ pub(super) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
                  WHERE r.oid<>v.oid AND r.relkind IN ('r','p','v','m','f') AND (vn.nspname=$1 OR rn.nspname=$1) \
                    AND rn.nspname NOT IN ('pg_catalog','information_schema')",
             )?.iter().map(|row| (row.get(0), row.get(1), row.get(2), row.get(3))).collect();
-            (false, foreign_keys, views)
+            (false, present, foreign_keys, views)
         }
     };
     let key = |name: &str| if fold { name.to_lowercase() } else { name.to_string() };
+    let in_schema = |object_schema: &str| key(object_schema) == key(&schema);
     let dumped = manifest.tables.iter().map(|table| key(&table.name))
         .chain(manifest.views.iter().map(|view| key(&view.name))).collect::<BTreeSet<_>>();
-    let name = |object_schema: &str, object: &str| if key(object_schema) == key(&schema) { object.to_string() } else { format!("{object_schema}.{object}") };
-    let mut linked = BTreeSet::new();
+    let dump_views = manifest.views.iter().map(|view| key(&view.name)).collect::<BTreeSet<_>>();
+    let present = present.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
+    let name = |object_schema: &str, object: &str| if in_schema(object_schema) { object.to_string() } else { format!("{object_schema}.{object}") };
+    let mut linked: BTreeSet<Refusal> = BTreeSet::new();
     let here = schema.as_str();
+    let catalog_keys = foreign_keys.into_iter().map(|link| (link, false));
     let manifest_keys = manifest.schema.tables.iter().flat_map(|table| table.foreign_keys.iter()
-        .map(move |fk| (here.to_string(), table.name.clone(), fk.name.clone(), here.to_string(), fk.referenced_table.clone())));
-    for (child_schema, child, constraint, parent_schema, parent) in foreign_keys.into_iter().chain(manifest_keys) {
-        if let Some(outside) = outside_end(&schema, &dumped, &key, (&child_schema, &child), (&parent_schema, &parent)) {
-            linked.insert((outside, format!("{}.{constraint} references {}", name(&child_schema, &child), name(&parent_schema, &parent))));
+        .map(move |fk| ((here.to_string(), table.name.clone(), fk.name.clone(), here.to_string(), fk.referenced_table.clone()), true)));
+    for ((child_schema, child, constraint, parent_schema, parent), from_dump) in catalog_keys.chain(manifest_keys) {
+        let Some((outside_schema, outside)) = outside_end(&schema, &dumped, &key, (&child_schema, &child), (&parent_schema, &parent)) else { continue };
+        let detail = format!("{}.{constraint} references {}", name(&child_schema, &child), name(&parent_schema, &parent));
+        if from_dump && !present.contains(&key(&parent)) {
+            // Only the dump's own FK names this parent, and the target has no such table either.
+            linked.insert(("external_parent_missing", Some(child.clone()), format!("{detail}, which neither the dump nor the target has")));
+        } else {
+            linked.insert(link_refusal(!in_schema(outside_schema), outside_schema, outside, detail));
         }
     }
     for (view_schema, view, table_schema, table) in views {
-        if let Some(outside) = outside_end(&schema, &dumped, &key, (&view_schema, &view), (&table_schema, &table)) {
-            linked.insert((outside, format!("view {} reads {}", name(&view_schema, &view), name(&table_schema, &table))));
+        // PostgreSQL replaces a dump view in place and leaves what its old definition read alone;
+        // the MySQL swap would take that table along.
+        if postgres && in_schema(&view_schema) && in_schema(&table_schema) && dump_views.contains(&key(&view)) {
+            continue;
+        }
+        if let Some((outside_schema, outside)) = outside_end(&schema, &dumped, &key, (&view_schema, &view), (&table_schema, &table)) {
+            let detail = format!("view {} reads {}", name(&view_schema, &view), name(&table_schema, &table));
+            linked.insert(link_refusal(!in_schema(outside_schema), outside_schema, outside, detail));
         }
     }
-    refusals.extend(linked.into_iter().map(|(outside, detail)| {
-        // An earlier MySQL swap keeps each replaced view's old definition as `tf_p_<nonce>_oldv<i>`.
-        if outside.starts_with("tf_p_") && outside.contains("_oldv") {
-            ("saved_view_alias", Some(outside), format!("{detail}; an earlier swap saved this old view definition, clean it up before the next swap"))
-        } else {
-            ("linked_target_only", Some(outside), format!("{detail}; a table or view outside the dump is linked to it, and the swap cannot leave that object as it is"))
-        }
-    }));
+    refusals.extend(linked);
     Ok(refusals)
 }
 
+/// The refusal for a link whose end outside the dump is `object` (in another schema when `elsewhere`).
+fn link_refusal(elsewhere: bool, object_schema: &str, object: &str, detail: String) -> Refusal {
+    let shown = if elsewhere { format!("{object_schema}.{object}") } else { object.to_string() };
+    if elsewhere && ["tf_restore_", "tf_backup_", "tf_promote_"].iter().any(|prefix| object_schema.starts_with(prefix)) {
+        // E.g. an earlier PostgreSQL swap leaves the copy's views bound to the tables it moved in.
+        ("previous_copy_leftover", Some(shown), format!("{detail}; an earlier verify-in-copy left this object, clean up that copy or backup first"))
+    } else if !elsewhere && object.starts_with("tf_p_") && object.contains("_oldv") {
+        // An earlier MySQL swap keeps each replaced view's old definition as `tf_p_<nonce>_oldv<i>`.
+        ("saved_view_alias", Some(shown), format!("{detail}; an earlier swap saved this old view definition, clean it up before the next swap"))
+    } else {
+        ("linked_target_only", Some(shown), format!("{detail}; a table or view outside the dump is linked to it, and the swap cannot leave that object as it is"))
+    }
+}
+
 /// The end of a link (an FK child and its parent, or a view and what it reads) that lies outside
-/// the dump while the other end is in it; qualified when it is in another schema.
-fn outside_end(schema: &str, dumped: &BTreeSet<String>, key: &dyn Fn(&str) -> String, from: (&str, &str), to: (&str, &str)) -> Option<String> {
-    let in_schema = |object_schema: &str| key(object_schema) == key(schema);
-    let in_dump = |(object_schema, object): (&str, &str)| in_schema(object_schema) && dumped.contains(&key(object));
+/// the dump while the other end is in it, as `(schema, name)`.
+fn outside_end<'a>(schema: &str, dumped: &BTreeSet<String>, key: &dyn Fn(&str) -> String, from: (&'a str, &'a str), to: (&'a str, &'a str)) -> Option<(&'a str, &'a str)> {
+    let in_dump = |(object_schema, object): (&str, &str)| key(object_schema) == key(schema) && dumped.contains(&key(object));
     if in_dump(from) == in_dump(to) {
         return None;
     }
-    let (object_schema, object) = if in_dump(from) { to } else { from };
-    Some(if in_schema(object_schema) { object.to_string() } else { format!("{object_schema}.{object}") })
+    Some(if in_dump(from) { to } else { from })
 }
 
 /// A connection that works while the target namespace is missing: MySQL connects to
@@ -1146,13 +1184,22 @@ mod tests {
         let fold = |name: &str| name.to_lowercase();
         let exact = |name: &str| name.to_string();
         let end = |from, to| outside_end("app", &dumped, &exact, from, to);
-        assert_eq!(end(("app", "notes"), ("app", "orders")), Some("notes".into()), "a target-only child of a dump table");
-        assert_eq!(end(("app", "orders"), ("app", "customers")), Some("customers".into()), "a target-only parent of a dump table");
+        assert_eq!(end(("app", "notes"), ("app", "orders")), Some(("app", "notes")), "a target-only child of a dump table");
+        assert_eq!(end(("app", "orders"), ("app", "customers")), Some(("app", "customers")), "a target-only parent of a dump table");
         assert_eq!(end(("app", "orders"), ("app", "order_view")), None, "both ends in the dump");
         assert_eq!(end(("app", "notes"), ("app", "archive")), None, "both ends outside the dump");
-        assert_eq!(end(("reports", "summary"), ("app", "orders")), Some("reports.summary".into()), "a view in another schema");
+        assert_eq!(end(("reports", "summary"), ("app", "orders")), Some(("reports", "summary")), "a view in another schema");
         assert_eq!(end(("reports", "orders"), ("app", "notes")), None, "a same-named table in another schema is not in the dump");
-        assert_eq!(outside_end("App", &dumped, &fold, ("app", "Orders"), ("APP", "Notes")), Some("Notes".into()), "lower_case_table_names folds names");
+        assert_eq!(outside_end("App", &dumped, &fold, ("app", "Orders"), ("APP", "Notes")), Some(("APP", "Notes")), "lower_case_table_names folds names");
+
+        let code = |elsewhere, schema, object| link_refusal(elsewhere, schema, object, "d".into());
+        assert_eq!(code(false, "app", "notes"), ("linked_target_only", Some("notes".into()), "d; a table or view outside the dump is linked to it, and the swap cannot leave that object as it is".into()));
+        assert_eq!(code(true, "reports", "summary").1.as_deref(), Some("reports.summary"));
+        assert_eq!(code(false, "app", "tf_p_1760_oldv0").0, "saved_view_alias", "an old view an earlier MySQL swap kept");
+        for leftover in ["tf_restore_1_2", "tf_backup_1_2", "tf_promote_1"] {
+            assert_eq!(code(true, leftover, "order_view").0, "previous_copy_leftover", "{leftover}");
+        }
+        assert_eq!(code(false, "app", "tf_restore_notes").0, "linked_target_only", "only another namespace is a leftover copy");
     }
 
     #[test]
@@ -1165,7 +1212,9 @@ mod tests {
         let result = run(&Request { command: "dump.import".into(), request_id: None, payload }, |_| {}).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(result["status"], "failed_original_untouched");
-        assert!(result["error"].as_str().unwrap().starts_with("partial_table_filter: "), "{result}");
+        assert!(result["error"].as_str().unwrap().starts_with("copy_refused: "), "{result}");
+        assert_eq!(result["copy_blockers"][0]["code"], "partial_table_filter", "{result}");
+        assert_eq!(result["cutover_pending"], false, "nothing was made, so no switch is waiting: {result}");
     }
 
     #[test]
