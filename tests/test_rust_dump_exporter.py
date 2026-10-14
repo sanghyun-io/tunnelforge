@@ -1630,3 +1630,65 @@ class TestExportRefusalContract:
         assert success is True
         assert facade.payload["allow_incomplete"] is True
         assert exporter.last_refusal is None
+
+
+
+_HANGUL = range(ord("가"), ord("힣") + 1)
+
+
+@pytest.mark.parametrize(("message", "expected"), [
+    ("Rust DB Core import 오류: load_failed: orders: create_table failed: MySqlError { ERROR 1822 (HY000): x }",
+     "orders: 테이블을 만들거나 데이터를 넣다가 서버 오류로 멈췄습니다."),
+    ("target_create_failed: the target database app was not found (or is not visible to this account) and could not "
+     "be created; no target tables were changed: MySqlError { ERROR 1044 (42000): Access denied }",
+     "대상 DB(스키마)가 없거나 이 계정에 보이지 않고, 새로 만들지도 못했습니다. 대상 테이블은 바뀌지 않았습니다."),
+    # A safe restore's message puts the core reason after its own sentence.
+    ("Safe restore failed; original database was not changed. cross_engine: safe restore currently verifies "
+     "same-engine dumps only", "다른 DB 종류에서 만든 덤프는 복사본에서 검증할 수 없습니다."),
+    ("post_load_validation_failed: postgresql SQL execution error: db error; code=23503; message=x",
+     "데이터를 넣은 뒤 행 수를 확인하거나 인덱스·외래 키를 만들다가 멈췄습니다."),
+    ("mysql connection error: TLS required (error_code=tls_unavailable)",
+     "DB 서버가 TLS를 제공하지 않습니다. 서버의 TLS 설정을 확인하세요."),
+    # An unknown leading identifier (a table name) is not taken for a code.
+    ("secret_table: load_failed: x", "테이블을 만들거나 데이터를 넣다가 서버 오류로 멈췄습니다."),
+    ("secret_table: something failed", None),
+    ("connection refused", None),
+    ("", None),
+])
+def test_core_error_codes_map_to_korean(message, expected):
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES, describe_core_code, describe_core_failure
+
+    assert describe_core_failure(message) == expected
+    # A preview blocker names its table; an unknown code has no sentence.
+    assert describe_core_code("dependent_view", "orders") == "orders: 대상의 뷰가 이 테이블을 쓰고 있어 교체할 수 없습니다."
+    assert describe_core_code("SPATIAL_UNSUPPORTED") == CORE_CODE_SENTENCES["spatial_unsupported"]
+    assert describe_core_code("not_a_core_code", "orders") is None
+
+    for code, sentence in CORE_CODE_SENTENCES.items():
+        assert any(ord(char) in _HANGUL for char in sentence), code
+        assert not any(word in sentence.lower() for word in ("preflight", "manifest", "계약", "safe", "replace")), code
+    i18n.set_language("en")
+    for code in CORE_CODE_SENTENCES:
+        assert not any(ord(char) in _HANGUL for char in describe_core_code(code)), code
+
+
+def test_every_code_the_core_can_emit_has_a_korean_sentence():
+    import re
+    from pathlib import Path
+    from src.core.error_report_codes import RUST_CORE_CODES
+    from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES
+
+    emitted = set(RUST_CORE_CODES)
+    for path in (Path(__file__).resolve().parents[1] / "migration_core" / "src").rglob("*.rs"):
+        source = path.read_text(encoding="utf-8")
+        emitted.update(re.findall(r'classified_import_error\(\s*"([a-z_]+)"', source))
+        if path.name == "import_preview.rs":  # upgrade.analyze has an issue() of its own
+            emitted.update(re.findall(r'\b(?:issue|warning)\(\s*"([a-z_]+)"', source))
+        # The (code, ...) tuples that feed the preview's blockers and warnings.
+        emitted.update(re.findall(r'push\(\(\s*"([a-z_]+)"', source))
+        emitted.update(re.findall(r'"error_code"\s*:\s*"([a-z_]+)"', source))
+        for body in re.findall(r"fn manifest_warning_code\b.*?\n\}", source, re.DOTALL):
+            emitted.update(re.findall(r'"([a-z_]+)"', body))
+    assert {"load_failed", "dependent_object", "views_outside_snapshot", "partial_table_filter", "no_tables"} <= emitted
+    assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []

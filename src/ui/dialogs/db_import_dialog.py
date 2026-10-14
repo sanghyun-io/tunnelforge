@@ -26,7 +26,8 @@ from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component
 from src.exporters.rust_dump_exporter import (
-    build_rust_dump_config, check_rust_dump, dump_original_namespace, restore_target_connection_info
+    build_rust_dump_config, check_rust_dump, describe_core_failure, dump_original_namespace,
+    restore_target_connection_info,
 )
 from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
@@ -1763,29 +1764,53 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                     if self.import_audit.get("original_unchanged") is True
                     else "안전 복원 실패 · 원본 상태는 보고서에서 확인하세요"
                 )
-            self.txt_log.addItem(f"❌ 실패: {message}")
+            # The core's own text stays behind '자세히'; the window shows its code's sentence.
+            cause = describe_core_failure(message)
+            self.txt_log.addItem(f"❌ 실패: {cause or message}")
 
             if self._cancel_requested:
                 self._add_log("Import가 취소되었습니다.")
             else:
                 if self.last_import_mode == "safe":
-                    QMessageBox.warning(self, "안전 복원 실패", self.label_status.text() + "\n\n" + message)
+                    self._show_failure("안전 복원 실패", self.label_status.text() + "\n\n" + (cause or message),
+                                       message if cause else "")
                 else:
                     details = _replace_failure_details(getattr(self, "import_audit", {}))
                     if error_count > 0:
                         text = translate_text("❌ Import 중 오류가 발생했습니다.\n\n"
+                            "{}\n\n"
                             "성공: {}개 테이블\n"
                             "실패: {}개 테이블\n\n"
                             "미실행: {}개 테이블\n\n"
-                            "대상 데이터를 확인한 후 원래 범위로 전체 Import를 다시 시작하세요.").format(done_count, error_count, blocked_count)
+                            "대상 데이터를 확인한 후 원래 범위로 전체 Import를 다시 시작하세요.").format(
+                                cause or translate_text("원인을 분류하지 못했습니다. '자세히'에서 원문을 확인하세요."),
+                                done_count, error_count, blocked_count)
                     else:
-                        text = f"❌ {message}"
-                    QMessageBox.warning(self, "Import 실패", f"{text}\n\n{details}" if details else text)
+                        text = f"❌ {cause or message}"
+                    self._show_failure("Import 실패", f"{text}\n\n{details}" if details else text,
+                                       message if cause or error_count > 0 else "")
 
                 self._report_error_anonymously()
 
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
+
+    def _show_failure(self, title: str, text: str, details: str = ""):
+        """Failure window; ``details`` (the core's own text) opens only from its '자세히' button."""
+        if not details:
+            QMessageBox.warning(self, title, text)
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+        # Not setDetailedText: its "Show Details..." button is never translated.
+        more = box.addButton(translate_text("자세히"), QMessageBox.ButtonRole.ActionRole)
+        box.buttonClicked.connect(lambda button: button == more and QMessageBox.information(self, title, details))
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()
 
     def _show_report_link(self):
         """Core 가 남긴 Import 보고서가 있으면 링크로 보여 준다 (중지/실패 후에도 상태 확인용)."""

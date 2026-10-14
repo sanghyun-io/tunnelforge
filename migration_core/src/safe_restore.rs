@@ -201,10 +201,8 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
     }
     let outcome = (|| -> Result<Value, String> {
         if !string_list(request.payload.get("tables")).is_empty() {
-            return Err(
-                "safe restore requires the complete dump; partial table filters are not supported"
-                    .into(),
-            );
+            return Err(classified_import_error("partial_table_filter",
+                "safe restore requires the complete dump; partial table filters are not supported", None));
         }
         let manifest = read_dump_manifest(path)?;
         state["dump_manifest_sha256"] = json!(sha256_file(&path.join("_tunnelforge_dump.json"))?);
@@ -212,11 +210,11 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             return Err("unsupported dump manifest format".into());
         }
         crate::import::check_mysql_spatial_import(&manifest, &Default::default(), &original.engine)?;
-        if let Some((_, reason)) = copy_refusals(&manifest, &original.engine).into_iter().next() {
-            return Err(reason);
+        if let Some((code, reason)) = copy_refusals(&manifest, &original.engine).into_iter().next() {
+            return Err(classified_import_error(code, &reason, None));
         }
         if manifest.tables.is_empty() {
-            return Err("safe restore found no tables".into());
+            return Err(classified_import_error("no_tables", "safe restore found no tables", None));
         }
         let format = manifest.data_format.to_ascii_lowercase();
         let compression = manifest.compression.to_ascii_lowercase();
@@ -984,6 +982,19 @@ mod tests {
         write_dump_import_report(&dir, &report).unwrap();
         assert!(load_verified_plan(&path, &original).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_safe_restore_names_its_code() {
+        let dir = std::env::temp_dir().join(format!("tf-safe-refused-{}-{}", std::process::id(), current_unix_seconds()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Refused before the manifest is read or the target is reached (port 1 has no server).
+        let payload = json!({"input_dir": dir.to_string_lossy(), "tables": ["users"],
+            "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "u", "password": "secret-value", "database": "app"}});
+        let result = run(&Request { command: "dump.import".into(), request_id: None, payload }, |_| {}).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result["status"], "failed_original_untouched");
+        assert!(result["error"].as_str().unwrap().starts_with("partial_table_filter: "), "{result}");
     }
 
     #[test]
