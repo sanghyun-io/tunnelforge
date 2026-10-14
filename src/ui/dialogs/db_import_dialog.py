@@ -35,7 +35,7 @@ from src.ui.workers.error_reporting_worker import (
     report_operation_error,
     sanitize_local_diagnostic_json,
 )
-from src.ui.dialogs.job_recording import IMPORT_REPORT_NAME, begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job
+from src.ui.dialogs.job_recording import begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job, record_import_report
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
@@ -1348,7 +1348,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.txt_log.addItem(f"🔄 재시도 모드: {len(retry_tables)}개 테이블")
 
         # 작업 스레드 시작
-        self._job_id = begin_import_job(self, input_dir, namespace or target_schema,
+        self._job_id = begin_import_job(self, namespace or target_schema,
                                         self._get_import_mode_text(selected_mode), self.spin_threads.value())
         self.worker = RustDumpWorker(
             "import", config,
@@ -1571,7 +1571,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             if isinstance(event, dict):
                 sanitized_event = _sanitized_rust_event(event)
                 self.import_audit = getattr(self, "import_audit", {})
+                known_report = self.import_audit.get("report_path")
                 _capture_import_audit(self.import_audit, sanitized_event)
+                if self.import_audit.get("report_path") != known_report:
+                    record_import_report(self)
                 normalized_event = _normalized_import_telemetry(sanitized_event)
                 if normalized_event is None:
                     visible_summary = sanitize_local_diagnostic_json(
@@ -1788,15 +1791,9 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             QTimer.singleShot(0, self.close)
 
     def _show_report_link(self):
-        """Core 가 남긴 Import 보고서가 있으면 링크로 보여 준다 (중지/실패 후에도 상태 확인용)."""
+        """Core 가 이번 실행에 쓴 Import 보고서가 있으면 링크로 보여 준다 (중지/실패 후에도 상태 확인용).
+        실행마다 보고서 파일이 따로 생기므로 Core 가 알려 준 파일만 쓴다. Dump 폴더의 다른 보고서는 이전 실행의 것이다."""
         path = str(self.import_audit.get("report_path") or "")
-        if not path and self.last_input_dir and self.import_start_time:
-            # Core 가 경로를 알려 주지 않았으면 Dump 폴더의 보고서를 쓰되, 이번 실행 중에 쓰인 것만 쓴다
-            # (이전 실행의 보고서를 이번 결과로 오인하지 않도록).
-            # ponytail: 2초 여유는 파일시스템 타임스탬프 해상도용. 직전 실행이 2초 안에 끝났다면 구분 못 한다.
-            fallback = os.path.join(self.last_input_dir, IMPORT_REPORT_NAME)
-            if os.path.isfile(fallback) and os.path.getmtime(fallback) >= self.import_start_time.timestamp() - 2:
-                path = fallback
         if path and os.path.isfile(path):
             self.label_report_link.setText('<a href="{}">{}</a>'.format(
                 QUrl.fromLocalFile(path).toString(), translate_text("📄 Import 보고서 열기")))

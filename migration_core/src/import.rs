@@ -192,7 +192,8 @@ fn manifest_warning_code(warning: &str) -> &'static str {
 }
 
 struct ImportJournal {
-    input_path: std::path::PathBuf,
+    /// This attempt's own report file in the dump folder.
+    report_path: std::path::PathBuf,
     target: Value,
     mode: String,
     phase: String,
@@ -247,7 +248,7 @@ impl ImportJournal {
     }
 
     fn checkpoint(&self) -> Result<(), String> {
-        write_dump_import_report(&self.input_path, &self.report("running", None))
+        write_import_report_file(&self.report_path, &self.report("running", None))
     }
 }
 
@@ -257,21 +258,23 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     // Checked before the report checkpoint, so a refused mode leaves no report behind.
     match mode {
         "safe" => safe_restore::run(request, emit),
-        "replace" | "recreate" => dump_import_with_context(request, None, |event| emit(event)),
+        "replace" | "recreate" => dump_import_with_context(request, None, None, |event| emit(event)),
         "merge" => Err(classified_import_error("import_plan_invalid",
             "the merge import mode was removed: Import no longer adds rows to existing tables; it replaces each table in the dump", None)),
         other => Err(classified_import_error("import_plan_invalid", &format!("unsupported dump import mode: {other}"), None)),
     }
 }
 
-fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Option<Value>, mut emit: F) -> Result<Value, String> {
+/// `report_path` is the safe restore's own report when this is its candidate import; otherwise
+/// the attempt gets a new report file.
+fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Option<Value>, report_path: Option<std::path::PathBuf>, mut emit: F) -> Result<Value, String> {
     let endpoint = request_endpoint(request)?;
     let input_dir = request.payload.get("input_dir").and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty()).ok_or("dump.import requires input_dir")?;
     let mode = request.payload.get("mode").or_else(|| request.payload.get("import_mode"))
         .and_then(Value::as_str).unwrap_or("replace");
     let mut journal = ImportJournal {
-        input_path: Path::new(input_dir).to_path_buf(),
+        report_path: match report_path { Some(path) => path, None => new_dump_import_report_path(Path::new(input_dir))? },
         target: json!({"engine": endpoint.engine, "host": endpoint.host, "port": endpoint.port,
             "database": endpoint.database, "schema": endpoint_schema(&endpoint)}),
         mode: mode.into(), phase: "dump_import_validation".into(), planned: Vec::new(),
@@ -281,13 +284,14 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         namespace_creation_outcome_unknown: false, namespace_created: false,
         safe_context,
     };
-    // Replacing a prior success report is a prerequisite for starting a new attempt.
+    // The attempt starts only once its own report exists.
     journal.checkpoint()?;
-    let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
+    let report_path = journal.report_path.display().to_string();
     emit(json!({"event":"import_report", "request_id":request.request_id, "status":"running", "report_path":report_path, "target":journal.target}));
     let result = dump_import_attempt(request, &mut journal, |event| emit(event))
         .map(|mut result| {
             if journal.safe_context.is_none() { result["namespace_created"] = json!(journal.namespace_created); }
+            result["import_report"] = json!(report_path);
             result
         })
         .map_err(|error| redact_endpoint_secret(&error, &endpoint));
@@ -308,7 +312,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         report["candidate_import_completed"] = result.as_ref().unwrap()["success"].clone();
         report["mode"] = json!("safe");
     }
-    if let Err(error) = write_dump_import_report(&journal.input_path, &report) {
+    if let Err(error) = write_import_report_file(&journal.report_path, &report) {
         emit(json!({"event":"import_report", "request_id":request.request_id, "status":"failed", "report_path":report_path, "report_write_failed":true, "message":error}));
         return Err(match result { Err(original) => format!("{original}; failure report could not be persisted: {error}"), Ok(_) => format!("Import data was applied, but its completion report could not be persisted: {error}") });
     }
@@ -457,7 +461,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         journal.checkpoint()?;
         emit(json!({"event":"phase", "request_id":request.request_id, "phase":journal.phase,
             "message":"검증 완료: 선택한 대상 테이블 교체를 준비합니다.",
-            "report_path":dump_import_report_path(input_path)?.display().to_string()}));
+            "report_path":journal.report_path.display().to_string()}));
 
         let planned_set = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
         let target_engine = adapter.engine();
@@ -593,7 +597,7 @@ fn create_missing_target_namespace<F: FnMut(Value)>(
     } else {
         (endpoint_schema(endpoint), "schema", "create_schema")
     };
-    let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
+    let report_path = journal.report_path.display().to_string();
     let event = |status: &str| json!({"event":"target_change", "request_id":request_id, "phase":"dump_import_create_namespace",
         "action":action, "status":status, "namespace":name, "report_path":report_path});
     // Only the CREATE itself is reported under this phase; a later connect failure keeps the earlier one.
@@ -790,7 +794,7 @@ fn replace_target_table<F: FnMut(Value)>(
     if !import_target_table_exists(adapter, target_schema, table)? {
         return Ok(());
     }
-    let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
+    let report_path = journal.report_path.display().to_string();
     for (child, constraint) in incoming_import_set_foreign_keys(adapter, target_schema, table, planned)? {
         // Kept so the FK can be re-added if the import stops before the child's own turn.
         let definition = foreign_key_definition(adapter, target_schema, &child, &constraint)?;
@@ -1201,7 +1205,6 @@ fn finalize_dump_import<F: FnMut(Value)>(
     table_total: usize,
     mut emit: F,
 ) -> Result<Value, String> {
-    let input_path = Path::new(input_dir);
     let target_engine = adapter.engine().to_string();
     // Indexes and foreign keys were created right after each table's data.
     emit(json!({
@@ -1258,7 +1261,6 @@ fn finalize_dump_import<F: FnMut(Value)>(
         "views_failed": view_outcome.failed,
         "views_skipped_cross_engine": view_outcome.skipped_cross_engine
     });
-    let import_report_path = dump_import_report_path(input_path)?;
 
     Ok(json!({
         "event": "result",
@@ -1275,7 +1277,6 @@ fn finalize_dump_import<F: FnMut(Value)>(
         "chunks_imported": chunks_imported,
         "imported_rows_by_table": imported_rows_by_table,
         "verification": import_report["verification"].clone(),
-        "import_report": import_report_path.display().to_string(),
         "views_imported": import_report["views_imported"].clone(),
         "views_failed": import_report["views_failed"].clone(),
         "views_skipped_cross_engine": import_report["views_skipped_cross_engine"].clone()
@@ -2576,12 +2577,45 @@ mod tests {
             let payload = json!({ "input_dir": dir.to_string_lossy(), key: mode, "target": { "engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app" } });
             let mut events = Vec::new();
             let err = dump_import(&Request { command: "dump.import".into(), request_id: None, payload }, |event| events.push(event)).unwrap_err();
-            let report_written = dump_import_report_path(&dir).unwrap().exists();
+            let report_written = !dump_import_report_paths(&dir).is_empty();
             fs::remove_dir_all(&dir).unwrap();
             assert!(err.starts_with("import_plan_invalid:") && err.contains(expected), "{key}={mode}: {err}");
             assert!(!report_written, "{key}={mode}: a refused mode must not leave an import report");
             assert!(events.is_empty(), "{key}={mode}: {events:?}");
         }
+    }
+
+    #[test]
+    fn every_import_attempt_keeps_its_own_report() {
+        let dir = std::env::temp_dir().join(format!("tunnelforge-report-per-attempt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // An old dump folder's single report stays as it was.
+        let legacy = dump_import_report_path(&dir).unwrap();
+        fs::write(&legacy, br#"{"success":true}"#).unwrap();
+        let attempt = || {
+            // No manifest: each attempt fails after its first checkpoint, before any connection.
+            let payload = json!({"input_dir": dir.to_string_lossy(), "mode": "replace", "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app"}});
+            let mut events = Vec::new();
+            assert!(dump_import(&Request { command: "dump.import".into(), request_id: None, payload }, |event| events.push(event)).is_err());
+            let paths = events.iter().filter(|event| event["event"] == "import_report")
+                .map(|event| event["report_path"].as_str().unwrap().to_string()).collect::<BTreeSet<_>>();
+            assert_eq!(paths.len(), 1, "one attempt names one report: {events:?}");
+            std::path::PathBuf::from(paths.into_iter().next().unwrap())
+        };
+        let first = attempt();
+        let first_report = fs::read(&first).unwrap();
+        let second = attempt();
+        let reports = dump_import_report_paths(&dir);
+        let first_after = fs::read(&first).unwrap();
+        let legacy_after = fs::read(&legacy).unwrap();
+        let second_report: Value = serde_json::from_slice(&fs::read(&second).unwrap()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(reports, vec![legacy.clone(), first.clone(), second.clone()], "oldest first");
+        assert_eq!(first_after, first_report, "a retry overwrote the earlier attempt's report");
+        assert_eq!(legacy_after, br#"{"success":true}"#);
+        assert_eq!(second_report["status"], "failed");
     }
 
     #[test]

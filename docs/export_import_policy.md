@@ -58,6 +58,15 @@ with `mode` or `import_mode` set to `merge`, or to any value not listed above, i
 refused as `import_plan_invalid` before anything is written, including the
 import report.
 
+Every import attempt (`replace`, `recreate` or `safe`) writes its own report into
+the dump folder, `_tunnelforge_import_report_<nanoseconds>_<process>_<n>.json`,
+and names it (`report_path`) in its `import_report` events from the start, so a
+retry never overwrites the record of an earlier attempt. A safe restore and the
+candidate import inside it share one report, which a later promotion updates in
+place. Dump folders imported by earlier versions keep their single
+`_tunnelforge_import_report.json`; it is still read, and the job list and the
+Import dialog link to the report of their own run.
+
 Target-only tables are preserved. A target-only FK referencing an imported parent
 requires the recreated parent to retain a compatible key/type contract, including
 children in other schemas. MySQL creates only the primary key and full-column
@@ -163,9 +172,10 @@ Backup namespaces do not represent an independently complete full-database backu
 ### Backup lifecycle (`restore.backups`)
 
 The Core command `restore.backups` (UI: Import dialog, "복원 백업 관리") works from the
-promotion journals stored in the dump directories passed as `input_dirs`; a
-namespace that only follows the `tf_backup_` naming is listed as unproven and is
-never deleted.
+safe-restore reports (every attempt's, and the single report of earlier
+versions) and promotion journals stored in the dump directories passed as
+`input_dirs`; a namespace that only follows the `tf_backup_` naming is listed as
+unproven and is never deleted.
 
 | Action | Effect |
 | --- | --- |

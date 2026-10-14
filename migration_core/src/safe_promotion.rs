@@ -343,7 +343,7 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
                 &verified.candidate,
                 plan,
                 engine_digest,
-                report_dir,
+                &report_path,
             ),
         };
         let mut result = outcome.unwrap_or_else(|error| {
@@ -373,7 +373,7 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
             report["status"] = json!("promoted");
             report["original_unchanged"] = json!(false);
         }
-        if let Err(error) = write_dump_import_report(report_dir, &report) {
+        if let Err(error) = write_import_report_file(&report_path, &report) {
             result["report_warning"] = json!(format!(
                 "Cutover outcome known, but restore report update failed: {error}"
             ));

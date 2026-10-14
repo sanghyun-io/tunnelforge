@@ -470,7 +470,7 @@ mod tests {
         let payload = json!({"input_dir": dir.to_string_lossy(), "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "secret-value", "database": "app"}});
         let mut events = Vec::new();
         handle(&Request { command: "dump.import_preview".into(), request_id: Some("p-1".into()), payload }, |event| events.push(event));
-        let report_written = dump_import_report_path(&dir).unwrap().exists();
+        let report_written = !dump_import_report_paths(&dir).is_empty();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["event"], "error");

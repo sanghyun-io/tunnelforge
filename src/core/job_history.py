@@ -298,6 +298,17 @@ class JobHistory:
                     return True
         return False
 
+    def set_report_path(self, job_id: str, report_path: str) -> bool:
+        """실행 중에 보고서 파일이 정해지면 바로 남긴다. 앱이 도중에 꺼져도 기록이 그 보고서를 가리킨다."""
+        with _WRITE_LOCK:
+            records = self._read()
+            for record in records:
+                if record.id == job_id:
+                    record.report_path = scrub_text(report_path, 500)
+                    self._write(records)
+                    return True
+        return False
+
     def list(self) -> List[JobRecord]:
         """최신순."""
         with _WRITE_LOCK:
@@ -370,6 +381,15 @@ def job_finish(job_id: Optional[str], status: str, **fields) -> None:
         logger.warning('job history finish failed', exc_info=True)
     finally:
         _ACTIVE_IDS.discard(job_id)
+
+
+def job_report_path(job_id: Optional[str], report_path: str) -> None:
+    if not job_id or not report_path:
+        return
+    try:
+        make_history().set_report_path(job_id, report_path)
+    except Exception:
+        logger.warning('job history report path failed', exc_info=True)
 
 
 def sweep_interrupted() -> int:

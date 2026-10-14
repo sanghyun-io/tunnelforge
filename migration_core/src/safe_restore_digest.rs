@@ -894,7 +894,7 @@ mod tests {
             .find(|event| event["event"] == "result")
             .unwrap();
         assert_eq!(result["success"], true, "{imported:?}");
-        let report_path = dump_import_report_path(&directory).unwrap();
+        let report_path = std::path::PathBuf::from(result["report_path"].as_str().unwrap());
         let plan = super::super::safe_restore::load_verified_plan(&report_path, &original).unwrap();
         let mut candidate = LiveAdapter::connect(&plan.candidate).unwrap();
         candidate.execute_sql(mutation).unwrap();

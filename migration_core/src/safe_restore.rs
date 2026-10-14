@@ -175,14 +175,16 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         .filter(|s| !s.trim().is_empty())
         .ok_or("dump.import requires input_dir")?;
     let path = Path::new(input);
-    let report_path = dump_import_report_path(path)?.display().to_string();
+    // The candidate import below writes into this same report.
+    let report_file = new_dump_import_report_path(path)?;
+    let report_path = report_file.display().to_string();
     let mut state = json!({"success":false,"mode":"safe","status":"staging","phase":"safe_restore_validation",
         "original_target":public_target(&original),"candidate_target":null,
         "original_unchanged":true,"cutover_pending":true,"ready_for_switch":false,
         "verified":false,"candidate_created":false,"candidate_retained":false,
         "automatic_cutover":false,"report_path":report_path,
         "interrupted_attempt_policy":"Original namespace remains unchanged. Inspect the recorded candidate; no automatic cleanup or promotion is performed."});
-    if let Err(error) = write_dump_import_report(path, &state) {
+    if let Err(error) = write_import_report_file(&report_file, &state) {
         state["success"] = json!(false);
         state["status"] = json!("failed_original_untouched");
         state["ready_for_switch"] = json!(false);
@@ -199,6 +201,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         state["command"] = json!("dump.import");
         return Ok(state);
     }
+    emit(json!({"event":"import_report", "request_id":request.request_id, "status":"running", "report_path":report_path}));
     let outcome = (|| -> Result<Value, String> {
         if !string_list(request.payload.get("tables")).is_empty() {
             return Err(
@@ -332,7 +335,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         state["candidate_target"] = public_target(&candidate);
         state["phase"] = json!("safe_restore_create_candidate");
         state["candidate_creation_outcome_unknown"] = json!(true);
-        write_dump_import_report(path, &state)?;
+        write_import_report_file(&report_file, &state)?;
         create_namespace(&mut admin, &original, &name,
             "safe candidate creation failed (existing namespaces are never reused)")?;
         state["namespace_created"] = json!(true);
@@ -340,7 +343,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         state["candidate_retained"] = json!(true);
         state["candidate_creation_outcome_unknown"] = json!(false);
         state["phase"] = json!("safe_restore_import_candidate");
-        write_dump_import_report(path, &state)?;
+        write_import_report_file(&report_file, &state)?;
         let mut target_event = state.clone();
         target_event["event"] = json!("safe_restore_target");
         target_event["request_id"] = json!(request.request_id);
@@ -371,9 +374,10 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
                 payload,
             },
             Some(context),
+            Some(report_file.clone()),
             |event| emit(event),
         )?;
-        if let Ok(bytes) = std::fs::read(dump_import_report_path(path)?) {
+        if let Ok(bytes) = std::fs::read(&report_file) {
             if let Ok(report) = serde_json::from_slice::<Value>(&bytes) {
                 state["candidate_journal"] = report;
             }
@@ -387,7 +391,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
                 .into());
         }
         state["phase"] = json!("safe_restore_verify_candidate");
-        write_dump_import_report(path, &state)?;
+        write_import_report_file(&report_file, &state)?;
         emit(
             json!({"event":"phase","request_id":request.request_id,"phase":state["phase"],
             "message":"후보 데이터베이스의 실제 행 수, 테이블 구조, 인덱스와 외래 키를 검증합니다. 원본은 그대로 유지됩니다."}),
@@ -432,7 +436,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
     if let Err(error) = outcome {
         // Preserve the inner journal's mutation evidence and failure phase.
         if state["candidate_created"] == true && state.get("candidate_journal").is_none() {
-            if let Ok(bytes) = std::fs::read(dump_import_report_path(path)?) {
+            if let Ok(bytes) = std::fs::read(&report_file) {
                 if let Ok(report) = serde_json::from_slice::<Value>(&bytes) {
                     state["candidate_journal"] = report;
                 }
@@ -446,7 +450,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         ));
         state["error"] = json!(redact_endpoint_secret(&error, &original));
     }
-    if let Err(error) = write_dump_import_report(path, &state) {
+    if let Err(error) = write_import_report_file(&report_file, &state) {
         let original_error = state["error"]
             .as_str()
             .unwrap_or("Candidate preparation finished");
@@ -984,6 +988,31 @@ mod tests {
         write_dump_import_report(&dir, &report).unwrap();
         assert!(load_verified_plan(&path, &original).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn each_safe_restore_attempt_writes_and_names_its_own_report() {
+        let dir = std::env::temp_dir().join(format!("tf-safe-report-per-attempt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let attempt = || {
+            // No manifest: the attempt fails before it connects anywhere.
+            let payload = json!({"input_dir": dir.to_string_lossy(), "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app"}});
+            let mut events = Vec::new();
+            let result = run(&Request { command: "dump.import".into(), request_id: None, payload }, |event| events.push(event)).unwrap();
+            assert_eq!(result["status"], "failed_original_untouched", "{result}");
+            assert_eq!(events[0]["event"], "import_report", "the report is named before any work: {events:?}");
+            assert!(events.iter().all(|event| event.get("report_path").is_none_or(|path| *path == result["report_path"])), "{events:?}");
+            std::path::PathBuf::from(result["report_path"].as_str().unwrap())
+        };
+        let first = attempt();
+        let second = attempt();
+        let reports = dump_import_report_paths(&dir);
+        let first_report: Value = serde_json::from_slice(&std::fs::read(&first).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(reports, vec![first, second]);
+        assert_eq!(first_report["status"], "failed_original_untouched", "a retry overwrote the earlier report");
     }
 
     #[test]

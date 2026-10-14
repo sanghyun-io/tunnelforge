@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1817,8 +1816,9 @@ def test_import_stop_button_cancels_without_closing_and_shows_final_status_and_r
 
         from datetime import datetime
         dialog.import_start_time = datetime.now()
-        report = tmp_path / "_tunnelforge_import_report.json"
+        report = tmp_path / "_tunnelforge_import_report_1_2_0.json"
         report.write_text("{}", encoding="utf-8")
+        dialog.on_raw_output(json.dumps({"event": "import_report", "status": "running", "report_path": str(report)}))
         dialog.last_input_dir = str(tmp_path)
         dialog.last_import_mode = "replace"
         dialog.import_results = {"a": {"status": "done"}, "b": {"status": "blocked"}}
@@ -1832,7 +1832,7 @@ def test_import_stop_button_cancels_without_closing_and_shows_final_status_and_r
         assert dialog.label_status.text().startswith("⏹ Import 취소됨")
         assert dialog.btn_stop.isHidden()
         assert not dialog.label_report_link.isHidden()
-        assert "_tunnelforge_import_report.json" in dialog.label_report_link.text()
+        assert report.name in dialog.label_report_link.text()
     finally:
         dialog.worker = None
         type(dialog).close(dialog)
@@ -1880,22 +1880,24 @@ def test_stopped_safe_import_shows_stopped_status_not_safe_restore_failure(monke
         type(dialog).close(dialog)
 
 
-def test_report_link_ignores_a_stale_report_from_an_earlier_run(monkeypatch, tmp_path):
+def test_report_link_shows_only_the_report_the_core_named_for_this_run(monkeypatch, tmp_path):
     from datetime import datetime as _dt
     dialog = _stop_test_dialog(monkeypatch)
     try:
-        report = tmp_path / "_tunnelforge_import_report.json"
-        report.write_text("{}", encoding="utf-8")
-        old = report.stat().st_mtime - 3600
-        os.utime(report, (old, old))
+        # Earlier attempts' reports in the same dump folder, even freshly written, belong to other runs.
+        (tmp_path / "_tunnelforge_import_report.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "_tunnelforge_import_report_1_1_0.json").write_text("{}", encoding="utf-8")
         dialog.last_input_dir = str(tmp_path)
         dialog.import_audit = {}
         dialog.import_start_time = _dt.now()
         dialog._show_report_link()
-        assert dialog.label_report_link.isHidden(), "a report older than this run is not this run's report"
-        report.write_text("{}", encoding="utf-8")  # rewritten during this run
+        assert dialog.label_report_link.isHidden(), "a report the core did not name is not this run's report"
+        own = tmp_path / "_tunnelforge_import_report_2_1_0.json"
+        own.write_text("{}", encoding="utf-8")
+        dialog.import_audit = {"report_path": str(own)}
         dialog._show_report_link()
         assert not dialog.label_report_link.isHidden()
+        assert own.name in dialog.label_report_link.text()
     finally:
         type(dialog).close(dialog)
 

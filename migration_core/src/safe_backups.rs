@@ -17,6 +17,8 @@ struct Entry {
     input_dir: PathBuf,
     restore_id: String,
     report: Option<Value>,
+    /// The file `report` was read from.
+    report_path: Option<PathBuf>,
     stored: Option<StoredPlan>,
     attempt: Option<Value>,
 }
@@ -78,38 +80,40 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-/// Journals of one dump directory: the safe-restore report and every promotion plan/attempt.
+/// Journals of one dump directory: every safe-restore report (one per import attempt, plus the
+/// single report older versions kept) and every promotion plan/attempt.
 fn discover_dir(dir: &Path, entries: &mut Vec<Entry>) {
-    let report = read_json(&dump_import_report_path(dir).unwrap_or_default())
-        .filter(|report| report["mode"] == "safe" && report["candidate_created"] == true);
-    if let Some(report) = &report {
-        if let Some(id) = report["restore_id"].as_str() {
-            let mut entry = Entry { input_dir: dir.into(), restore_id: id.into(), report: Some(report.clone()), stored: None, attempt: None };
-            if let Ok(plan_dir) = plan_dir_for(dir, id) {
-                entry.attempt = prior_attempt(&plan_dir).ok().flatten();
-                entry.stored = entry
-                    .attempt
-                    .as_ref()
-                    .and_then(|a| serde_json::from_value(a["stored_plan"].clone()).ok())
-                    .or_else(|| read_json(&dump_import_report_path(&plan_dir).unwrap_or_default()).and_then(|v| serde_json::from_value(v).ok()));
-            }
-            entries.push(entry);
-            return;
-        }
+    let mut reported = std::collections::BTreeSet::new();
+    for report_path in dump_import_report_paths(dir) {
+        let Some(report) = read_json(&report_path).filter(|report| report["mode"] == "safe" && report["candidate_created"] == true) else { continue };
+        let Some(id) = report["restore_id"].as_str().map(str::to_string) else { continue };
+        let (stored, attempt) = plan_journals(dir, &id);
+        reported.insert(id.clone());
+        entries.push(Entry { input_dir: dir.into(), restore_id: id, report: Some(report), report_path: Some(report_path), stored, attempt });
     }
     // Promotion journals without a readable restore report still identify backups.
     let Ok(read) = fs::read_dir(dir) else { return };
-    for item in read.flatten() {
-        let name = item.file_name().to_string_lossy().to_string();
-        let Some(id) = name.strip_prefix(PLAN_DIR_PREFIX) else { continue };
-        let Ok(plan_dir) = plan_dir_for(dir, id) else { continue };
-        let attempt = prior_attempt(&plan_dir).ok().flatten();
-        let stored = attempt
-            .as_ref()
-            .and_then(|a| serde_json::from_value(a["stored_plan"].clone()).ok())
-            .or_else(|| read_json(&dump_import_report_path(&plan_dir).unwrap_or_default()).and_then(|v| serde_json::from_value(v).ok()));
-        entries.push(Entry { input_dir: dir.into(), restore_id: id.into(), report: None, stored, attempt });
+    let mut ids: Vec<String> = read
+        .flatten()
+        .filter_map(|item| item.file_name().to_string_lossy().strip_prefix(PLAN_DIR_PREFIX).map(str::to_string))
+        .filter(|id| !reported.contains(id) && plan_dir_for(dir, id).is_ok())
+        .collect();
+    ids.sort();
+    for id in ids {
+        let (stored, attempt) = plan_journals(dir, &id);
+        entries.push(Entry { input_dir: dir.into(), restore_id: id, report: None, report_path: None, stored, attempt });
     }
+}
+
+/// The promotion plan and the last attempt recorded for one restore.
+fn plan_journals(dir: &Path, restore_id: &str) -> (Option<StoredPlan>, Option<Value>) {
+    let Ok(plan_dir) = plan_dir_for(dir, restore_id) else { return (None, None) };
+    let attempt = prior_attempt(&plan_dir).ok().flatten();
+    let stored = attempt
+        .as_ref()
+        .and_then(|a| serde_json::from_value(a["stored_plan"].clone()).ok())
+        .or_else(|| read_json(&dump_import_report_path(&plan_dir).unwrap_or_default()).and_then(|v| serde_json::from_value(v).ok()));
+    (stored, attempt)
 }
 
 fn plan_dir_for(dir: &Path, restore_id: &str) -> Result<PathBuf, String> {
@@ -413,8 +417,8 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
                 if !unpromoted {
                     blockers.push(format!("the candidate still holds data and the promotion state is {status}/{verdict}; only a verified, unpromoted candidate can be discarded"));
                 }
-                let report_path = dump_import_report_path(&entry.input_dir)?;
-                match crate::import::safe_restore::load_verified_plan(&report_path, credentials)
+                match entry.report_path.as_deref().ok_or_else(|| "no safe restore report for this restore was found".to_string())
+                    .and_then(|report_path| crate::import::safe_restore::load_verified_plan(report_path, credentials))
                     .and_then(|verified| crate::import::safe_restore::reverify_candidate(&verified))
                 {
                     Ok(_) => {}
@@ -630,7 +634,7 @@ mod tests {
 
     #[test]
     fn journal_status_reflects_attempt_state_only() {
-        let entry = |attempt: Option<Value>| Entry { input_dir: PathBuf::new(), restore_id: "r".into(), report: None, stored: None, attempt };
+        let entry = |attempt: Option<Value>| Entry { input_dir: PathBuf::new(), restore_id: "r".into(), report: None, report_path: None, stored: None, attempt };
         assert_eq!(entry(None).journal_status(), "not_attempted");
         assert_eq!(entry(Some(json!({"status": "cutover_unknown"}))).journal_status(), "cutover_unknown");
         assert_eq!(entry(Some(json!({}))).journal_status(), "pending");
@@ -645,6 +649,29 @@ mod tests {
         discover_dir(&dir, &mut entries);
         assert!(entries.is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn discovery_finds_every_safe_restore_report_and_every_plan() {
+        let dir = temp("every_report");
+        let safe = |id: &str| json!({"mode": "safe", "candidate_created": true, "restore_id": id});
+        // The single report an older version kept, then one report per later attempt.
+        write_dump_import_report(&dir, &safe("old_1")).unwrap();
+        let newer = new_dump_import_report_path(&dir).unwrap();
+        write_import_report_file(&newer, &safe("new_2")).unwrap();
+        write_import_report_file(&new_dump_import_report_path(&dir).unwrap(), &json!({"mode": "replace", "status": "failed"})).unwrap();
+        for id in ["new_2", "orphan_3"] {
+            fs::create_dir(dir.join(format!("{PLAN_DIR_PREFIX}{id}"))).unwrap();
+        }
+        let mut entries = Vec::new();
+        discover_dir(&dir, &mut entries);
+        let found: Vec<(&str, Option<PathBuf>)> = entries.iter().map(|e| (e.restore_id.as_str(), e.report_path.clone())).collect();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, vec![
+            ("old_1", Some(dump_import_report_path(&dir).unwrap())),
+            ("new_2", Some(newer)),
+            ("orphan_3", None),
+        ]);
     }
 
     #[test]
