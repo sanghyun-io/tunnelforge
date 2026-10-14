@@ -130,6 +130,26 @@ existing same-engine target, the target checks `safe` runs before making a copy
 `not_strict`, `legacy_timezone`, `legacy_dump`, `create_privilege_unproven`,
 `drop_privilege_unproven` and `view_dependencies_unknown`.
 
+### Failure texts
+
+Core failures and preview items carry stable codes: the leading `code:` of an
+error (`code: table: ...` when it names a table), an error event's `error_code`
+or `(error_code=...)`, and a preview item's `code`. The application words each
+code as one plain Korean sentence (`CORE_CODE_SENTENCES` in
+`rust_dump_exporter.py`), prefixed with the table name when there is one; a test
+fails when the core emits a code without a sentence. The Import failure window
+shows that sentence (after a failed table, as the first cause above the table
+counts) and keeps the core's own text behind its "자세히" button. Without a known
+code, a failed table is reported as an unclassified cause with the text behind
+"자세히"; any other failure text is shown as it is.
+
+A failed or refused `safe` restore arrives as a `success: false` result with
+status `failed_original_untouched`, not as an error. Its `error` and `blockers`
+are passed through as the failure message, so the window names the core's
+reason. The refusals before a copy is made are coded as well:
+`partial_table_filter`, `legacy_bit_unverifiable`, `cross_engine` and
+`no_tables`.
+
 ### Safe restoration and destination names
 
 If the requested destination does not exist, use the source name or the user's

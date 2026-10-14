@@ -212,7 +212,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             return Err(copy_stop(&mut state, &refusals));
         }
         if manifest.tables.is_empty() {
-            return Err("safe restore found no tables".into());
+            return Err(classified_import_error("no_tables", "safe restore found no tables", None));
         }
         let format = manifest.data_format.to_ascii_lowercase();
         let compression = manifest.compression.to_ascii_lowercase();
@@ -1147,6 +1147,19 @@ mod tests {
         assert_eq!(end(("reports", "summary"), ("app", "orders")), Some("reports.summary".into()), "a view in another schema");
         assert_eq!(end(("reports", "orders"), ("app", "notes")), None, "a same-named table in another schema is not in the dump");
         assert_eq!(outside_end("App", &dumped, &fold, ("app", "Orders"), ("APP", "Notes")), Some("Notes".into()), "lower_case_table_names folds names");
+    }
+
+    #[test]
+    fn a_refused_safe_restore_names_its_code() {
+        let dir = std::env::temp_dir().join(format!("tf-safe-refused-{}-{}", std::process::id(), current_unix_seconds()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Refused before the manifest is read or the target is reached (port 1 has no server).
+        let payload = json!({"input_dir": dir.to_string_lossy(), "tables": ["users"],
+            "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "u", "password": "secret-value", "database": "app"}});
+        let result = run(&Request { command: "dump.import".into(), request_id: None, payload }, |_| {}).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result["status"], "failed_original_untouched");
+        assert!(result["error"].as_str().unwrap().starts_with("partial_table_filter: "), "{result}");
     }
 
     #[test]

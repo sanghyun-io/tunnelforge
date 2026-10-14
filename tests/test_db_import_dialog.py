@@ -1937,3 +1937,83 @@ def test_promotion_plan_step_has_no_stop_button_and_cutover_stop_shows_stopped_s
     finally:
         dialog.worker = None
         type(dialog).close(dialog)
+
+
+def _failure_test_dialog(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    shown = []
+    for name in ("warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, lambda parent, title, text, *a, **k: shown.append(text))
+    dialog = RustDumpImportDialog()
+    dialog._test_app = app  # keep the QApplication alive
+    return dialog, shown
+
+
+def _open_failure_window(dialog):
+    boxes = [box for box in dialog.findChildren(QMessageBox) if box.isVisible()]
+    assert len(boxes) == 1
+    return boxes[0]
+
+
+def _click_details(box):
+    next(button for button in box.buttons() if button.text() == "자세히").click()
+
+
+def test_import_failure_window_shows_first_cause(monkeypatch):
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    raw = ("Rust DB Core import 오류: load_failed: orders: create_table failed: "
+           "MySqlError { ERROR 1118 (42000): Row size too large }")
+    try:
+        dialog.last_import_mode = "replace"
+        dialog.import_results = {"customers": {"status": "done"}, "orders": {"status": "error", "message": raw},
+                                 "items": {"status": "blocked"}}
+        dialog.on_finished(False, raw)
+
+        box = _open_failure_window(dialog)
+        assert "orders: 테이블을 만들거나 데이터를 넣다가 서버 오류로 멈췄습니다." in box.text()
+        assert "실패: 1개 테이블" in box.text()
+        assert "MySqlError" not in box.text() and "create_table" not in box.text()
+        assert shown == []
+        _click_details(box)
+        assert shown == [raw]
+    finally:
+        dialog.close()
+
+
+def test_safe_restore_failure_passes_core_reason_through(monkeypatch, tmp_path):
+    from src.exporters.rust_dump_exporter import RustDumpImporter
+
+    (tmp_path / "_tunnelforge_dump.json").write_text(json.dumps({
+        "format": "tunnelforge-dump", "format_version": 5, "source_engine": "mysql", "database": "app",
+        "tables": [{"name": "users", "path": "0001_users", "rows": 0, "chunks": 0}],
+    }), encoding="utf-8")
+    reason = "load_failed: users: create_table failed: MySqlError { ERROR 1822 (HY000): Failed to add the foreign key }"
+    blocker = "The original namespace contains tables absent from this dump; preserve them before switching."
+
+    class FakeFacade:
+        def import_dump(self, payload, on_event=None):
+            return {"success": False, "mode": "safe", "status": "failed_original_untouched", "original_unchanged": True,
+                    "message": f"Safe restore failed; original database was not changed. {reason}",
+                    "error": reason, "blockers": [blocker]}
+
+    importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=FakeFacade())
+    success, message, _ = importer.import_dump(str(tmp_path), import_mode="safe")
+    assert success is False
+    assert message == f"{reason}\n{blocker}"
+    assert importer.last_error_code == "LOAD_FAILED:MYSQL-1822"
+
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    try:
+        dialog.last_import_mode = "safe"
+        dialog.import_audit = {"original_unchanged": True}
+        dialog.on_finished(False, message)
+
+        box = _open_failure_window(dialog)
+        assert "원본 미변경" in box.text()
+        assert "users: 테이블을 만들거나 데이터를 넣다가 서버 오류로 멈췄습니다." in box.text()
+        assert "MySqlError" not in box.text() and "absent from this dump" not in box.text()
+        _click_details(box)
+        assert len(shown) == 1 and reason in shown[0] and blocker in shown[0]
+    finally:
+        dialog.close()
