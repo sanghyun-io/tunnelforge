@@ -36,10 +36,37 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | `replace` | Like mysqldump: each selected dump table is dropped, recreated, loaded and finished (its secondary indexes, PostgreSQL unique indexes/comments/sequences) one table at a time; each FK is added as soon as both of its tables are done (a parent outside the dump counts as done), and views follow at the end. Existing selected-table data is lost. A failure leaves at most the table in progress missing, partially loaded or unfinished; tables already replaced are complete, and tables not yet reached keep their original data; an FK such a table lost when its parent was replaced is linked again after the failure if that parent was reloaded (otherwise it stays reported as removed). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
 
+A `replace` (or `recreate`) import into a MySQL database or PostgreSQL schema
+that does not exist creates it first, after the dump checks and before any table
+work. A new MySQL database is created as `utf8mb4`, with the server's default
+collation when that is a `utf8mb4` one and `utf8mb4_unicode_ci` otherwise, so
+cross-engine tables (which carry no table collation) never inherit a latin1
+server default; a safe restore into a missing MySQL database does the same.
+This needs the CREATE privilege for that database (MySQL) or on the database
+(PostgreSQL). A database the account cannot see (no privilege on it) counts as
+missing, so its CREATE fails as `target_create_failed`.
+The import report records `namespace_creation_outcome_unknown: true` before the
+CREATE and `namespace_created: true` only after it succeeded, so a failed CREATE
+stays reported as of unknown outcome; `target_change` events (`create_database`
+or `create_schema`, status `started` then `completed`) bracket it. A namespace
+created this way is not dropped when the import fails later; the result and the
+failure report carry `namespace_created`. A missing PostgreSQL database is never
+created: the import fails to connect.
+
 The former `merge` mode (append rows to existing tables) was removed. A request
 with `mode` or `import_mode` set to `merge`, or to any value not listed above, is
 refused as `import_plan_invalid` before anything is written, including the
 import report.
+
+Every import attempt (`replace`, `recreate` or `safe`) writes its own report into
+the dump folder, `_tunnelforge_import_report_<nanoseconds>_<process>_<n>.json`,
+and names it (`report_path`) in its `import_report` events from the start, so a
+retry never overwrites the record of an earlier attempt. The attempt's last
+`import_report` event carries its final status. A safe restore and the
+candidate import inside it share one report, which a later promotion updates in
+place. Dump folders imported by earlier versions keep their single
+`_tunnelforge_import_report.json`; it is still read, and the job list and the
+Import dialog link to the report of their own run.
 
 Target-only tables are preserved. A target-only FK referencing an imported parent
 requires the recreated parent to retain a compatible key/type contract, including
@@ -64,6 +91,91 @@ live target table), and all probes are then removed. A rejected definition, a
 missing REFERENCES privilege, or an FK that no longer fits a parent outside the
 dump stops the import with the target unchanged. A view or other non-table
 object that already uses a selected table's name is refused the same way.
+On PostgreSQL, anything that DROP TABLE would refuse over is also found first:
+a table the account neither owns nor owns the schema of, a view, a target-only
+FK child, and any other `pg_depend` dependent, such as a default or view that
+uses a sequence a selected table owns, a column of a selected table's row type,
+an inheriting table, or a policy or function body naming the table. Tables are
+dropped one by one in dependency order, so a dependent that is itself a selected
+table counts only when its table is dropped after the one it depends on.
+
+### Preview (`dump.import_preview`)
+
+`dump.import_preview` takes the `dump.import` payload without `mode` and reports
+what a replace import would do. It changes nothing: it writes no import report,
+creates no probe tables and does not read chunk data. `service.hello` lists the
+command, and the application refuses to preview with a core that does not, since
+an older core ignores unknown `dump.import` fields.
+
+The result lists the dump tables that would be replaced (`replace`) or created
+(`create`) in the order the import takes them, target tables left alone
+(`untouched`), kept target-only children (`kept_children`), FKs to parents
+outside the dump and whether the target has them (`external_parents`), view
+changes (`views`: `replace`, `create`, `may_not_replace` for views the account
+may not drop: on MySQL under another DEFINER when the account lacks SYSTEM_USER,
+on PostgreSQL owned by a role the account cannot act as, `may_break` for MySQL
+target-only views over replaced tables, from
+`information_schema.VIEW_TABLE_USAGE`), the triggers that disappear with replaced
+tables (`triggers_dropped`), and the dump's `strict_export`, `snapshot_policy`
+and `source_timezone`. When the namespace is missing, every table is under
+`create` and `target.can_create` says whether the account may create it (`null`
+when its grants cannot tell, for example with roles or partial revokes); the
+replace import creates it.
+
+`blockers` (`{code, table, detail}`) are what the import refuses before its first
+DROP: `dump_invalid`, `untranslatable_table`, `spatial_unsupported`,
+`temporal_unsupported`, `no_tables`, the PostgreSQL
+dependents above (`drop_privilege_missing`, `dependent_view`,
+`target_only_fk_child`, `dependent_object`), `check_name_collision`,
+`name_collision`, `create_privilege_missing`, on MySQL `drop_privilege_missing`
+when the account has no database-wide DROP grant (the DDL probe drops its own
+tables), and on PostgreSQL `external_parent_missing` (MySQL adds such an FK with
+`foreign_key_checks=0`). `copy_blockers` are what `safe` refuses on top of that
+(`legacy_bit_unverifiable`, `cross_engine`, and `partial_table_filter` when the
+request carries a `tables` filter; a partial export is not refused), plus, for an
+existing same-engine target, the target checks `safe` runs before making a copy
+(see below); when those checks cannot run, one `copy_checks_unavailable` item
+takes their place and the rest of the preview is still returned. `warnings`
+(`{code, detail}`) map the manifest's texts to `unsynchronized_snapshot`,
+`views_outside_snapshot`, `omitted_object` or `source_dump_warning`, and add
+`not_strict`, `legacy_timezone`, `legacy_dump`, `create_privilege_unproven`,
+`drop_privilege_unproven` and `view_dependencies_unknown`.
+
+### Failure texts
+
+Core failures and preview items carry stable codes: the leading `code:` of an
+error (`code: table: ...` when it names a table), an error event's `error_code`
+or `(error_code=...)`, and a preview item's `code`. A failed table is
+`load_failed: table: ...` whether its DROP, its CREATE or its row load failed; a
+row-load error that already has a code (`export_invalid` for a bad chunk) keeps
+it. The application words each code as one plain Korean sentence
+(`CORE_CODE_SENTENCES` in `rust_dump_exporter.py`), prefixed with the table name
+when there is one; a test scans the core's import sources and fails on a code
+without a sentence. A code is taken only at the start of a failure text (after
+the importer's own prefix) or after `; additionally: `, never from a path or
+server text inside it. When the core joins several failures, each code is
+worded, and a text that says the Import report could not be persisted adds that
+the report was not saved.
+
+The Import failure window shows those sentences (after a failed table, as the
+cause above the table counts) and keeps the core's own text behind its "자세히"
+button, which opens it beside the window. Without a known code, a failed table
+is reported as an unclassified cause with the text behind "자세히"; any other
+failure text is shown as it is.
+
+A failed or refused `safe` restore arrives as a `success: false` result with
+status `failed_original_untouched`, not as an error. Its `error` and `blockers`
+are passed through as the failure message (its `message` instead when the final
+report could not be written, since only `message` says so), so the window names
+the core's reason. When the copy was already made, the window names it and says
+it was left in place; without an existing target the copy is the requested
+target itself and may be only partly loaded. A restore that stopped before
+making a copy (`copy_refused`, below) is shown instead as the `copy_refused`
+sentence followed by one sentence per `copy_blockers` code with the objects it
+names; the core's own text opens from "자세히", and a code without a sentence
+gets a general line that points to the report. The other refusals before a
+copy are coded as well: `dump_invalid`, `spatial_unsupported` (checked after the
+copy refusals, so a cross-engine dump is refused as such) and `no_tables`.
 
 ### Safe restoration and destination names
 
@@ -84,6 +196,42 @@ available without changing the original. Partial table filters and cross-engine
 safe restoration are currently refused; use the explicit migration workflow for
 cross-engine changes.
 
+Into an existing namespace, `safe` stops before it makes a copy (and before it
+reads the chunks) when the later swap could not go through. The result is
+`failed_original_untouched` with `candidate_created: false`,
+`cutover_pending: false`, an `error` that starts with `copy_refused:`,
+`error_code: "copy_refused"` and `copy_blockers` (`{code, table, detail}`), the
+same list `dump.import_preview` returns. A `tables` filter stops the run before
+the dump is read (`partial_table_filter`); `legacy_bit_unverifiable` and
+`cross_engine` stop it from the dump alone; the rest come from the target:
+
+| Code | Stops when |
+| --- | --- |
+| `copy_create_privilege_missing` | MySQL: the grants do not show that the account can create `tf_restore_*`, `tf_backup_*` and `tf_promote_*` databases (unreadable grants count as missing); PostgreSQL: it has no CREATE on the database. |
+| `metadata_visibility_unproven` | MySQL: no direct global SELECT, SHOW VIEW and PROCESS grants (roles and partial revokes count as unproven). |
+| `target_routines`, `target_events` | The target namespace has stored routines (PostgreSQL: functions) or MySQL events; the swap does not move them and cannot prove they still work afterwards. |
+| `target_triggers` | MySQL: a dump table has a trigger in the target; PostgreSQL: any table in the schema has one. |
+| `linked_target_only` | A table or view outside the dump is linked to a dump table or view: an FK in either direction (from the target catalog or the dump's own FK definitions) or a view reading one, in this or another schema. On PostgreSQL, a dump view whose current definition reads a table outside the dump in the same schema does not count: the swap replaces that view in place and leaves the table alone. |
+| `external_parent_missing` | A dump table's own FK names a parent that is neither in the dump nor in the target. |
+| `saved_view_alias` | The linked object is an old view definition an earlier MySQL swap kept (`tf_p_<nonce>_oldv<i>`); clean it up first (`target: "view_aliases"` below). |
+| `previous_copy_leftover` | The linked object is in a `tf_restore_*`, `tf_backup_*` or `tf_promote_*` namespace an earlier restore left, e.g. the views a PostgreSQL candidate keeps after its swap (they stay bound to the tables it moved in); clean up that candidate or backup first. |
+| `view_dependencies_unknown` | MySQL older than 8.0.13: views over the target cannot be listed. |
+
+A linked table or view is never rebuilt from its SHOW CREATE text to keep it
+(TF-STATUS-173): the run stops instead. Tables and views outside the dump that are
+not linked to it do not block: the swap leaves them and their other objects
+where they are (PostgreSQL re-creates only the dump's views; a trigger on any
+of its tables still stops the run, see `target_triggers`), so such a restore
+reaches `ready_for_switch`. As a second guard, `dump.promote`
+runs the same target checks again when it plans and before it confirms (links
+to the restore's own copy aside): a plan is `blocked` with the same
+`copy_blockers`, and a confirm whose target changed since review is refused. It
+also refuses a plan that would rebuild a table or view outside the dump (MySQL)
+or move a target-only table's FK to the new parent (PostgreSQL), and a stored
+plan that would. A request with `verify_only: true` (the scheduled restore
+rehearsal, which only verifies and cleans up the copy) skips these target checks;
+its report records `verify_only: true` and `dump.promote` refuses it.
+
 Supported MySQL replacement uses write locks and one atomic multi-object RENAME;
 PostgreSQL replacement uses locks and a transaction. Both recheck dependencies and
 the candidate before switching and retain displaced tables in an owned backup
@@ -100,16 +248,17 @@ Backup namespaces do not represent an independently complete full-database backu
 ### Backup lifecycle (`restore.backups`)
 
 The Core command `restore.backups` (UI: Import dialog, "복원 백업 관리") works from the
-promotion journals stored in the dump directories passed as `input_dirs`; a
-namespace that only follows the `tf_backup_` naming is listed as unproven and is
-never deleted.
+safe-restore reports (every attempt's, and the single report of earlier
+versions) and promotion journals stored in the dump directories passed as
+`input_dirs`; a namespace that only follows the `tf_backup_` naming is listed as
+unproven and is never deleted.
 
 | Action | Effect |
 | --- | --- |
 | `list` | Journal status, backup namespace, ownership proof, table count and estimated rows, cutover verdict, candidate namespace. MySQL saved view aliases are reported as "not views over backup data". |
 | `reconcile` | Compares an unknown/pending journal with live identities (MySQL InnoDB table ids, PostgreSQL relation OIDs): `promoted`, `not_promoted` or `undeterminable`. Report-only; retry and cleanup stay blocked unless the result is `promoted`. |
 | `cleanup_plan` | Read-only preview of exactly what would be dropped, with blockers. |
-| `cleanup_apply` | Requires `confirmed: true` and the digest of a plan reviewed just before; every check is re-derived from the live objects, then one owned namespace is dropped. |
+| `cleanup_apply` | Requires `confirmed: true` and the digest of a plan reviewed just before; every check is re-derived from the live objects, then one owned namespace (or, for `view_aliases`, the listed views) is dropped. |
 
 Cleanup of a backup requires all of: recorded ownership (identities match the
 journal and the namespace holds exactly the recorded tables), no object outside it
@@ -119,11 +268,18 @@ right after the commit; a journal without a fingerprint is refused), and a
 confirmed promotion. MySQL additionally needs proven global SELECT/SHOW
 VIEW/PROCESS visibility. A candidate (`tf_restore_<id>` only, never the restore
 destination itself) is removable when unpromoted and still proven identical to its
-verification, or, after promotion, when it holds only objects the promotion plan
+verification; after a failed restore (no plan or attempt recorded), when it holds
+only the dump's tables and views and leftover `tf_probe_` tables (any routine,
+event or trigger, or on PostgreSQL any function, explicit type or unowned
+sequence, blocks it); or, after
+promotion, when it holds only objects the promotion plan
 recorded (PostgreSQL: the candidate's own views; MySQL: the recorded replacement
 views, after the recorded temporary `tf_promote_` clone database, which is a separate
-`target: "clone"` cleanup, is gone). Original objects and namespaces without a
-journal are never dropped.
+`target: "clone"` cleanup, is gone). After a confirmed MySQL promotion,
+`target: "view_aliases"` drops the saved old-view aliases (`tf_p_<nonce>_oldv<i>`)
+the journal records, while each still holds the definition it saved and no view
+uses it and no routine, trigger or event mentions it; the active views are not
+touched. Original objects and namespaces without a journal are never dropped.
 
 Guided recovery (`rollback_plan` / `rollback_apply`) is the inverse of the
 promotion: one atomic multi-object RENAME (MySQL) or one transaction (PostgreSQL)

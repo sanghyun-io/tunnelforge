@@ -196,6 +196,7 @@ def test_facade_uses_dump_protocols():
         '{"event":"phase","phase":"dump","message":"started"}',
         '{"event":"result","command":"dump.run","success":true,"rows_dumped":3}',
         '{"event":"result","command":"dump.import","success":true,"rows_imported":3}',
+        '{"event":"result","command":"dump.import_preview","success":true,"dry_run":true}',
     ])
     client = DbCoreServiceClient(
         executable="fake-core",
@@ -206,10 +207,13 @@ def test_facade_uses_dump_protocols():
 
     dump_result = facade.run_dump({"output_dir": "dump"}, on_event=events.append)
     import_result = facade.import_dump({"input_dir": "dump"})
+    preview_result = facade.preview_import({"input_dir": "dump"})
 
     sent = [json.loads(line) for line in process.stdin.getvalue().strip().splitlines()]
     assert sent[0]["command"] == "dump.run"
     assert sent[1]["command"] == "dump.import"
+    assert sent[2]["command"] == "dump.import_preview"
+    assert preview_result["dry_run"] is True
     assert dump_result["rows_dumped"] == 3
     assert import_result["rows_imported"] == 3
     assert events[0]["event"] == "phase"

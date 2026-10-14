@@ -164,7 +164,9 @@ class RestoreRehearsal:
                 value = json.loads(line)
             except (TypeError, ValueError):
                 return
-            if isinstance(value, dict) and value.get("event") == "safe_restore_ready":
+            # safe_restore_target 가 후보 생성 시점에 restore_id 를 알려 주므로, 결과 없이 끝난 실행도 자기 후보만 정리한다.
+            if isinstance(value, dict) and value.get("event") in (
+                    "safe_restore_target", "safe_restore_ready", "safe_restore_failed"):
                 state.update(value)
 
         try:
@@ -175,7 +177,7 @@ class RestoreRehearsal:
             importer = RustDumpImporter(config, facade=facade)
             ok, message, _ = importer.import_dump(
                 backup_dir, target_schema=schedule.rehearsal_schema, threads=4, import_mode="safe",
-                raw_output_callback=capture)
+                raw_output_callback=capture, verify_only=True)
             error = "" if ok else f"후보 복원 실패: {message}"
             facts.restore_id = str(state.get("restore_id") or "")
             facts.status = str(state.get("status") or "")
@@ -229,6 +231,10 @@ class RestoreRehearsal:
         return ""
 
     def _cleanup_candidates(self, facade, schedule: ScheduleConfig, backup_dir: str, target, facts: _Facts) -> str:
+        if not facts.restore_id:
+            # 이 실행이 후보를 만든 증거가 없다. 같은 폴더의 다른 복원 후보(검토 대기 등)는 건드리지 않는다.
+            facts.cleanup = "nothing_to_clean"
+            return ""
         endpoint = apply_registered_tls(self._endpoint_payload(schedule, target))
         base = {"endpoint": endpoint, "input_dirs": [backup_dir]}
         try:
@@ -237,8 +243,7 @@ class RestoreRehearsal:
             facts.cleanup, facts.cleanup_message = "list_failed", str(exc)
             return f"리허설 후보 정리 실패(조회): {exc}"
         leftovers = [e for e in listing.get("backups") or []
-                     if (e.get("candidate") or {}).get("exists")
-                     and (not facts.restore_id or e.get("restore_id") == facts.restore_id)]
+                     if (e.get("candidate") or {}).get("exists") and e.get("restore_id") == facts.restore_id]
         if not leftovers:
             facts.cleanup = "nothing_to_clean"
             return ""

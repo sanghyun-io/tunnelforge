@@ -24,6 +24,7 @@ class RustDumpWorker(QThread):
     metadata_analyzed = pyqtSignal(dict)  # dump 메타데이터 분석 결과 (chunk_counts, table_sizes, total_bytes, schema)
     table_chunk_progress = pyqtSignal(str, int, int)  # table_name, completed_chunks, total_chunks (테이블별 chunk 진행률)
     promotion_finished = pyqtSignal(bool, str, dict)
+    preview_finished = pyqtSignal(bool, str, dict)  # success, message, dump.import_preview result
 
     def __init__(self, task_type: str, config: RustDumpConfig, **kwargs):
         super().__init__()
@@ -91,6 +92,8 @@ class RustDumpWorker(QThread):
                 self._run_export_tables()
             elif self.task_type == "import":
                 self._run_import()
+            elif self.task_type == "import_preview":
+                self._run_import_preview()
             elif self.task_type == "promote":
                 self._run_promotion()
         except Exception as e:
@@ -98,10 +101,12 @@ class RustDumpWorker(QThread):
                 message = CANCELLED_MESSAGE
                 if self.task_type == "import":
                     self.import_finished.emit(False, message, {})
-                self.finished.emit(False, message)
             else:
-                self.error_code = classify_error_code(getattr(e, "error_code", None), str(e))
-                self.finished.emit(False, str(e))
+                message = str(e)
+                self.error_code = classify_error_code(getattr(e, "error_code", None), message)
+            if self.task_type == "import_preview":
+                self.preview_finished.emit(False, message, {})
+            self.finished.emit(False, message)
         finally:
             self._active_runner = None
 
@@ -194,4 +199,20 @@ class RustDumpWorker(QThread):
         self.error_code = getattr(importer, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)
         self.import_finished.emit(success, msg, results)
+        self.finished.emit(success, msg)
+
+    def _run_import_preview(self):
+        importer = RustDumpImporter(self.config)
+        self._active_runner = importer
+
+        success, msg, preview = importer.preview_import(
+            self.kwargs['input_dir'],
+            self.kwargs.get('target_schema'),
+            self.kwargs.get('threads', 8),
+            self.kwargs.get('timezone_sql'),
+            use_source_timezone=self.kwargs.get('use_source_timezone', True),
+        )
+        self.error_code = getattr(importer, "last_error_code", None)
+        success, msg = self._is_cancelled_message(success, msg)
+        self.preview_finished.emit(success, msg, {} if self._cancel_requested else preview)
         self.finished.emit(success, msg)

@@ -10,10 +10,9 @@ from typing import Any, Dict, Optional
 from src.core.job_history import (
     KIND_EXPORT_FULL, KIND_EXPORT_TABLES, KIND_IMPORT, KIND_MIGRATION_PREFLIGHT, KIND_MIGRATION_RESUME,
     KIND_MIGRATION_RUN, KIND_PROMOTE, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PARTIAL,
-    job_begin, job_finish,
+    job_begin, job_finish, job_report_path,
 )
 
-IMPORT_REPORT_NAME = "_tunnelforge_import_report.json"
 DUMP_MANIFEST_NAME = "_tunnelforge_dump.json"
 
 
@@ -88,17 +87,22 @@ def finish_export_job(dialog, success: bool, message: str) -> None:
 
 # ------------------------------------------------------------------ import
 
-def begin_import_job(dialog, input_dir: str, target: str, import_mode: str, threads: int) -> Optional[str]:
+def begin_import_job(dialog, target: str, import_mode: str, threads: int) -> Optional[str]:
+    # 보고서는 실행마다 새 파일이라 Core 가 이름을 알려 줄 때 기록한다 (record_import_report).
     try:
         profile = getattr(dialog, "tunnel_config", None) or {}
         context = {"profile_id": profile.get("id"), "profile_name": profile.get("name")}
         return job_begin(
             KIND_IMPORT, target=target, mode=f"{import_mode} · 스레드 {threads}",
-            report_path=os.path.join(input_dir, IMPORT_REPORT_NAME) if input_dir else "",
             **_profile(context, getattr(dialog, "connection_info", "")),
         )
     except Exception:
         return None
+
+
+def record_import_report(dialog) -> None:
+    """Core 가 이번 실행의 보고서 파일을 알려 주면 실행 중인 기록에 바로 남긴다."""
+    job_report_path(getattr(dialog, "_job_id", None), str((getattr(dialog, "import_audit", None) or {}).get("report_path") or ""))
 
 
 def import_status(success: bool, cancelled: bool, done: int, errors: int) -> str:

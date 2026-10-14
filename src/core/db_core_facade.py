@@ -314,6 +314,10 @@ class DbCoreFacade:
     ) -> Dict[str, Any]:
         return self.client.request("dump.import", payload, on_event=on_event)
 
+    def preview_import(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Read-only plan of a replace import; the target is not changed."""
+        return self.client.request("dump.import_preview", payload)
+
     def run_oneclick(
         self,
         payload: Dict[str, Any],

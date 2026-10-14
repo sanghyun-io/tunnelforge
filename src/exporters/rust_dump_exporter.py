@@ -1,6 +1,7 @@
 """Rust DB Core backed dump export/import helpers."""
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,9 @@ from src.core.constants import (
     DEFAULT_LOCAL_HOST,
     DEFAULT_MYSQL_PORT,
 )
+from src.core.connection_trust import ERROR_MESSAGES as CONNECTION_ERROR_MESSAGES
 from src.core.error_report_codes import classify_error_code
+from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.exporters.dump_progress import DumpEventCallbacks, TableProgressTracker, emit_core_event
 
@@ -511,6 +514,7 @@ _OPERATION_SCOPED_IMPORT_CODES = (
     "target_dependency_preflight_failed:",
     "ddl_preflight_failed:",
     "preflight_surviving_fk:",
+    "target_create_failed:",
 )
 
 
@@ -518,8 +522,187 @@ def _is_operation_scoped_import_error(message: str) -> bool:
     return message.lstrip().startswith(_OPERATION_SCOPED_IMPORT_CODES)
 
 
+# One sentence per code the Rust core emits: the leading `code:` of an error, an error
+# event's error_code, and the code of a dump.import_preview blocker or warning.
+CORE_CODE_SENTENCES = {
+    **CONNECTION_ERROR_MESSAGES,
+    # Import errors
+    "load_failed": "이 테이블을 지우고 다시 만들거나 데이터를 넣는 중에 멈췄습니다.",
+    "ddl_preflight_failed": "대상에 테이블을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "ddl_probe_cleanup_failed": "확인용으로 잠시 만든 테이블을 지우지 못했습니다. 원래 테이블은 바뀌지 않았습니다.",
+    "incompatible_surviving_fk": "덤프에 없는 대상 테이블의 외래 키가 새 테이블과 맞지 않아 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "target_dependency_preflight_failed": "대상의 다른 객체가 테이블에 기대고 있어 교체할 수 없습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "target_create_failed": "대상 DB(스키마)가 없거나 이 계정에 보이지 않아 새로 만들려 했지만 오류로 멈췄습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "post_load_validation_failed": "데이터를 넣은 뒤 행 수를 확인하거나 인덱스·외래 키를 만들다가 멈췄습니다.",
+    "import_plan_invalid": "요청한 Import 설정이나 제약 조건 이름 때문에 시작할 수 없습니다.",
+    "export_invalid": "덤프 파일이 온전하지 않거나 이 대상에 만들 수 없는 테이블이 있습니다.",
+    "view_target_invalid": "덤프의 뷰 정의를 그대로 만들 수 없습니다.",
+    # Verify-in-copy
+    "safe_promotion": "검증한 복사본을 원래 이름으로 바꾸지 못했습니다.",
+    "safe_restore_content_invalid": "복사본을 검증하다가 덤프에서 읽을 수 없는 값을 만났습니다.",
+    "safe_restore_content_mismatch": "복사본의 데이터가 덤프와 달라 교체하지 않았습니다.",
+    "safe_restore_content_read_failed": "복사본의 데이터를 읽지 못해 검증하지 못했습니다.",
+    "legacy_bit_unverifiable": "예전 형식 덤프라 BIT 열을 복사본에서 검증할 수 없습니다. 이 버전으로 다시 내보내세요.",
+    "cross_engine": "다른 DB 종류에서 만든 덤프는 복사본에서 검증할 수 없습니다.",
+    "partial_table_filter": "일부 테이블만 넣을 때는 복사본에서 검증할 수 없습니다.",
+    # Why verify-in-copy stopped before making a copy (copy_blockers)
+    "copy_refused": "복사본을 만들기 전에 멈췄습니다. 원본은 그대로입니다.",
+    "copy_create_privilege_missing": "이 계정에 복사본과 백업을 둘 DB(PostgreSQL은 스키마)를 만들 권한이 없거나, 권한 목록으로 확인할 수 없습니다.",
+    "metadata_visibility_unproven": "이 계정에 서버 전체를 조회하는 권한(SELECT, SHOW VIEW, PROCESS)이 없거나 확인할 수 없어, 대상에 이어진 것을 모두 확인할 수 없습니다.",
+    "target_routines": "대상에 저장 프로시저나 함수가 있어, 교체 뒤에도 제대로 동작하는지 확인할 수 없습니다.",
+    "target_events": "대상에 예약 이벤트가 있어, 교체 뒤에도 제대로 동작하는지 확인할 수 없습니다.",
+    "target_triggers": "대상 테이블에 트리거가 있어 교체할 수 없습니다.",
+    "linked_target_only": "덤프에 없는 테이블이나 뷰가 외래 키나 뷰로 덤프 테이블과 이어져 있어, 그대로 둔 채 교체할 수 없습니다.",
+    "saved_view_alias": "이전 교체에서 남긴 옛 뷰가 있습니다. 작업 목록에서 이전 Import 기록의 '복원 백업 관리'에서 먼저 정리하세요.",
+    "previous_copy_leftover": "이전 복사본이나 백업에 남은 뷰가 덤프 테이블을 읽고 있습니다. 작업 목록에서 이전 Import 기록의 '복원 백업 관리'에서 먼저 정리하세요.",
+    "copy_checks_unavailable": "대상을 확인하지 못해, 먼저 복사본에서 검증할 수 있는지 알 수 없습니다.",
+    # Preview blockers
+    "dump_invalid": "덤프 파일 내용에 문제가 있어 넣을 수 없습니다.",
+    "untranslatable_table": "이 테이블은 대상 DB 종류에서 만들 수 없습니다.",
+    "spatial_unsupported": "위치·도형(공간) 열은 이 덤프에서 대상으로 넣을 수 없습니다.",
+    "temporal_unsupported": "대상 DB 종류에는 이 날짜·시간 형식을 그대로 담을 열이 없습니다.",
+    "no_tables": "넣을 테이블이 없습니다.",
+    "create_privilege_missing": "대상 DB(스키마)가 없는데 이 계정은 새로 만들 권한이 없습니다.",
+    "drop_privilege_missing": "이 계정은 대상 테이블을 지울 권한이 없습니다.",
+    "dependent_view": "대상의 뷰가 이 테이블을 쓰고 있어 교체할 수 없습니다.",
+    "target_only_fk_child": "덤프에 없는 대상 테이블이 외래 키로 이 테이블을 참조하고 있어 교체할 수 없습니다.",
+    "dependent_object": "대상의 다른 객체(시퀀스, 함수 등)가 이 테이블에 기대고 있어 교체할 수 없습니다.",
+    "check_name_collision": "같은 이름의 CHECK 제약이 덤프에 없는 대상 테이블에 이미 있습니다.",
+    "name_collision": "대상에서 뷰 같은 다른 객체가 이 이름을 쓰고 있어 테이블로 바꿀 수 없습니다.",
+    "external_parent_missing": "이 테이블이 참조하는 부모 테이블이 덤프에도 대상에도 없습니다.",
+    # Preview warnings
+    "unsynchronized_snapshot": "덤프의 테이블들이 같은 시점에 내보내지지 않아 서로 맞지 않을 수 있습니다.",
+    "views_outside_snapshot": "뷰 정의는 테이블 데이터와 같은 시점에 담기지 않았습니다.",
+    "omitted_object": "내보낼 때 일부 객체가 빠졌습니다.",
+    "source_dump_warning": "덤프를 만들 때 남긴 경고가 있습니다.",
+    "not_strict": "이 덤프는 완전한 백업으로 표시되어 있지 않습니다. 내보낼 때의 한계가 그대로 남습니다.",
+    "legacy_timezone": "예전 덤프라 시간대가 기록되어 있지 않습니다. 고른 시간대나 대상 서버 기본값으로 시간을 읽습니다.",
+    "legacy_dump": "예전 형식 덤프라 일부 파일의 무결성 정보가 없습니다.",
+    "create_privilege_unproven": "대상 DB(스키마)가 없는데 이 계정이 만들 수 있는지 권한 목록으로는 알 수 없습니다.",
+    "drop_privilege_unproven": "이 계정이 대상 테이블을 지울 수 있는지 권한 목록으로는 알 수 없습니다.",
+    "view_dependencies_unknown": "교체할 테이블을 쓰는 뷰를 확인하지 못했습니다(MySQL 8.0.13 이상 필요).",
+}
+_REPORT_NOT_SAVED = "Import 보고서를 저장하지 못했습니다. 보고서 내용은 최신이 아닙니다."
+
+# A known `code:` where the core puts one: at the start (after the importer's own prefix) or after
+# "; additionally: ", so code text inside a path or a server message is not taken. The scope of
+# `code: name: ...` is kept when it is one word (classified_import_error).
+_CORE_CODE_TOKEN = re.compile(
+    r"(?:^\s*(?:Rust DB Core import 오류: |Import 오류: |Safe restore failed; original database was not changed\. )?"
+    r"|; additionally: )"
+    r"(" + "|".join(map(re.escape, CORE_CODE_SENTENCES)) + r")\s*:(?:\s*([^\s:]+):\s)?",
+    re.IGNORECASE,
+)
+_TRAILING_CORE_CODE = re.compile(r"\(error_code=([a-z_]+)\)")
+
+
+def describe_core_code(code: object, name: object = "") -> Optional[str]:
+    """The sentence for one core code, prefixed with the table (or other object) it names; None when unknown."""
+    sentence = CORE_CODE_SENTENCES.get(str(code or "").lower())
+    if sentence is None:
+        return None
+    sentence = translate_text(sentence)
+    return f"{name}: {sentence}" if name else sentence
+
+
+def describe_core_failure(message: object) -> Optional[str]:
+    """The sentences for the core codes in a failure text; None when it carries none."""
+    text = str(message or "")
+    found = [describe_core_code(match.group(1), match.group(2) or "") for match in _CORE_CODE_TOKEN.finditer(text)]
+    if not found and (trailing := _TRAILING_CORE_CODE.search(text)):
+        found = [describe_core_code(trailing.group(1))]
+    sentences = list(dict.fromkeys(sentence for sentence in found if sentence))
+    # Only beside a code sentence: an uncoded text keeps the core's own wording, which says so.
+    if sentences and "could not be persisted" in text:
+        sentences.append(translate_text(_REPORT_NOT_SAVED))
+    return " ".join(sentences) or None
+
+
+IMPORT_PREVIEW_CAPABILITY = "dump.import_preview"
+_UNKNOWN_TARGET_MESSAGE = "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요."
+_MISSING_MANIFEST_MESSAGE = "TunnelForge Rust dump manifest를 찾을 수 없습니다."
+
+_UNKNOWN_COPY_BLOCKER = "복사본에서 검증할 수 없는 다른 이유가 있습니다. Import 보고서에서 확인하세요."
+
+
+def describe_copy_blockers(blockers: object) -> List[str]:
+    """One line per copy_blockers code (why verify-in-copy stopped), naming the tables or views it concerns."""
+    grouped: Dict[str, List[str]] = {}
+    for item in blockers if isinstance(blockers, list) else []:
+        if isinstance(item, dict):
+            names = grouped.setdefault(str(item.get("code") or "").lower(), [])
+            if item.get("table") and str(item["table"]) not in names:
+                names.append(str(item["table"]))
+    lines = []
+    for code, names in grouped.items():
+        sentence = translate_text(CORE_CODE_SENTENCES.get(code) or _UNKNOWN_COPY_BLOCKER)
+        shown = ", ".join(names[:10]) + (f" … (+{len(names) - 10})" if len(names) > 10 else "")
+        lines.append(f"- {sentence}" + (f" ({shown})" if names else ""))
+    return lines
+
+
 class RustDumpImporter(_RustDumpClientBase):
     """Rust DB Core backed dump importer."""
+
+    def _import_payload(
+        self,
+        input_dir: str,
+        target_schema: str,
+        threads: int,
+        timezone_sql: Optional[str],
+        use_source_timezone: bool,
+    ) -> Optional[dict]:
+        """The dump.import payload without its mode; None when the target namespace is unknown."""
+        if not target_schema:
+            return None
+        payload = {
+            "target": self._endpoint(target_schema).to_payload(),
+            "input_dir": input_dir,
+            "threads": max(1, int(threads)),
+            "strict_manifest": True,
+            "use_source_timezone": use_source_timezone,
+        }
+        if timezone_sql:
+            payload["timezone_sql"] = timezone_sql
+        return payload
+
+    def preview_import(
+        self,
+        input_dir: str,
+        target_schema: Optional[str] = None,
+        threads: int = DEFAULT_DUMP_THREADS,
+        timezone_sql: Optional[str] = None,
+        use_source_timezone: bool = True,
+    ) -> Tuple[bool, str, dict]:
+        """What a replace import would do, read from the target without changing it.
+
+        Nothing is sent to a core whose ``service.hello`` does not list ``dump.import_preview``.
+        """
+        try:
+            manifest_path = Path(input_dir) / "_tunnelforge_dump.json"
+            if not manifest_path.exists():
+                return False, _MISSING_MANIFEST_MESSAGE, {}
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload = self._import_payload(
+                input_dir,
+                target_schema or dump_original_namespace(manifest, self.config.engine),
+                threads,
+                timezone_sql,
+                use_source_timezone,
+            )
+            if payload is None:
+                return False, _UNKNOWN_TARGET_MESSAGE, {}
+            if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):
+                return False, "이 Rust DB Core는 Import 미리보기를 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요.", {}
+            return True, "", self.facade.preview_import(payload)
+        except DbCoreServiceError as exc:
+            self._remember_error_code(exc)
+            return False, f"Rust DB Core import 미리보기 오류: {exc}", {}
+        except Exception as exc:
+            self._remember_error_code(exc)
+            return False, f"Import 미리보기 오류: {exc}", {}
+        finally:
+            _shutdown_owned_facade(self.facade, self._owns_facade)
 
     def _analyze_dump_metadata(self, dump_dir: str) -> Optional[Dict]:
         manifest_path = Path(dump_dir) / "_tunnelforge_dump.json"
@@ -580,12 +763,15 @@ class RustDumpImporter(_RustDumpClientBase):
         metadata_callback: Optional[Callable[[dict], None]] = None,
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
         use_source_timezone: bool = True,
+        verify_only: bool = False,
     ) -> Tuple[bool, str, dict]:
+        """``verify_only`` (safe mode): the copy is only verified, never swapped in, so the core
+        skips the checks that guard the swap."""
         import_results: dict = {}
         try:
             manifest_path = Path(input_dir) / "_tunnelforge_dump.json"
             if not manifest_path.exists():
-                return False, "TunnelForge Rust dump manifest를 찾을 수 없습니다.", import_results
+                return False, _MISSING_MANIFEST_MESSAGE, import_results
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             source_schema = dump_original_namespace(manifest, self.config.engine)
@@ -607,20 +793,14 @@ class RustDumpImporter(_RustDumpClientBase):
                 if table_status_callback:
                     table_status_callback(table, "pending", "")
 
-            final_target_schema = target_schema or source_schema
-            if not final_target_schema:
-                return False, "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요.", import_results
-
-            payload = {
-                "target": self._endpoint(final_target_schema).to_payload(),
-                "input_dir": input_dir,
-                "mode": import_mode,
-                "threads": max(1, int(threads)),
-                "strict_manifest": True,
-                "use_source_timezone": use_source_timezone,
-            }
-            if timezone_sql:
-                payload["timezone_sql"] = timezone_sql
+            payload = self._import_payload(
+                input_dir, target_schema or source_schema, threads, timezone_sql, use_source_timezone,
+            )
+            if payload is None:
+                return False, _UNKNOWN_TARGET_MESSAGE, import_results
+            payload["mode"] = import_mode
+            if verify_only:
+                payload["verify_only"] = True
             if retry_tables:
                 payload["tables"] = retry_tables
 
@@ -640,11 +820,22 @@ class RustDumpImporter(_RustDumpClientBase):
 
             if import_mode == "safe":
                 candidate = restore_target_connection_info(result.get("candidate_target"))
-                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "restore_id", "report_path", "plan_digest")}
+                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "candidate_created", "restore_id", "report_path", "plan_digest")}
                 state.update(event="safe_restore_ready", candidate_target=candidate,
                              original_target=restore_target_connection_info(result.get("original_target")))
                 if raw_output_callback:
                     raw_output_callback(json.dumps(state, ensure_ascii=False))
+                if result.get("status") == "failed_original_untouched":
+                    # A refused or failed safe restore is a result, not an error: keep the core's reason.
+                    # A failed final report write keeps the first error and says so only in `message`.
+                    reason = str((result.get("message") if result.get("report_write_failed") else result.get("error"))
+                                 or result.get("message") or "")
+                    self.last_error_code = classify_error_code(result.get("error_code"), reason)
+                    stops = describe_copy_blockers(result.get("copy_blockers"))
+                    if stops:
+                        # Stopped before making a copy: one sentence per reason; the core's text is in the report.
+                        return False, "\n".join([describe_core_code("copy_refused"), *stops]), import_results
+                    return False, "\n".join([reason, *(str(item) for item in result.get("blockers") or [])]), import_results
                 new_target = result.get("status") == "completed_new_target" and result.get("namespace_existed") is False and result.get("namespace_created") is True
                 if not ((new_target or result.get("status") in ("ready_for_switch", "ready_for_review"))
                         and result.get("verified") is True and result.get("original_unchanged") is True
@@ -677,6 +868,12 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += f" (View {len(views_failed)}개 생성 실패: {failed_names})"
             if views_skipped:
                 message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
+            if import_mode != "safe" and result.get("namespace_created") is True:
+                if self.config.engine == "postgresql":
+                    # Without a configured database the schema lands in the `postgres` database.
+                    message += f"\n새 스키마 {payload['target']['database']}.{payload['target']['schema']}을 만들어 넣었습니다"
+                else:
+                    message += f"\n새 DB {payload['target']['database']}을 만들어 넣었습니다"
             for warning in (result.get("verification") or {}).get("warnings", []) or []:
                 warning_line = f"Import warning: {warning}"
                 message += "\n" + warning_line

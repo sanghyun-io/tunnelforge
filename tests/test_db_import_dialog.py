@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1673,7 +1672,24 @@ def test_replace_failure_details_name_lost_and_untouched_tables():
     details = _replace_failure_details(audit)
     assert "원본 테이블에서 제거된 외래 키" not in details
     assert "다시 연결한 외래 키: items.fk_items_orders" in details
+    assert "새로 만든 대상" not in details
     assert _replace_failure_details({}) == ""
+    # A database the import created is named, so the user knows it was left in place.
+    created = {}
+    _capture_import_audit(created, {"event": "import_report", "namespace_created": True,
+                                    "target": {"engine": "mysql", "schema": "new_db"}})
+    assert _replace_failure_details(created) == "이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): new_db"
+    # Tables of a target this import created never held original data.
+    _capture_import_audit(created, {"event": "import_report", "unattempted_tables": ["items"]})
+    assert "아직 만들지 않은 테이블: items" in _replace_failure_details(created)
+    assert "원본 데이터를 유지" not in _replace_failure_details(created)
+    # A CREATE of unknown outcome is named with its PostgreSQL database.
+    unknown = {}
+    _capture_import_audit(unknown, {"event": "import_report", "namespace_created": False,
+                                    "namespace_creation_outcome_unknown": True, "unattempted_tables": ["items"],
+                                    "target": {"engine": "postgresql", "database": "app", "schema": "new_schema"}})
+    assert _replace_failure_details(unknown) == ("아직 만들지 않은 테이블: items\n"
+                                                 "새 대상을 만들었는지 확인하지 못함: app.new_schema")
 
 
 def test_import_unknown_original_namespace_requires_explicit_ui_selection(monkeypatch, tmp_path):
@@ -1800,8 +1816,9 @@ def test_import_stop_button_cancels_without_closing_and_shows_final_status_and_r
 
         from datetime import datetime
         dialog.import_start_time = datetime.now()
-        report = tmp_path / "_tunnelforge_import_report.json"
+        report = tmp_path / "_tunnelforge_import_report_1_2_0.json"
         report.write_text("{}", encoding="utf-8")
+        dialog.on_raw_output(json.dumps({"event": "import_report", "status": "running", "report_path": str(report)}))
         dialog.last_input_dir = str(tmp_path)
         dialog.last_import_mode = "replace"
         dialog.import_results = {"a": {"status": "done"}, "b": {"status": "blocked"}}
@@ -1815,7 +1832,7 @@ def test_import_stop_button_cancels_without_closing_and_shows_final_status_and_r
         assert dialog.label_status.text().startswith("⏹ Import 취소됨")
         assert dialog.btn_stop.isHidden()
         assert not dialog.label_report_link.isHidden()
-        assert "_tunnelforge_import_report.json" in dialog.label_report_link.text()
+        assert report.name in dialog.label_report_link.text()
     finally:
         dialog.worker = None
         type(dialog).close(dialog)
@@ -1863,22 +1880,24 @@ def test_stopped_safe_import_shows_stopped_status_not_safe_restore_failure(monke
         type(dialog).close(dialog)
 
 
-def test_report_link_ignores_a_stale_report_from_an_earlier_run(monkeypatch, tmp_path):
+def test_report_link_shows_only_the_report_the_core_named_for_this_run(monkeypatch, tmp_path):
     from datetime import datetime as _dt
     dialog = _stop_test_dialog(monkeypatch)
     try:
-        report = tmp_path / "_tunnelforge_import_report.json"
-        report.write_text("{}", encoding="utf-8")
-        old = report.stat().st_mtime - 3600
-        os.utime(report, (old, old))
+        # Earlier attempts' reports in the same dump folder, even freshly written, belong to other runs.
+        (tmp_path / "_tunnelforge_import_report.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "_tunnelforge_import_report_1_1_0.json").write_text("{}", encoding="utf-8")
         dialog.last_input_dir = str(tmp_path)
         dialog.import_audit = {}
         dialog.import_start_time = _dt.now()
         dialog._show_report_link()
-        assert dialog.label_report_link.isHidden(), "a report older than this run is not this run's report"
-        report.write_text("{}", encoding="utf-8")  # rewritten during this run
+        assert dialog.label_report_link.isHidden(), "a report the core did not name is not this run's report"
+        own = tmp_path / "_tunnelforge_import_report_2_1_0.json"
+        own.write_text("{}", encoding="utf-8")
+        dialog.import_audit = {"report_path": str(own)}
         dialog._show_report_link()
         assert not dialog.label_report_link.isHidden()
+        assert own.name in dialog.label_report_link.text()
     finally:
         type(dialog).close(dialog)
 
@@ -1920,3 +1939,158 @@ def test_promotion_plan_step_has_no_stop_button_and_cutover_stop_shows_stopped_s
     finally:
         dialog.worker = None
         type(dialog).close(dialog)
+
+
+def _failure_test_dialog(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    shown = []
+    for name in ("warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, lambda parent, title, text, *a, **k: shown.append(text))
+    dialog = RustDumpImportDialog()
+    dialog._test_app = app  # keep the QApplication alive
+    return dialog, shown
+
+
+def _open_failure_window(dialog):
+    boxes = [box for box in dialog.findChildren(QMessageBox) if box.isVisible()]
+    assert len(boxes) == 1
+    return boxes[0]
+
+
+def _click_details(box):
+    next(button for button in box.buttons() if button.text() == "자세히").click()
+
+
+_LOAD_FAILED = "이 테이블을 지우고 다시 만들거나 데이터를 넣는 중에 멈췄습니다."
+
+
+def _safe_dump_dir(tmp_path):
+    (tmp_path / "_tunnelforge_dump.json").write_text(json.dumps({
+        "format": "tunnelforge-dump", "format_version": 5, "source_engine": "mysql", "database": "app",
+        "tables": [{"name": "users", "path": "0001_users", "rows": 0, "chunks": 0}],
+    }), encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_import_failure_window_shows_first_cause(monkeypatch):
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    raw = ("Rust DB Core import 오류: load_failed: orders: create_table failed: "
+           "MySqlError { ERROR 1118 (42000): Row size too large }")
+    try:
+        dialog.last_import_mode = "replace"
+        dialog.import_results = {"customers": {"status": "done"}, "orders": {"status": "error", "message": raw},
+                                 "items": {"status": "blocked"}}
+        dialog.on_finished(False, raw)
+
+        box = _open_failure_window(dialog)
+        assert f"orders: {_LOAD_FAILED}" in box.text()
+        assert "실패: 1개 테이블" in box.text()
+        assert "MySqlError" not in box.text() and "create_table" not in box.text()
+        assert sorted(button.text() for button in box.buttons()) == ["닫기", "자세히"]
+        assert shown == []
+        _click_details(box)
+        assert shown == [raw]
+        assert box.isVisible()  # the details open beside the failure window, which stays
+    finally:
+        dialog.close()
+
+
+def test_import_failure_before_any_table_words_every_code(monkeypatch):
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    raw = ("Rust DB Core import 오류: ddl_preflight_failed: orders: server rejected create_table before target "
+           "replacement: MySqlError { ERROR 1118 (42000): Row size too large }; additionally: ddl_probe_cleanup_failed: "
+           "owned probes tf_p_0 could not be removed; original target tables were not changed: MySqlError { x }")
+    cause = ("orders: 대상에 테이블을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다. "
+             "확인용으로 잠시 만든 테이블을 지우지 못했습니다. 원래 테이블은 바뀌지 않았습니다.")
+    try:
+        dialog.last_import_mode = "replace"
+        dialog.import_results = {"orders": {"status": "pending"}}
+        dialog.on_finished(False, raw)
+
+        box = _open_failure_window(dialog)
+        assert f"❌ {cause}" in box.text() and "MySqlError" not in box.text()
+        assert f"❌ 실패: {cause}" in [dialog.txt_log.item(index).text() for index in range(dialog.txt_log.count())]
+        _click_details(box)
+        assert shown == [raw]
+    finally:
+        dialog.close()
+
+
+def test_safe_restore_failure_passes_core_reason_through(monkeypatch, tmp_path):
+    from src.exporters.rust_dump_exporter import RustDumpImporter
+
+    reason = "load_failed: users: create_table failed: MySqlError { ERROR 1822 (HY000): Failed to add the foreign key }"
+    blocker = "The original namespace contains tables absent from this dump; preserve them before switching."
+
+    class FakeFacade:
+        def import_dump(self, payload, on_event=None):
+            return {"success": False, "mode": "safe", "status": "failed_original_untouched", "original_unchanged": True,
+                    "message": f"Safe restore failed; original database was not changed. {reason}",
+                    "error": reason, "blockers": [blocker]}
+
+    importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=FakeFacade())
+    success, message, _ = importer.import_dump(_safe_dump_dir(tmp_path), import_mode="safe")
+    assert success is False
+    assert message == f"{reason}\n{blocker}"
+    assert importer.last_error_code == "LOAD_FAILED:MYSQL-1822"
+
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    try:
+        dialog.last_import_mode = "safe"
+        dialog.import_audit = {"original_unchanged": True}
+        dialog.on_finished(False, message)
+
+        box = _open_failure_window(dialog)
+        assert "원본 미변경" in box.text()
+        assert f"users: {_LOAD_FAILED}" in box.text()
+        assert "MySqlError" not in box.text() and "absent from this dump" not in box.text()
+        assert "남겨 둠" not in box.text()  # no copy was made
+        _click_details(box)
+        assert shown == [f"{reason}\n{blocker}"]
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize(("namespace_existed", "report_write_failed", "copy_left"), [
+    (True, False, "이번 복원에서 만든 복사본(지우지 않고 남겨 둠): tf_restore_1"),
+    # Without a target, the copy is the requested database itself.
+    (False, True, "이번 복원에서 새로 만든 대상(일부만 들어갔을 수 있음, 지우지 않고 남겨 둠): app"),
+])
+def test_safe_restore_failure_names_the_copy_it_left(monkeypatch, tmp_path, namespace_existed, report_write_failed,
+                                                    copy_left):
+    from src.exporters.rust_dump_exporter import RustDumpImporter
+
+    reason = ("load_failed: users: load_rows failed: mysql insert error: "
+              "MySqlError { ERROR 1406 (22001): Data too long for column 'name' at row 1 }")
+    # A failed final report write keeps the first error and says so only in the message.
+    message = (f"{reason}; final safe restore report could not be persisted: disk full. Original namespace was not changed."
+               if report_write_failed else f"Safe restore failed; original database was not changed. {reason}")
+    candidate = "tf_restore_1" if namespace_existed else "app"
+
+    class FakeFacade:
+        def import_dump(self, payload, on_event=None):
+            return {"success": False, "mode": "safe", "status": "failed_original_untouched", "original_unchanged": True,
+                    "candidate_created": True, "namespace_created": True, "namespace_existed": namespace_existed,
+                    "candidate_target": {"engine": "mysql", "host": "localhost", "port": 3306, "database": candidate},
+                    "report_write_failed": report_write_failed, "message": message, "error": reason}
+
+    lines = []
+    importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=FakeFacade())
+    success, failure, _ = importer.import_dump(_safe_dump_dir(tmp_path), import_mode="safe",
+                                               raw_output_callback=lines.append)
+    assert success is False and failure == (message if report_write_failed else reason)
+
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    try:
+        dialog.last_import_mode = "safe"
+        for line in lines:
+            dialog.on_raw_output(line)
+        dialog.on_finished(False, failure)
+
+        text = _open_failure_window(dialog).text()
+        assert f"users: {_LOAD_FAILED}" in text and copy_left in text
+        assert ("Import 보고서를 저장하지 못했습니다." in text) is report_write_failed
+        assert "MySqlError" not in text
+    finally:
+        dialog.close()

@@ -183,22 +183,35 @@ pub fn inspect_live(endpoint: &Endpoint) -> Result<InspectionResult, String> {
 }
 
 pub(crate) fn validate_target_check_names(adapter: &mut LiveAdapter, target_schema: &str, schema: &NormalizedSchema) -> Result<(), String> {
-    let LiveAdapter::MySql(conn) = adapter else { return Ok(()); };
+    match target_check_name_problems(adapter, target_schema, schema)?.into_iter().next() {
+        Some((_, _, message)) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// MySQL CHECK names the import cannot create, as `(code, table, message)`: one the dump repeats
+/// (`dump_invalid`) or one an unselected target table already uses (`check_name_collision`).
+pub(crate) fn target_check_name_problems(adapter: &mut LiveAdapter, target_schema: &str, schema: &NormalizedSchema) -> Result<Vec<(&'static str, String, String)>, String> {
+    let LiveAdapter::MySql(conn) = adapter else { return Ok(Vec::new()); };
     let selected: std::collections::BTreeSet<_> = schema.tables.iter().map(|table| table.name.as_str()).collect();
     let mut names = std::collections::BTreeSet::new();
+    let mut problems = Vec::new();
     for table in &schema.tables {
         for check in &table.checks {
-            if !names.insert(check.name.to_lowercase()) { return Err(format!("import_plan_invalid: duplicate schema-scoped CHECK name {}",check.name)); }
+            if !names.insert(check.name.to_lowercase()) {
+                problems.push(("dump_invalid", table.name.clone(), format!("import_plan_invalid: duplicate schema-scoped CHECK name {}",check.name)));
+                continue;
+            }
             let owners: Vec<String> = conn.exec(
                 "SELECT TABLE_NAME FROM information_schema.table_constraints WHERE CONSTRAINT_SCHEMA=? AND CONSTRAINT_NAME=? AND CONSTRAINT_TYPE='CHECK'",
                 (target_schema,&check.name),
             ).map_err(|err| format!("CHECK name collision preflight failed: {err}"))?;
             if let Some(owner) = owners.iter().find(|owner| !selected.contains(owner.as_str())) {
-                return Err(format!("import_plan_invalid: CHECK {} already belongs to unselected target table {owner}",check.name));
+                problems.push(("check_name_collision", table.name.clone(), format!("import_plan_invalid: CHECK {} already belongs to unselected target table {owner}",check.name)));
             }
         }
     }
-    Ok(())
+    Ok(problems)
 }
 
 /// per-table 스키마 inspect 를 엔진 독립적으로 수행하기 위한 어댑터.

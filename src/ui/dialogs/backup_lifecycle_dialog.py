@@ -100,8 +100,9 @@ class BackupLifecycleDialog(QDialog):
         self.btn_cleanup_candidate = QPushButton("후보 정리 미리보기")
         self.btn_cleanup_clone = QPushButton("임시 clone 정리 미리보기")
         self.btn_cleanup_displaced = QPushButton("복구 백업 정리 미리보기")
+        self.btn_cleanup_view_aliases = QPushButton("남은 옛 뷰 정리 미리보기")
         self._danger_buttons = (self.btn_rollback, self.btn_cleanup_backup, self.btn_cleanup_candidate,
-                                self.btn_cleanup_clone, self.btn_cleanup_displaced)
+                                self.btn_cleanup_clone, self.btn_cleanup_view_aliases, self.btn_cleanup_displaced)
         for button in self._danger_buttons:
             button.setStyleSheet(ButtonStyles.DELETE)
             danger_row.addWidget(button)
@@ -120,6 +121,7 @@ class BackupLifecycleDialog(QDialog):
         self.btn_cleanup_candidate.clicked.connect(lambda: self.cleanup("candidate"))
         self.btn_cleanup_clone.clicked.connect(lambda: self.cleanup("clone"))
         self.btn_cleanup_displaced.clicked.connect(lambda: self.cleanup("displaced"))
+        self.btn_cleanup_view_aliases.clicked.connect(lambda: self.cleanup("view_aliases"))
         self.btn_rollback.clicked.connect(self.rollback)
         self._update_buttons()
 
@@ -278,9 +280,15 @@ class BackupLifecycleDialog(QDialog):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("정리 확인")
-        box.setText(
-            f"다음 네임스페이스를 삭제합니다 (되돌릴 수 없음):\n{', '.join(plan.get('will_delete') or [])}\n\n{detail}\n\n"
-            "원본과 다른 객체는 삭제되지 않습니다.")
+        if plan.get("target") == "view_aliases":
+            # Views inside the original database, not a whole database: no row counts.
+            box.setText(
+                f"이전 교체에서 남긴 옛 뷰를 삭제합니다 (되돌릴 수 없음):\n{', '.join(plan.get('will_delete') or [])}\n\n"
+                "지금 쓰는 뷰와 테이블은 삭제되지 않습니다.")
+        else:
+            box.setText(
+                f"다음 네임스페이스를 삭제합니다 (되돌릴 수 없음):\n{', '.join(plan.get('will_delete') or [])}\n\n{detail}\n\n"
+                "원본과 다른 객체는 삭제되지 않습니다.")
         yes = box.addButton("삭제", QMessageBox.ButtonRole.DestructiveRole)
         no = box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(no)

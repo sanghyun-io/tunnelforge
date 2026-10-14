@@ -327,6 +327,7 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "query.explain" => emit_all_events(crate::explain::explain_stateless(&request), emit),
         "dump.run" => dump_run_streaming(&request, emit),
         "dump.import" => dump_import_streaming(&request, emit),
+        "dump.import_preview" => crate::import::import_preview::handle(&request, emit),
         "dump.promote" => crate::safe_promotion::handle(&request, emit),
         "restore.backups" => crate::safe_backups::handle(&request, emit),
         "migration.plan" => emit_all_events(alias_events(&request, "plan"), emit),
@@ -434,6 +435,7 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "query.explain",
             "dump.run",
             "dump.import",
+            "dump.import_preview",
             "dump.promote",
             "restore.backups",
             "migration.plan",
@@ -857,6 +859,21 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("oneclick.derive_charset_contracts")));
+    }
+
+    #[test]
+    fn preview_is_a_separate_command_advertised_by_hello() {
+        // A core without the command would answer "unknown command" instead of running an import.
+        let hello = handle_request(Request { command: "service.hello".into(), request_id: None, payload: json!({}) });
+        assert!(hello[0]["capabilities"].as_array().unwrap().contains(&json!("dump.import_preview")));
+        let events = handle_request(Request {
+            command: "dump.import_preview".into(),
+            request_id: Some("preview-1".into()),
+            payload: json!({"target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app"}}),
+        });
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(events[0]["message"], "dump.import_preview requires input_dir");
     }
 
     #[test]

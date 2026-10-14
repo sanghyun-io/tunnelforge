@@ -389,7 +389,7 @@ fn postgres_failed_view_reports_partial_import_after_table_data_is_restored() {
     admin.batch_execute(&format!("UPDATE {schema}.items SET value='changed'")).unwrap();
     let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode":"replace"}));
     let result = imported.iter().find(|event| event["event"] == "result").unwrap();
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
     let value: String = admin.query_one(&format!("SELECT value FROM {schema}.items WHERE id=1"), &[]).unwrap().get(0);
     admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
@@ -472,10 +472,12 @@ fn mysql_server_ddl_probe_rejects_before_original_table_is_dropped() {
     let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     manifest["schema"]["tables"][0]["columns"][1]["type"] = json!("DECIMAL(100,2)");
     std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    // An earlier attempt's report: this attempt writes its own and leaves that one as it was.
     std::fs::write(output.join("_tunnelforge_import_report.json"), b"{\"success\":true}").unwrap();
     let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace"}));
     let original = conn.query_first::<u64,_>(format!("SELECT value FROM {table} WHERE id=1"));
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
+    let earlier = std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap();
     conn.query_drop(format!("DROP TABLE IF EXISTS {table}")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
     assert!(!success(&imported));
@@ -483,6 +485,7 @@ fn mysql_server_ddl_probe_rejects_before_original_table_is_dropped() {
     assert_eq!(report["success"], false);
     assert_eq!(report["phase"], "dump_import_ddl_preflight");
     assert_eq!(report["dropped_tables"], json!([]));
+    assert_eq!(earlier, b"{\"success\":true}", "the import overwrote an earlier attempt's report");
 }
 
 #[test]
@@ -506,9 +509,11 @@ fn mysql_import_failure_persists_confirmed_changes_and_unattempted_tables() {
     std::fs::write(chunk,bytes).unwrap();
     table["chunk_sha256"]["chunk_000001.jsonl"] = json!(format!("{:x}",Sha256::digest(bytes)));
     std::fs::write(path,serde_json::to_vec(&manifest).unwrap()).unwrap();
+    // An earlier attempt's report: this attempt writes its own and leaves that one as it was.
     std::fs::write(output.join("_tunnelforge_import_report.json"), b"{\"success\":true}").unwrap();
     let imported = run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
+    let earlier = std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap();
     let untouched = conn.query_first::<u64,_>(format!("SELECT value FROM {} WHERE id=1", tables[2]));
     for table in &tables { conn.query_drop(format!("DROP TABLE IF EXISTS {table}")).unwrap(); }
     std::fs::remove_dir_all(output).unwrap();
@@ -516,6 +521,7 @@ fn mysql_import_failure_persists_confirmed_changes_and_unattempted_tables() {
     assert_eq!(report["success"],false);
     assert_eq!(report["status"],"failed");
     assert_eq!(report["phase"],"dump_import_data");
+    assert_eq!(earlier, b"{\"success\":true}", "the import overwrote an earlier attempt's report");
     // mysqldump처럼 테이블마다 DROP→CREATE: 실패 이후 테이블은 원본을 유지한다.
     assert_eq!(report["dropped_tables"],json!([tables[0],tables[1]]));
     assert_eq!(report["dropped_not_restored_tables"],json!([tables[1]]));
@@ -551,7 +557,7 @@ fn mysql_replace_refuses_surviving_fk_bound_to_post_load_index_before_any_drop()
     conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, code VARCHAR(20), CONSTRAINT fk_{child} FOREIGN KEY(code) REFERENCES {parent}(code)) ENGINE=InnoDB")).unwrap();
     conn.query_drop(format!("INSERT INTO {child} VALUES(7,'a')")).unwrap();
     let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
-    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report = import_report_file(&imported);
     let parent_row = conn.query_first::<String,_>(format!("SELECT code FROM {parent} WHERE id=1"));
     conn.query_drop(format!("DROP TABLE {child}")).unwrap();
     conn.query_drop(format!("DROP TABLE IF EXISTS {parent}")).unwrap();
@@ -670,7 +676,7 @@ fn postgres_post_load_failure_persists_restored_data_and_incomplete_finalization
     table["chunk_sha256"]["chunk_000001.jsonl"]=json!(format!("{:x}",Sha256::digest(bytes)));
     std::fs::write(path,serde_json::to_vec(&manifest).unwrap()).unwrap();
     let imported=run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace"}));
-    let report:Value=serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let report=import_report_file(&imported);
     let rows:i64=admin.query_one(&format!("SELECT COUNT(*) FROM {schema}.items"),&[]).unwrap().get(0);
     admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
@@ -827,11 +833,17 @@ fn postgres_legacy_replace_refuses_dependent_views_before_any_table_drop() {
     admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.a_protected(id INT PRIMARY KEY); CREATE TABLE {schema}.z_independent(id INT PRIMARY KEY); INSERT INTO {schema}.a_protected VALUES(7); INSERT INTO {schema}.z_independent VALUES(11); CREATE VIEW {schema}.v_protected AS SELECT * FROM {schema}.a_protected")).unwrap();
     let output=std::env::temp_dir().join(unique("tf_pg_dependency"));
     assert!(success(&run("dump.run",json!({"source":endpoint,"output_dir":output,"data_format":"jsonl","threads":1}))));
+    admin.batch_execute(&format!("CREATE TABLE {schema}.keeper(id INT PRIMARY KEY, z_id INT CONSTRAINT fk_keeper REFERENCES {schema}.z_independent(id))")).unwrap();
+    let previewed=preview(&endpoint,&output);
     let imported=run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace"}));
     let preserved=admin.query_one(&format!("SELECT id FROM {schema}.z_independent"),&[]).ok().map(|row|row.get::<_,i32>(0));
     let view_value:i32=admin.query_one(&format!("SELECT id FROM {schema}.v_protected"),&[]).unwrap().get(0);
     admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
+    let blocker=|code:&str,table:&str,needle:&str|previewed["blockers"].as_array().unwrap().iter()
+        .any(|item|item["code"]==code&&item["table"]==table&&item["detail"].as_str().unwrap().contains(needle));
+    assert!(blocker("dependent_view","a_protected","v_protected"),"{previewed}");
+    assert!(blocker("target_only_fk_child","z_independent","keeper.fk_keeper"),"{previewed}");
     assert!(!success(&imported));
     assert_eq!(preserved,Some(11),"an unrelated table was dropped before discovering the view dependency");
     assert_eq!(view_value,7);
@@ -930,6 +942,7 @@ fn mysql_replace_refuses_a_view_with_a_dumped_table_name_before_any_drop() {
     conn.query_drop(format!("UPDATE {first} SET label='kept'")).unwrap();
     conn.query_drop(format!("DROP TABLE {second}")).unwrap();
     conn.query_drop(format!("CREATE VIEW {second} AS SELECT id FROM {first}")).unwrap();
+    let previewed = preview(&endpoint, &output);
     let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
     let label = conn.query_first::<String, _>(format!("SELECT label FROM {first} WHERE id=1")).unwrap();
     conn.query_drop(format!("DROP VIEW IF EXISTS {second}")).unwrap();
@@ -938,6 +951,9 @@ fn mysql_replace_refuses_a_view_with_a_dumped_table_name_before_any_drop() {
     std::fs::remove_dir_all(output).unwrap();
     assert_refused_before_any_drop(&imported, &format!("{second} (VIEW)"));
     assert_eq!(label.as_deref(), Some("kept"), "an earlier table was replaced before the refusal");
+    let collision = previewed["blockers"].as_array().unwrap().iter().find(|item| item["code"] == "name_collision").unwrap_or_else(|| panic!("{previewed}"));
+    assert_eq!(collision["table"], json!(second));
+    assert_eq!(collision["detail"], "VIEW");
 }
 
 #[test]
@@ -1023,4 +1039,544 @@ fn mysql_replace_refuses_a_kept_child_whose_parent_column_is_not_in_the_dump() {
     assert_eq!(legacy.ok().flatten(), Some(7), "the parent was replaced before the refusal");
     let error = imported.iter().find(|event| event["event"] == "error").unwrap();
     assert!(error["message"].as_str().unwrap().contains("incompatible_surviving_fk"), "{error}");
+}
+
+/// The report file this import attempt named in its `import_report` events.
+fn import_report_file(imported: &[Value]) -> Value {
+    serde_json::from_slice(&std::fs::read(import_report(imported)["report_path"].as_str().unwrap()).unwrap()).unwrap()
+}
+
+/// Whether the dump folder holds any import report: the old single one or one per attempt.
+fn any_import_report(output: &std::path::Path) -> bool {
+    std::fs::read_dir(output).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().starts_with("_tunnelforge_import_report"))
+}
+
+/// `action:status` of the import's database/schema creation events, in order.
+fn namespace_changes(imported: &[Value]) -> Vec<String> {
+    imported.iter()
+        .filter(|event| event["event"] == "target_change" && event["action"].as_str().is_some_and(|action| action.starts_with("create_")))
+        .map(|event| format!("{}:{}", event["action"].as_str().unwrap(), event["status"].as_str().unwrap_or("")))
+        .collect()
+}
+
+fn mysql_database_exists(conn: &mut mysql::PooledConn, name: &str) -> bool {
+    conn.exec_first::<u64, _, _>("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", (name,)).unwrap().unwrap() > 0
+}
+
+#[test]
+fn replace_into_missing_database_creates_it() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (source_db, created_db, failed_db) = (unique("tf_create_src"), unique("tf_create_new"), unique("tf_create_fail"));
+    for sql in [
+        format!("CREATE DATABASE {source_db}"),
+        format!("CREATE TABLE {source_db}.parent (id INT PRIMARY KEY, label VARCHAR(20))"),
+        format!("CREATE TABLE {source_db}.child (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY (parent_id) REFERENCES {source_db}.parent (id))"),
+        format!("INSERT INTO {source_db}.parent VALUES (1,'a'),(2,'b')"),
+        format!("INSERT INTO {source_db}.child VALUES (10,1),(11,2)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let output = std::env::temp_dir().join(unique("tf_create_missing"));
+    let source = Endpoint { database: source_db.clone(), ..endpoint.clone() };
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "data_format": "jsonl", "compression": "none", "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    let created = Endpoint { database: created_db.clone(), ..endpoint.clone() };
+    let first = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace", "threads": 1}));
+    let first_report = import_report_file(&first);
+    let rows: Vec<(u64, u64)> = root.query(format!("SELECT c.id, p.id FROM {created_db}.child c JOIN {created_db}.parent p ON p.id = c.parent_id ORDER BY c.id")).unwrap_or_default();
+    // The database exists now, so this import replaces its tables as usual.
+    let second = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace", "threads": 1}));
+    // A failure after the CREATE keeps the new database.
+    let failed = import_with_rewritten_chunk(&Endpoint { database: failed_db.clone(), ..endpoint.clone() }, &output, "child",
+        b"{\"id\":\"not-an-integer\",\"parent_id\":1}\n{\"id\":11,\"parent_id\":2}\n");
+    let failed_report = import_report_file(&failed);
+    // Each attempt keeps its own report: the later ones did not overwrite the first.
+    let first_report_kept = import_report_file(&first);
+    let failed_db_kept = mysql_database_exists(&mut root, &failed_db);
+    for db in [&source_db, &created_db, &failed_db] {
+        root.query_drop(format!("DROP DATABASE IF EXISTS {db}")).unwrap();
+    }
+    std::fs::remove_dir_all(output).unwrap();
+
+    assert!(success(&first), "{first:?}");
+    assert_eq!(rows, vec![(10, 1), (11, 2)]);
+    let result = first.iter().find(|event| event["event"] == "result").unwrap();
+    assert_eq!(result["namespace_created"], true, "{result}");
+    for report in [&first_report, import_report(&first)] {
+        assert_eq!(report["namespace_created"], true, "{report}");
+        assert_eq!(report["namespace_creation_outcome_unknown"], false, "{report}");
+    }
+    assert_eq!(namespace_changes(&first), ["create_database:started", "create_database:completed"]);
+    assert_eq!(first_report_kept, first_report);
+    assert_eq!(import_report(&first)["target"]["schema"], created_db.as_str());
+
+    assert!(success(&second), "{second:?}");
+    assert_eq!(second.iter().find(|event| event["event"] == "result").unwrap()["namespace_created"], false);
+    assert!(namespace_changes(&second).is_empty());
+
+    assert_failed_on(&failed, "child");
+    assert!(failed_db_kept, "the database created for the failed import was dropped");
+    assert_eq!(failed_report["namespace_created"], true, "{failed_report}");
+    assert_eq!(failed_report["data_loaded_tables"], json!(["parent"]), "{failed_report}");
+    // The failure window reads the new database's name from the summary event, not the report file.
+    let summary = import_report(&failed);
+    assert_eq!(summary["namespace_created"], true, "{summary}");
+    assert_eq!(summary["target"]["schema"], failed_db.as_str(), "{summary}");
+}
+
+#[test]
+fn replace_into_missing_schema_creates_it() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let (source_schema, created_schema) = (unique("tf_pg_create_src"), unique("tf_pg_create_new"));
+    let source = Endpoint {
+        engine: "postgresql".into(), host: host.clone(), port: 5432,
+        user: "postgres".into(), password: "tf_local_test".into(), database: "tf_test".into(),
+        schema: Some(source_schema.clone()),
+        tls: Default::default(),
+    };
+    let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test")
+        .dbname("tf_test").connect(postgres::NoTls).unwrap();
+    admin.batch_execute(&format!(
+        "CREATE SCHEMA {source_schema}; CREATE TABLE {source_schema}.parent(id INT PRIMARY KEY);
+         CREATE TABLE {source_schema}.child(id INT PRIMARY KEY, parent_id INT REFERENCES {source_schema}.parent(id));
+         INSERT INTO {source_schema}.parent VALUES(1),(2); INSERT INTO {source_schema}.child VALUES(10,1),(11,2)"
+    )).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_create_missing"));
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "data_format": "jsonl", "threads": 1}));
+    assert!(success(&exported), "{exported:?}");
+    let created = Endpoint { schema: Some(created_schema.clone()), ..source.clone() };
+    let imported = run("dump.import", json!({"target": created, "input_dir": output, "mode": "replace"}));
+    let rows = admin.query_one(&format!("SELECT COUNT(*) FROM {created_schema}.child c JOIN {created_schema}.parent p ON p.id=c.parent_id"), &[])
+        .ok().map(|row| row.get::<_, i64>(0));
+    // A missing PostgreSQL database is never created.
+    let missing_db = unique("tf_pg_missing_db");
+    let refused = run("dump.import", json!({"target": Endpoint { database: missing_db.clone(), ..created.clone() }, "input_dir": output, "mode": "replace"}));
+    let refused_report = import_report_file(&refused);
+    let databases: i64 = admin.query_one("SELECT COUNT(*) FROM pg_database WHERE datname=$1", &[&missing_db]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS {created_schema} CASCADE; DROP SCHEMA {source_schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+
+    assert!(success(&imported), "{imported:?}");
+    assert_eq!(rows, Some(2));
+    assert_eq!(imported.iter().find(|event| event["event"] == "result").unwrap()["namespace_created"], true);
+    assert_eq!(import_report(&imported)["namespace_created"], true);
+    assert_eq!(namespace_changes(&imported), ["create_schema:started", "create_schema:completed"]);
+
+    assert!(!success(&refused), "{refused:?}");
+    assert_eq!(databases, 0);
+    assert_eq!(refused_report["namespace_created"], false, "{refused_report}");
+    assert_eq!(refused_report["namespace_creation_outcome_unknown"], false, "{refused_report}");
+    assert!(namespace_changes(&refused).is_empty());
+}
+
+#[test]
+fn failed_create_is_journaled_as_outcome_unknown() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (source_db, missing_db, user) = (unique("tf_nocreate_src"), unique("tf_nocreate_new"), "tf_import_nocreate");
+    for sql in [
+        format!("DROP USER IF EXISTS '{user}'@'%'"),
+        format!("CREATE DATABASE {source_db}"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        // No CREATE privilege outside this database.
+        format!("GRANT ALL ON {source_db}.* TO '{user}'@'%'"),
+        format!("CREATE TABLE {source_db}.items (id INT PRIMARY KEY)"),
+        format!("INSERT INTO {source_db}.items VALUES (1)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let output = std::env::temp_dir().join(unique("tf_nocreate"));
+    let source = Endpoint { database: source_db.clone(), ..endpoint.clone() };
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    let scoped = Endpoint { user: user.into(), database: missing_db.clone(), ..endpoint.clone() };
+    let imported = run("dump.import", json!({"target": scoped, "input_dir": output, "mode": "replace", "threads": 1}));
+    let report = import_report_file(&imported);
+    let created = mysql_database_exists(&mut root, &missing_db);
+    root.query_drop(format!("DROP DATABASE {source_db}")).unwrap();
+    root.query_drop(format!("DROP DATABASE IF EXISTS {missing_db}")).unwrap();
+    root.query_drop(format!("DROP USER '{user}'@'%'")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+
+    assert!(!success(&imported));
+    let error = imported.iter().find(|event| event["event"] == "error").unwrap()["message"].as_str().unwrap();
+    assert!(error.contains("target_create_failed") && error.contains(&missing_db), "{error}");
+    assert!(!created, "the denied CREATE DATABASE created {missing_db}");
+    for report in [&report, import_report(&imported)] {
+        assert_eq!(report["namespace_creation_outcome_unknown"], true, "{report}");
+        assert_eq!(report["namespace_created"], false, "{report}");
+        assert_eq!(report["phase"], "dump_import_create_namespace", "{report}");
+        assert_eq!(report["dropped_tables"], json!([]), "{report}");
+    }
+    assert_eq!(namespace_changes(&imported), ["create_database:started"]);
+}
+
+fn preview(target: &Endpoint, output: &std::path::Path) -> Value {
+    let events = run("dump.import_preview", json!({"target": target, "input_dir": output, "threads": 1}));
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "result", "{events:?}");
+    assert_eq!(events[0]["dry_run"], true);
+    events[0].clone()
+}
+
+fn sorted(value: &Value) -> Vec<String> {
+    let mut names = value.as_array().unwrap().iter().map(|item| item.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn codes(value: &Value) -> Vec<&str> {
+    value.as_array().unwrap().iter().map(|item| item["code"].as_str().unwrap()).collect()
+}
+
+/// A database holding `parent` and `child` (FK fk_child_parent), exported in full.
+fn mysql_preview_fixture(root: &mut mysql::PooledConn, endpoint: &Endpoint, prefix: &str) -> (String, Endpoint, std::path::PathBuf) {
+    let db = unique(prefix);
+    for sql in [
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE TABLE {db}.parent (id INT PRIMARY KEY, label VARCHAR(10))"),
+        format!("CREATE TABLE {db}.child (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES {db}.parent (id))"),
+        format!("INSERT INTO {db}.parent VALUES (1,'dumped')"),
+        format!("INSERT INTO {db}.child VALUES (10,1)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let target = Endpoint { database: db.clone(), ..endpoint.clone() };
+    let output = std::env::temp_dir().join(unique(prefix));
+    let exported = run("dump.run", json!({"source": target, "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    (db, target, output)
+}
+
+#[test]
+fn mysql_preview_leaves_target_unchanged() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, target, output) = mysql_preview_fixture(&mut root, &endpoint, "tf_preview_same");
+    root.query_drop(format!("UPDATE {db}.parent SET label='kept'")).unwrap();
+    root.query_drop(format!("CREATE TRIGGER {db}.parent_touch BEFORE UPDATE ON {db}.parent FOR EACH ROW SET NEW.label = NEW.label")).unwrap();
+    // A recreated table gets a new InnoDB id; a reload changes the checksum.
+    let state = |conn: &mut mysql::PooledConn| {
+        let mut state: Vec<String> = conn.query(format!(
+            "SELECT CONCAT(NAME, ' ', TABLE_ID) FROM information_schema.INNODB_TABLES WHERE NAME LIKE '{db}/%' ORDER BY NAME")).unwrap();
+        for table in ["parent", "child"] {
+            let checksum: Option<(String, Option<u64>)> = conn.query_first(format!("CHECKSUM TABLE {db}.{table}")).unwrap();
+            state.push(format!("{checksum:?}"));
+        }
+        state.extend(conn.query::<String, _>(format!("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA='{db}'")).unwrap());
+        state
+    };
+    let before = state(&mut root);
+    let result = preview(&target, &output);
+    let after = state(&mut root);
+    let probes = mysql_probe_tables(&mut root, &db);
+    let report_written = any_import_report(&output);
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(before, after, "the preview changed the target");
+    assert_eq!(probes, 0);
+    assert!(!report_written, "the preview wrote an import report");
+    assert_eq!(sorted(&result["replace"]), ["child", "parent"]);
+    assert_eq!(result["blockers"], json!([]), "{result}");
+}
+
+#[test]
+fn mysql_preview_classifies_replace_create_untouched() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, target, output) = mysql_preview_fixture(&mut root, &endpoint, "tf_preview_classes");
+    for sql in [
+        format!("DROP TABLE {db}.child"),
+        format!("CREATE TABLE {db}.extra (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.keeper (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_keeper FOREIGN KEY (parent_id) REFERENCES {db}.parent (id))"),
+    ] { root.query_drop(sql).unwrap(); }
+    let existing = preview(&target, &output);
+    let missing_db = unique("tf_preview_missing");
+    let missing = preview(&Endpoint { database: missing_db.clone(), ..target.clone() }, &output);
+    let created: u64 = root.exec_first("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", (&missing_db,)).unwrap().unwrap();
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(existing["target"]["exists"], true);
+    assert_eq!(existing["replace"], json!(["parent"]));
+    assert_eq!(existing["create"], json!(["child"]));
+    assert_eq!(sorted(&existing["untouched"]), ["extra", "keeper"]);
+    assert_eq!(existing["kept_children"], json!([{"table": "keeper", "constraint": "fk_keeper", "parent": "parent"}]));
+    assert_eq!(existing["blockers"], json!([]), "{existing}");
+    assert_eq!(missing["target"]["exists"], false);
+    assert_eq!(missing["target"]["can_create"], true, "root can create databases");
+    assert_eq!(missing["replace"], json!([]));
+    assert_eq!(sorted(&missing["create"]), ["child", "parent"]);
+    assert_eq!(missing["blockers"], json!([]), "{missing}");
+    assert_eq!(created, 0, "the preview created the missing database");
+}
+
+#[test]
+fn mysql_preview_reports_triggers_on_replaced_tables() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, target, output) = mysql_preview_fixture(&mut root, &endpoint, "tf_preview_triggers");
+    for sql in [
+        format!("CREATE TRIGGER {db}.parent_touch BEFORE UPDATE ON {db}.parent FOR EACH ROW SET NEW.label = NEW.label"),
+        format!("CREATE TABLE {db}.extra (id INT PRIMARY KEY)"),
+        format!("CREATE TRIGGER {db}.extra_touch BEFORE UPDATE ON {db}.extra FOR EACH ROW SET NEW.id = NEW.id"),
+    ] { root.query_drop(sql).unwrap(); }
+    let result = preview(&target, &output);
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    // A trigger on a table the import leaves alone stays, so it is not listed.
+    assert_eq!(result["triggers_dropped"], json!([{"table": "parent", "name": "parent_touch"}]));
+}
+
+#[test]
+fn mysql_preview_flags_views_a_scoped_account_cannot_replace() {
+    let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, user, definer) = (unique("tf_preview_view"), "tf_preview_view_owner", "tf_preview_view_definer");
+    for sql in [
+        format!("DROP USER IF EXISTS '{user}'@'%', '{definer}'@'%'"),
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        format!("CREATE USER '{definer}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        format!("GRANT ALL ON {db}.* TO '{user}'@'%'"),
+        format!("CREATE TABLE {db}.items (id INT PRIMARY KEY)"),
+        format!("INSERT INTO {db}.items VALUES (1)"),
+        // Neither account is the DEFINER, so only root's SYSTEM_USER keeps the view off the list.
+        format!("CREATE DEFINER='{definer}'@'%' SQL SECURITY INVOKER VIEW {db}.item_ids AS SELECT id FROM {db}.items"),
+    ] { root.query_drop(sql).unwrap(); }
+    let source = Endpoint { database: db.clone(), ..endpoint.clone() };
+    let scoped = Endpoint { user: user.into(), ..source.clone() };
+    let output = std::env::temp_dir().join(unique("tf_preview_view"));
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    let as_scoped = preview(&scoped, &output);
+    let as_root = preview(&source, &output);
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    root.query_drop(format!("DROP USER '{user}'@'%', '{definer}'@'%'")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(as_scoped["views"]["replace"], json!(["item_ids"]), "{as_scoped}");
+    let flagged = as_scoped["views"]["may_not_replace"].as_array().unwrap();
+    assert_eq!(flagged.len(), 1, "{as_scoped}");
+    assert_eq!(flagged[0]["name"], "item_ids");
+    assert!(flagged[0]["definer"].as_str().unwrap().starts_with(&format!("{definer}@")), "{}", flagged[0]);
+    assert_eq!(as_root["views"]["may_not_replace"], json!([]), "root has SYSTEM_USER: {as_root}");
+}
+
+#[test]
+fn mysql_preview_lists_mysql_views_over_replaced_tables() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, target, output) = mysql_preview_fixture(&mut root, &endpoint, "tf_preview_may_break");
+    for sql in [
+        format!("CREATE VIEW {db}.parent_labels AS SELECT label FROM {db}.parent"),
+        format!("CREATE TABLE {db}.extra (id INT PRIMARY KEY)"),
+        format!("CREATE VIEW {db}.extra_ids AS SELECT id FROM {db}.extra"),
+    ] { root.query_drop(sql).unwrap(); }
+    let result = preview(&target, &output);
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(result["views"]["may_break"], json!([{"view": "parent_labels", "table": "parent"}]), "{result}");
+    assert!(!codes(&result["warnings"]).contains(&"view_dependencies_unknown"), "{result}");
+}
+
+#[test]
+fn mysql_preview_reports_external_parents() {
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let db = unique("tf_preview_outside");
+    for sql in [
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE TABLE {db}.parent (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.child (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES {db}.parent (id))"),
+    ] { root.query_drop(sql).unwrap(); }
+    let target = Endpoint { database: db.clone(), ..endpoint.clone() };
+    let output = std::env::temp_dir().join(unique("tf_preview_outside"));
+    let exported = run("dump.run", json!({"source": target, "tables": ["child"], "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    let present = preview(&target, &output);
+    root.query_drop("SET SESSION foreign_key_checks=0").unwrap();
+    root.query_drop(format!("DROP TABLE {db}.parent")).unwrap();
+    root.query_drop("SET SESSION foreign_key_checks=1").unwrap();
+    let absent = preview(&target, &output);
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(present["external_parents"], json!([{"child": "child", "constraint": "fk_child_parent", "parent": "parent", "exists_in_target": true}]));
+    assert_eq!(absent["external_parents"][0]["exists_in_target"], false);
+    // MySQL adds the FK with foreign_key_checks=0, so a missing parent does not stop the import.
+    assert!(!codes(&absent["blockers"]).contains(&"external_parent_missing"), "{absent}");
+}
+
+fn postgres_endpoint(host: &str, schema: &str) -> Endpoint {
+    Endpoint { engine: "postgresql".into(), host: host.into(), port: 5432, user: "postgres".into(), password: "tf_local_test".into(),
+        database: "tf_test".into(), schema: Some(schema.into()), tls: Default::default() }
+}
+
+fn postgres_admin(host: &str) -> postgres::Client {
+    postgres::Config::new().host(host).user("postgres").password("tf_local_test").dbname("tf_test").connect(postgres::NoTls).unwrap()
+}
+
+#[test]
+fn postgres_preview_leaves_target_unchanged() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_preview_same");
+    let endpoint = postgres_endpoint(&host, &schema);
+    let mut admin = postgres_admin(&host);
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.parent(id INT PRIMARY KEY, label TEXT); CREATE TABLE {schema}.child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_child_parent REFERENCES {schema}.parent(id)); INSERT INTO {schema}.parent VALUES(1,'dumped'); INSERT INTO {schema}.child VALUES(10,1)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_preview_same"));
+    assert!(success(&run("dump.run", json!({"source": endpoint, "output_dir": output, "data_format": "jsonl", "threads": 1}))));
+    admin.batch_execute(&format!("UPDATE {schema}.parent SET label='kept'")).unwrap();
+    // A recreated relation gets a new oid; a reload changes the row digest.
+    let state = |admin: &mut postgres::Client| {
+        let mut state: Vec<String> = admin.query("SELECT c.relname || ' ' || c.oid::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY 1", &[&schema])
+            .unwrap().iter().map(|row| row.get(0)).collect();
+        state.push(admin.query_one(&format!("SELECT md5(string_agg(p::text, ',' ORDER BY id)) FROM {schema}.parent p"), &[]).unwrap().get(0));
+        state
+    };
+    let before = state(&mut admin);
+    let result = preview(&endpoint, &output);
+    let after = state(&mut admin);
+    let report_written = any_import_report(&output);
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(before, after, "the preview changed the target");
+    assert!(!report_written, "the preview wrote an import report");
+    assert_eq!(sorted(&result["replace"]), ["child", "parent"]);
+    assert_eq!(result["blockers"], json!([]), "{result}");
+}
+
+#[test]
+fn postgres_preview_and_replace_refuse_non_view_dependents() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_preview_seq");
+    let endpoint = postgres_endpoint(&host, &schema);
+    let mut admin = postgres_admin(&host);
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.a_first(id INT PRIMARY KEY); CREATE TABLE {schema}.counter(id SERIAL PRIMARY KEY, label TEXT); INSERT INTO {schema}.a_first VALUES(1); INSERT INTO {schema}.counter(label) VALUES('dumped')")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_preview_seq"));
+    assert!(success(&run("dump.run", json!({"source": endpoint, "output_dir": output, "data_format": "jsonl", "threads": 1}))));
+    // Another table now draws its ids from the sequence counter owns, and a view reads that
+    // sequence, so DROP TABLE counter fails.
+    admin.batch_execute(&format!("UPDATE {schema}.counter SET label='kept'; CREATE TABLE {schema}.borrower(id INT PRIMARY KEY DEFAULT nextval('{schema}.counter_id_seq')); CREATE VIEW {schema}.counter_next AS SELECT last_value FROM {schema}.counter_id_seq")).unwrap();
+    let oid = |admin: &mut postgres::Client| -> u32 { admin.query_one(&format!("SELECT '{schema}.a_first'::regclass::oid"), &[]).unwrap().get(0) };
+    let first_oid = oid(&mut admin);
+    let result = preview(&endpoint, &output);
+    let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "replace"}));
+    let label: String = admin.query_one(&format!("SELECT label FROM {schema}.counter"), &[]).unwrap().get(0);
+    let first_kept = oid(&mut admin) == first_oid;
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    for dependent in ["borrower", "counter_next"] {
+        let blocker = result["blockers"].as_array().unwrap().iter()
+            .find(|item| item["code"] == "dependent_object" && item["detail"].as_str().unwrap().contains(dependent))
+            .unwrap_or_else(|| panic!("{dependent}: {result}"));
+        assert_eq!(blocker["table"], "counter");
+    }
+    assert!(!success(&imported));
+    let error = imported.iter().find(|event| event["event"] == "error").unwrap()["message"].as_str().unwrap();
+    assert!(error.contains("target_dependency_preflight_failed") && error.contains("borrower") && error.contains("counter_next"), "{error}");
+    assert!(!imported.iter().any(|event| event["event"] == "target_change"), "a table was changed before the refusal");
+    assert_eq!(label, "kept");
+    assert!(first_kept, "a_first was replaced before the refusal");
+}
+
+#[test]
+fn postgres_preview_blocks_a_missing_external_parent() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_preview_outside");
+    let endpoint = postgres_endpoint(&host, &schema);
+    let mut admin = postgres_admin(&host);
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.parent(id INT PRIMARY KEY); CREATE TABLE {schema}.child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_child_parent REFERENCES {schema}.parent(id))")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_preview_outside"));
+    assert!(success(&run("dump.run", json!({"source": endpoint, "tables": ["child"], "output_dir": output, "data_format": "jsonl", "threads": 1}))));
+    let present = preview(&endpoint, &output);
+    admin.batch_execute(&format!("DROP TABLE {schema}.parent CASCADE")).unwrap();
+    let absent = preview(&endpoint, &output);
+    let missing_schema = unique("tf_pg_preview_missing");
+    let missing = preview(&postgres_endpoint(&host, &missing_schema), &output);
+    let created: bool = admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)", &[&missing_schema]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(present["external_parents"], json!([{"child": "child", "constraint": "fk_child_parent", "parent": "parent", "exists_in_target": true}]));
+    assert_eq!(present["blockers"], json!([]), "{present}");
+    assert_eq!(absent["external_parents"][0]["exists_in_target"], false);
+    assert_eq!(codes(&absent["blockers"]), ["external_parent_missing"], "{absent}");
+    assert_eq!(missing["target"]["exists"], false);
+    assert_eq!(missing["target"]["can_create"], true);
+    assert_eq!(missing["create"], json!(["child"]));
+    assert_eq!(codes(&missing["blockers"]), ["external_parent_missing"], "{missing}");
+    assert!(!created, "the preview created the missing schema");
+}
+
+#[test]
+fn mysql_preview_runs_no_ddl_for_a_read_only_account() {
+    let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, target, output) = mysql_preview_fixture(&mut root, &endpoint, "tf_preview_reader");
+    let user = "tf_preview_reader";
+    for sql in [
+        format!("DROP USER IF EXISTS '{user}'@'%'"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        format!("GRANT SELECT ON {db}.* TO '{user}'@'%'"),
+    ] { root.query_drop(sql).unwrap(); }
+    // A probe CREATE TABLE would fail for this account, so a result shows the preview ran none.
+    let result = preview(&Endpoint { user: user.into(), ..target.clone() }, &output);
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    root.query_drop(format!("DROP USER '{user}'@'%'")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert_eq!(sorted(&result["replace"]), ["child", "parent"]);
+    assert_eq!(codes(&result["blockers"]), ["drop_privilege_missing"], "{result}");
+}
+
+#[test]
+fn postgres_preview_follows_the_drop_order_inside_the_dump() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let mut admin = postgres_admin(&host);
+    // m_user's default draws from a sequence another dumped table owns. Dropping the owner first
+    // fails; dropping m_user first removes the default before the owner goes.
+    for (owner, blocked) in [("a_owner", true), ("z_owner", false)] {
+        let schema = unique("tf_pg_preview_order");
+        let endpoint = postgres_endpoint(&host, &schema);
+        admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.{owner}(id SERIAL PRIMARY KEY); CREATE TABLE {schema}.m_user(id INT PRIMARY KEY, label TEXT); INSERT INTO {schema}.{owner} DEFAULT VALUES; INSERT INTO {schema}.m_user VALUES(1,'dumped')")).unwrap();
+        let output = std::env::temp_dir().join(unique("tf_pg_preview_order"));
+        assert!(success(&run("dump.run", json!({"source": endpoint, "output_dir": output, "data_format": "jsonl", "threads": 1}))));
+        admin.batch_execute(&format!("UPDATE {schema}.m_user SET label='kept'; ALTER TABLE {schema}.m_user ALTER COLUMN id SET DEFAULT nextval('{schema}.{owner}_id_seq')")).unwrap();
+        let result = preview(&endpoint, &output);
+        let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "replace"}));
+        let label: String = admin.query_one(&format!("SELECT label FROM {schema}.m_user"), &[]).unwrap().get(0);
+        admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+        std::fs::remove_dir_all(&output).unwrap();
+        if blocked {
+            let blocker = result["blockers"].as_array().unwrap().iter().find(|item| item["code"] == "dependent_object").unwrap_or_else(|| panic!("{result}"));
+            assert_eq!(blocker["table"], owner);
+            assert!(blocker["detail"].as_str().unwrap().contains("m_user"), "{blocker}");
+            let error = imported.iter().find(|event| event["event"] == "error").unwrap_or_else(|| panic!("{imported:?}"))["message"].as_str().unwrap();
+            assert!(error.contains("target_dependency_preflight_failed") && error.contains("m_user"), "{error}");
+            assert!(!imported.iter().any(|event| event["event"] == "target_change"), "a table was changed before the refusal");
+            assert_eq!(label, "kept");
+        } else {
+            assert_eq!(result["blockers"], json!([]), "{result}");
+            assert!(success(&imported), "{imported:?}");
+            assert_eq!(label, "dumped");
+        }
+    }
+}
+
+#[test]
+fn postgres_preview_and_replace_pass_over_partition_clones_of_a_dumped_fk() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_preview_clone");
+    let endpoint = postgres_endpoint(&host, &schema);
+    let mut admin = postgres_admin(&host);
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.parent(id INT PRIMARY KEY); CREATE TABLE {schema}.child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_child_parent REFERENCES {schema}.parent(id)); INSERT INTO {schema}.parent VALUES(1); INSERT INTO {schema}.child VALUES(10,1)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_preview_clone"));
+    assert!(success(&run("dump.run", json!({"source": endpoint, "output_dir": output, "data_format": "jsonl", "threads": 1}))));
+    // The target's child is now partitioned, so its partition holds a clone of fk_child_parent
+    // (conparentid<>0). The clone goes with the root constraint the import drops before the parent.
+    admin.batch_execute(&format!("DROP TABLE {schema}.child; CREATE TABLE {schema}.child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_child_parent REFERENCES {schema}.parent(id)) PARTITION BY RANGE (id); CREATE TABLE {schema}.child_low PARTITION OF {schema}.child FOR VALUES FROM (0) TO (100); INSERT INTO {schema}.child VALUES(20,1)")).unwrap();
+    let clones: i64 = admin.query_one("SELECT COUNT(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname=$1 AND c.contype='f' AND c.conparentid<>0", &[&schema]).unwrap().get(0);
+    let result = preview(&endpoint, &output);
+    let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "replace"}));
+    let rows: Vec<i32> = admin.query(&format!("SELECT id FROM {schema}.child ORDER BY id"), &[]).unwrap().iter().map(|row| row.get(0)).collect();
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(&output).unwrap();
+    assert!(clones > 0, "the fixture has no partition clone");
+    assert_eq!(sorted(&result["replace"]), ["child", "parent"]);
+    assert_eq!(result["blockers"], json!([]), "{result}");
+    assert!(success(&imported), "{imported:?}");
+    assert_eq!(rows, [10]);
 }

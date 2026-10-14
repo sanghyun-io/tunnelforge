@@ -14,6 +14,8 @@ use crate::*;
 pub(crate) mod safe_restore;
 #[path = "safe_restore_digest.rs"]
 pub(crate) mod safe_restore_digest;
+#[path = "import_preview.rs"]
+pub(crate) mod import_preview;
 
 /// MySQL `LOAD DATA LOCAL`이 비활성화됐을 때 반환되는 에러 코드(ERROR 3948) 매칭 토큰.
 const MYSQL_ERR_LOCAL_INFILE_DISABLED: &str = "3948";
@@ -46,6 +48,21 @@ fn validate_import_metadata(
     selected: &BTreeSet<String>,
     target_engine: &str,
 ) -> Result<BTreeMap<String, String>, String> {
+    let (ddls, untranslatable) = import_table_ddls(manifest, selected, target_engine)?;
+    if !untranslatable.is_empty() {
+        let reasons = untranslatable.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>();
+        return Err(classified_import_error("export_invalid",
+            &format!("{} tables cannot be created on {target_engine}: {}", reasons.len(), reasons.join("; ")), None));
+    }
+    Ok(ddls)
+}
+
+/// The DDL of every selected table, plus `(table, reason)` for each table the target cannot take.
+fn import_table_ddls(
+    manifest: &DumpManifest,
+    selected: &BTreeSet<String>,
+    target_engine: &str,
+) -> Result<(BTreeMap<String, String>, Vec<(String, String)>), String> {
     let invalid = |message: String| classified_import_error("export_invalid", &message, None);
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
@@ -97,41 +114,86 @@ fn validate_import_metadata(
                 }
             }
             if let Err(reason) = validate_target_foreign_key_actions(definition, target_engine) {
-                untranslatable.push(reason);
+                untranslatable.push((table.name.clone(), reason));
                 continue;
             }
             match generate_table_ddl(definition, &manifest.source_engine, target_engine) {
                 Some(ddl) => { ddls.insert(table.name.clone(), ddl); }
-                None => untranslatable.push(format!("cannot generate DDL for table {}", table.name)),
+                None => untranslatable.push((table.name.clone(), format!("cannot generate DDL for table {}", table.name))),
             }
         }
     }
-    if !untranslatable.is_empty() {
-        return Err(invalid(format!("{} tables cannot be created on {target_engine}: {}", untranslatable.len(), untranslatable.join("; "))));
+    Ok((ddls, untranslatable))
+}
+
+/// The manifest's (data_format, compression), refusing what this build cannot read.
+fn supported_dump_format(manifest: &DumpManifest) -> Result<(String, String), String> {
+    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
+        return Err("unsupported dump manifest format".to_string());
     }
-    Ok(ddls)
+    let data_format = manifest.data_format.to_ascii_lowercase();
+    if !matches!(data_format.as_str(), "jsonl" | "tsv") {
+        return Err(format!("unsupported dump data_format: {data_format}"));
+    }
+    let compression = manifest.compression.to_ascii_lowercase();
+    if !matches!(compression.as_str(), "none" | "zstd") {
+        return Err(format!("unsupported dump compression: {compression}"));
+    }
+    Ok((data_format, compression))
+}
+
+/// Cross-engine temporal types the target cannot store, as `(table, "table.column: problem")`.
+fn cross_engine_temporal_refusals(manifest: &DumpManifest, tables: &[DumpTableManifest], target_engine: &str) -> Vec<(String, String)> {
+    if manifest.source_engine == target_engine {
+        return Vec::new();
+    }
+    let source_engine = manifest.source_engine.as_str();
+    manifest.schema.tables.iter().filter(|table| tables.iter().any(|selected| selected.name == table.name))
+        .flat_map(|table| table.columns.iter().filter_map(move |column| match temporal_type_problem(source_engine, &column.type_name) {
+            Some((true, problem)) => Some((table.name.clone(), format!("{}.{}: {problem}", table.name, column.name))),
+            _ => None,
+        }))
+        .collect()
 }
 
 fn source_dump_warnings(manifest: &DumpManifest) -> Vec<String> {
+    coded_source_dump_warnings(manifest).into_iter().map(|(_, warning)| warning).collect()
+}
+
+/// The source dump's warnings, each with a stable code the application words for the user.
+fn coded_source_dump_warnings(manifest: &DumpManifest) -> Vec<(&'static str, String)> {
     let mut warnings = manifest.manifest_warnings.iter()
-        .map(|warning| format!("source dump: {warning}")).collect::<Vec<_>>();
+        .map(|warning| (manifest_warning_code(warning), format!("source dump: {warning}"))).collect::<Vec<_>>();
     if manifest.snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot" {
-        warnings.push("legacy source dump used independent snapshots; cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
+        warnings.push(("unsynchronized_snapshot", "legacy source dump used independent snapshots; cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into()));
     }
     if manifest.snapshot_policy == "mysql_parallel_unsynchronized_snapshots" {
-        warnings.push("source dump was exported by parallel workers with independent snapshots and no shared lock (explicit opt-in); cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
+        warnings.push(("unsynchronized_snapshot", "source dump was exported by parallel workers with independent snapshots and no shared lock (explicit opt-in); cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into()));
     }
     if !manifest.strict_export {
-        warnings.push("source dump is not marked strict; its recorded fidelity and consistency limitations remain after import".into());
+        warnings.push(("not_strict", "source dump is not marked strict; its recorded fidelity and consistency limitations remain after import".into()));
     }
     if manifest.source_timezone.is_none() {
-        warnings.push("legacy source dump does not record its source timezone; timestamp interpretation follows the selected import timezone or target server default".into());
+        warnings.push(("legacy_timezone", "legacy source dump does not record its source timezone; timestamp interpretation follows the selected import timezone or target server default".into()));
     }
     warnings
 }
 
+fn manifest_warning_code(warning: &str) -> &'static str {
+    if warning.starts_with(WARNING_UNSYNCHRONIZED_SNAPSHOTS) {
+        "unsynchronized_snapshot"
+    } else if warning.starts_with(WARNING_VIEWS_OUTSIDE_SNAPSHOT) {
+        "views_outside_snapshot"
+    } else if warning.starts_with(WARNING_OBJECT_NOT_EXPORTED) || warning.starts_with(WARNING_NON_TRANSACTIONAL_EXCLUDED) {
+        "omitted_object"
+    } else {
+        "source_dump_warning"
+    }
+}
+
 struct ImportJournal {
-    input_path: std::path::PathBuf,
+    /// This attempt's own report file in the dump folder.
+    report_path: std::path::PathBuf,
     target: Value,
     mode: String,
     phase: String,
@@ -146,6 +208,9 @@ struct ImportJournal {
     restored_foreign_keys: Vec<String>,
     rows_imported: u64,
     chunks_imported: u64,
+    /// Set just before CREATE DATABASE/SCHEMA and cleared only once it succeeded.
+    namespace_creation_outcome_unknown: bool,
+    namespace_created: bool,
     safe_context: Option<Value>,
 }
 
@@ -163,6 +228,8 @@ impl ImportJournal {
             "failed_tables": failed, "unattempted_tables": unattempted,
             "pending_drop_table": self.pending_drop,
             "drop_outcome_unknown": self.pending_drop.is_some(),
+            "namespace_creation_outcome_unknown": self.namespace_creation_outcome_unknown,
+            "namespace_created": self.namespace_created,
             "current_table": self.current_table, "error": error,
             "rows_imported": self.rows_imported, "chunks_imported": self.chunks_imported,
             "post_load_completed": false,
@@ -181,7 +248,7 @@ impl ImportJournal {
     }
 
     fn checkpoint(&self) -> Result<(), String> {
-        write_dump_import_report(&self.input_path, &self.report("running", None))
+        write_import_report_file(&self.report_path, &self.report("running", None))
     }
 }
 
@@ -191,34 +258,42 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     // Checked before the report checkpoint, so a refused mode leaves no report behind.
     match mode {
         "safe" => safe_restore::run(request, emit),
-        "replace" | "recreate" => dump_import_with_context(request, None, |event| emit(event)),
+        "replace" | "recreate" => dump_import_with_context(request, None, None, |event| emit(event)),
         "merge" => Err(classified_import_error("import_plan_invalid",
             "the merge import mode was removed: Import no longer adds rows to existing tables; it replaces each table in the dump", None)),
         other => Err(classified_import_error("import_plan_invalid", &format!("unsupported dump import mode: {other}"), None)),
     }
 }
 
-fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Option<Value>, mut emit: F) -> Result<Value, String> {
+/// `report_path` is the safe restore's own report when this is its candidate import; otherwise
+/// the attempt gets a new report file.
+fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Option<Value>, report_path: Option<std::path::PathBuf>, mut emit: F) -> Result<Value, String> {
     let endpoint = request_endpoint(request)?;
     let input_dir = request.payload.get("input_dir").and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty()).ok_or("dump.import requires input_dir")?;
     let mode = request.payload.get("mode").or_else(|| request.payload.get("import_mode"))
         .and_then(Value::as_str).unwrap_or("replace");
     let mut journal = ImportJournal {
-        input_path: Path::new(input_dir).to_path_buf(),
+        report_path: match report_path { Some(path) => path, None => new_dump_import_report_path(Path::new(input_dir))? },
         target: json!({"engine": endpoint.engine, "host": endpoint.host, "port": endpoint.port,
             "database": endpoint.database, "schema": endpoint_schema(&endpoint)}),
         mode: mode.into(), phase: "dump_import_validation".into(), planned: Vec::new(),
         load_attempted: BTreeSet::new(), dropped: Vec::new(), loaded: Vec::new(),
         current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), restored_foreign_keys: Vec::new(),
         rows_imported: 0, chunks_imported: 0,
+        namespace_creation_outcome_unknown: false, namespace_created: false,
         safe_context,
     };
-    // Replacing a prior success report is a prerequisite for starting a new attempt.
+    // The attempt starts only once its own report exists.
     journal.checkpoint()?;
-    let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
+    let report_path = journal.report_path.display().to_string();
     emit(json!({"event":"import_report", "request_id":request.request_id, "status":"running", "report_path":report_path, "target":journal.target}));
     let result = dump_import_attempt(request, &mut journal, |event| emit(event))
+        .map(|mut result| {
+            if journal.safe_context.is_none() { result["namespace_created"] = json!(journal.namespace_created); }
+            result["import_report"] = json!(report_path);
+            result
+        })
         .map_err(|error| redact_endpoint_secret(&error, &endpoint));
     let mut report = match &result {
         Ok(result) => {
@@ -237,12 +312,13 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         report["candidate_import_completed"] = result.as_ref().unwrap()["success"].clone();
         report["mode"] = json!("safe");
     }
-    if let Err(error) = write_dump_import_report(&journal.input_path, &report) {
+    if let Err(error) = write_import_report_file(&journal.report_path, &report) {
         emit(json!({"event":"import_report", "request_id":request.request_id, "status":"failed", "report_path":report_path, "report_write_failed":true, "message":error}));
         return Err(match result { Err(original) => format!("{original}; failure report could not be persisted: {error}"), Ok(_) => format!("Import data was applied, but its completion report could not be persisted: {error}") });
     }
     let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
-    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed"] {
+    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed",
+        "namespace_creation_outcome_unknown", "namespace_created", "target"] {
         summary[key] = report[key].clone();
     }
     emit(summary);
@@ -266,18 +342,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
-    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
-        return Err("unsupported dump manifest format".to_string());
-    }
+    let (data_format, compression) = supported_dump_format(&manifest)?;
     let legacy_bit_text = manifest.format_version < 4 && manifest.source_engine == "mysql";
-    let data_format = manifest.data_format.to_ascii_lowercase();
-    if !matches!(data_format.as_str(), "jsonl" | "tsv") {
-        return Err(format!("unsupported dump data_format: {data_format}"));
-    }
-    let compression = manifest.compression.to_ascii_lowercase();
-    if !matches!(compression.as_str(), "none" | "zstd") {
-        return Err(format!("unsupported dump compression: {compression}"));
-    }
 
     let selected_tables = string_list(request.payload.get("tables"));
     let selected: BTreeSet<String> = selected_tables.into_iter().collect();
@@ -322,17 +388,10 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         "tables": tables.len(),
     }));
     // Cross-engine imports refuse temporal types and values the target cannot store before anything changes.
-    if manifest.source_engine != endpoint.engine {
-        let source_engine = manifest.source_engine.as_str();
-        let refused = manifest.schema.tables.iter().filter(|table| tables.iter().any(|selected| selected.name == table.name))
-            .flat_map(|table| table.columns.iter().filter_map(move |column| match temporal_type_problem(source_engine, &column.type_name) {
-                Some((true, problem)) => Some(format!("{}.{}: {problem}", table.name, column.name)),
-                _ => None,
-            }))
-            .collect::<Vec<_>>();
-        if !refused.is_empty() {
-            return Err(format!("{}; leave these tables out or convert the columns in the source and export again", refused.join("; ")));
-        }
+    let refused = cross_engine_temporal_refusals(&manifest, &tables, &endpoint.engine);
+    if !refused.is_empty() {
+        let refused = refused.into_iter().map(|(_, problem)| problem).collect::<Vec<_>>();
+        return Err(format!("{}; leave these tables out or convert the columns in the source and export again", refused.join("; ")));
     }
     let source_engine = manifest.source_engine.clone();
     let temporal_check = move |column: &NormalizedColumn, text: &str| temporal_value_problem(&source_engine, &column.type_name, text);
@@ -360,6 +419,10 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             .cloned()
             .collect(),
     };
+    // A safe restore's candidate import runs in the namespace the safe restore created.
+    if journal.safe_context.is_none() {
+        create_missing_target_namespace(&endpoint, journal, request.request_id.clone(), &mut emit)?;
+    }
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
@@ -398,7 +461,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         journal.checkpoint()?;
         emit(json!({"event":"phase", "request_id":request.request_id, "phase":journal.phase,
             "message":"검증 완료: 선택한 대상 테이블 교체를 준비합니다.",
-            "report_path":dump_import_report_path(input_path)?.display().to_string()}));
+            "report_path":journal.report_path.display().to_string()}));
 
         let planned_set = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
         let target_engine = adapter.engine();
@@ -455,7 +518,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
                     }
                     emit(event);
                 },
-            )?;
+            ).map_err(|err| table_load_error(&table.name, err))?;
             rows_imported += table_rows;
             chunks_imported += table_chunks;
             imported_rows_by_table.insert(table.name.clone(), table_rows);
@@ -520,6 +583,40 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     )
 }
 
+/// Creates the target MySQL database or PostgreSQL schema when it is missing (a missing PostgreSQL
+/// database still fails to connect). A namespace created here is kept if the import fails later.
+fn create_missing_target_namespace<F: FnMut(Value)>(
+    endpoint: &Endpoint, journal: &mut ImportJournal, request_id: Option<String>, emit: &mut F,
+) -> Result<(), String> {
+    let mut admin = safe_restore::maintenance_connection(endpoint)?;
+    if safe_restore::target_namespace_exists(&mut admin, endpoint)? {
+        return Ok(());
+    }
+    let (name, kind, action) = if endpoint.engine == "mysql" {
+        (endpoint.database.clone(), "database", "create_database")
+    } else {
+        (endpoint_schema(endpoint), "schema", "create_schema")
+    };
+    let report_path = journal.report_path.display().to_string();
+    let event = |status: &str| json!({"event":"target_change", "request_id":request_id, "phase":"dump_import_create_namespace",
+        "action":action, "status":status, "namespace":name, "report_path":report_path});
+    // Only the CREATE itself is reported under this phase; a later connect failure keeps the earlier one.
+    let previous_phase = std::mem::replace(&mut journal.phase, "dump_import_create_namespace".into());
+    journal.namespace_creation_outcome_unknown = true;
+    journal.checkpoint()?;
+    emit(event("started"));
+    // SCHEMATA hides a database the account has no privilege on, and another session may create it meanwhile.
+    let context = classified_import_error("target_create_failed",
+        &format!("the target {kind} {name} was not found (or is not visible to this account) and could not be created; no target tables were changed"), None);
+    safe_restore::create_namespace(&mut admin, endpoint, &name, &context)?;
+    journal.phase = previous_phase;
+    journal.namespace_created = true;
+    journal.namespace_creation_outcome_unknown = false;
+    journal.checkpoint()?;
+    emit(event("completed"));
+    Ok(())
+}
+
 /// Builds every selected table under an owned probe name before any target table is dropped. The
 /// probes also get the indexes and foreign keys the import adds after each table, so a missing
 /// REFERENCES privilege or an incompatible parent outside the dump stops the import while the
@@ -540,6 +637,9 @@ fn probe_import_ddl(
 /// A foreign key of a table the import keeps, referencing a table the import replaces.
 pub(crate) struct SurvivingForeignKey {
     label: String,
+    /// `schema.table` when the child lives in another schema.
+    child: String,
+    constraint: String,
     parent: String,
     /// (the child column's type, the parent column it references)
     columns: Vec<(String, String)>,
@@ -573,7 +673,9 @@ fn surviving_foreign_keys(adapter: &mut LiveAdapter, schema: &str, import_schema
         let id = (child_schema.clone(), child.clone(), constraint.clone());
         if current.as_ref() != Some(&id) {
             let child = if same_schema { child } else { format!("{child_schema}.{child}") };
-            keys.push(SurvivingForeignKey { label: format!("{child}.{constraint} -> {parent}"), parent: parent.clone(), columns: Vec::new() });
+            keys.push(SurvivingForeignKey {
+                label: format!("{child}.{constraint} -> {parent}"), child, constraint, parent: parent.clone(), columns: Vec::new(),
+            });
             current = Some(id);
         }
         let definition = match (charset, collation) {
@@ -692,7 +794,7 @@ fn replace_target_table<F: FnMut(Value)>(
     if !import_target_table_exists(adapter, target_schema, table)? {
         return Ok(());
     }
-    let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
+    let report_path = journal.report_path.display().to_string();
     for (child, constraint) in incoming_import_set_foreign_keys(adapter, target_schema, table, planned)? {
         // Kept so the FK can be re-added if the import stops before the child's own turn.
         let definition = foreign_key_definition(adapter, target_schema, &child, &constraint)?;
@@ -827,9 +929,23 @@ fn import_target_table_exists(adapter: &mut LiveAdapter, schema: &str, table: &s
 /// DROP TABLE cannot replace a view (or any other non-table object) that has a dump table's name,
 /// so refuse before any target table changes.
 fn refuse_non_table_name_collisions(adapter: &mut LiveAdapter, schema: &str, import_schema: &NormalizedSchema) -> Result<(), String> {
+    let collisions = non_table_name_collisions(adapter, schema, import_schema)?;
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    let collisions = collisions.iter().map(|(name, kind)| format!("{name} ({kind})")).collect::<Vec<_>>();
+    Err(classified_import_error(
+        "ddl_preflight_failed",
+        &format!("target objects that are not tables already use these names; no target tables were changed: {}", collisions.join(", ")),
+        None,
+    ))
+}
+
+/// Target objects other than tables that use a dump table's name, as `(name, kind)`.
+fn non_table_name_collisions(adapter: &mut LiveAdapter, schema: &str, import_schema: &NormalizedSchema) -> Result<Vec<(String, String)>, String> {
     let names = import_schema.tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
     let inspect_error = |err: &dyn std::fmt::Display| format!("target object inspection failed: {err}");
-    let collisions: Vec<String> = match adapter {
+    Ok(match adapter {
         LiveAdapter::MySql(conn) => {
             let rows: Vec<(String, String)> = conn.exec(
                 "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_TYPE<>'BASE TABLE'",
@@ -838,51 +954,95 @@ fn refuse_non_table_name_collisions(adapter: &mut LiveAdapter, schema: &str, imp
             // Case-insensitive like lower_case_table_names servers; a false refusal is safe.
             rows.into_iter()
                 .filter(|(name, _)| names.iter().any(|table| table.eq_ignore_ascii_case(name)))
-                .map(|(name, kind)| format!("{name} ({kind})"))
                 .collect()
         }
         LiveAdapter::PostgreSql(client) => client.query(
             "SELECT c.relname, CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'S' THEN 'SEQUENCE' WHEN 'c' THEN 'TYPE' ELSE 'INDEX' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind NOT IN ('r','p') ORDER BY 1",
             &[&schema, &names],
         ).map_err(|err| inspect_error(&err))?
-            .iter().map(|row| format!("{} ({})", row.get::<_, String>(0), row.get::<_, String>(1))).collect(),
-    };
-    if collisions.is_empty() {
-        return Ok(());
-    }
-    Err(classified_import_error(
-        "ddl_preflight_failed",
-        &format!("target objects that are not tables already use these names; no target tables were changed: {}", collisions.join(", ")),
-        None,
-    ))
+            .iter().map(|row| (row.get(0), row.get(1))).collect(),
+    })
 }
 
 fn validate_postgres_drop_dependencies(adapter: &mut LiveAdapter, schema: &str, tables: &[DumpTableManifest]) -> Result<(), String> {
-    let LiveAdapter::PostgreSql(client)=adapter else { return Ok(()); };
-    let names=tables.iter().map(|table|table.name.clone()).collect::<Vec<_>>();
-    let fail=|detail:String|classified_import_error("target_dependency_preflight_failed",&format!("PostgreSQL target dependencies prevent replacement; no target tables were changed. Use safe restore. {detail}"),None);
-    let views=client.query(
-        "SELECT DISTINCT vn.nspname,v.relname FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid JOIN pg_class v ON v.oid=r.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_class source ON source.oid=d.refobjid JOIN pg_namespace sn ON sn.oid=source.relnamespace WHERE d.classid='pg_rewrite'::regclass AND d.refclassid='pg_class'::regclass AND v.relkind IN ('v','m') AND v.oid<>source.oid AND sn.nspname=$1 AND source.relname=ANY($2::text[])",
-        &[&schema,&names],
-    ).map_err(|err|fail(format!("Dependency inspection failed: {err}")))?;
-    if !views.is_empty() {
-        let names=views.iter().map(|row|format!("{}.{}",row.get::<_,String>(0),row.get::<_,String>(1))).collect::<Vec<_>>();
-        return Err(fail(format!("Dependent views: {}",names.join(", "))));
+    let LiveAdapter::PostgreSql(client) = adapter else { return Ok(()); };
+    let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
+    let fail = |detail: String| classified_import_error("target_dependency_preflight_failed",
+        &format!("PostgreSQL target dependencies prevent replacement; no target tables were changed. {detail}"), None);
+    let dependents = postgres_drop_dependents(client, schema, &names).map_err(fail)?;
+    if dependents.is_empty() {
+        return Ok(());
     }
-    let planned=tables.iter().map(|table|table.name.as_str()).collect::<BTreeSet<_>>();
-    let keys=client.query(
-        "SELECT child_ns.nspname,child.relname,parent.relname,c.conname FROM pg_constraint c JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace child_ns ON child_ns.oid=child.relnamespace JOIN pg_class parent ON parent.oid=c.confrelid JOIN pg_namespace parent_ns ON parent_ns.oid=parent.relnamespace WHERE c.contype='f' AND parent_ns.nspname=$1 AND parent.relname=ANY($2::text[])",
-        &[&schema,&names],
-    ).map_err(|err|fail(format!("Foreign key inspection failed: {err}")))?;
-    for row in keys {
-        let child_schema:String=row.get(0);let child:String=row.get(1);let parent:String=row.get(2);let constraint:String=row.get(3);
-        // Import-set children lose this FK just before the parent is replaced
-        // (replace_target_table); only target-only children would block DROP.
-        if child_schema!=schema || !planned.contains(child.as_str()) {
-            return Err(fail(format!("Target-only foreign key {child_schema}.{child}.{constraint} references {parent}")));
+    Err(fail(dependents.into_iter().map(|(_, _, detail)| detail).collect::<Vec<_>>().join("; ")))
+}
+
+/// Everything that would make DROP TABLE of the import set fail, as `(code, dumped table, detail)`.
+/// `names` is the order the import drops the tables in. Import-set children in the same schema
+/// are not listed: their FK is dropped just before the parent is replaced (replace_target_table).
+fn postgres_drop_dependents(client: &mut postgres::Client, schema: &str, names: &[String]) -> Result<Vec<(&'static str, String, String)>, String> {
+    let mut dependents = Vec::new();
+    for row in client.query(
+        "SELECT c.relname, pg_get_userbyid(c.relowner)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','p') AND NOT pg_has_role(c.relowner,'USAGE') AND NOT pg_has_role(n.nspowner,'USAGE') ORDER BY 1",
+        &[&schema, &names],
+    ).map_err(|err| format!("Owner inspection failed: {err}"))? {
+        let (table, owner): (String, String) = (row.get(0), row.get(1));
+        let detail = format!("Table {schema}.{table} belongs to {owner}; only its owner or the schema owner can drop it");
+        dependents.push(("drop_privilege_missing", table, detail));
+    }
+    for row in client.query(
+        "SELECT DISTINCT vn.nspname,v.relname,source.relname FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid JOIN pg_class v ON v.oid=r.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_class source ON source.oid=d.refobjid JOIN pg_namespace sn ON sn.oid=source.relnamespace WHERE d.classid='pg_rewrite'::regclass AND d.refclassid='pg_class'::regclass AND v.relkind IN ('v','m') AND v.oid<>source.oid AND sn.nspname=$1 AND source.relname=ANY($2::text[]) ORDER BY 3,1,2",
+        &[&schema, &names],
+    ).map_err(|err| format!("Dependency inspection failed: {err}"))? {
+        dependents.push(("dependent_view", row.get(2), format!("Dependent view {}.{}", row.get::<_, String>(0), row.get::<_, String>(1))));
+    }
+    let planned = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    // Partition clones (conparentid<>0) go away with their root constraint.
+    for row in client.query(
+        "SELECT child_ns.nspname,child.relname,parent.relname,c.conname FROM pg_constraint c JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace child_ns ON child_ns.oid=child.relnamespace JOIN pg_class parent ON parent.oid=c.confrelid JOIN pg_namespace parent_ns ON parent_ns.oid=parent.relnamespace WHERE c.contype='f' AND c.conparentid=0 AND parent_ns.nspname=$1 AND parent.relname=ANY($2::text[]) ORDER BY 3,1,2,4",
+        &[&schema, &names],
+    ).map_err(|err| format!("Foreign key inspection failed: {err}"))? {
+        let (child_schema, child, parent, constraint): (String, String, String, String) = (row.get(0), row.get(1), row.get(2), row.get(3));
+        if child_schema != schema || !planned.contains(child.as_str()) {
+            let detail = format!("Target-only foreign key {child_schema}.{child}.{constraint} references {parent}");
+            dependents.push(("target_only_fk_child", parent, detail));
         }
     }
-    Ok(())
+    // Any other object that depends on something DROP TABLE removes with a table (an owned
+    // sequence used by another table's default or a view, a column of the table's row type, an
+    // inheriting table, a policy or function body naming it), unless it is already gone: the
+    // tables are dropped one by one in `names` order. Views over a dumped table and FKs to one,
+    // with their partition clones and FK triggers, are listed above or dropped first.
+    for row in client.query(
+        "WITH RECURSIVE dropped(classid, objid, root, seed) AS (
+            SELECT 'pg_class'::regclass::oid, c.oid, c.relname::text, true FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+             WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','p')
+            UNION
+            SELECT d.classid, d.objid, p.root, false FROM pg_depend d JOIN dropped p ON p.classid=d.refclassid AND p.objid=d.refobjid
+             WHERE d.deptype IN ('a','i')),
+         listed_fk(oid) AS (
+            SELECT k.oid FROM pg_constraint k JOIN dropped s ON s.seed AND s.objid=k.confrelid WHERE k.contype='f' AND k.conparentid=0
+            UNION
+            SELECT k.oid FROM pg_constraint k JOIN listed_fk f ON k.conparentid=f.oid)
+         SELECT DISTINCT p.root,
+                COALESCE(pg_describe_object(d.classid,d.objid,d.objsubid), d.classid::regclass::text || ' ' || d.objid::text),
+                COALESCE(pg_describe_object(d.refclassid,d.refobjid,d.refobjsubid), d.refclassid::regclass::text || ' ' || d.refobjid::text)
+         FROM pg_depend d JOIN dropped p ON p.classid=d.refclassid AND p.objid=d.refobjid
+         WHERE d.deptype='n'
+           AND NOT EXISTS (SELECT 1 FROM dropped x WHERE x.classid=d.classid AND x.objid=d.objid
+                            AND array_position($2::text[], x.root) <= array_position($2::text[], p.root))
+           AND NOT EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_class v ON v.oid=r.ev_class
+                            JOIN pg_depend vd ON vd.classid='pg_rewrite'::regclass AND vd.objid=r.oid AND vd.refclassid='pg_class'::regclass
+                            JOIN dropped s ON s.seed AND s.objid=vd.refobjid
+                           WHERE d.classid='pg_rewrite'::regclass AND r.oid=d.objid AND v.relkind IN ('v','m'))
+           AND NOT (d.classid='pg_constraint'::regclass AND d.objid IN (SELECT oid FROM listed_fk))
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN listed_fk f ON f.oid=t.tgconstraint WHERE d.classid='pg_trigger'::regclass AND t.oid=d.objid)
+         ORDER BY 1,2,3",
+        &[&schema, &names],
+    ).map_err(|err| format!("Dependency inspection failed: {err}"))? {
+        let (table, dependent, referenced): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+        dependents.push(("dependent_object", table, format!("{dependent} depends on {referenced}")));
+    }
+    Ok(dependents)
 }
 
 /// 단일 테이블의 데이터를 적재한다. MySQL TSV fast-path(LOAD DATA / 병렬 / fallback)와
@@ -933,6 +1093,15 @@ pub(crate) fn check_mysql_spatial_import(manifest: &DumpManifest, selected: &BTr
         return Err(format!("this dump was written before format version 5 and stored MySQL spatial values as text, which corrupted them: {}; re-export the database with this version", spatial.join(", ")));
     }
     Ok(())
+}
+
+/// A failed row load names its table under `load_failed`, like a failed CREATE, unless the
+/// error already carries a code (`export_invalid` for a bad chunk, `load_failed` for a BIT value).
+fn table_load_error(table: &str, err: String) -> String {
+    let coded = err.split_once(": ").is_some_and(|(code, _)| {
+        code.contains('_') && code.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    });
+    if coded { err } else { dump_import_ddl_error("load_rows", table, &err) }
 }
 
 fn import_table_rows<F: FnMut(Value)>(
@@ -1045,7 +1214,6 @@ fn finalize_dump_import<F: FnMut(Value)>(
     table_total: usize,
     mut emit: F,
 ) -> Result<Value, String> {
-    let input_path = Path::new(input_dir);
     let target_engine = adapter.engine().to_string();
     // Indexes and foreign keys were created right after each table's data.
     emit(json!({
@@ -1102,7 +1270,6 @@ fn finalize_dump_import<F: FnMut(Value)>(
         "views_failed": view_outcome.failed,
         "views_skipped_cross_engine": view_outcome.skipped_cross_engine
     });
-    let import_report_path = dump_import_report_path(input_path)?;
 
     Ok(json!({
         "event": "result",
@@ -1119,7 +1286,6 @@ fn finalize_dump_import<F: FnMut(Value)>(
         "chunks_imported": chunks_imported,
         "imported_rows_by_table": imported_rows_by_table,
         "verification": import_report["verification"].clone(),
-        "import_report": import_report_path.display().to_string(),
         "views_imported": import_report["views_imported"].clone(),
         "views_failed": import_report["views_failed"].clone(),
         "views_skipped_cross_engine": import_report["views_skipped_cross_engine"].clone()
@@ -2216,7 +2382,10 @@ mod tests {
     fn ddl_probe_recreates_kept_children_before_their_parent_and_names_the_offender() {
         use crate::adapters::test_support::schema as sample_schema;
         let schema = sample_schema();
-        let kept = [SurvivingForeignKey { label: "orders.fk_user -> users".into(), parent: "users".into(), columns: vec![("bigint unsigned".into(), "id".into())] }];
+        let kept = [SurvivingForeignKey {
+            label: "orders.fk_user -> users".into(), child: "orders".into(), constraint: "fk_user".into(),
+            parent: "users".into(), columns: vec![("bigint unsigned".into(), "id".into())],
+        }];
         let mut statements = Vec::new();
         let err = run_owned_ddl_probe(&schema, "mysql", "mysql", &kept, "p", |_| Ok(()), |sql| {
             statements.push(sql.to_string());
@@ -2417,12 +2586,45 @@ mod tests {
             let payload = json!({ "input_dir": dir.to_string_lossy(), key: mode, "target": { "engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app" } });
             let mut events = Vec::new();
             let err = dump_import(&Request { command: "dump.import".into(), request_id: None, payload }, |event| events.push(event)).unwrap_err();
-            let report_written = dump_import_report_path(&dir).unwrap().exists();
+            let report_written = !dump_import_report_paths(&dir).is_empty();
             fs::remove_dir_all(&dir).unwrap();
             assert!(err.starts_with("import_plan_invalid:") && err.contains(expected), "{key}={mode}: {err}");
             assert!(!report_written, "{key}={mode}: a refused mode must not leave an import report");
             assert!(events.is_empty(), "{key}={mode}: {events:?}");
         }
+    }
+
+    #[test]
+    fn every_import_attempt_keeps_its_own_report() {
+        let dir = std::env::temp_dir().join(format!("tunnelforge-report-per-attempt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // An old dump folder's single report stays as it was.
+        let legacy = dump_import_report_path(&dir).unwrap();
+        fs::write(&legacy, br#"{"success":true}"#).unwrap();
+        let attempt = || {
+            // No manifest: each attempt fails after its first checkpoint, before any connection.
+            let payload = json!({"input_dir": dir.to_string_lossy(), "mode": "replace", "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app"}});
+            let mut events = Vec::new();
+            assert!(dump_import(&Request { command: "dump.import".into(), request_id: None, payload }, |event| events.push(event)).is_err());
+            let paths = events.iter().filter(|event| event["event"] == "import_report")
+                .map(|event| event["report_path"].as_str().unwrap().to_string()).collect::<BTreeSet<_>>();
+            assert_eq!(paths.len(), 1, "one attempt names one report: {events:?}");
+            std::path::PathBuf::from(paths.into_iter().next().unwrap())
+        };
+        let first = attempt();
+        let first_report = fs::read(&first).unwrap();
+        let second = attempt();
+        let reports = dump_import_report_paths(&dir);
+        let first_after = fs::read(&first).unwrap();
+        let legacy_after = fs::read(&legacy).unwrap();
+        let second_report: Value = serde_json::from_slice(&fs::read(&second).unwrap()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(reports, vec![legacy.clone(), first.clone(), second.clone()], "oldest first");
+        assert_eq!(first_after, first_report, "a retry overwrote the earlier attempt's report");
+        assert_eq!(legacy_after, br#"{"success":true}"#);
+        assert_eq!(second_report["status"], "failed");
     }
 
     #[test]
@@ -2505,6 +2707,23 @@ mod tests {
         assert!(!is_mysql_local_infile_disabled_error(
             "mysql LOAD DATA error: duplicate key"
         ));
+    }
+
+    #[test]
+    fn a_failed_row_load_names_its_table_under_load_failed() {
+        for raw in [
+            "mysql insert error: MySqlError { ERROR 1406 (22001): Data too long for column 'name' at row 1 }",
+            "mysql LOAD DATA error: MySqlError { ERROR 1062 (23000): Duplicate entry '1' for key 'PRIMARY' }",
+            "MySqlError { ERROR 1406 (22001): Data too long for column 'name' at row 1 }",
+            "import data validation failed: 1 MySQL warnings: 1265: Data truncated for column 'kind' at row 1",
+        ] {
+            let error = table_load_error("orders", raw.into());
+            assert!(error.starts_with("load_failed: orders: load_rows failed: ") && error.ends_with(raw), "{error}");
+        }
+        // An error that carries its own code keeps it.
+        for coded in ["export_invalid: orders: chunk 1 sha256 mismatch", "load_failed: orders: BIT column flags: bad"] {
+            assert_eq!(table_load_error("orders", coded.into()), coded);
+        }
     }
 
     #[test]

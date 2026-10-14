@@ -1,11 +1,13 @@
 //! TF-STATUS-119: backup/candidate lifecycle after safe promotion.
 //!
-//! `restore.backups` actions: `list`, `reconcile`, `cleanup_plan`, `cleanup_apply`.
+//! `restore.backups` actions: `list`, `reconcile`, `cleanup_plan`, `cleanup_apply`, `rollback_plan`,
+//! `rollback_apply`. Cleanup targets: `backup`, `clone`, `view_aliases`, `displaced`, `candidate`.
 //! Journals (the promotion attempt journal and the safe-restore report kept in each
 //! dump directory) are the only source of ownership. A namespace that merely follows
 //! the naming convention is listed as unproven and is never deleted.
 use crate::safe_promotion::{prior_attempt, public_target, EnginePlan, StoredPlan};
 use crate::*;
+use mysql::prelude::Queryable;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -17,6 +19,8 @@ struct Entry {
     input_dir: PathBuf,
     restore_id: String,
     report: Option<Value>,
+    /// The file `report` was read from.
+    report_path: Option<PathBuf>,
     stored: Option<StoredPlan>,
     attempt: Option<Value>,
 }
@@ -78,38 +82,40 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-/// Journals of one dump directory: the safe-restore report and every promotion plan/attempt.
+/// Journals of one dump directory: every safe-restore report (one per import attempt, plus the
+/// single report older versions kept) and every promotion plan/attempt.
 fn discover_dir(dir: &Path, entries: &mut Vec<Entry>) {
-    let report = read_json(&dump_import_report_path(dir).unwrap_or_default())
-        .filter(|report| report["mode"] == "safe" && report["candidate_created"] == true);
-    if let Some(report) = &report {
-        if let Some(id) = report["restore_id"].as_str() {
-            let mut entry = Entry { input_dir: dir.into(), restore_id: id.into(), report: Some(report.clone()), stored: None, attempt: None };
-            if let Ok(plan_dir) = plan_dir_for(dir, id) {
-                entry.attempt = prior_attempt(&plan_dir).ok().flatten();
-                entry.stored = entry
-                    .attempt
-                    .as_ref()
-                    .and_then(|a| serde_json::from_value(a["stored_plan"].clone()).ok())
-                    .or_else(|| read_json(&dump_import_report_path(&plan_dir).unwrap_or_default()).and_then(|v| serde_json::from_value(v).ok()));
-            }
-            entries.push(entry);
-            return;
-        }
+    let mut reported = std::collections::BTreeSet::new();
+    for report_path in dump_import_report_paths(dir) {
+        let Some(report) = read_json(&report_path).filter(|report| report["mode"] == "safe" && report["candidate_created"] == true) else { continue };
+        let Some(id) = report["restore_id"].as_str().map(str::to_string) else { continue };
+        let (stored, attempt) = plan_journals(dir, &id);
+        reported.insert(id.clone());
+        entries.push(Entry { input_dir: dir.into(), restore_id: id, report: Some(report), report_path: Some(report_path), stored, attempt });
     }
     // Promotion journals without a readable restore report still identify backups.
     let Ok(read) = fs::read_dir(dir) else { return };
-    for item in read.flatten() {
-        let name = item.file_name().to_string_lossy().to_string();
-        let Some(id) = name.strip_prefix(PLAN_DIR_PREFIX) else { continue };
-        let Ok(plan_dir) = plan_dir_for(dir, id) else { continue };
-        let attempt = prior_attempt(&plan_dir).ok().flatten();
-        let stored = attempt
-            .as_ref()
-            .and_then(|a| serde_json::from_value(a["stored_plan"].clone()).ok())
-            .or_else(|| read_json(&dump_import_report_path(&plan_dir).unwrap_or_default()).and_then(|v| serde_json::from_value(v).ok()));
-        entries.push(Entry { input_dir: dir.into(), restore_id: id.into(), report: None, stored, attempt });
+    let mut ids: Vec<String> = read
+        .flatten()
+        .filter_map(|item| item.file_name().to_string_lossy().strip_prefix(PLAN_DIR_PREFIX).map(str::to_string))
+        .filter(|id| !reported.contains(id) && plan_dir_for(dir, id).is_ok())
+        .collect();
+    ids.sort();
+    for id in ids {
+        let (stored, attempt) = plan_journals(dir, &id);
+        entries.push(Entry { input_dir: dir.into(), restore_id: id, report: None, report_path: None, stored, attempt });
     }
+}
+
+/// The promotion plan and the last attempt recorded for one restore.
+fn plan_journals(dir: &Path, restore_id: &str) -> (Option<StoredPlan>, Option<Value>) {
+    let Ok(plan_dir) = plan_dir_for(dir, restore_id) else { return (None, None) };
+    let attempt = prior_attempt(&plan_dir).ok().flatten();
+    let stored = attempt
+        .as_ref()
+        .and_then(|a| serde_json::from_value(a["stored_plan"].clone()).ok())
+        .or_else(|| read_json(&dump_import_report_path(&plan_dir).unwrap_or_default()).and_then(|v| serde_json::from_value(v).ok()));
+    (stored, attempt)
 }
 
 fn plan_dir_for(dir: &Path, restore_id: &str) -> Result<PathBuf, String> {
@@ -200,6 +206,52 @@ fn counts(credentials: &Endpoint, _target: &Value, namespace: &str) -> Result<(b
     } else {
         crate::safe_promote_postgres::namespace_counts(&endpoint, namespace)
     }
+}
+
+/// A restore that made its copy and then failed, with no promotion plan or attempt behind it.
+fn failed_copy(entry: &Entry) -> bool {
+    entry.stored.is_none() && entry.attempt.is_none()
+        && entry.report.as_ref().is_some_and(|report| report["status"] == "failed_original_untouched" && report["verified"] != true)
+}
+
+/// Objects in a failed copy that its import does not make: anything but the dump's tables and
+/// views and leftover DDL probes. The import makes no routines, events, triggers, types or
+/// unowned sequences, so each one is a stray.
+fn copy_strays(credentials: &Endpoint, input_dir: &Path, namespace: &str) -> Result<Vec<String>, String> {
+    let manifest = read_dump_manifest(input_dir)?;
+    let mut adapter = LiveAdapter::connect(credentials)?;
+    let (fold, present, others): (bool, Vec<String>, Vec<String>) = match &mut adapter {
+        LiveAdapter::MySql(conn) => {
+            let mut others = Vec::new();
+            for sql in [
+                "SELECT CONCAT('routine ', ROUTINE_NAME) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=?",
+                "SELECT CONCAT('event ', EVENT_NAME) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=?",
+                "SELECT CONCAT('trigger ', TRIGGER_NAME) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=?",
+            ] {
+                others.extend(conn.exec::<String, _, _>(sql, (namespace,)).map_err(|e| e.to_string())?);
+            }
+            (mysql_folds_table_names(conn)?, conn
+                .exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (namespace,))
+                .map_err(|e| e.to_string())?, others)
+        }
+        LiveAdapter::PostgreSql(client) => {
+            let mut query = |sql: &str| -> Result<Vec<String>, String> {
+                Ok(client.query(sql, &[&namespace]).map_err(|e| e.to_string())?.iter().map(|row| row.get(0)).collect())
+            };
+            let present = query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f')")?;
+            let mut others = query("SELECT 'function ' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1")?;
+            // A table's row type and every array type depend internally on what they belong to.
+            others.extend(query("SELECT 'type ' || t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname=$1 \
+                AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_type'::regclass AND d.objid=t.oid AND d.deptype='i')")?);
+            others.extend(query("SELECT 'sequence ' || s.relname FROM pg_class s JOIN pg_namespace n ON n.oid=s.relnamespace WHERE n.nspname=$1 AND s.relkind='S' \
+                AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=s.oid AND d.refclassid='pg_class'::regclass AND d.deptype IN ('a','i'))")?);
+            (false, present, others)
+        }
+    };
+    let key = |name: &str| if fold { name.to_lowercase() } else { name.to_string() };
+    let made = manifest.tables.iter().map(|table| key(&table.name))
+        .chain(manifest.views.iter().map(|view| key(&view.name))).collect::<std::collections::BTreeSet<_>>();
+    Ok(present.into_iter().filter(|name| !made.contains(&key(name)) && !name.starts_with("tf_probe_")).chain(others).collect())
 }
 
 fn created_unix(entry: &Entry) -> Option<u64> {
@@ -339,6 +391,22 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
             tables = vec![];
             notes = vec!["Temporary database of the promotion; its tables were renamed into place, only prepared views remain.".into()];
         }
+        "view_aliases" => {
+            let Some(EnginePlan::MySql(plan)) = entry.stored.as_ref().map(|s| &s.engine_plan) else {
+                return Err("only MySQL promotions keep saved view aliases".into());
+            };
+            namespace = plan.original_database.clone();
+            if status != "promoted" {
+                blockers.push(format!("the promotion is not recorded as promoted (journal {status}); reconcile first"));
+            }
+            let (aliases, problems) = crate::safe_promote_mysql::saved_view_aliases(credentials, plan)?;
+            blockers.extend(problems);
+            if aliases.is_empty() {
+                blockers.push("no saved view alias of this promotion remains".into());
+            }
+            tables = aliases.into_iter().map(|name| json!({"name": name})).collect();
+            notes = vec!["Old view definitions the promotion kept under these names in the original database; the active views are not touched.".into()];
+        }
         "displaced" => {
             let record = entry.rolled_back().ok_or("no completed recovery is recorded for this restore")?;
             let displaced = inspect_displaced(entry, credentials, &record, true)?.ok_or("this restore has no promotion journal")?;
@@ -403,6 +471,13 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
                 if !unrecorded.is_empty() {
                     blockers.push(format!("the candidate holds objects the promotion journal does not record: {}", unrecorded.join(", ")));
                 }
+            } else if table_count + view_count > 0 && failed_copy(entry) {
+                // A copy whose load or verification failed has no proof to recheck; it may go
+                // when it holds only what its import makes.
+                let strays = copy_strays(credentials, &entry.input_dir, &name)?;
+                if !strays.is_empty() {
+                    blockers.push(format!("the failed copy holds objects its import does not make: {}", strays.join(", ")));
+                }
             } else if table_count + view_count > 0 {
                 // A staged candidate still holds data: only an unpromoted, still-verified copy may go.
                 let verdict = inspect_backup(entry, credentials, false)?
@@ -413,8 +488,8 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
                 if !unpromoted {
                     blockers.push(format!("the candidate still holds data and the promotion state is {status}/{verdict}; only a verified, unpromoted candidate can be discarded"));
                 }
-                let report_path = dump_import_report_path(&entry.input_dir)?;
-                match crate::import::safe_restore::load_verified_plan(&report_path, credentials)
+                match entry.report_path.as_deref().ok_or_else(|| "no safe restore report for this restore was found".to_string())
+                    .and_then(|report_path| crate::import::safe_restore::load_verified_plan(report_path, credentials))
                     .and_then(|verified| crate::import::safe_restore::reverify_candidate(&verified))
                 {
                     Ok(_) => {}
@@ -445,8 +520,13 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
         "host": credentials.host, "port": credentials.port, "blockers": blockers});
     let plan_digest = hex::encode(Sha256::digest(digest_input.to_string().as_bytes()));
     let _ = engine_endpoint;
+    let will_delete = if target == "view_aliases" {
+        tables.iter().filter_map(|alias| alias["name"].as_str()).map(|alias| format!("{namespace}.{alias}")).collect()
+    } else {
+        vec![namespace.clone()]
+    };
     Ok(json!({"success": true, "can_cleanup": blockers.is_empty(), "target": target, "restore_id": entry.restore_id,
-        "namespace": namespace, "tables": tables, "will_delete": [namespace], "blockers": blockers, "notes": notes,
+        "namespace": namespace, "tables": tables, "will_delete": will_delete, "blockers": blockers, "notes": notes,
         "plan_digest": plan_digest, "confirmation_required": true,
         "message": "Original and unproven objects are never deleted. Nothing has been changed."}))
 }
@@ -557,16 +637,22 @@ fn cleanup_apply(request: &Request, credentials: &Endpoint) -> Result<Value, Str
         "candidate" => endpoint_for(credentials, &candidate_namespace(entry).ok_or("candidate missing")?.1),
         _ => endpoint_for(credentials, &original_target(entry).ok_or("original target missing")?),
     };
-    if credentials.engine == "mysql" {
-        crate::safe_promote_mysql::drop_namespace(&endpoint, &namespace)?;
-    } else {
-        crate::safe_promote_postgres::drop_namespace(&endpoint, &namespace)?;
+    let aliases = fresh["tables"].as_array().into_iter().flatten().filter_map(|alias| alias["name"].as_str().map(str::to_string)).collect::<Vec<_>>();
+    match (target, entry.stored.as_ref().map(|s| &s.engine_plan)) {
+        ("view_aliases", Some(EnginePlan::MySql(plan))) => crate::safe_promote_mysql::drop_saved_view_aliases(&endpoint, plan, &aliases)?,
+        ("view_aliases", _) => return Err("only MySQL promotions keep saved view aliases".into()),
+        _ if credentials.engine == "mysql" => crate::safe_promote_mysql::drop_namespace(&endpoint, &namespace)?,
+        _ => crate::safe_promote_postgres::drop_namespace(&endpoint, &namespace)?,
     }
     let record = json!({"restore_id": entry.restore_id, "target": target, "namespace": namespace,
-        "plan_digest": confirmed, "dropped": true,
+        "plan_digest": confirmed, "dropped": true, "will_delete": fresh["will_delete"],
         "target_public": public_target(&endpoint)});
     let mut result = json!({"success": true, "status": "cleaned", "target": target, "namespace": namespace,
-        "restore_id": entry.restore_id, "message": "The verified namespace was dropped. Original and other objects were not touched."});
+        "restore_id": entry.restore_id, "message": if target == "view_aliases" {
+            "The saved view aliases were dropped. Active views, tables and other objects were not touched."
+        } else {
+            "The verified namespace was dropped. Original and other objects were not touched."
+        }});
     if let Ok(plan_dir) = plan_dir_for(&entry.input_dir, &entry.restore_id) {
         let path = plan_dir.join(format!("cleanup_{target}.json"));
         if let Err(error) = fs::write(&path, serde_json::to_vec_pretty(&record).unwrap_or_default()) {
@@ -630,7 +716,7 @@ mod tests {
 
     #[test]
     fn journal_status_reflects_attempt_state_only() {
-        let entry = |attempt: Option<Value>| Entry { input_dir: PathBuf::new(), restore_id: "r".into(), report: None, stored: None, attempt };
+        let entry = |attempt: Option<Value>| Entry { input_dir: PathBuf::new(), restore_id: "r".into(), report: None, report_path: None, stored: None, attempt };
         assert_eq!(entry(None).journal_status(), "not_attempted");
         assert_eq!(entry(Some(json!({"status": "cutover_unknown"}))).journal_status(), "cutover_unknown");
         assert_eq!(entry(Some(json!({}))).journal_status(), "pending");
@@ -645,6 +731,29 @@ mod tests {
         discover_dir(&dir, &mut entries);
         assert!(entries.is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn discovery_finds_every_safe_restore_report_and_every_plan() {
+        let dir = temp("every_report");
+        let safe = |id: &str| json!({"mode": "safe", "candidate_created": true, "restore_id": id});
+        // The single report an older version kept, then one report per later attempt.
+        write_dump_import_report(&dir, &safe("old_1")).unwrap();
+        let newer = new_dump_import_report_path(&dir).unwrap();
+        write_import_report_file(&newer, &safe("new_2")).unwrap();
+        write_import_report_file(&new_dump_import_report_path(&dir).unwrap(), &json!({"mode": "replace", "status": "failed"})).unwrap();
+        for id in ["new_2", "orphan_3"] {
+            fs::create_dir(dir.join(format!("{PLAN_DIR_PREFIX}{id}"))).unwrap();
+        }
+        let mut entries = Vec::new();
+        discover_dir(&dir, &mut entries);
+        let found: Vec<(&str, Option<PathBuf>)> = entries.iter().map(|e| (e.restore_id.as_str(), e.report_path.clone())).collect();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, vec![
+            ("old_1", Some(dump_import_report_path(&dir).unwrap())),
+            ("new_2", Some(newer)),
+            ("orphan_3", None),
+        ]);
     }
 
     #[test]
