@@ -188,8 +188,14 @@ impl ImportJournal {
 fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
     let mode = request.payload.get("mode").or_else(|| request.payload.get("import_mode"))
         .map(|value| value.as_str().ok_or("dump import mode must be a string")).transpose()?.unwrap_or("safe");
-    if mode == "safe" { return safe_restore::run(request, emit); }
-    dump_import_with_context(request, None, |event| emit(event))
+    // Checked before the report checkpoint, so a refused mode leaves no report behind.
+    match mode {
+        "safe" => safe_restore::run(request, emit),
+        "replace" | "recreate" => dump_import_with_context(request, None, |event| emit(event)),
+        "merge" => Err(classified_import_error("import_plan_invalid",
+            "the merge import mode was removed: Import no longer adds rows to existing tables; it replaces each table in the dump", None)),
+        other => Err(classified_import_error("import_plan_invalid", &format!("unsupported dump import mode: {other}"), None)),
+    }
 }
 
 fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Option<Value>, mut emit: F) -> Result<Value, String> {
@@ -257,9 +263,6 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         .or_else(|| request.payload.get("import_mode"))
         .and_then(Value::as_str)
         .unwrap_or("replace");
-    if !matches!(mode, "replace" | "merge" | "recreate") {
-        return Err(format!("unsupported dump import mode: {mode}"));
-    }
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
@@ -373,9 +376,6 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
 
     let import_result = (|| -> Result<(), String> {
         set_mysql_import_session_tuning(&mut adapter, false)?;
-        if mode == "merge" && endpoint.engine == "mysql" {
-            adapter.execute_sql("SET SESSION foreign_key_checks=1")?;
-        }
         if let Some(sql) = timezone_sql.as_deref() {
             adapter.execute_sql(sql)?;
         }
@@ -388,22 +388,17 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         journal.checkpoint()?;
         emit(json!({"event":"phase", "request_id":request.request_id, "phase":journal.phase,
             "message":"서버에서 테이블 생성 정의를 검증 중입니다. 기존 대상 테이블은 아직 변경하지 않습니다."}));
-        let surviving = if matches!(mode, "replace" | "recreate") {
-            validate_postgres_drop_dependencies(&mut adapter, &target_schema, &tables)?;
-            surviving_foreign_keys(&mut adapter, &target_schema, &import_schema)?
-        } else {
-            Vec::new()
-        };
+        validate_postgres_drop_dependencies(&mut adapter, &target_schema, &tables)?;
+        let surviving = surviving_foreign_keys(&mut adapter, &target_schema, &import_schema)?;
         validate_target_check_names(&mut adapter, &target_schema, &import_schema)?;
         refuse_non_table_name_collisions(&mut adapter, &target_schema, &import_schema)?;
-        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, should_apply_post_load_ddl(mode), &surviving)?;
+        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, &surviving)?;
         journal.current_table = None;
         journal.phase = "dump_import_prepare".into();
         journal.checkpoint()?;
         emit(json!({"event":"phase", "request_id":request.request_id, "phase":journal.phase,
-            "message":if mode == "merge" { "검증 완료: 기존 테이블을 유지하며 데이터 적재를 준비합니다." } else { "검증 완료: 선택한 대상 테이블 교체를 준비합니다." },
+            "message":"검증 완료: 선택한 대상 테이블 교체를 준비합니다.",
             "report_path":dump_import_report_path(input_path)?.display().to_string()}));
-        prepare_import_target(mode, &tables, &mut adapter, &target_schema)?;
 
         let planned_set = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
         let target_engine = adapter.engine();
@@ -428,19 +423,13 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.load_attempted.insert(table.name.clone());
             journal.phase = "dump_import_create".into();
             journal.checkpoint()?;
-            if matches!(mode, "replace" | "recreate") {
-                // mysqldump처럼 테이블마다 DROP 직후 CREATE한다. 실패해도 이 테이블만
-                // 비고, 아직 차례가 오지 않은 테이블은 원본 데이터를 유지한다.
-                replace_target_table(&mut adapter, &target_schema, &table.name, &planned_set,
-                    journal, request.request_id.clone(), &mut emit)?;
-                adapter
-                    .create_new_table(ddl)
-                    .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
-            } else {
-                adapter
-                    .create_table(table, ddl)
-                    .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
-            }
+            // mysqldump처럼 테이블마다 DROP 직후 CREATE한다. 실패해도 이 테이블만
+            // 비고, 아직 차례가 오지 않은 테이블은 원본 데이터를 유지한다.
+            replace_target_table(&mut adapter, &target_schema, &table.name, &planned_set,
+                journal, request.request_id.clone(), &mut emit)?;
+            adapter
+                .create_new_table(ddl)
+                .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
 
             journal.phase = "dump_import_data".into();
             journal.checkpoint()?;
@@ -452,7 +441,6 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
                 table_manifest,
                 &data_format,
                 &compression,
-                mode,
                 legacy_bit_text,
                 manifest.source_engine != endpoint.engine,
                 timezone_sql.as_deref(),
@@ -474,12 +462,10 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.loaded.push(table.name.clone());
             journal.rows_imported = rows_imported;
             journal.chunks_imported = chunks_imported;
-            if should_apply_post_load_ddl(mode) {
-                // Finish this table now, so a later failure leaves every earlier table complete.
-                journal.phase = "dump_import_post_load".into();
-                journal.checkpoint()?;
-                complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
-            }
+            // Finish this table now, so a later failure leaves every earlier table complete.
+            journal.phase = "dump_import_post_load".into();
+            journal.checkpoint()?;
+            complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
             journal.current_table = None;
             journal.checkpoint()?;
             emit(json!({
@@ -534,19 +520,19 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     )
 }
 
-/// Builds every selected table under an owned probe name before any target table is dropped. For
-/// replace imports the probes also get the indexes and foreign keys the import adds after each
-/// table, so a missing REFERENCES privilege or an incompatible parent outside the dump stops the
-/// import while the target is still untouched.
+/// Builds every selected table under an owned probe name before any target table is dropped. The
+/// probes also get the indexes and foreign keys the import adds after each table, so a missing
+/// REFERENCES privilege or an incompatible parent outside the dump stops the import while the
+/// target is still untouched.
 fn probe_import_ddl(
-    adapter: &mut LiveAdapter, schema: &NormalizedSchema, source_engine: &str, journal: &mut ImportJournal, with_post_load: bool,
+    adapter: &mut LiveAdapter, schema: &NormalizedSchema, source_engine: &str, journal: &mut ImportJournal,
     surviving: &[SurvivingForeignKey],
 ) -> Result<(), String> {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("cannot allocate DDL probe name: {err}"))?.as_nanos();
     let prefix = format!("tf_probe_{}_{nonce}", std::process::id());
     let engine = adapter.engine();
-    run_owned_ddl_probe(schema, source_engine, engine, with_post_load, surviving, &prefix,
+    run_owned_ddl_probe(schema, source_engine, engine, surviving, &prefix,
         |table| { journal.current_table = Some(table.to_string()); journal.checkpoint() },
         |sql| adapter.execute_sql(sql))
 }
@@ -600,7 +586,7 @@ fn surviving_foreign_keys(adapter: &mut LiveAdapter, schema: &str, import_schema
 }
 
 fn run_owned_ddl_probe(
-    schema: &NormalizedSchema, source_engine: &str, engine: &str, with_post_load: bool, surviving: &[SurvivingForeignKey], prefix: &str,
+    schema: &NormalizedSchema, source_engine: &str, engine: &str, surviving: &[SurvivingForeignKey], prefix: &str,
     mut enter_table: impl FnMut(&str) -> Result<(), String>,
     mut execute: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -644,8 +630,7 @@ fn run_owned_ddl_probe(
             }
             let ddl = generate_table_ddl(&probe, source_engine, engine)
                 .ok_or_else(|| format!("DDL probe generation failed for {}", table.name))?;
-            // Raw execution must fail on collisions; create_table intentionally treats
-            // existing tables as valid during merge and cannot establish ownership.
+            // Raw execution must fail on collisions, so the probe owns every table it drops.
             execute(&ddl).map_err(|err| {
                 match surviving.iter().zip(&surviving_names).find(|(_, name)| err.contains(&format!("'{name}'"))) {
                     Some((fk, _)) => incompatible(fk, err),
@@ -653,14 +638,9 @@ fn run_owned_ddl_probe(
                 }
             })?;
             created.push(probe.name.clone());
-            if with_post_load {
-                for sql in secondary_index_ddl(&probe, engine) {
-                    execute(&sql).map_err(|err| rejected("CREATE INDEX", &table.name, err))?;
-                }
+            for sql in secondary_index_ddl(&probe, engine) {
+                execute(&sql).map_err(|err| rejected("CREATE INDEX", &table.name, err))?;
             }
-        }
-        if !with_post_load {
-            return Ok(());
         }
         for table in &schema.tables {
             enter_table(&table.name)?;
@@ -694,31 +674,6 @@ fn run_owned_ddl_probe(
         (Err(err), Err(cleanup)) => Err(format!("{err}; additionally: {cleanup}")),
         (result, cleanup) => result.and(cleanup),
     }
-}
-
-/// merge 모드에서는 기존 MySQL 대상의 트랜잭션 지원 여부만 확인한다. replace의 사전 점검은
-/// 모두 `probe_import_ddl`이 서버에서 직접 한다.
-fn prepare_import_target(
-    mode: &str,
-    tables: &[DumpTableManifest],
-    adapter: &mut LiveAdapter,
-    target_schema: &str,
-) -> Result<(), String> {
-    if matches!(mode, "replace" | "recreate") {
-        return Ok(());
-    }
-    if let LiveAdapter::MySql(conn) = adapter {
-        for table in tables {
-            let engine: Option<String> = conn.exec_first(
-                "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",
-                (target_schema, &table.name),
-            ).map_err(|err| format!("mysql merge engine preflight failed: {err}"))?;
-            if engine.is_some_and(|engine| !engine.eq_ignore_ascii_case("InnoDB")) {
-                return Err(format!("import_plan_invalid: merge requires an InnoDB target table for safe rollback: {}", table.name));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// 테이블 하나를 교체 가능한 상태로 만든다. import set 안의 다른(아직 원본인) 테이블이 이
@@ -988,7 +943,6 @@ fn import_table_rows<F: FnMut(Value)>(
     table_manifest: &DumpTableManifest,
     data_format: &str,
     compression: &str,
-    mode: &str,
     legacy_bit_text: bool,
     cross_engine: bool,
     timezone_sql: Option<&str>,
@@ -1006,7 +960,6 @@ fn import_table_rows<F: FnMut(Value)>(
                 table,
                 table_manifest,
                 compression,
-                mode,
                 timezone_sql,
                 request_id: request_id.clone(),
                 overall_rows_before,
@@ -1094,24 +1047,14 @@ fn finalize_dump_import<F: FnMut(Value)>(
 ) -> Result<Value, String> {
     let input_path = Path::new(input_dir);
     let target_engine = adapter.engine().to_string();
-    if should_apply_post_load_ddl(mode) {
-        // Indexes and foreign keys were created right after each table's data.
-        emit(json!({
-            "event": "phase",
-            "request_id": request_id,
-            "phase": "dump_import_post_load",
-            "message": "현재 단계: 마무리 확인 중 - 인덱스/FK는 테이블마다 적재 직후 생성했습니다",
-            "strategy": "per_table_post_load"
-        }));
-    } else {
-        emit(json!({
-            "event": "phase",
-            "request_id": request_id,
-            "phase": "dump_import_post_load",
-            "message": post_load_ddl_skip_message(mode),
-            "strategy": "existing_schema"
-        }));
-    }
+    // Indexes and foreign keys were created right after each table's data.
+    emit(json!({
+        "event": "phase",
+        "request_id": request_id,
+        "phase": "dump_import_post_load",
+        "message": "현재 단계: 마무리 확인 중 - 인덱스/FK는 테이블마다 적재 직후 생성했습니다",
+        "strategy": "per_table_post_load"
+    }));
     // import가 실제로 적재한 행 수가 덤프와 일치하는지만 검증한다(적재 정확성).
     // 타겟 DB를 다시 세는 검증(verify_target_row_counts)은 하지 않는다 — 타겟이
     // 살아있는 DB면 import 동안 외부 write(예: login_attempts에 새 로그인 시도)로
@@ -1127,7 +1070,6 @@ fn finalize_dump_import<F: FnMut(Value)>(
             adapter,
             manifest,
             &target_engine,
-            mode,
             request_id.clone(),
             &mut emit,
         )
@@ -1199,7 +1141,6 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
     adapter: &mut A,
     manifest: &DumpManifest,
     target_engine: &str,
-    mode: &str,
     request_id: Option<String>,
     mut emit: F,
 ) -> ViewImportOutcome {
@@ -1255,25 +1196,23 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
         }
     }
 
-    // replace/recreate 모드면 기존 View를 먼저 정리한다 (테이블이 아닌 View 전용 DROP).
+    // 기존 View를 먼저 정리한다 (테이블이 아닌 View 전용 DROP).
     // 검증을 통과한 View만 DROP 대상으로 삼는다.
-    if matches!(mode, "replace" | "recreate") {
-        let mut undroppable = BTreeMap::new();
-        for name in &validated_names {
-            if let Err(err) = adapter.execute_sql(&drop_view_sql(target_engine, name)) {
-                undroppable.insert(name.to_string(), err);
-            }
+    let mut undroppable = BTreeMap::new();
+    for name in &validated_names {
+        if let Err(err) = adapter.execute_sql(&drop_view_sql(target_engine, name)) {
+            undroppable.insert(name.to_string(), err);
         }
-        // CREATE would only say the view already exists; report why it could not be replaced
-        // (e.g. MySQL ERROR 1227: its DEFINER has SYSTEM_USER and this account does not).
-        pending.retain(|(name, _)| match undroppable.get(name) {
-            Some(err) => {
-                outcome.failed.push(json!({"name": name, "error": format!("existing view could not be replaced and was left as it was: {err}")}));
-                false
-            }
-            None => true,
-        });
     }
+    // CREATE would only say the view already exists; report why it could not be replaced
+    // (e.g. MySQL ERROR 1227: its DEFINER has SYSTEM_USER and this account does not).
+    pending.retain(|(name, _)| match undroppable.get(name) {
+        Some(err) => {
+            outcome.failed.push(json!({"name": name, "error": format!("existing view could not be replaced and was left as it was: {err}")}));
+            false
+        }
+        None => true,
+    });
 
     // fixpoint 루프: 한 바퀴에 하나도 성공하지 못하면 중단한다.
     let mut last_errors: BTreeMap<String, String> = BTreeMap::new();
@@ -1335,7 +1274,6 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
 /// 전체 진행률 기준선을 한 번에 관통시켜 시그니처 부풀림을 줄인다.
 #[derive(Clone)]
 struct MysqlImportChunkContext<'a> {
-    mode: &'a str,
     timezone_sql: Option<&'a str>,
     table: &'a NormalizedTable,
     table_manifest: &'a DumpTableManifest,
@@ -1343,10 +1281,6 @@ struct MysqlImportChunkContext<'a> {
     request_id: Option<String>,
     overall_rows_before: u64,
     overall_rows_total: u64,
-}
-
-fn may_restart_import_table(mode: &str, completed_attempts: u32) -> bool {
-    matches!(mode, "replace" | "recreate") && completed_attempts < 2
 }
 
 fn import_mysql_tsv_table<F: FnMut(Value)>(
@@ -1375,8 +1309,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         return import_mysql_tsv_table_parallel(endpoint, input_path, threads, ctx, emit);
     }
 
-    // A disconnect can hide a committed LOAD DATA. Only a fresh replacement table
-    // can be cleared and replayed safely; merge must preserve pre-existing rows.
+    // A disconnect can hide a committed LOAD DATA. The table was freshly created by this
+    // import, so it can be cleared and replayed once.
     let mut table_attempt: u32 = 0;
     loop {
         table_attempt += 1;
@@ -1441,7 +1375,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         match retryable_table_error {
             None => return Ok((rows_imported, chunks_imported)),
             Some(err) => {
-                if !may_restart_import_table(ctx.mode, table_attempt) {
+                if table_attempt >= 2 {
                     return Err(err);
                 }
                 emit(json!({
@@ -1455,7 +1389,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     "strategy": "table_restart"
                 }));
                 // 재접속 후 TRUNCATE. 새 세션은 튜닝이 초기화되므로 튜닝 적용된 커넥션으로 교체.
-                *conn = connect_tuned_mysql_import_conn(endpoint, ctx.timezone_sql, ctx.mode)?;
+                *conn = connect_tuned_mysql_import_conn(endpoint, ctx.timezone_sql)?;
                 conn.query_drop(format!(
                     "TRUNCATE TABLE {}",
                     quote_ident("mysql", &ctx.table.name)
@@ -1762,10 +1696,9 @@ fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> 
 /// 새 세션은 항상 튜닝이 초기화되므로, connect 직후 반드시 튜닝을 재적용한다.
 /// 병렬 워커 생성부와 청크 재접속 재시도부에서 공용으로 사용한다 — 그 전에는 병렬
 /// 워커가 어떤 세션 튜닝도 하지 않아 fk_checks/timeout이 누락돼 있었다.
-fn connect_tuned_mysql_import_conn(endpoint: &Endpoint, timezone_sql: Option<&str>, mode: &str) -> Result<mysql::PooledConn, String> {
+fn connect_tuned_mysql_import_conn(endpoint: &Endpoint, timezone_sql: Option<&str>) -> Result<mysql::PooledConn, String> {
     let mut adapter = LiveAdapter::connect(endpoint)?;
     set_mysql_import_session_tuning(&mut adapter, false)?;
-    if mode == "merge" { adapter.execute_sql("SET SESSION foreign_key_checks=1")?; }
     if let Some(sql) = timezone_sql { adapter.execute_sql(sql)?; }
     match adapter {
         LiveAdapter::MySql(conn) => Ok(conn),
@@ -1887,7 +1820,6 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                 chunk_index,
                 ctx.compression.to_string(),
                 ctx.timezone_sql.map(str::to_string),
-                ctx.mode.to_string(),
                 sender.clone(),
             ));
             active += 1;
@@ -1931,7 +1863,6 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                         next_chunk,
                         ctx.compression.to_string(),
                         ctx.timezone_sql.map(str::to_string),
-                        ctx.mode.to_string(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -2001,14 +1932,13 @@ fn spawn_mysql_import_chunk_worker(
     chunk_index: u64,
     compression: String,
     timezone_sql: Option<String>,
-    mode: String,
     sender: mpsc::Sender<ImportChunkEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
             // 워커 커넥션에도 세션 튜닝(fk/unique/sql_mode + timeout)을 적용한다.
             // 이전에는 워커가 튜닝 없이 연결해 fk_checks/timeout이 누락돼 있었다.
-            let mut conn = connect_tuned_mysql_import_conn(&endpoint, timezone_sql.as_deref(), &mode)?;
+            let mut conn = connect_tuned_mysql_import_conn(&endpoint, timezone_sql.as_deref())?;
             let chunk_path = dump_manifest_chunk_path(
                 &input_path,
                 &table_path,
@@ -2269,14 +2199,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_never_restarts_by_truncating_existing_rows() {
-        assert!(!may_restart_import_table("merge", 1));
-        assert!(may_restart_import_table("replace", 1));
-        assert!(may_restart_import_table("recreate", 1));
-        assert!(!may_restart_import_table("replace", 2));
-    }
-
-    #[test]
     fn parallel_import_stops_dispatching_after_first_worker_error() {
         let mut pending = VecDeque::from([3, 4, 5]);
         assert_eq!(next_import_chunk_after_completion(&mut pending, false), Some(3));
@@ -2291,7 +2213,7 @@ mod tests {
         let schema = sample_schema();
         let kept = [SurvivingForeignKey { label: "orders.fk_user -> users".into(), parent: "users".into(), columns: vec![("bigint unsigned".into(), "id".into())] }];
         let mut statements = Vec::new();
-        let err = run_owned_ddl_probe(&schema, "mysql", "mysql", true, &kept, "p", |_| Ok(()), |sql| {
+        let err = run_owned_ddl_probe(&schema, "mysql", "mysql", &kept, "p", |_| Ok(()), |sql| {
             statements.push(sql.to_string());
             // MySQL judges the kept child FK when the parent is created, as in the real replace.
             if sql.starts_with("CREATE TABLE `p_0`") {
@@ -2313,7 +2235,7 @@ mod tests {
         let schema = NormalizedSchema { tables: vec![parent, child] };
         let run = |fail: &str| {
             let mut statements = Vec::new();
-            let result = run_owned_ddl_probe(&schema, "mysql", "mysql", true, &[], "p", |_| Ok(()), |sql| {
+            let result = run_owned_ddl_probe(&schema, "mysql", "mysql", &[], "p", |_| Ok(()), |sql| {
                 statements.push(sql.to_string());
                 if !fail.is_empty() && sql.contains(fail) { Err("denied".into()) } else { Ok(()) }
             });
@@ -2472,6 +2394,22 @@ mod tests {
             let err = dump_import(&Request { command: "dump.import".into(), request_id: None, payload }, |_| {}).unwrap_err();
             fs::remove_dir_all(&dir).unwrap();
             assert!(err.contains(expected), "{defect}: expected {expected}, got {err}");
+        }
+    }
+
+    #[test]
+    fn merge_mode_is_rejected_before_any_report_is_written() {
+        for key in ["mode", "import_mode"] {
+            let dir = std::env::temp_dir().join(format!("tunnelforge-merge-removed-{}-{key}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let payload = json!({ "input_dir": dir.to_string_lossy(), key: "merge", "target": { "engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "", "database": "app" } });
+            let mut events = Vec::new();
+            let err = dump_import(&Request { command: "dump.import".into(), request_id: None, payload }, |event| events.push(event)).unwrap_err();
+            let report_written = dump_import_report_path(&dir).unwrap().exists();
+            fs::remove_dir_all(&dir).unwrap();
+            assert!(err.starts_with("import_plan_invalid:") && err.contains("merge import mode was removed"), "{key}: {err}");
+            assert!(!report_written, "{key}: a refused mode must not leave an import report");
+            assert!(events.is_empty(), "{key}: {events:?}");
         }
     }
     

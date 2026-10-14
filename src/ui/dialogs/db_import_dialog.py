@@ -663,16 +663,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         mode_layout.addWidget(overwrite_description)
         self.btn_import_mode.addButton(self.radio_overwrite)
 
-        # 1. 증분 Import (병합)
-        mode_merge_layout = QVBoxLayout()
-        self.radio_merge = QRadioButton("데이터 추가 Import")
-        mode_merge_desc = QLabel("   기존 행을 유지하고 Dump의 행을 추가합니다.\n   ⚠️ 변경분 동기화가 아니며 중복 또는 제약 조건 오류가 발생할 수 있습니다.")
-        mode_merge_desc.setStyleSheet("color: #7f8c8d; font-size: 10pt; margin-left: 20px;")
-        mode_merge_layout.addWidget(self.radio_merge)
-        mode_merge_layout.addWidget(mode_merge_desc)
-        mode_layout.addLayout(mode_merge_layout)
-
-        # 2. Replace selected tables; failure cannot roll back the whole restore.
+        # Replace selected tables; failure cannot roll back the whole restore.
         mode_replace_layout = QVBoxLayout()
         self.radio_replace = QRadioButton("고급: 전체 교체 Import (선택 테이블 삭제 후 재생성)")
         self.radio_replace.setToolTip("mysqldump처럼 선택한 테이블을 하나씩 삭제한 직후 다시 만듭니다. 실패해도 자동으로 되돌리지 않습니다.")
@@ -686,7 +677,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         mode_replace_layout.addWidget(mode_replace_desc)
         mode_layout.addLayout(mode_replace_layout)
 
-        # 3. Retain the recreate protocol option as an explicit legacy alias.
+        # Retain the recreate protocol option as an explicit legacy alias.
         mode_recreate_layout = QVBoxLayout()
         self.radio_recreate = QRadioButton("고급: 완전 재생성 Import (이전 모드 · 교체와 동일)")
         self.radio_recreate.setToolTip("전체 교체 Import와 동일하게 선택한 테이블만 삭제 후 재생성합니다. 데이터베이스 전체를 삭제하는 모드가 아닙니다.")
@@ -696,7 +687,6 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         mode_recreate_layout.addWidget(mode_recreate_desc)
         mode_layout.addLayout(mode_recreate_layout)
 
-        self.btn_import_mode.addButton(self.radio_merge)
         self.btn_import_mode.addButton(self.radio_replace)
         self.btn_import_mode.addButton(self.radio_recreate)
 
@@ -1086,7 +1076,6 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.chk_use_original.setEnabled(enabled)
         self.combo_target_schema.setEnabled(enabled and not self.chk_use_original.isChecked())
         self.spin_threads.setEnabled(enabled)
-        self.radio_merge.setEnabled(enabled)
         self.radio_safe.setEnabled(enabled)
         self.radio_replace.setEnabled(enabled)
         self.radio_recreate.setEnabled(enabled)
@@ -1150,15 +1139,13 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.chk_use_original.setToolTip("원본 스키마가 기록되지 않았거나 다른 DB 엔진입니다. 대상 데이터베이스/스키마를 직접 선택하세요.")
 
     def _get_selected_import_mode(self) -> str:
-        if self.radio_safe.isChecked():
-            return "safe"
         if self.radio_overwrite.isChecked():
             return "overwrite"
         if self.radio_replace.isChecked():
             return "replace"
         if self.radio_recreate.isChecked():
             return "recreate"
-        return "merge"
+        return "safe"
 
     def _get_import_mode_text(self, import_mode: Optional[str] = None) -> str:
         """선택했거나 실제 실행한 Import 모드의 표시 텍스트 반환"""
@@ -1166,7 +1153,6 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         return {
             "safe": "안전 복원: 새 대상에 복원·검증",
             "overwrite": "덮어쓰기: 검증 후 기존 이름으로 교체",
-            "merge": "데이터 추가 Import",
             "replace": "전체 교체 Import",
             "recreate": "완전 재생성 Import",
         }.get(mode, "확인 불가")

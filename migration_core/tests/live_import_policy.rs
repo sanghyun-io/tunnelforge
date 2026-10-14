@@ -43,6 +43,16 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())
 }
 
+/// Re-declares a column of the dump with a narrower type than its exported values need, so a
+/// replace import creates a table too small for them.
+fn narrow_dump_column(output: &std::path::Path, table: &str, column: &str, type_name: &str) {
+    let path = output.join("_tunnelforge_dump.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let definition = manifest["schema"]["tables"].as_array_mut().unwrap().iter_mut().find(|item| item["name"] == table).unwrap();
+    definition["columns"].as_array_mut().unwrap().iter_mut().find(|item| item["name"] == column).unwrap()["type"] = json!(type_name);
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
 #[test]
 fn mysql_import_preserves_zero_auto_increment_values() {
     let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -85,11 +95,11 @@ fn mysql_import_rejects_silent_value_coercion() {
     let original = conn.query_first("SELECT @@GLOBAL.local_infile").unwrap().unwrap();
     let mut global = GlobalSettings { conn, local_infile: original };
     let mut failures = Vec::new();
-    for (source_type, target_type, value, sentinel) in [
-        ("VARCHAR(20)", "VARCHAR(3)", "'long value'", "'old'"),
-        ("DECIMAL(8,3)", "DECIMAL(8,1)", "12.345", "0"),
-        ("INT", "TINYINT", "1000", "0"),
-        ("ENUM('A','B')", "ENUM('A')", "'B'", "'A'"),
+    for (source_type, target_type, value) in [
+        ("VARCHAR(20)", "varchar(3)", "'long value'"),
+        ("DECIMAL(8,3)", "decimal(8,1)", "12.345"),
+        ("INT", "tinyint", "1000"),
+        ("ENUM('A','B')", "enum('A')", "'B'"),
     ] {
     for (format, local_infile, threads) in [("jsonl", 0, 1), ("tsv", 0, 1), ("tsv", 1, 1), ("tsv", 1, 2)] {
         global.conn.query_drop(format!("SET GLOBAL local_infile={local_infile}")).unwrap();
@@ -99,13 +109,11 @@ fn mysql_import_rejects_silent_value_coercion() {
         let output = std::env::temp_dir().join(unique("tf_coercion"));
         let exported = run("dump.run", json!({"source": endpoint, "tables": [table], "output_dir": output, "data_format": format, "compression": "none", "chunk_size": 1, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
         assert!(success(&exported), "{exported:?}");
-        global.conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-        global.conn.query_drop(format!("CREATE TABLE {table}(id INT PRIMARY KEY, value {target_type}) ENGINE=InnoDB")).unwrap();
-        global.conn.query_drop(format!("INSERT INTO {table} VALUES (99,{sentinel})")).unwrap();
-        let expected: Vec<(u64, String)> = global.conn.query(format!("SELECT id,CAST(value AS CHAR) FROM {table} ORDER BY id")).unwrap();
-        let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "merge", "threads": threads}));
+        narrow_dump_column(&output, &table, "value", target_type);
+        let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "replace", "threads": threads}));
+        // Every exported value overflows the declared type, so no row may be stored.
         let rows: Vec<(u64, String)> = global.conn.query(format!("SELECT id,CAST(value AS CHAR) FROM {table} ORDER BY id")).unwrap();
-        if success(&imported) || rows != expected {
+        if success(&imported) || !rows.is_empty() {
             failures.push(format!("{source_type}->{target_type} {format} local_infile={local_infile} threads={threads}: success={} rows={rows:?}", success(&imported)));
         }
         global.conn.query_drop(format!("DROP TABLE {table}")).unwrap();
@@ -167,15 +175,13 @@ fn mysql_legacy_enum_compatibility_never_allows_unrelated_coercion() {
         let output = std::env::temp_dir().join(unique("tf_enum_mixed"));
         let exported = run("dump.run", json!({"source": endpoint, "tables": [table], "output_dir": output, "data_format": format, "compression": "none", "chunk_size": 100, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
         assert!(success(&exported), "{exported:?}");
-        global.conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-        global.conn.query_drop(format!("CREATE TABLE {table}(id INT PRIMARY KEY, choice ENUM('alpha','beta') NOT NULL, amount DECIMAL(8,1)) ENGINE=InnoDB")).unwrap();
-        global.conn.query_drop(format!("INSERT INTO {table} VALUES(99,'alpha',1.0)")).unwrap();
-        let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "merge", "threads": 1}));
+        narrow_dump_column(&output, &table, "amount", "decimal(8,1)");
+        let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "replace", "threads": 1}));
         let ids: Vec<u64> = global.conn.query(format!("SELECT id FROM {table} ORDER BY id")).unwrap();
         global.conn.query_drop(format!("DROP TABLE {table}")).unwrap();
         std::fs::remove_dir_all(output).unwrap();
         assert!(!success(&imported), "{format}: unrelated decimal truncation was accepted");
-        assert_eq!(ids, [99], "{format}: mixed warning statement was not rolled back");
+        assert!(ids.is_empty(), "{format}: mixed warning statement was not rolled back: {ids:?}");
     }
 }
 
@@ -186,7 +192,7 @@ fn mysql_import_modes_preserve_values_across_load_and_insert_paths() {
     let mut conn = connect(&endpoint);
     let original = conn.query_first("SELECT @@GLOBAL.local_infile").unwrap().unwrap();
     let mut global = GlobalSettings { conn, local_infile: original };
-    for mode in ["replace", "recreate", "merge"] {
+    for mode in ["replace", "recreate"] {
         for (format, local_infile, threads) in [("jsonl", 0, 1), ("tsv", 0, 1), ("tsv", 1, 1), ("tsv", 1, 2)] {
             global.conn.query_drop(format!("SET GLOBAL local_infile={local_infile}")).unwrap();
             let table = unique("tf_modes");
@@ -200,8 +206,7 @@ fn mysql_import_modes_preserve_values_across_load_and_insert_paths() {
             let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": mode, "threads": threads}));
             assert!(success(&imported), "{mode} {format}: {imported:?}");
             let rows: Vec<(u64, String)> = global.conn.query(format!("SELECT id,value FROM {table} ORDER BY id")).unwrap();
-            let mut expected = vec![(1, "한글 😀".into()), (2, "".into())];
-            if mode == "merge" { expected.push((99, "old".into())); }
+            let expected = vec![(1, "한글 😀".into()), (2, "".into())];
             assert_eq!(rows, expected, "{mode} {format} local_infile={local_infile} threads={threads}");
             global.conn.query_drop(format!("DROP TABLE {table}")).unwrap();
             std::fs::remove_dir_all(output).unwrap();
@@ -270,7 +275,7 @@ fn mysql_import_works_for_an_account_without_session_variables_admin() {
     let output = std::env::temp_dir().join(unique("tf_scoped"));
     let exported = run("dump.run", json!({"source": source, "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
     assert!(success(&exported), "{exported:?}");
-    for mode in ["replace", "recreate", "merge"] {
+    for mode in ["replace", "recreate"] {
         root.query_drop(format!("DELETE FROM {db}.child")).unwrap();
         root.query_drop(format!("DELETE FROM {db}.parent")).unwrap();
         let imported = run("dump.import", json!({"target": scoped, "input_dir": output, "mode": mode, "threads": 2}));
@@ -281,40 +286,6 @@ fn mysql_import_works_for_an_account_without_session_variables_admin() {
     root.query_drop(format!("DROP DATABASE {db}")).unwrap();
     root.query_drop(format!("DROP USER '{user}'@'%'")).unwrap();
     std::fs::remove_dir_all(output).unwrap();
-}
-
-#[test]
-fn mysql_merge_enforces_existing_foreign_keys() {
-    let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-    let Some(endpoint) = endpoint() else { return };
-    let mut conn = connect(&endpoint);
-    let original = conn.query_first("SELECT @@GLOBAL.local_infile").unwrap().unwrap();
-    let mut global = GlobalSettings { conn, local_infile: original };
-    let mut failures = Vec::new();
-    for (format, local_infile, threads) in [("jsonl", 0, 1), ("tsv", 0, 1), ("tsv", 1, 1), ("tsv", 1, 2)] {
-        global.conn.query_drop(format!("SET GLOBAL local_infile={local_infile}")).unwrap();
-        let parent = unique("tf_merge_parent");
-        let child = unique("tf_merge_child");
-        global.conn.query_drop(format!("CREATE TABLE {parent}(id INT PRIMARY KEY) ENGINE=InnoDB")).unwrap();
-        global.conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, parent_id INT, FOREIGN KEY(parent_id) REFERENCES {parent}(id)) ENGINE=InnoDB")).unwrap();
-        global.conn.query_drop(format!("INSERT INTO {parent} VALUES(1),(2),(99)")).unwrap();
-        global.conn.query_drop(format!("INSERT INTO {child} VALUES(1,1),(2,2)")).unwrap();
-        let output = std::env::temp_dir().join(unique("tf_merge_fk"));
-        let exported = run("dump.run", json!({"source": endpoint, "tables": [child], "output_dir": output, "data_format": format, "compression": "none", "chunk_size": 1, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
-        assert!(success(&exported), "{exported:?}");
-        global.conn.query_drop(format!("DELETE FROM {child}")).unwrap();
-        global.conn.query_drop(format!("DELETE FROM {parent} WHERE id<>99")).unwrap();
-        global.conn.query_drop(format!("INSERT INTO {child} VALUES(99,99)")).unwrap();
-        let imported = run("dump.import", json!({"target": endpoint, "input_dir": output, "mode": "merge", "threads": threads}));
-        let rows: Vec<(u64,u64)> = global.conn.query(format!("SELECT id,parent_id FROM {child} ORDER BY id")).unwrap();
-        if success(&imported) || rows != vec![(99,99)] {
-            failures.push(format!("{format} local_infile={local_infile} threads={threads}: success={} rows={rows:?}", success(&imported)));
-        }
-        global.conn.query_drop(format!("DROP TABLE {child}")).unwrap();
-        global.conn.query_drop(format!("DROP TABLE {parent}")).unwrap();
-        std::fs::remove_dir_all(output).unwrap();
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
