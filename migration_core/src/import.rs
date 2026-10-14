@@ -552,13 +552,16 @@ fn create_missing_target_namespace<F: FnMut(Value)>(
     let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
     let event = |status: &str| json!({"event":"target_change", "request_id":request_id, "phase":"dump_import_create_namespace",
         "action":action, "status":status, "namespace":name, "report_path":report_path});
-    journal.phase = "dump_import_create_namespace".into();
+    // Only the CREATE itself is reported under this phase; a later connect failure keeps the earlier one.
+    let previous_phase = std::mem::replace(&mut journal.phase, "dump_import_create_namespace".into());
     journal.namespace_creation_outcome_unknown = true;
     journal.checkpoint()?;
     emit(event("started"));
+    // SCHEMATA hides a database the account has no privilege on, and another session may create it meanwhile.
     let context = classified_import_error("target_create_failed",
-        &format!("the target {kind} {name} does not exist and could not be created; no target tables were changed"), None);
+        &format!("the target {kind} {name} was not found (or is not visible to this account) and could not be created; no target tables were changed"), None);
     safe_restore::create_namespace(&mut admin, endpoint, &name, &context)?;
+    journal.phase = previous_phase;
     journal.namespace_created = true;
     journal.namespace_creation_outcome_unknown = false;
     journal.checkpoint()?;

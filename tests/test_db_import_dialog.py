@@ -1680,6 +1680,17 @@ def test_replace_failure_details_name_lost_and_untouched_tables():
     _capture_import_audit(created, {"event": "import_report", "namespace_created": True,
                                     "target": {"engine": "mysql", "schema": "new_db"}})
     assert _replace_failure_details(created) == "이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): new_db"
+    # Tables of a target this import created never held original data.
+    _capture_import_audit(created, {"event": "import_report", "unattempted_tables": ["items"]})
+    assert "아직 만들지 않은 테이블: items" in _replace_failure_details(created)
+    assert "원본 데이터를 유지" not in _replace_failure_details(created)
+    # A CREATE of unknown outcome is named with its PostgreSQL database.
+    unknown = {}
+    _capture_import_audit(unknown, {"event": "import_report", "namespace_created": False,
+                                    "namespace_creation_outcome_unknown": True, "unattempted_tables": ["items"],
+                                    "target": {"engine": "postgresql", "database": "app", "schema": "new_schema"}})
+    assert _replace_failure_details(unknown) == ("아직 만들지 않은 테이블: items\n"
+                                                 "새 대상을 만들었는지 확인하지 못함: app.new_schema")
 
 
 def test_import_unknown_original_namespace_requires_explicit_ui_selection(monkeypatch, tmp_path):

@@ -1055,12 +1055,15 @@ class TestRustDumpImporter:
         assert "broken_view" in msg
         assert "생성 실패" in msg
 
-    @pytest.mark.parametrize(("engine", "created", "expected"), [
-        ("mysql", True, "새 DB app을 만들어 넣었습니다"),
-        ("postgresql", True, "새 스키마 app을 만들어 넣었습니다"),
-        ("mysql", False, None),
+    @pytest.mark.parametrize(("engine", "mode", "created", "expected"), [
+        ("mysql", "replace", True, "새 DB app을 만들어 넣었습니다"),
+        # Without a configured database the core imports into `postgres`; the message says so.
+        ("postgresql", "replace", True, "새 스키마 postgres.app을 만들어 넣었습니다"),
+        ("mysql", "replace", False, None),
+        # A safe restore always creates its candidate; that is not a new target namespace.
+        ("mysql", "safe", True, None),
     ])
-    def test_import_dump_names_a_target_namespace_the_core_created(self, tmp_path, engine, created, expected):
+    def test_import_dump_names_a_target_namespace_the_core_created(self, tmp_path, engine, mode, created, expected):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
 
         dump_dir = tmp_path / 'dump'
@@ -1074,10 +1077,15 @@ class TestRustDumpImporter:
 
         class FakeFacade:
             def import_dump(self, payload, on_event=None):
-                return {"success": True, "tables": 1, "rows_imported": 0, "namespace_created": created}
+                result = {"success": True, "tables": 1, "rows_imported": 0, "namespace_created": created}
+                if mode == "safe":
+                    result.update(status="ready_for_switch", verified=True, original_unchanged=True,
+                                  cutover_pending=True, namespace_existed=True,
+                                  candidate_target={"engine": engine, "database": "app_restore"})
+                return result
 
         config = RustDumpConfig('localhost', 3306, 'root', 'password', engine=engine)
-        success, msg, _results = RustDumpImporter(config, facade=FakeFacade()).import_dump(str(dump_dir), import_mode='replace')
+        success, msg, _results = RustDumpImporter(config, facade=FakeFacade()).import_dump(str(dump_dir), import_mode=mode)
 
         assert success is True
         if expected:

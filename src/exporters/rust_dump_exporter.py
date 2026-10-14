@@ -679,8 +679,11 @@ class RustDumpImporter(_RustDumpClientBase):
             if views_skipped:
                 message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
             if import_mode != "safe" and result.get("namespace_created") is True:
-                kind = "스키마" if self.config.engine == "postgresql" else "DB"
-                message += f"\n새 {kind} {final_target_schema}을 만들어 넣었습니다"
+                if self.config.engine == "postgresql":
+                    # Without a configured database the schema lands in the `postgres` database.
+                    message += f"\n새 스키마 {payload['target']['database']}.{final_target_schema}을 만들어 넣었습니다"
+                else:
+                    message += f"\n새 DB {final_target_schema}을 만들어 넣었습니다"
             for warning in (result.get("verification") or {}).get("warnings", []) or []:
                 warning_line = f"Import warning: {warning}"
                 message += "\n" + warning_line

@@ -508,8 +508,8 @@ pub(crate) fn target_namespace_exists(admin: &mut LiveAdapter, original: &Endpoi
     })
 }
 
-/// CREATE DATABASE (MySQL, with the original's or the server's character set) or CREATE SCHEMA
-/// (PostgreSQL). A failure reads `{context}: {server error}`.
+/// CREATE DATABASE (MySQL, with the original's character set, or utf8mb4 when there is no
+/// original) or CREATE SCHEMA (PostgreSQL). A failure reads `{context}: {error}`.
 pub(crate) fn create_namespace(
     adapter: &mut LiveAdapter,
     original: &Endpoint,
@@ -517,13 +517,19 @@ pub(crate) fn create_namespace(
     context: &str,
 ) -> Result<(), String> {
     if let LiveAdapter::MySql(conn) = adapter {
-        let defaults:Option<(String,String)>=conn.exec_first("SELECT DEFAULT_CHARACTER_SET_NAME,DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?",(&original.database,)).map_err(|e|e.to_string())?;
+        let defaults:Option<(String,String)>=conn.exec_first("SELECT DEFAULT_CHARACTER_SET_NAME,DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?",(&original.database,)).map_err(|e|format!("{context}: {e}"))?;
         let (charset, collation) = match defaults {
             Some(value) => value,
-            None => conn
-                .query_first("SELECT @@character_set_server,@@collation_server")
-                .map_err(|e| e.to_string())?
-                .ok_or("server charset metadata unavailable")?,
+            // Not the server default: cross-engine tables carry no table collation, so on a latin1
+            // server (MySQL 5.7, MariaDB) they would inherit latin1.
+            None => {
+                let server: String = conn
+                    .query_first("SELECT @@collation_server")
+                    .map_err(|e| format!("{context}: {e}"))?
+                    .ok_or_else(|| format!("{context}: server collation metadata unavailable"))?;
+                let collation = if server.starts_with("utf8mb4_") { server } else { "utf8mb4_unicode_ci".into() };
+                ("utf8mb4".to_string(), collation)
+            }
         };
         conn.query_drop(format!(
             "CREATE DATABASE {} CHARACTER SET {} COLLATE {}",

@@ -70,8 +70,14 @@ def _capture_import_audit(audit: dict, event: dict):
             if isinstance(event.get(key), list):
                 audit[key] = event[key]
         target = event.get("target")
-        if event.get("namespace_created") is True and isinstance(target, dict) and isinstance(target.get("schema"), str):
-            audit["created_namespace"] = target["schema"]
+        if isinstance(target, dict) and isinstance(target.get("schema"), str):
+            name = target["schema"]
+            if target.get("engine") == "postgresql" and isinstance(target.get("database"), str):
+                name = f"{target['database']}.{name}"
+            if event.get("namespace_created") is True:
+                audit["created_namespace"] = name
+            if event.get("namespace_creation_outcome_unknown") is True:
+                audit["namespace_outcome_unknown"] = name
 
     if str(event.get("event", "")).startswith("safe_restore") or event.get("candidate_target"):
         for key in ("original_target", "candidate_target"):
@@ -103,7 +109,10 @@ def _replace_failure_details(audit: dict) -> str:
     kept = [name for name in audit.get("unattempted_tables") or [] if isinstance(name, str)]
     if lost:
         lines.append(translate_text("삭제 후 복원되지 않은 테이블: {}").format(_names_preview(lost)))
-    if kept:
+    if kept and (audit.get("created_namespace") or audit.get("namespace_outcome_unknown")):
+        # The target did not exist before this import, so these tables had no original data.
+        lines.append(translate_text("아직 만들지 않은 테이블: {}").format(_names_preview(kept)))
+    elif kept:
         lines.append(translate_text("원본 데이터를 유지한 테이블(미실행): {}").format(_names_preview(kept)))
     # A child that was never dropped (unattempted, or failed before its own DROP)
     # still holds its original rows but lost the FK to an already replaced parent.
@@ -120,6 +129,8 @@ def _replace_failure_details(audit: dict) -> str:
         lines.append(translate_text("다시 연결한 외래 키: {}").format(_names_preview(restored)))
     if audit.get("created_namespace"):
         lines.append(translate_text("이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): {}").format(audit["created_namespace"]))
+    if audit.get("namespace_outcome_unknown"):
+        lines.append(translate_text("새 대상을 만들었는지 확인하지 못함: {}").format(audit["namespace_outcome_unknown"]))
     return "\n".join(lines)
 
 
@@ -594,7 +605,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         target_layout.addWidget(QLabel("대상 스키마:"))
         self.combo_target_schema = QComboBox()
         self.combo_target_schema.setEditable(True)
-        self.combo_target_schema.setToolTip("기존 대상을 선택하거나 새 이름을 입력하세요. 안전 복원은 대상이 없으면 입력한 이름으로 새 대상을 만듭니다.")
+        self.combo_target_schema.setToolTip("기존 대상을 선택하거나 새 이름을 입력하세요. 대상이 없으면 입력한 이름으로 새로 만듭니다.")
         self.combo_target_schema.setMinimumWidth(200)
         self.combo_target_schema.setEnabled(False)
         target_layout.addWidget(self.combo_target_schema)

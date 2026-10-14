@@ -1082,6 +1082,7 @@ fn replace_into_missing_database_creates_it() {
         assert_eq!(report["namespace_creation_outcome_unknown"], false, "{report}");
     }
     assert_eq!(namespace_changes(&first), ["create_database:started", "create_database:completed"]);
+    assert_eq!(import_report(&first)["target"]["schema"], created_db.as_str());
 
     assert!(success(&second), "{second:?}");
     assert_eq!(second.iter().find(|event| event["event"] == "result").unwrap()["namespace_created"], false);
@@ -1091,6 +1092,10 @@ fn replace_into_missing_database_creates_it() {
     assert!(failed_db_kept, "the database created for the failed import was dropped");
     assert_eq!(failed_report["namespace_created"], true, "{failed_report}");
     assert_eq!(failed_report["data_loaded_tables"], json!(["parent"]), "{failed_report}");
+    // The failure window reads the new database's name from the summary event, not the report file.
+    let summary = import_report(&failed);
+    assert_eq!(summary["namespace_created"], true, "{summary}");
+    assert_eq!(summary["target"]["schema"], failed_db.as_str(), "{summary}");
 }
 
 #[test]

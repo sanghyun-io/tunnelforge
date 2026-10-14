@@ -38,8 +38,13 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 
 A `replace` (or `recreate`) import into a MySQL database or PostgreSQL schema
 that does not exist creates it first, after the dump checks and before any table
-work; MySQL uses the server's default character set and collation. This needs
-the CREATE privilege for that database (MySQL) or on the database (PostgreSQL).
+work. A new MySQL database is created as `utf8mb4`, with the server's default
+collation when that is a `utf8mb4` one and `utf8mb4_unicode_ci` otherwise, so
+cross-engine tables (which carry no table collation) never inherit a latin1
+server default; a safe restore into a missing MySQL database does the same.
+This needs the CREATE privilege for that database (MySQL) or on the database
+(PostgreSQL). A database the account cannot see (no privilege on it) counts as
+missing, so its CREATE fails as `target_create_failed`.
 The import report records `namespace_creation_outcome_unknown: true` before the
 CREATE and `namespace_created: true` only after it succeeded, so a failed CREATE
 stays reported as of unknown outcome; `target_change` events (`create_database`
