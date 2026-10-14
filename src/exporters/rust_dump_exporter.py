@@ -575,7 +575,7 @@ CORE_CODE_SENTENCES = {
     "views_outside_snapshot": "뷰 정의는 테이블 데이터와 같은 시점에 담기지 않았습니다.",
     "omitted_object": "내보낼 때 일부 객체가 빠졌습니다.",
     "source_dump_warning": "덤프를 만들 때 남긴 경고가 있습니다.",
-    "not_strict": "이 덤프는 완전한 백업으로 표시되어 있지 않습니다. 내보낼 때의 한계가 그대로 남습니다.",
+    "not_strict": "이 덤프는 내보낼 때 일부를 담지 못했거나, 다 담았는지 확인하지 못했습니다. 이유는 '자세히'에 있습니다.",
     "legacy_timezone": "예전 덤프라 시간대가 기록되어 있지 않습니다. 고른 시간대나 대상 서버 기본값으로 시간을 읽습니다.",
     "legacy_dump": "예전 형식 덤프라 일부 파일의 무결성 정보가 없습니다.",
     "create_privilege_unproven": "대상 DB(스키마)가 없는데 이 계정이 만들 수 있는지 권한 목록으로는 알 수 없습니다.",
@@ -697,7 +697,7 @@ class RustDumpImporter(_RustDumpClientBase):
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, {}
             if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):
-                return False, "이 Rust DB Core는 Import 미리보기를 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요.", {}
+                return False, "Import 엔진이 이 버전보다 오래되어 실행 전 확인을 할 수 없습니다. TunnelForge를 다시 설치하세요.", {}
             return True, "", self.facade.preview_import(payload)
         except DbCoreServiceError as exc:
             self._remember_error_code(exc)

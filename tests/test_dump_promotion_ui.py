@@ -30,6 +30,10 @@ def _stop_window(dialog):
     return boxes[0]
 
 
+def _visible_log(dialog):
+    return "\n".join(dialog.txt_log.item(index).text() for index in range(dialog.txt_log.count()))
+
+
 def test_promotion_facade_uses_explicit_command_and_confirmation_payload():
     client = MagicMock()
     facade = DbCoreFacade(client)
@@ -58,11 +62,14 @@ def test_failed_cutover_does_not_claim_original_unchanged(promotion_dialog, monk
     assert promotion_dialog.import_audit["original_unchanged"] is None
     assert promotion_dialog.import_audit["restore_status"] == "promotion_outcome_unknown"
     assert promotion_dialog.import_success is False
-    assert "미확인" in promotion_dialog.label_status.text()
+    assert promotion_dialog.label_status.text() == "교체 결과를 확인하지 못했습니다 · 원본·백업·복사본 상태를 확인하세요"
+    box = _stop_window(promotion_dialog)
+    assert box.windowTitle() == "교체 결과를 확인하지 못했습니다" and "connection lost" not in box.text()
 
 
 def test_confirmed_unchanged_refusal_preserves_failure_details(promotion_dialog, monkeypatch):
-    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", lambda *args: None)
+    for name in ("question", "warning", "information"):
+        monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
     promotion_dialog._promotion_action = "confirm"
     promotion_dialog._on_promotion_finished(False, "stale plan", {
         "status": "failed_original_unchanged", "original_unchanged": True,
@@ -70,7 +77,13 @@ def test_confirmed_unchanged_refusal_preserves_failure_details(promotion_dialog,
     })
     assert promotion_dialog.import_audit["original_unchanged"] is True
     assert promotion_dialog.import_audit["promotion_result"]["phase"] == "validation"
-    assert "차단" in promotion_dialog.label_status.text()
+    # The original is known to be unchanged: the one stop window, which says the copy is kept and where to clean it up.
+    box = _stop_window(promotion_dialog)
+    assert box.text().startswith("복사본 tf_restore_1에 넣고 검증했지만 다음 이유로 교체하지 않았습니다.")
+    assert "교체 직전에 다시 확인해 보니 교체를 막는 조건이 있었습니다." in box.text() and "stale plan" not in box.text()
+    assert "'복원 백업 관리'에서 정리" in box.text()
+    assert promotion_dialog.label_status.text() == "교체하지 않았습니다 · 원본은 그대로입니다"
+    assert "stale plan" in _visible_log(promotion_dialog)
 
 
 def test_verify_in_copy_stop_shows_the_coded_reason(promotion_dialog, monkeypatch):
@@ -177,16 +190,26 @@ def test_verify_in_copy_swaps_a_clean_plan_without_asking_again(promotion_dialog
     assert promotion_dialog.import_audit["operator_choice"] == "overwrite_confirmed_before_import"
 
 
+_RECHECK = "교체 직전에 다시 확인해 보니 교체를 막는 조건이 있었습니다. 아래 실행 로그에서 확인하세요."
+
+
 @pytest.mark.parametrize("restore_status, plan, reason", [
-    ("ready_for_review", {"can_promote": True, "plan_digest": "d", "blockers": []}, "교체를 막는 다른 조건이 있습니다"),
-    ("ready_for_switch", {"can_promote": False, "plan_digest": "d", "blockers": ["incoming FK"]}, "교체를 막는 다른 조건이 있습니다"),
-    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": ["view dependency"]}, "교체를 막는 다른 조건이 있습니다"),
-    ("ready_for_switch", {"can_promote": True, "plan_digest": "", "blockers": []}, "교체를 막는 다른 조건이 있습니다"),
+    ("ready_for_review", {"can_promote": True, "plan_digest": "d", "blockers": []}, _RECHECK),
+    ("ready_for_switch", {"can_promote": False, "plan_digest": "d", "blockers": ["incoming FK"]}, _RECHECK),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": ["view dependency"]}, _RECHECK),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "", "blockers": []}, _RECHECK),
     ("ready_for_switch", {"can_promote": False, "plan_digest": "d", "blockers": ["x"],
                           "copy_blockers": [{"code": "target_triggers", "table": "users", "detail": "trg"}]},
      "대상 테이블에 트리거가 있어 교체할 수 없습니다. (users)"),
+    # The target changed after the copy was made: copy_blockers alone stop the swap.
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": [],
+                          "copy_blockers": [{"code": "target_triggers", "table": "users", "detail": "trg"}]},
+     "대상 테이블에 트리거가 있어 교체할 수 없습니다. (users)"),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": [],
+                          "copy_blockers": [{"code": "brand_new_code", "table": "users", "detail": "x"}]},
+     "교체를 막는 조건이 있습니다. 아래 실행 로그에서 확인하세요. (users)"),
 ])
-def test_verify_in_copy_not_clean_shows_stop_and_close_only(promotion_dialog, monkeypatch, restore_status, plan, reason):
+def test_verify_in_copy_not_clean_shows_one_stop_window(promotion_dialog, monkeypatch, restore_status, plan, reason):
     for name in ("question", "warning", "information"):
         monkeypatch.setattr(QMessageBox, name, MagicMock(side_effect=AssertionError(f"QMessageBox.{name}")))
     promotion_dialog.import_audit["restore_status"] = restore_status
@@ -194,10 +217,12 @@ def test_verify_in_copy_not_clean_shows_stop_and_close_only(promotion_dialog, mo
     promotion_dialog._on_promotion_finished(True, "planned", {"success": True, **plan})
     promotion_dialog._start_promotion.assert_not_called()
     box = _stop_window(promotion_dialog)
-    assert [button.text() for button in box.buttons()] == ["닫기"]
+    assert sorted(button.text() for button in box.buttons()) == ["닫기", "복원 백업 관리"]
     assert box.text().startswith("복사본 tf_restore_1에 넣고 검증했지만 다음 이유로 교체하지 않았습니다.")
     assert reason in box.text() and "원본은 그대로입니다" in box.text()
     assert "incoming FK" not in box.text() and "view dependency" not in box.text()  # raw core text stays in the log
+    for raw in plan["blockers"]:
+        assert f"교체 차단: {raw}" in _visible_log(promotion_dialog)  # the log the window points to shows it
 
 
 def test_failed_swap_plan_stops_and_explains_without_swapping(promotion_dialog, monkeypatch):
@@ -207,8 +232,9 @@ def test_failed_swap_plan_stops_and_explains_without_swapping(promotion_dialog, 
     promotion_dialog._promotion_action = "plan"
     promotion_dialog._on_promotion_finished(False, "core unavailable", {})
     promotion_dialog._start_promotion.assert_not_called()
-    assert "교체를 막는 다른 조건이 있습니다" in _stop_window(promotion_dialog).text()
+    assert _RECHECK in _stop_window(promotion_dialog).text()
     assert any("core unavailable" in entry for entry in promotion_dialog.log_entries)
+    assert "core unavailable" in _visible_log(promotion_dialog)
 
 
 def test_cancelled_swap_plan_shows_no_window(promotion_dialog, monkeypatch):

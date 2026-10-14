@@ -35,23 +35,25 @@ def _texts(dialog):
 
 
 def test_import_plan_dialog_lists_replace_create_untouched_and_warnings():
-    dialog = _dialog(toggles="켜진 고급 설정: 동시 작업 4개")
+    dialog = _dialog(toggles="적용 중인 고급 설정: 동시 작업 4개")
     try:
         texts = _texts(dialog)
         assert "넣을 곳: 127.0.0.1:3306 / app" in texts and "(새로 만듭니다)" not in texts
-        assert "켜진 고급 설정: 동시 작업 4개" in texts
+        assert "적용 중인 고급 설정: 동시 작업 4개" in texts
         for key, title, names in (("replace", "덮어쓸 테이블 2개 ▸", "users\norders"),
                                   ("create", "새로 만들 테이블 1개 ▸", "audit"),
-                                  ("untouched", "건드리지 않을 테이블 1개 ▸", "notes")):
+                                  ("untouched", "그대로 둘 테이블 1개 (덤프에 없음) ▸", "notes")):
             button, label = dialog.lists[key]
-            assert button.text() == title and label.text() == names and label.isHidden()
+            assert button.text() == title and label.text() == names and not label.isVisibleTo(dialog)
             button.click()
-            assert not label.isHidden()
+            assert label.isVisibleTo(dialog)
         warnings = dialog.label_warnings.text()
-        assert "- 교체하면 사라지는 트리거: users.trg_users" in warnings
+        assert "- 덮어쓰면 사라지는 트리거: users.trg_users" in warnings
         assert "- 이 계정으로 지우지 못할 수 있는 뷰(다른 계정이 만듦): v_users (admin@%)" in warnings
         assert "- 교체 뒤 동작하지 않을 수 있는 뷰: v_notes → users" in warnings
-        assert "- 부모 행과 맞는지 확인하지 않습니다: orders.fk_orders_shops → shops" in warnings
+        assert ("- 덤프에 없는 부모 테이블을 가리키는 외래 키입니다. 부모 테이블에 맞는 행이 있는지는 확인하지 않습니다: "
+                "orders.fk_orders_shops → shops") in warnings
+        assert "덤프에도 대상에도 없는" not in warnings
         # One line per code, in plain Korean; an unknown code gets the general sentence.
         assert warnings.count("같은 시점에 내보내지지 않아") == 1
         assert "뷰 정의는 테이블 데이터와 같은 시점에 담기지 않았습니다." in warnings
@@ -59,7 +61,7 @@ def test_import_plan_dialog_lists_replace_create_untouched_and_warnings():
         assert "independent snapshots" not in warnings and "mystery_code" not in warnings
         # Behind '자세히': kept children, view counts and the core's own text.
         button, details = dialog.details
-        assert details.isHidden()
+        assert not details.isVisibleTo(dialog)
         assert "notes.fk_notes_users → users" in details.text() and "교체할 뷰 1개, 새로 만들 뷰 0개" in details.text()
         assert "mystery_code: a future warning" in details.text()
         assert not hasattr(dialog, "label_blockers") and dialog.btn_execute.isEnabled()
@@ -78,9 +80,52 @@ def test_point_in_time_warning_only_for_unsynchronized_policies():
 def test_legacy_timezone_warning_names_the_choice_or_where_to_make_it():
     preview = {"warnings": [{"code": "legacy_timezone", "detail": "x"}]}
     unchosen = describe_plan(preview, False)
-    assert unchosen["must_see"] is True and "'타임존 직접 정하기'에서 고를 수 있습니다." in unchosen["warnings"][0]
+    assert unchosen["must_see"] is True and unchosen["warnings"] == [
+        "- 예전 덤프라 시간대가 기록되어 있지 않아, 대상 서버의 기본 시간대로 시간을 읽습니다. "
+        "다른 시간대를 쓰려면 고급 설정의 '시간대 직접 정하기'에서 고르세요."]
     chosen = describe_plan(preview, False, "한국 시간(+09:00)")
-    assert chosen["must_see"] is False and chosen["warnings"][0].endswith("고른 시간대: 한국 시간(+09:00)")
+    assert chosen["must_see"] is False and chosen["warnings"] == [
+        "- 예전 덤프라 시간대가 기록되어 있지 않아, 고른 시간대(한국 시간(+09:00))로 시간을 읽습니다."]
+    assert not any("타임존" in line for plan in (unchosen, chosen) for line in plan["warnings"])
+
+
+def test_fk_to_a_parent_missing_everywhere_is_worded_apart():
+    preview = {"external_parents": [
+        {"child": "orders", "constraint": "fk_shop", "parent": "shops", "exists_in_target": True},
+        {"child": "orders", "constraint": "fk_gone", "parent": "gone", "exists_in_target": False}]}
+    warnings = describe_plan(preview, False)["warnings"]
+    assert warnings == [
+        "- 덤프에 없는 부모 테이블을 가리키는 외래 키입니다. 부모 테이블에 맞는 행이 있는지는 확인하지 않습니다: "
+        "orders.fk_shop → shops",
+        "- 가리키는 부모 테이블이 덤프에도 대상에도 없는 외래 키입니다: orders.fk_gone → gone"]
+
+
+def test_not_strict_note_says_what_it_means():
+    notes = describe_plan({"warnings": [{"code": "not_strict", "detail": "triggers unproven"}]}, False)["warnings"]
+    assert notes == ["- 이 덤프는 내보낼 때 일부를 담지 못했거나, 다 담았는지 확인하지 못했습니다. 이유는 '자세히'에 있습니다."]
+
+
+def test_a_long_name_list_scrolls_inside_the_dialog():
+    from PyQt6.QtWidgets import QScrollArea
+    preview = {**PREVIEW, "untouched": [f"t{index}" for index in range(2000)]}
+    dialog = _dialog(preview)
+    try:
+        button, label = dialog.lists["untouched"]
+        area = next(area for area in dialog.findChildren(QScrollArea) if area.widget() is label)
+        assert area.maximumHeight() <= 200 and label.text().count("\n") == 1999
+    finally:
+        dialog.close()
+
+
+def test_production_names_what_to_type_for_the_engine():
+    for engine, word in (("mysql", "DB"), ("postgresql", "스키마")):
+        dialog = _dialog({**PREVIEW, "target": {**PREVIEW["target"], "engine": engine}}, Environment.PRODUCTION)
+        try:
+            texts = _texts(dialog)
+            assert f"계속하려면 <b>{word} 이름을 똑같이 입력</b>하세요:" in texts and "스키마명" not in texts
+            assert dialog.input_schema.placeholderText() == f"{word} 이름 입력"
+        finally:
+            dialog.close()
 
 
 def test_import_plan_dialog_production_requires_typed_name():
@@ -99,11 +144,15 @@ def test_import_plan_dialog_production_requires_typed_name():
     (Environment.PRODUCTION, "운영 환경"), (Environment.STAGING, "스테이징 환경"), (Environment.UNKNOWN, "미분류 환경"),
 ])
 def test_import_plan_dialog_uses_korean_env_and_correct_warning_line(environment, header):
+    no_views = {"replace": [], "create": []}
     for preview, verify, line in (
         (PREVIEW, False, "⚠️ 덮어쓴 테이블은 되돌릴 수 없습니다"),
         (PREVIEW, True, "⚠️ 교체 전 테이블은 백업 DB에 남습니다"),
-        ({**PREVIEW, "replace": [], "target": {"exists": False}}, False, "⚠️ 새로 만들기만 합니다"),
-        ({**PREVIEW, "replace": [], "target": {"exists": False}}, True, "⚠️ 새로 만들기만 합니다"),
+        ({**PREVIEW, "target": {"engine": "postgresql", "exists": True}}, True, "⚠️ 교체 전 테이블은 백업 스키마에 남습니다"),
+        ({**PREVIEW, "replace": [], "views": no_views, "target": {"exists": False}}, False, "⚠️ 새로 만들기만 합니다"),
+        ({**PREVIEW, "replace": [], "views": no_views, "target": {"exists": False}}, True, "⚠️ 새로 만들기만 합니다"),
+        # Only an existing view is replaced: the line does not claim that nothing is overwritten.
+        ({**PREVIEW, "replace": []}, False, "⚠️ 기존 뷰 1개를 바꾸고, 나머지는 새로 만듭니다"),
     ):
         dialog = _dialog(preview, environment, verify)
         try:
@@ -153,9 +202,15 @@ def test_copy_blockers_stop_only_verify_in_copy_and_say_how_to_go_on():
     blockers = describe_plan(preview, True)["blockers"]
     assert blockers == ["- 대상 테이블에 트리거가 있어 교체할 수 없습니다. (users)",
                         "'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."]
+    # Before the run there is no Import report: an unknown code points to '자세히'.
+    unknown = describe_plan({**PREVIEW, "copy_blockers": [{"code": "brand_new_code", "table": "t"}]}, True)["blockers"]
+    assert unknown[0] == "- 복사본에서 검증할 수 없는 다른 이유가 있습니다. '자세히'에서 확인하세요. (t)"
     dialog = _dialog(preview, verify=True)
     try:
         assert not dialog.btn_execute.isEnabled()
+        # Verified in a copy, the old tables go to a backup: "교체", never "덮어쓰기".
+        assert dialog.lists["replace"][0].text() == "교체할 테이블 2개 ▸"
+        assert "- 교체하면 사라지는 트리거: users.trg_users" in dialog.label_warnings.text()
     finally:
         dialog.close()
 

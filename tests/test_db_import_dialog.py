@@ -45,7 +45,8 @@ class _Signal:
             slot(*args)
 
 
-_NOTHING_OVERWRITTEN = {"replace": [], "create": ["users"], "untouched": [], "blockers": [], "warnings": []}
+_NOTHING_OVERWRITTEN = {"dry_run": True, "replace": [], "create": ["users"], "untouched": [], "blockers": [],
+                        "warnings": []}
 
 
 def _fake_plan_dialog(monkeypatch, accept=None):
@@ -65,13 +66,15 @@ def _fake_plan_dialog(monkeypatch, accept=None):
     return shown
 
 
-def _fake_workers(monkeypatch, preview=None, preview_ok=True, preview_message=""):
-    """Replace RustDumpWorker: a preview answers at once; any other task only records itself."""
+def _fake_workers(monkeypatch, preview=None, preview_ok=True, preview_message="", hold_preview=False):
+    """Replace RustDumpWorker: a preview answers at once (``hold_preview``: it keeps running until the
+    test emits its answer); any other task only records itself."""
     created = []
 
     class FakeWorker:
         def __init__(self, task_type, config, **kwargs):
             self.task_type, self.config, self.kwargs, self.started = task_type, config, kwargs, False
+            self.running, self.cancelled = False, False
             for name in ("progress", "table_progress", "detail_progress", "table_status", "raw_output", "import_finished",
                          "finished", "metadata_analyzed", "table_chunk_progress", "preview_finished", "promotion_finished"):
                 setattr(self, name, _Signal())
@@ -80,14 +83,17 @@ def _fake_workers(monkeypatch, preview=None, preview_ok=True, preview_message=""
         def start(self):
             self.started = True
             if self.task_type == "import_preview":
+                if hold_preview:
+                    self.running = True
+                    return
                 self.preview_finished.emit(preview_ok, preview_message,
                                            dict(_NOTHING_OVERWRITTEN) if preview is None else preview)
 
         def isRunning(self):
-            return False
+            return self.running
 
         def cancel(self):
-            pass
+            self.cancelled = True
 
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
     _fake_plan_dialog(monkeypatch)
@@ -1368,8 +1374,8 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
     dialog.save_log()
 
     saved_summary = output_path.read_text(encoding="utf-8").split("상세 로그", 1)[0]
-    assert "Import 모드: 덤프 테이블 교체" in saved_summary
-    assert "Import 모드: 먼저 복사본에서 검증하고 교체" not in saved_summary
+    assert "실행 방식: 덤프 테이블 교체" in saved_summary
+    assert "실행 방식: 먼저 복사본에서 검증하고 교체" not in saved_summary
     assert f"127.0.0.1:{5432 if db_engine == 'postgresql' else 3306}" in saved_summary
     assert Path(dialog_paths[0]).name.startswith("import_log_original_db_failed_")
     assert dialog.worker.kwargs["target_schema"] == "original/db"
@@ -1481,19 +1487,27 @@ def test_import_toggle_payloads(monkeypatch, tmp_path, setup, expected):
         dialog.close()
 
 
-def test_plan_dialog_only_when_a_table_is_overwritten_but_production_always_types_the_name(monkeypatch, tmp_path):
+def test_plan_dialog_only_when_an_existing_table_or_view_is_overwritten(monkeypatch, tmp_path):
+    """F12: the list appears only when the run overwrites something (or must show a blocker or a data
+    warning); otherwise the run starts at once, on production too. A blocker never starts a run."""
     app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
-    for environment, preview, plan_shown in (
-        ("development", _NOTHING_OVERWRITTEN, False),
-        ("staging", _NOTHING_OVERWRITTEN, False),
-        ("development", {**_NOTHING_OVERWRITTEN, "replace": ["users"]}, True),
-        ("production", _NOTHING_OVERWRITTEN, True),
+    for environment, preview, plan_shown, imports in (
+        ("development", _NOTHING_OVERWRITTEN, False, 1),
+        ("staging", _NOTHING_OVERWRITTEN, False, 1),
+        ("production", _NOTHING_OVERWRITTEN, False, 1),
+        ("development", {**_NOTHING_OVERWRITTEN, "replace": ["users"]}, True, 1),
+        ("production", {**_NOTHING_OVERWRITTEN, "replace": ["users"]}, True, 1),
+        # Replacing an existing view overwrites its definition.
+        ("development", {**_NOTHING_OVERWRITTEN, "views": {"replace": ["v_users"], "create": []}}, True, 1),
+        ("development", {**_NOTHING_OVERWRITTEN, "views": {"replace": [], "create": ["v_new"]}}, False, 1),
         # A warning that the data may be off is shown even when nothing is overwritten.
         ("development", {**_NOTHING_OVERWRITTEN, "snapshot_policy": "mysql_parallel_unsynchronized_snapshots",
-                         "warnings": [{"code": "unsynchronized_snapshot", "detail": "x"}]}, True),
-        ("development", {**_NOTHING_OVERWRITTEN, "warnings": [{"code": "views_outside_snapshot", "detail": "x"}]}, False),
-        ("development", {**_NOTHING_OVERWRITTEN, "blockers": [{"code": "no_tables", "table": None, "detail": "x"}]}, True),
+                         "warnings": [{"code": "unsynchronized_snapshot", "detail": "x"}]}, True, 1),
+        ("development", {**_NOTHING_OVERWRITTEN, "warnings": [{"code": "views_outside_snapshot", "detail": "x"}]}, False, 1),
+        # The fake dialog accepts, as a dialog whose start button was enabled by mistake would: nothing starts.
+        ("development", {**_NOTHING_OVERWRITTEN, "blockers": [{"code": "no_tables", "table": None, "detail": "x"}]}, True, 0),
+        ("development", {**_NOTHING_OVERWRITTEN, "blockers": ["a blocker the app cannot read"]}, True, 0),
     ):
         created = _fake_workers(monkeypatch, preview=preview)
         shown = _fake_plan_dialog(monkeypatch, accept=True)
@@ -1502,9 +1516,104 @@ def test_plan_dialog_only_when_a_table_is_overwritten_but_production_always_type
             dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
             dialog.do_import()
             assert bool(shown) is plan_shown, (environment, preview)
-            assert len(_imports(created)) == 1
+            assert len(_imports(created)) == imports, (environment, preview)
         finally:
             dialog.close()
+
+
+@pytest.mark.parametrize("preview", [
+    {**_NOTHING_OVERWRITTEN, "dry_run": None},  # not a preview result at all
+    {key: value for key, value in _NOTHING_OVERWRITTEN.items() if key != "replace"},
+    {**_NOTHING_OVERWRITTEN, "replace": "users"},
+    {**_NOTHING_OVERWRITTEN, "blockers": None},
+    ["not", "a", "dict"],
+])
+def test_unreadable_preview_starts_nothing(monkeypatch, tmp_path, preview):
+    """The one confirmation fails closed: a preview it cannot read is a failed preview, never 'nothing to show'."""
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    created = _fake_workers(monkeypatch, preview=preview)
+    dialog.tunnel_config = {"environment": "development"}
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        assert _imports(created) == []
+        box = _open_failure_window(dialog)
+        assert box.windowTitle() == "Import를 시작하지 않았습니다"
+        assert box.text() == "실행 전 확인 중에 오류가 나서 Import를 시작하지 않았습니다. '자세히'에서 원문을 확인하세요."
+        _click_details(box)
+        assert shown and shown[0].startswith("Import 미리보기 오류: unexpected preview result")
+    finally:
+        dialog.close()
+
+
+def test_rerun_while_the_preview_runs_starts_no_second_run(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    created = _fake_workers(monkeypatch, hold_preview=True)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.on_import_finished(False, "x", {"a": {"status": "error"}})  # an earlier failure shows the rerun button
+        assert not dialog.btn_rerun.isHidden()
+        dialog.btn_rerun.click()
+        assert not dialog.btn_rerun.isEnabled()
+        dialog.btn_rerun.click()
+        dialog.do_import()  # even a direct call waits for the running preview
+        assert [worker.task_type for worker in created] == ["import_preview"]
+        preview = created[0]
+        # A late answer of an earlier preview is dropped.
+        monkeypatch.setattr(dialog, "sender", lambda: object())
+        preview.preview_finished.emit(True, "", dict(_NOTHING_OVERWRITTEN))
+        assert _imports(created) == [] and dialog._previewing
+        monkeypatch.setattr(dialog, "sender", lambda: preview)
+        preview.running = False
+        preview.preview_finished.emit(True, "", dict(_NOTHING_OVERWRITTEN))
+        assert len(_imports(created)) == 1
+    finally:
+        dialog._job_id = None
+        dialog.close()
+
+
+def test_closing_during_the_preview_stops_it_without_asking(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    monkeypatch.setattr(QMessageBox, "question", MagicMock(side_effect=AssertionError("the read-only check asks nothing")))
+    scheduled = []
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QTimer.singleShot", lambda delay, callback: scheduled.append(callback))
+    created = _fake_workers(monkeypatch, hold_preview=True)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        preview = created[0]
+        dialog.close()
+        assert preview.cancelled and dialog._cancel_requested and dialog._close_after_cancel
+        preview.running = False
+        preview.preview_finished.emit(False, "작업이 취소되었습니다.", {})
+        assert _imports(created) == [] and scheduled == [dialog.close]
+    finally:
+        dialog.close()
+
+
+def test_a_preview_answer_after_the_window_closed_starts_nothing(monkeypatch, tmp_path):
+    """The thread ended (success already sent) just before the window closed: no plan dialog, no replace."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QTimer.singleShot", lambda delay, callback: None)
+    created = _fake_workers(monkeypatch, hold_preview=True)
+    _fake_plan_dialog(monkeypatch)  # fails the test if shown
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        preview = created[0]
+        preview.running = False
+        dialog.close()  # the thread already ended: the window closes at once
+        assert dialog._close_after_cancel
+        preview.preview_finished.emit(True, "", {**_NOTHING_OVERWRITTEN, "replace": ["users"]})
+        assert _imports(created) == []
+    finally:
+        dialog.close()
 
 
 def test_import_preview_failure_never_starts_import(monkeypatch, tmp_path):
@@ -1549,7 +1658,7 @@ def test_preview_refused_without_core_capability_starts_no_worker(monkeypatch, t
     try:
         dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
         dialog.do_import()
-        assert shown == ["이 Rust DB Core는 Import 미리보기를 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요."]
+        assert shown == ["Import 엔진이 이 버전보다 오래되어 실행 전 확인을 할 수 없습니다. TunnelForge를 다시 설치하세요."]
         assert dialog.last_import_mode == "" and dialog.btn_import.isEnabled()
     finally:
         dialog.close()
@@ -1571,10 +1680,17 @@ def test_import_default_description_discloses_per_table_replace_and_no_rollback(
     descriptions = "\n".join(label.text() for label in dialog.findChildren(QLabel))
     assert "하나씩 지우고 다시 만들어" in descriptions
     assert "덤프에 없는 테이블은 그대로" in descriptions
-    assert "되돌리지 않습니다" in descriptions
-    for visible in (descriptions, dialog.chk_verify_copy.text(), dialog.chk_other_name.text()):
+    assert "이미 덮어쓴 테이블은 되돌리지 않고, 작업 중이던 테이블은 비어 있을 수 있습니다" in descriptions
+    # Verify-in-copy leaves the original alone: the line under the target says so instead.
+    dialog.chk_verify_copy.setChecked(True)
+    verify = dialog.lbl_mode_description.text()
+    assert verify.startswith("덤프를 먼저 복사본 DB에 넣어 검증하고") and "원본은 그대로입니다" in verify
+    assert "지우고" not in verify
+    for visible in (descriptions, verify, dialog.chk_verify_copy.text(), dialog.chk_other_name.text()):
         for jargon in ("preflight", "manifest", "namespace", "replace 모드", "safe restore", "안전 복원"):
             assert jargon not in visible
+    dialog.chk_verify_copy.setChecked(False)
+    assert "하나씩 지우고" in dialog.lbl_mode_description.text()
     dialog.close()
 
 
@@ -1638,11 +1754,15 @@ def test_forced_name_field_is_on_main_line(monkeypatch, tmp_path):
         assert not dialog.combo_target_schema.isHidden() and dialog.combo_target_schema.isEditable()
         assert not dialog.advanced_panel.isAncestorOf(dialog.combo_target_schema)
         assert dialog.lbl_target_name.isHidden()
-        assert dialog.lbl_advanced_summary.text().startswith("켜진 고급 설정: 다른 DB 이름(")
+        # The main line says why the name field appeared; the field starts empty.
+        assert not dialog.lbl_name_forced.isHidden()
+        assert dialog.lbl_name_forced.text() == "이 덤프에는 여기서 쓸 DB 이름이 없어 직접 정해야 합니다."
+        assert dialog.combo_target_schema.currentText() == ""
+        assert dialog.lbl_advanced_summary.text() == "적용 중인 고급 설정: 다른 DB 이름(입력 필요)"
         # Another engine's dump cannot be verified in a copy either, and the panel says why.
         assert not dialog.chk_verify_copy.isEnabled() and not dialog.lbl_verify_note.isHidden()
         dialog.do_import()
-        assert warnings == ["원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요."] and created == []
+        assert warnings == ["넣을 DB 이름을 정할 수 없습니다. '넣을 곳'에 DB 이름을 입력하세요."] and created == []
         dialog.combo_target_schema.setCurrentText("typed")
         dialog.do_import()
         assert _imports(created)[0].kwargs["target_schema"] == "typed"
@@ -1653,6 +1773,30 @@ def test_forced_name_field_is_on_main_line(monkeypatch, tmp_path):
         assert not dialog.chk_other_name.isChecked() and dialog.chk_other_name.isEnabled()
         assert dialog.combo_target_schema.isHidden() and dialog.lbl_target_name.text() == "app"
         assert dialog.chk_verify_copy.isEnabled() and dialog.lbl_verify_note.isHidden()
+        assert dialog.lbl_name_forced.isHidden()
+    finally:
+        dialog.close()
+
+
+def test_other_name_field_starts_empty_even_with_existing_databases(monkeypatch, tmp_path):
+    """The name list holds the server's DBs, but none is picked for the user: an unchanged field starts nothing."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text: warnings.append(text))
+    created = _fake_workers(monkeypatch)
+    connector = MagicMock(host="127.0.0.1", port=3306, user="root", password="pw", engine="mysql")
+    connector.get_schemas.return_value = ["first_db", "second_db"]
+    dialog = RustDumpImportDialog(connector=connector, tunnel_config={"environment": "development"})
+    try:
+        assert dialog.combo_target_schema.count() == 2 and dialog.combo_target_schema.currentText() == ""
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog._update_target_options()
+        dialog.combo_target_schema.setCurrentIndex(1)
+        dialog.chk_other_name.setChecked(True)  # turning it on clears anything left in the field
+        assert dialog.combo_target_schema.currentText() == ""
+        dialog.do_import()
+        assert warnings == ["넣을 DB 이름을 입력하세요."] and created == []
     finally:
         dialog.close()
 
@@ -1672,7 +1816,7 @@ def test_timezone_toggle_disabled_for_dump_with_source_timezone(monkeypatch, tmp
         dialog._update_target_options()
         assert not dialog.chk_timezone.isEnabled() and not dialog.chk_timezone.isChecked()
         assert not dialog.combo_timezone.isEnabled()
-        assert dialog.lbl_timezone_note.text() == "이 덤프는 시간대가 기록되어 있어 그대로 씁니다."
+        assert dialog.lbl_timezone_note.text() == "이 덤프에는 시간대가 기록되어 있어 그대로 씁니다."
         assert not dialog.lbl_timezone_note.isHidden()
     finally:
         dialog.close()
@@ -1692,7 +1836,7 @@ def test_advanced_summary_lists_active_toggles(monkeypatch, tmp_path):
         dialog.chk_timezone.setChecked(True)
         dialog.spin_threads.setValue(4)
         assert dialog.lbl_advanced_summary.text() == (
-            "켜진 고급 설정: 다른 DB 이름(abc), 먼저 복사본에서 검증, 타임존 한국 시간(+09:00), 동시 작업 4개")
+            "적용 중인 고급 설정: 다른 DB 이름(abc), 먼저 복사본에서 검증, 시간대 한국 시간(+09:00), 동시 작업 4개")
         dialog._toggle_advanced_options()
         assert not dialog.advanced_panel.isHidden() and dialog.btn_advanced.text() == "고급 설정 닫기"
     finally:
@@ -1760,8 +1904,9 @@ def test_verified_copy_swaps_or_stops_without_any_handoff_button(monkeypatch, re
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QTimer.singleShot", lambda delay, callback: scheduled.append(callback))
     dialog = RustDumpImportDialog()
     try:
-        for removed in ("btn_copy_restore_target", "btn_review_restore", "btn_manage_backups"):
+        for removed in ("btn_copy_restore_target", "btn_review_restore"):
             assert not hasattr(dialog, removed)
+        assert dialog.btn_manage_backups.isHidden()  # only after a run that made a copy
         dialog.last_import_mode = "safe"
         dialog.on_raw_output(json.dumps({
             "event": "safe_restore_ready", "status": restore_status, "verified": True,
@@ -1771,15 +1916,52 @@ def test_verified_copy_swaps_or_stops_without_any_handoff_button(monkeypatch, re
                                  "password": "private", "user": "private-user"},
         }))
         dialog.on_finished(True, "candidate ready")
+        assert not dialog.btn_manage_backups.isHidden()  # the copy can be cleaned up from this window too
         if restore_status == "ready_for_switch":
             assert scheduled == [dialog._plan_promotion]  # the swap follows without asking again
         else:
             assert scheduled == []
             box = _open_failure_window(dialog)
-            assert [button.text() for button in box.buttons()] == ["닫기"]
+            assert sorted(button.text() for button in box.buttons()) == ["닫기", "복원 백업 관리"]
             assert box.text().startswith("복사본 candidate에 넣고 검증했지만 다음 이유로 교체하지 않았습니다.")
-            assert "작업 목록 > 복원 백업 관리" in box.text() and "private" not in box.text()
+            assert "'복원 백업 관리'에서 정리" in box.text() and "private" not in box.text()
             assert dialog.label_status.text() == "교체하지 않았습니다 · 원본은 그대로입니다"
+    finally:
+        dialog.close()
+
+
+def test_backup_management_opens_with_this_sessions_credentials(monkeypatch, tmp_path):
+    """A main-menu Import has no saved profile: the stop window and the dialog's button still open it."""
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    opened = []
+
+    class FakeBackups:
+        def __init__(self, target, dirs, parent):
+            opened.append((target, dirs))
+
+        def refresh(self):
+            pass
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.BackupLifecycleDialog", FakeBackups)
+    dialog = RustDumpImportDialog()
+    try:
+        dialog.restore_config = RustDumpConfig("127.0.0.1", 3306, "session-user", "session-pw")
+        dialog.import_audit = {"report_path": str(tmp_path / "_tunnelforge_import_report_1.json"),
+                               "candidate_created": True, "namespace_existed": True,
+                               "original_target": {"engine": "mysql", "host": "127.0.0.1", "port": 3306, "database": "app"},
+                               "candidate_target": {"engine": "mysql", "database": "tf_restore_1"}}
+        dialog._stop_and_explain(["- x"])
+        box = _open_failure_window(dialog)
+        next(button for button in box.buttons() if button.text() == "복원 백업 관리").click()
+        target, dirs = opened[0]
+        assert target["user"] == "session-user" and target["password"] == "session-pw" and target["database"] == "app"
+        assert dirs == [str(tmp_path)]
+        dialog.btn_manage_backups.click()
+        assert len(opened) == 2
     finally:
         dialog.close()
 
@@ -1816,14 +1998,15 @@ def test_import_success_has_no_modal(monkeypatch, engine):
         dialog.last_import_mode = "replace"
         dialog.import_results = {"users": {"status": "done"}, "orders": {"status": "done"}}
         dialog.on_finished(True, "Rust DB Core import 완료")
-        assert dialog.label_status.text() == "✅ 덤프 테이블 2개를 교체했습니다"
-        assert dialog.txt_log.item(dialog.txt_log.count() - 1).text() == "✅ 덤프 테이블 2개를 교체했습니다"
+        # Every dump table counts, overwritten or new: "넣었습니다", never "교체했습니다".
+        assert dialog.label_status.text() == "✅ 덤프 테이블 2개를 넣었습니다"
+        assert dialog.txt_log.item(dialog.txt_log.count() - 1).text() == "✅ 덤프 테이블 2개를 넣었습니다"
 
         name = "app" if engine == "mysql" else "appdb.app"
         kind = "DB" if engine == "mysql" else "스키마"
         dialog.import_audit = {"created_namespace": name}
         dialog.on_finished(True, "Rust DB Core import 완료")
-        assert dialog.label_status.text() == f"✅ 새 {kind} {name}을 만들어 넣었습니다"
+        assert dialog.label_status.text() == f"✅ 새 {kind}를 만들어 넣었습니다: {name}"
 
         dialog.last_import_mode = "safe"
         dialog.import_audit = {"restore_status": "completed_new_target", "namespace_existed": False,
@@ -1832,11 +2015,12 @@ def test_import_success_has_no_modal(monkeypatch, engine):
                                "candidate_target": {"engine": engine, "database": "appdb" if engine == "postgresql" else "app",
                                                     "schema": "app"}}
         dialog.on_finished(True, "verified")
-        assert dialog.label_status.text() == f"✅ 새 {kind} {name}을 만들어 넣었습니다"
+        assert dialog.label_status.text() == f"✅ 새 {kind}를 만들어 넣었습니다: {name}"
 
         dialog._promotion_action = "confirm"
+        dialog.import_audit["original_target"] = {"engine": engine, "database": "app"}
         dialog._on_promotion_finished(True, "", {"status": "promoted", "backup_namespace": "tf_backup_1"})
-        assert dialog.label_status.text() == "✅ 교체했습니다. 이전 테이블은 tf_backup_1에 있습니다"
+        assert dialog.label_status.text() == f"✅ 교체했습니다. 이전 테이블은 백업 {kind} tf_backup_1에 있습니다"
     finally:
         dialog.close()
 
@@ -1922,7 +2106,7 @@ def test_import_stop_button_cancels_without_closing_and_shows_final_status_and_r
         app.processEvents()
 
         assert closed == [], "stopping keeps the dialog open"
-        assert dialog.label_status.text().startswith("⏹ Import 취소됨")
+        assert dialog.label_status.text().startswith("⏹ Import 중지됨")
         assert dialog.btn_stop.isHidden()
         assert not dialog.label_report_link.isHidden()
         assert report.name in dialog.label_report_link.text()
@@ -1959,6 +2143,33 @@ def _stop_test_dialog(monkeypatch):
     return dialog
 
 
+@pytest.mark.parametrize("mode, action, expected", [
+    ("replace", "", "이미 덮어쓴 테이블은 되돌리지 않고, 작업 중이던 테이블은 비어 있을 수 있습니다"),
+    ("safe", "", "복사본에 넣는 중입니다. 지금 중지해도 원본은 그대로입니다."),
+    ("safe", "confirm", "교체하는 중입니다. 지금 중지하면 교체가 끝났는지 알 수 없게 될 수 있습니다."),
+    ("safe", "plan", None),  # the check before the swap only reads: it stops without asking
+])
+def test_stop_question_says_what_stopping_leaves_behind(monkeypatch, mode, action, expected):
+    asked = []
+    dialog = _stop_test_dialog(monkeypatch)
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda parent, title, text, *a, **k: asked.append(text) or QMessageBox.StandardButton.Yes)
+    try:
+        dialog.worker = MagicMock()
+        dialog.worker.isRunning.return_value = True
+        dialog.last_import_mode, dialog._promotion_action = mode, action
+        assert dialog.request_stop() is True
+        dialog.worker.cancel.assert_called_once_with()
+        if expected is None:
+            assert asked == []
+        else:
+            assert len(asked) == 1 and expected in asked[0] and asked[0].endswith("중지하시겠습니까?")
+            assert "Rust DB Core" not in asked[0] and "취소" not in asked[0]
+    finally:
+        dialog.worker = None
+        type(dialog).close(dialog)
+
+
 def test_stopped_safe_import_shows_stopped_status_not_safe_restore_failure(monkeypatch):
     from datetime import datetime as _dt
     dialog = _stop_test_dialog(monkeypatch)
@@ -1969,7 +2180,7 @@ def test_stopped_safe_import_shows_stopped_status_not_safe_restore_failure(monke
         dialog.import_results = {"a": {"status": "done"}, "b": {"status": "blocked"}}
         dialog._cancel_requested = True
         dialog.on_finished(False, "cancelled")
-        assert dialog.label_status.text().startswith("⏹ Import 취소됨")
+        assert dialog.label_status.text().startswith("⏹ Import 중지됨")
     finally:
         dialog.worker = None
         type(dialog).close(dialog)
@@ -2027,10 +2238,10 @@ def test_promotion_plan_step_has_no_stop_button_and_cutover_stop_shows_stopped_s
         dialog.import_audit["report_path"] = str(report)
         dialog._cancel_requested = True
         dialog._on_promotion_finished(False, "cancelled", {"original_unchanged": False})
-        assert dialog.label_status.text().startswith("⏹ 전환 중지됨")
+        assert dialog.label_status.text().startswith("⏹ 교체 중지됨 · 원본·백업·복사본 상태")
         assert not dialog.label_report_link.isHidden()
         dialog._on_promotion_finished(False, "cancelled", {"original_unchanged": True})
-        assert dialog.label_status.text() == "⏹ 전환 중지됨 · 원본 미변경"
+        assert dialog.label_status.text() == "⏹ 교체 중지됨 · 원본은 그대로입니다"
     finally:
         dialog.worker = None
         type(dialog).close(dialog)
@@ -2112,6 +2323,29 @@ def test_import_failure_before_any_table_words_every_code(monkeypatch):
         dialog.close()
 
 
+def test_an_uncoded_core_failure_keeps_its_raw_text_behind_details(monkeypatch, tmp_path):
+    dialog, shown = _failure_test_dialog(monkeypatch)
+    raw = "Rust DB Core import 오류: unexpected end of stream"
+    try:
+        dialog.last_import_mode = "replace"
+        dialog.import_results = {"orders": {"status": "pending"}}
+        dialog.on_finished(False, raw)
+        box = _open_failure_window(dialog)
+        assert box.text() == "❌ Import 중에 오류가 나서 멈췄습니다. '자세히'에서 원문을 확인하세요."
+        _click_details(box)
+        assert shown == [raw]
+        box.close()
+
+        created = _fake_workers(monkeypatch, preview_ok=False, preview_message="Rust DB Core import 미리보기 오류: boom")
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.do_import()
+        assert _imports(created) == []
+        box = _open_failure_window(dialog)
+        assert box.text() == "실행 전 확인 중에 오류가 나서 Import를 시작하지 않았습니다. '자세히'에서 원문을 확인하세요."
+    finally:
+        dialog.close()
+
+
 def test_safe_restore_failure_passes_core_reason_through(monkeypatch, tmp_path):
     from src.exporters.rust_dump_exporter import RustDumpImporter
 
@@ -2148,9 +2382,9 @@ def test_safe_restore_failure_passes_core_reason_through(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(("namespace_existed", "report_write_failed", "copy_left"), [
-    (True, False, "이번 복원에서 만든 복사본(지우지 않고 남겨 둠): tf_restore_1"),
+    (True, False, "이번 Import에서 만든 복사본(지우지 않고 남겨 둠): tf_restore_1"),
     # Without a target, the copy is the requested database itself.
-    (False, True, "이번 복원에서 새로 만든 대상(일부만 들어갔을 수 있음, 지우지 않고 남겨 둠): app"),
+    (False, True, "이번 Import에서 새로 만든 대상(일부만 들어갔을 수 있음, 지우지 않고 남겨 둠): app"),
 ])
 def test_safe_restore_failure_names_the_copy_it_left(monkeypatch, tmp_path, namespace_existed, report_write_failed,
                                                     copy_left):

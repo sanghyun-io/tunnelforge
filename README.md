@@ -56,7 +56,7 @@ Questions or ideas: [Discussions](https://github.com/sanghyun-io/tunnelforge/dis
 | 🔁 | **Transaction Mode** | Manual commit/rollback with a running list of pending, uncommitted changes. |
 | ✏️ | **Inline Cell Editing** | Edit query results directly in the grid — updates are scoped safely by primary key. |
 | 🕘 | **Query History** | Revisit and re-run past queries. |
-| 🛡️ | **Production Guard** | Production profiles open SQL sessions read-only by default; unlock a window by typing the schema name, and review a change summary before commit. Export/Import/migration keep their confirmation prompts. See [production read-only sessions](docs/production_read_only.md). |
+| 🛡️ | **Production Guard** | Production profiles open SQL sessions read-only by default; unlock a window by typing the schema name, and review a change summary before commit. On a production profile, an Import that overwrites existing tables starts only after the name is typed; Export and migration keep their confirmation prompts. See [production read-only sessions](docs/production_read_only.md). |
 | ⏹️ | **Query Cancel & Timeout** | Server-side cancel and timeout for running queries, with row and byte limits on results. |
 | 🌊 | **Streaming Result Grid** | Results stream into the grid while the query is still running. |
 | 💾 | **Save Results** | Save results to CSV or JSON Lines — the shown rows or the full result. See [saving results](docs/query_results_export.md). |

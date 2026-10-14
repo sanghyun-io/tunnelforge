@@ -25,7 +25,7 @@ from src.core.error_report_sanitizer import (
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component
-from src.core.production_guard import Environment, ProductionGuard
+from src.core.production_guard import ProductionGuard
 from src.exporters.rust_dump_exporter import (
     DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure,
     dump_original_namespace, restore_target_connection_info,
@@ -37,7 +37,10 @@ from src.ui.workers.error_reporting_worker import (
     report_operation_error,
     sanitize_local_diagnostic_json,
 )
-from src.ui.dialogs.job_recording import begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job, record_import_report
+from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
+from src.ui.dialogs.job_recording import (
+    begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job, made_copy, record_import_report,
+)
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
@@ -146,8 +149,8 @@ def _safe_copy_left(audit: dict) -> str:
     name = _namespace_name(audit.get("candidate_target"))
     if audit.get("namespace_existed") is False:
         # The copy is the requested target itself, under its own name.
-        return translate_text("이번 복원에서 새로 만든 대상(일부만 들어갔을 수 있음, 지우지 않고 남겨 둠): {}").format(name)
-    return translate_text("이번 복원에서 만든 복사본(지우지 않고 남겨 둠): {}").format(name)
+        return translate_text("이번 Import에서 새로 만든 대상(일부만 들어갔을 수 있음, 지우지 않고 남겨 둠): {}").format(name)
+    return translate_text("이번 Import에서 만든 복사본(지우지 않고 남겨 둠): {}").format(name)
 
 
 # Remembered between runs (F5). The other name and the timezone are never remembered: a wrong one
@@ -162,8 +165,28 @@ def _mode_text(mode: str) -> str:
 
 
 # A verified copy the core still wants reviewed (ready_for_review) is never swapped.
-_REVIEW_REASON = "대상에 덤프로 옮길 수 없는 객체가 있어, 교체 뒤에도 그대로 남는지 확인할 수 없습니다."
-_PLAN_BLOCKED_REASON = "교체를 막는 다른 조건이 있습니다. Import 보고서에서 확인하세요."
+_REVIEW_REASON = "대상에 덤프에 담을 수 없는 객체가 있어, 교체한 뒤에도 그대로 남는지 확인할 수 없습니다."
+# The core's promote-plan reasons reach only the run log, not the Import report.
+_PLAN_BLOCKED_REASON = "교체 직전에 다시 확인해 보니 교체를 막는 조건이 있었습니다. 아래 실행 로그에서 확인하세요."
+_PLAN_BLOCKED_UNKNOWN = "교체를 막는 조건이 있습니다. 아래 실행 로그에서 확인하세요."
+# A failure the core sent without a code: the window says so, the raw text opens from '자세히'.
+_UNCODED_FAILURE_PREFIXES = ("Rust DB Core import 미리보기 오류:", "Import 미리보기 오류:",
+                             "Rust DB Core import 오류:", "Import 오류:")
+
+
+def _is_uncoded_core_failure(message: str) -> bool:
+    return str(message).startswith(_UNCODED_FAILURE_PREFIXES)
+
+
+def _is_preview(preview: object) -> bool:
+    """A dump.import_preview result the plan dialog can read; anything else starts nothing (fail closed)."""
+    return (isinstance(preview, dict) and preview.get("dry_run") is True
+            and all(isinstance(preview.get(key), list) for key in ("replace", "create", "blockers")))
+
+
+def _engine_word(engine: str) -> str:
+    """What the user calls the place the tables go: a MySQL DB or a PostgreSQL schema."""
+    return "스키마" if engine == "postgresql" else "DB"
 
 
 _IMPORT_TELEMETRY_NUMERIC_FIELDS = {
@@ -286,7 +309,7 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
         return (
             data_label,
             speed_label,
-            "🔄 현재 단계: 최종 스키마 전환 중 · 데이터 Import 완료, 후처리 진행 중",
+            "🔄 현재 단계: 마무리 교체 중 · 데이터 Import 완료",
         )
 
     if chunks_done and chunks_total:
@@ -536,11 +559,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         return status_group
 
     def _build_input_dir_group(self):
-        input_group = QGroupBox("Dump 폴더")
+        input_group = QGroupBox("덤프 폴더")
         input_layout = QHBoxLayout(input_group)
 
         self.input_dir = QLineEdit()
-        self.input_dir.setPlaceholderText("rust_dump dump 폴더 선택...")
+        self.input_dir.setPlaceholderText("Export로 만든 덤프 폴더를 고르세요")
         self.input_dir.editingFinished.connect(self._run_upgrade_check_for_current_input_dir)
 
         self.btn_browse = QPushButton("선택")
@@ -562,7 +585,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         upgrade_check_layout = QVBoxLayout(self.upgrade_check_group)
 
         status_line = QHBoxLayout()
-        self.lbl_upgrade_status = QLabel("📋 Dump 폴더를 선택하면 자동 검사됩니다.")
+        self.lbl_upgrade_status = QLabel("📋 덤프 폴더를 고르면 자동으로 검사합니다.")
         self.lbl_upgrade_status.setStyleSheet("color: #7f8c8d;")
         status_line.addWidget(self.lbl_upgrade_status)
         status_line.addStretch()
@@ -598,7 +621,6 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # the dump does not name its own DB (another engine, or an old dump).
         self.combo_target_schema = QComboBox()
         self.combo_target_schema.setEditable(True)
-        self.combo_target_schema.setToolTip("기존 대상을 선택하거나 새 이름을 입력하세요. 대상이 없으면 입력한 이름으로 새로 만듭니다.")
         self.combo_target_schema.setMinimumWidth(200)
         self.combo_target_schema.setVisible(False)
         self.combo_target_schema.currentTextChanged.connect(self._update_advanced_summary)
@@ -607,12 +629,17 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         target_line.addWidget(self.combo_target_schema)
         target_line.addStretch()
         target_layout.addLayout(target_line)
+        # Why the name field appeared without the toggle: the dump names no DB of this engine.
+        self.lbl_name_forced = QLabel()
+        self.lbl_name_forced.setStyleSheet("color: #b45309;")
+        self.lbl_name_forced.setVisible(False)
+        target_layout.addWidget(self.lbl_name_forced)
 
-        description = QLabel("덤프의 테이블을 하나씩 지우고 다시 만들어 넣습니다. 덤프에 없는 테이블은 그대로 둡니다. "
-                             "중간에 멈추면 이미 바꾼 테이블은 되돌리지 않습니다.")
-        description.setWordWrap(True)
-        description.setStyleSheet("color: #7f8c8d;")
-        target_layout.addWidget(description)
+        # Follows the verify-in-copy toggle (_update_advanced_summary).
+        self.lbl_mode_description = QLabel()
+        self.lbl_mode_description.setWordWrap(True)
+        self.lbl_mode_description.setStyleSheet("color: #7f8c8d;")
+        target_layout.addWidget(self.lbl_mode_description)
         return target_group
 
     def _build_advanced_section(self):
@@ -635,13 +662,12 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         panel_layout = QVBoxLayout(self.advanced_panel)
 
         self.chk_other_name = QCheckBox("다른 DB 이름으로 넣기")
-        self.chk_other_name.setToolTip("덤프에 적힌 원래 이름 대신 직접 정한 이름에 넣습니다. 없는 이름이면 새로 만듭니다.")
-        self.chk_other_name.toggled.connect(self._refresh_target_line)
+        self.chk_other_name.toggled.connect(self._on_other_name_toggled)
         panel_layout.addWidget(self.chk_other_name)
 
         self.chk_verify_copy = QCheckBox(VERIFY_TOGGLE_TEXT)
-        self.chk_verify_copy.setToolTip("덤프를 먼저 새 복사본 DB에 넣어 검증하고, 문제가 없을 때만 원래 이름과 바꿉니다. "
-                                        "바꾸기 전 테이블은 백업 DB에 남습니다.")
+        self.chk_verify_copy.setToolTip("덤프를 먼저 새 복사본 DB(PostgreSQL은 스키마)에 넣어 검증하고, 문제가 없을 때만 "
+                                        "원래 DB의 테이블과 바꿉니다. 바꾸기 전 테이블은 백업 DB(스키마)에 남습니다.")
         self.chk_verify_copy.toggled.connect(self._update_advanced_summary)
         self.lbl_verify_note = QLabel("다른 DB 종류에서 만든 덤프는 복사본에서 검증할 수 없습니다.")
         self.lbl_verify_note.setStyleSheet("color: #7f8c8d; margin-left: 20px;")
@@ -650,11 +676,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         panel_layout.addWidget(self.lbl_verify_note)
 
         timezone_line = QHBoxLayout()
-        self.chk_timezone = QCheckBox("타임존 직접 정하기")
+        self.chk_timezone = QCheckBox("시간대 직접 정하기")
         self.chk_timezone.toggled.connect(self._on_timezone_toggled)
         self.combo_timezone = QComboBox()
         # QComboBox items are not translated by the Qt hooks.
-        for text, mode in (("한국 시간(+09:00)", "kst"), ("세계 표준시(UTC)", "utc"), ("서버 기본값", "none")):
+        for text, mode in (("한국 시간(+09:00)", "kst"), ("세계 표준시(UTC)", "utc"), ("대상 서버 기본값", "none")):
             self.combo_timezone.addItem(translate_text(text), mode)
         self.combo_timezone.setEnabled(False)
         self.combo_timezone.currentIndexChanged.connect(self._update_advanced_summary)
@@ -662,7 +688,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         timezone_line.addWidget(self.combo_timezone)
         timezone_line.addStretch()
         panel_layout.addLayout(timezone_line)
-        self.lbl_timezone_note = QLabel("이 덤프는 시간대가 기록되어 있어 그대로 씁니다.")
+        self.lbl_timezone_note = QLabel("이 덤프에는 시간대가 기록되어 있어 그대로 씁니다.")
         self.lbl_timezone_note.setStyleSheet("color: #7f8c8d; margin-left: 20px;")
         self.lbl_timezone_note.setVisible(False)
         panel_layout.addWidget(self.lbl_timezone_note)
@@ -685,6 +711,12 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         visible = self.advanced_panel.isHidden()
         self.advanced_panel.setVisible(visible)
         self.btn_advanced.setText("고급 설정 닫기" if visible else "고급 설정 열기")
+
+    def _on_other_name_toggled(self, checked: bool):
+        if checked:  # also when a dump forces it: the name is typed, never a DB picked for the user
+            self.combo_target_schema.setCurrentIndex(-1)
+            self.combo_target_schema.clearEditText()
+        self._refresh_target_line()
 
     def _on_timezone_toggled(self, checked: bool):
         self.combo_timezone.setEnabled(checked and self.chk_timezone.isEnabled())
@@ -781,14 +813,20 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # 일부 테이블만 재시도하면 인덱스/FK 복원이 누락되므로, 원래 범위 전체를 같은 설정으로 다시 실행한다.
         self.btn_rerun = QPushButton("🔄 같은 설정으로 다시 Import")
         self.btn_rerun.setVisible(False)
-        self.btn_rerun.setToolTip("대상 데이터 상태를 확인한 뒤 원래 범위 전체를 같은 설정으로 다시 Import합니다.")
+        self.btn_rerun.setToolTip("덤프 전체를 지금 설정으로 다시 Import합니다. 시작 전에 다시 확인합니다.")
         self.btn_rerun.clicked.connect(lambda: self.do_import())
         self.label_rerun_hint = QLabel("대상 데이터 상태를 확인한 뒤 다시 실행하세요.")
         self.label_rerun_hint.setStyleSheet("color: gray; font-size: 11px;")
         self.label_rerun_hint.setVisible(False)
+        # After a run that made a copy: manage it with this session's credentials. The job list's
+        # route needs a saved profile with saved credentials, which a main-menu Import may not have.
+        self.btn_manage_backups = QPushButton("복원 백업 관리")
+        self.btn_manage_backups.setVisible(False)
+        self.btn_manage_backups.clicked.connect(self.open_backup_lifecycle)
 
         retry_layout.addWidget(self.btn_rerun)
         retry_layout.addWidget(self.label_rerun_hint)
+        retry_layout.addWidget(self.btn_manage_backups)
         retry_layout.addStretch()
         table_status_layout.addLayout(retry_layout)
 
@@ -883,6 +921,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         schemas = self.connector.get_schemas()
         for schema in schemas:
             self.combo_target_schema.addItem(schema)
+        # Starts empty: the first existing DB is no choice the user made (_import_request refuses an empty name).
+        self.combo_target_schema.setCurrentIndex(-1)
 
     def _load_import_options(self):
         """Remembered toggles; a saved value of the wrong type (older or edited settings) is ignored."""
@@ -919,10 +959,17 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.chk_other_name.setChecked(False)
         self._name_forced = forced
         self.chk_other_name.setEnabled(not forced)
-        self.chk_other_name.setText("다른 스키마 이름으로 넣기" if engine == "postgresql" else "다른 DB 이름으로 넣기")
+        pg = engine == "postgresql"
+        self.chk_other_name.setText("다른 스키마 이름으로 넣기" if pg else "다른 DB 이름으로 넣기")
+        forced_text = ("이 덤프에는 여기서 쓸 스키마 이름이 없어 직접 정해야 합니다." if pg
+                       else "이 덤프에는 여기서 쓸 DB 이름이 없어 직접 정해야 합니다.")
         self.chk_other_name.setToolTip(
-            "덤프에 이 DB 종류의 원래 이름이 없어 넣을 이름을 직접 정해야 합니다." if forced
-            else "덤프에 적힌 원래 이름 대신 직접 정한 이름에 넣습니다. 없는 이름이면 새로 만듭니다.")
+            forced_text if forced else "덤프에 적힌 원래 이름 대신 직접 정한 이름에 넣습니다. 없는 이름이면 새로 만듭니다.")
+        self.lbl_name_forced.setText(forced_text)
+        self.lbl_name_forced.setVisible(forced)
+        self.combo_target_schema.setToolTip(
+            "기존 스키마를 고르거나 새 이름을 입력하세요. 없는 이름이면 새로 만듭니다." if pg
+            else "기존 DB를 고르거나 새 이름을 입력하세요. 없는 이름이면 새로 만듭니다.")
         # Verify-in-copy needs a same-engine dump (safe_restore.rs copy_refusals).
         self._verify_allowed = not manifest or normalize_db_engine(manifest.get("source_engine") or engine) == engine
         self.chk_verify_copy.setEnabled(self._verify_allowed)
@@ -942,6 +989,9 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _target_endpoint_text(self) -> str:
         config = build_rust_dump_config(self.connector)
         text = f"{config.host}:{config.port} /"
+        profile = self.tunnel_config.get("name") if isinstance(self.tunnel_config, dict) else ""
+        if profile:  # over a tunnel the host is a local port: the profile says which server it is
+            text = f"{profile} ({config.host}:{config.port}) /"
         if config.engine == "postgresql":
             # Without a configured database the core uses `postgres`.
             text += f" {config.database or 'postgres'} /"
@@ -950,7 +1000,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _refresh_target_line(self):
         other = self._uses_other_name()
         self.lbl_target_endpoint.setText(self._target_endpoint_text())
-        self.lbl_target_name.setText(self._dump_original or translate_text("덤프 폴더를 고르면 정해집니다"))
+        self.lbl_target_name.setText(self._dump_original or translate_text("덤프 폴더를 고르면 표시됩니다"))
         self.lbl_target_name.setVisible(not other)
         self.combo_target_schema.setVisible(other)
         self._update_advanced_summary()
@@ -959,24 +1009,34 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         """Every toggle that is on or forced, in one line."""
         items = []
         if self._uses_other_name():
-            template = ("다른 스키마 이름({})" if build_rust_dump_config(self.connector).engine == "postgresql"
-                        else "다른 DB 이름({})")
-            items.append(translate_text(template).format(self.combo_target_schema.currentText().strip()))
+            word = _engine_word(build_rust_dump_config(self.connector).engine)
+            name = self.combo_target_schema.currentText().strip()
+            items.append(translate_text(f"다른 {word} 이름({{}})").format(name) if name
+                         else translate_text(f"다른 {word} 이름(입력 필요)"))
         if self.chk_verify_copy.isChecked() and self._verify_allowed:
             items.append(translate_text("먼저 복사본에서 검증"))
         if self.chk_timezone.isChecked():
-            items.append(translate_text("타임존 {}").format(self.combo_timezone.currentText()))
+            items.append(translate_text("시간대 {}").format(self.combo_timezone.currentText()))
         if self.spin_threads.value() != DEFAULT_DUMP_THREADS:
             items.append(translate_text("동시 작업 {}개").format(self.spin_threads.value()))
-        return translate_text("켜진 고급 설정: {}").format(", ".join(items)) if items else ""
+        return translate_text("적용 중인 고급 설정: {}").format(", ".join(items)) if items else ""
+
+    def _mode_description(self) -> str:
+        word = _engine_word(build_rust_dump_config(self.connector).engine)
+        if self.chk_verify_copy.isChecked() and self._verify_allowed:
+            return translate_text(f"덤프를 먼저 복사본 {word}에 넣어 검증하고, 문제가 없을 때만 원래 {word}의 테이블과 바꿉니다. "
+                                  f"바꾸기 전 테이블은 백업 {word}에 남습니다. 검증 중에 멈추면 원본은 그대로입니다.")
+        return translate_text("덤프의 테이블을 하나씩 지우고 다시 만들어 넣습니다. 덤프에 없는 테이블은 그대로 둡니다. "
+                              "중간에 멈추면 이미 덮어쓴 테이블은 되돌리지 않고, 작업 중이던 테이블은 비어 있을 수 있습니다.")
 
     def _update_advanced_summary(self, *_):
         self.lbl_advanced_summary.setText(self._advanced_summary())
+        self.lbl_mode_description.setText(self._mode_description())
 
     def browse_input_dir(self):
         start_dir = self._get_input_browse_start_dir()
         folder = QFileDialog.getExistingDirectory(
-            self, "Dump 폴더 선택", start_dir
+            self, "덤프 폴더 선택", start_dir
         )
         if folder:
             self.input_dir.setText(folder)
@@ -1028,7 +1088,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         else:
             self._upgrade_issues = []
             self.btn_view_issues.setVisible(False)
-            self.lbl_upgrade_status.setText("📋 Dump 폴더를 선택하면 자동 검사됩니다.")
+            self.lbl_upgrade_status.setText("📋 덤프 폴더를 고르면 자동으로 검사합니다.")
             self.lbl_upgrade_status.setStyleSheet("color: #7f8c8d;")
             self._update_target_options()
 
@@ -1145,7 +1205,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def set_ui_enabled(self, enabled: bool):
         """Import 진행 중 UI 요소 활성화/비활성화"""
         for widget in (self.input_dir, self.btn_browse, self.chk_other_name, self.combo_target_schema,
-                       self.chk_verify_copy, self.chk_timezone, self.combo_timezone, self.spin_threads, self.btn_import):
+                       self.chk_verify_copy, self.chk_timezone, self.combo_timezone, self.spin_threads, self.btn_import,
+                       self.btn_rerun, self.btn_manage_backups):
             widget.setEnabled(enabled)
         self.btn_stop.setVisible(not enabled)
         if not enabled:
@@ -1161,6 +1222,12 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.log_entries.append(log_entry)
         if len(self.log_entries) > MAX_LOG_ENTRIES:
             del self.log_entries[:-MAX_LOG_ENTRIES]
+
+    def _log_visible(self, msg: str):
+        """A line the stop window points to: in the run log on screen as well as in the saved log."""
+        self.txt_log.addItem(sanitize_local_diagnostic(msg))
+        self.txt_log.scrollToBottom()
+        self._add_log(msg)
 
     def _get_dump_schema_name(self, dump_dir: str) -> str:
         """Read the destination namespace from the Rust dump manifest."""
@@ -1183,7 +1250,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         """
         input_dir = self.input_dir.text()
         if not input_dir:
-            QMessageBox.warning(self, "오류", "Dump 폴더를 선택하세요.")
+            QMessageBox.warning(self, "오류", "덤프 폴더를 고르세요.")
             return None
         if not os.path.exists(input_dir):
             QMessageBox.warning(self, "오류", "폴더가 존재하지 않습니다.")
@@ -1194,13 +1261,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._update_target_options()
         other = self._uses_other_name()
         name = self.combo_target_schema.currentText().strip() if other else self._dump_original
-        if not name:
-            if self._name_forced:
-                QMessageBox.warning(self, "대상 선택 필요", "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요.")
-            else:
-                QMessageBox.warning(self, "오류", "대상 스키마를 선택하세요.")
-            return None
         engine = build_rust_dump_config(self.connector).engine
+        if not name:
+            word = _engine_word(engine)
+            if self._name_forced:
+                QMessageBox.warning(self, translate_text("이름 입력 필요"), translate_text(
+                    f"넣을 {word} 이름을 정할 수 없습니다. '넣을 곳'에 {word} 이름을 입력하세요."))
+            else:
+                QMessageBox.warning(self, translate_text("이름 입력 필요"), translate_text(f"넣을 {word} 이름을 입력하세요."))
+            return None
         timezone = self.combo_timezone.currentData() if self.chk_timezone.isChecked() else None
         verify = self.chk_verify_copy.isChecked() and self._verify_allowed
         return {
@@ -1210,7 +1279,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             "verify": verify,
             "import_mode": "safe" if verify else "replace",
             "threads": self.spin_threads.value(),
-            # 서버 기본값 turns the dump's own timezone off; the other two choices set one.
+            # 대상 서버 기본값 turns the dump's own timezone off; the other two choices set one.
             "timezone_sql": resolve_timezone_sql(engine, timezone) if timezone else None,
             "use_source_timezone": timezone != "none",
             "timezone_label": self.combo_timezone.currentText() if timezone else "",
@@ -1224,6 +1293,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def do_import(self):
         """Check the input, ask the core what the run would do, confirm when needed, then import."""
+        if self.worker and self.worker.isRunning():  # a second click (e.g. the rerun button) while a run is going
+            return
         self._cancel_requested = False
         self._close_after_cancel = False
         self._promotion_action = ""
@@ -1243,6 +1314,9 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.worker.start()
 
     def _on_preview_finished(self, success: bool, message: str, preview: dict):
+        sender = self.sender()
+        if sender is not None and sender is not self._preview_worker:
+            return  # an earlier preview's late answer
         self._previewing = False
         self.btn_import.setText("📥 Import 시작")
         if self._cancel_requested or self._close_after_cancel:
@@ -1250,13 +1324,18 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             if self._close_after_cancel:
                 QTimer.singleShot(0, self.close)
             return
+        if success and not _is_preview(preview):
+            # The one confirmation must not open on a result it cannot read.
+            success, message = False, f"Import 미리보기 오류: unexpected preview result {sanitize_local_diagnostic_json(preview)}"
         if not success:
             self.set_ui_enabled(True)
             cause = describe_core_failure(message)
-            self._show_failure("Import를 시작하지 않았습니다", cause or sanitize_local_diagnostic(message),
-                               message if cause else "")
+            uncoded = not cause and _is_uncoded_core_failure(message)
+            text = cause or (translate_text("실행 전 확인 중에 오류가 나서 Import를 시작하지 않았습니다. '자세히'에서 원문을 확인하세요.")
+                             if uncoded else sanitize_local_diagnostic(message))
+            self._show_failure("Import를 시작하지 않았습니다", text, message if cause or uncoded else "")
             return
-        if not self._confirm_plan(self._pending_request, preview if isinstance(preview, dict) else {}):
+        if not self._confirm_plan(self._pending_request, preview):
             self.set_ui_enabled(True)
             return
         self._start_import(self._pending_request)
@@ -1276,7 +1355,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if kept:
             notes.append("- " + translate_text("내보낼 때 연결된 부모 테이블이라 함께 담은 테이블: {}").format(_names_preview(kept)))
         if len(kept) < len(added):
-            notes.append("- " + translate_text("함께 담으려 했지만 덤프에 없는 부모 테이블(코어가 제외함): {}").format(
+            notes.append("- " + translate_text("내보낼 때 함께 담으려 했지만 덤프에 들어가지 않은 부모 테이블: {}").format(
                 _names_preview([name for name in added if name not in dumped])))
         config = build_rust_dump_config(self.connector)
         if config.engine == "postgresql" and not config.database:
@@ -1284,19 +1363,20 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         return notes
 
     def _confirm_plan(self, request: dict, preview: dict) -> bool:
-        """The one confirmation before a run (F12): only when it overwrites a table or has something to show.
-
-        Production always asks for the name to be typed.
+        """The one confirmation before a run (F12): only when it overwrites an existing table or view, or has
+        something to show (a blocker, a warning that the data may be off). Production must type the name in it.
         """
         environment = ProductionGuard.get_environment(self.tunnel_config or {})
         plan = describe_plan(preview, request["verify"], request["timezone_label"])
-        if environment != Environment.PRODUCTION and not preview.get("replace") and not plan["must_see"]:
+        views = preview.get("views") if isinstance(preview.get("views"), dict) else {}
+        if not preview["replace"] and not views.get("replace") and not plan["must_see"]:
             return True
         plan["warnings"] += self._plan_notes(request, preview)
         dialog = ImportPlanDialog(self, preview, plan, environment,
                                   f"{self._target_endpoint_text()} {request['namespace']}", request["namespace"],
                                   self._advanced_summary())
-        return dialog.exec() == QDialog.DialogCode.Accepted
+        # The start button is off with a blocker; a dialog that returns Accepted anyway still starts nothing.
+        return dialog.exec() == QDialog.DialogCode.Accepted and not plan["blockers"]
 
     def _start_import(self, request: dict):
         self._begin_error_report_operation()
@@ -1314,6 +1394,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.label_report_link.setVisible(False)
         self.btn_rerun.setVisible(False)
         self.label_rerun_hint.setVisible(False)
+        self.btn_manage_backups.setVisible(False)
         self.btn_save_log.setEnabled(False)
 
         # 설정 섹션 접기
@@ -1344,12 +1425,12 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._add_log(f"{'='*60}")
         self._add_log("Rust DB Core Import 시작")
         self._add_log(f"시작 시간: {self.import_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        self._add_log(f"Dump 폴더: {input_dir}")
-        self._add_log(f"대상 스키마: {namespace}")
-        self._add_log(f"Import 모드: {_mode_text(request['import_mode'])}")
+        self._add_log(f"덤프 폴더: {input_dir}")
+        self._add_log(f"넣을 곳: {namespace}")
+        self._add_log(f"실행 방식: {_mode_text(request['import_mode'])}")
         if self._advanced_summary():
             self._add_log(self._advanced_summary())
-        self._add_log(f"병렬 스레드: {request['threads']}")
+        self._add_log(f"동시 작업 수: {request['threads']}")
         self._add_log(f"{'='*60}")
 
         # 프로그레스 바 초기화
@@ -1592,9 +1673,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             if isinstance(event, dict):
                 sanitized_event = _sanitized_rust_event(event)
                 self.import_audit = getattr(self, "import_audit", {})
-                known_report = self.import_audit.get("report_path")
+                known = (self.import_audit.get("report_path"), self.import_audit.get("candidate_created"))
                 _capture_import_audit(self.import_audit, sanitized_event)
-                if self.import_audit.get("report_path") != known_report:
+                # The report and, once a copy exists, the label that opens backup management are on the
+                # running record at once: a run the app never finishes (crash, power loss) still has both.
+                if (self.import_audit.get("report_path"), self.import_audit.get("candidate_created")) != known:
                     record_import_report(self)
                 normalized_event = _normalized_import_telemetry(sanitized_event)
                 if normalized_event is None:
@@ -1750,6 +1833,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.set_ui_enabled(True)
         self.btn_save_log.setEnabled(True)  # 로그 저장 버튼 활성화
         self._show_report_link()
+        self.btn_manage_backups.setVisible(made_copy(self.import_audit))
 
         if success and self.last_import_mode == "safe" and not new_target:
             self.progress_bar.setValue(100)
@@ -1768,7 +1852,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self._add_log(sentence)
         else:
             self.label_status.setText(
-                f"⏹ Import 취소됨: {done_count}/{total_count} 테이블 완료"
+                f"⏹ Import 중지됨: {done_count}/{total_count} 테이블 완료"
                 if self._cancel_requested
                 else f"❌ Import 실패: {error_count}/{total_count} 테이블 오류"
             )
@@ -1783,7 +1867,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.txt_log.addItem(f"❌ 실패: {cause or message}")
 
             if self._cancel_requested:
-                self._add_log("Import가 취소되었습니다.")
+                self._add_log("Import가 중지되었습니다.")
             else:
                 if self.last_import_mode == "safe":
                     # A stop before the copy arrives as plain sentences; the core's own text is its error.
@@ -1794,19 +1878,22 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                                        message if cause else ("" if core_text in message else core_text))
                 else:
                     details = _replace_failure_details(getattr(self, "import_audit", {}))
+                    uncoded = not cause and _is_uncoded_core_failure(message)
                     if error_count > 0:
                         text = translate_text("❌ Import 중 오류가 발생했습니다.\n\n"
                             "{}\n\n"
                             "성공: {}개 테이블\n"
-                            "실패: {}개 테이블\n\n"
+                            "실패: {}개 테이블\n"
                             "미실행: {}개 테이블\n\n"
-                            "대상 데이터를 확인한 후 원래 범위로 전체 Import를 다시 시작하세요.").format(
+                            "대상 데이터를 확인한 뒤 '같은 설정으로 다시 Import'로 다시 실행하세요.").format(
                                 cause or translate_text("원인을 분류하지 못했습니다. '자세히'에서 원문을 확인하세요."),
                                 done_count, error_count, blocked_count)
+                    elif uncoded:
+                        text = "❌ " + translate_text("Import 중에 오류가 나서 멈췄습니다. '자세히'에서 원문을 확인하세요.")
                     else:
                         text = f"❌ {cause or message}"
                     self._show_failure("Import 실패", f"{text}\n\n{details}" if details else text,
-                                       message if cause or error_count > 0 else "")
+                                       message if cause or uncoded or error_count > 0 else "")
 
                 self._report_error_anonymously()
 
@@ -1845,32 +1932,50 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def _success_sentence(self, new_target: bool, table_count: int) -> str:
         """One sentence per result, for the status line and the log; success opens no window."""
-        pg = self.last_import_context.get("engine") == "postgresql"
+        word = _engine_word(self.last_import_context.get("engine"))
         created = (_namespace_name(self.import_audit.get("candidate_target")) if new_target
                    else self.import_audit.get("created_namespace"))
         if created:
-            return translate_text("새 스키마 {}을 만들어 넣었습니다" if pg else "새 DB {}을 만들어 넣었습니다").format(created)
-        return translate_text("덤프 테이블 {}개를 교체했습니다").format(table_count)
+            return translate_text(f"새 {word}를 만들어 넣었습니다: {{}}").format(created)
+        # The count covers every dump table, overwritten or newly created.
+        return translate_text("덤프 테이블 {}개를 넣었습니다").format(table_count)
 
     def _stop_and_explain(self, reasons: List[str]):
-        """Verify-in-copy ended without a swap: one window with a Close button. The copy stays for the job list."""
+        """Verify-in-copy ended without a swap: one window with a Close button. The copy stays; its cleanup
+        opens from this window, the dialog's own button or the job list."""
         text = "\n".join([
             translate_text("복사본 {}에 넣고 검증했지만 다음 이유로 교체하지 않았습니다.").format(
                 _namespace_name(self.import_audit.get("candidate_target"))),
             *reasons, "",
-            translate_text("원본은 그대로입니다. 복사본은 작업 목록 > 복원 백업 관리에서 정리할 수 있습니다."),
+            translate_text("원본은 그대로입니다. 복사본은 '복원 백업 관리'에서 정리할 수 있습니다."),
         ])
         self.import_audit["operator_choice"] = "not_swapped"
         self.label_status.setText(translate_text("교체하지 않았습니다 · 원본은 그대로입니다"))
         self._add_log(text)
+        self.btn_manage_backups.setVisible(True)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Information)
         box.setTextFormat(Qt.TextFormat.PlainText)
         box.setWindowTitle(translate_text("교체하지 않았습니다"))
         box.setText(text)
+        manage = box.addButton(translate_text("복원 백업 관리"), QMessageBox.ButtonRole.ActionRole)
+        manage.clicked.connect(self.open_backup_lifecycle)
         box.addButton(translate_text("닫기"), QMessageBox.ButtonRole.RejectRole)
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box.open()
+
+    def open_backup_lifecycle(self):
+        """The copy (and after a swap, the backup) this run made, with this session's credentials:
+        the job list's route needs a saved profile with saved credentials."""
+        original = restore_target_connection_info(self.import_audit.get("original_target"))
+        report_path = self.import_audit.get("report_path")
+        if not self.restore_config or not original or not report_path:
+            QMessageBox.information(self, "복원 백업 관리", "복사본을 만든 Import 보고서가 없어 열 수 없습니다.")
+            return
+        original.update(user=self.restore_config.user, password=self.restore_config.password)
+        dialog = BackupLifecycleDialog(apply_registered_tls(original), [os.path.dirname(str(report_path))], self)
+        dialog.refresh()
+        dialog.exec()
 
     def _promotion_payload(self, action: str) -> dict:
         original = restore_target_connection_info(self.import_audit.get("original_target"))
@@ -1902,7 +2007,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_success = None
             self.import_audit["original_unchanged"] = None
             self.import_audit["restore_status"] = "promotion_in_progress"
-            self._add_log("원래 이름으로 전환 시작. 결과가 확인될 때까지 원본 상태는 알 수 없습니다.")
+            self._add_log("교체 시작. 결과가 확인될 때까지 원본 상태는 알 수 없습니다.")
             self._promotion_job_id = begin_promotion_job(self, payload)
         self.worker = RustDumpWorker("promote", self.restore_config, payload=payload)
         self.worker.raw_output.connect(self.on_raw_output)
@@ -1928,7 +2033,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             elif success and self._plan_is_clean(result):
                 self._remember_promotion_plan(result)
                 self.import_audit["operator_choice"] = "overwrite_confirmed_before_import"
-                self._add_log("검증된 복원본으로 기존 이름 교체를 시작합니다.")
+                self._add_log("검증된 복사본으로 교체를 시작합니다.")
                 payload = self._promotion_payload("confirm")
                 payload.update(plan_digest=result["plan_digest"], overwrite_confirmed=True)
                 self._start_promotion(payload)
@@ -1936,11 +2041,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 reasons = []
                 if success:
                     self._remember_promotion_plan(result)
-                    reasons = describe_copy_blockers(result.get("copy_blockers"))
+                    reasons = describe_copy_blockers(result.get("copy_blockers"), unknown=_PLAN_BLOCKED_UNKNOWN)
                     for blocker in result.get("blockers") or []:
-                        self._add_log(f"교체 차단: {blocker}")
+                        self._log_visible(f"교체 차단: {blocker}")
                 else:
-                    self._add_log(message or "Promotion plan failed")
+                    self._log_visible(message or "Promotion plan failed")
                 cause = describe_core_failure(message) if not success else None
                 self._stop_and_explain(reasons or ["- " + (cause or translate_text(_PLAN_BLOCKED_REASON))])
         elif action == "confirm" and success and result.get("status") == "promoted":
@@ -1949,7 +2054,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_audit.update(restore_status="promoted", original_unchanged=False, cutover_pending=False)
             self.import_audit["backup_namespace"] = str(result.get("backup_namespace") or "unknown")
             self.import_audit["candidate_target"] = restore_target_connection_info(result.get("active_target") or self.import_audit.get("original_target"))
-            self.label_status.setText("✅ " + translate_text("교체했습니다. 이전 테이블은 {}에 있습니다").format(
+            word = _engine_word((self.import_audit.get("original_target") or {}).get("engine"))
+            self.label_status.setText("✅ " + translate_text(f"교체했습니다. 이전 테이블은 백업 {word} {{}}에 있습니다").format(
                 sanitize_local_diagnostic(self.import_audit["backup_namespace"])))
             self.progress_bar.setValue(100)
             self._add_log(self.label_status.text())
@@ -1960,14 +2066,20 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_audit["restore_status"] = "promotion_failed_original_unchanged" if known_unchanged else "promotion_outcome_unknown"
             self.import_audit["original_unchanged"] = True if known_unchanged else None
             self.import_audit["cutover_pending"] = True if known_unchanged else None
+            self._log_visible(message or "Promotion result could not be verified")
+            cause = describe_core_failure(message)
             if self._cancel_requested:
-                self.label_status.setText("⏹ 전환 중지됨 · 원본 미변경" if known_unchanged
-                                          else "⏹ 전환 중지됨 · 원본/백업/복원 대상의 상태를 보고서에서 확인하세요")
+                self.label_status.setText(translate_text(
+                    "⏹ 교체 중지됨 · 원본은 그대로입니다" if known_unchanged
+                    else "⏹ 교체 중지됨 · 원본·백업·복사본 상태를 Import 보고서에서 확인하세요"))
+            elif known_unchanged:
+                self._stop_and_explain(["- " + (cause or translate_text(_PLAN_BLOCKED_REASON))])
             else:
-                self.label_status.setText("전환 차단 · 원본 미변경" if known_unchanged else "전환 결과 미확인 · 원본/백업/복원 대상의 상태를 확인하세요")
-            self._add_log(message or "Promotion result could not be verified")
-            QMessageBox.warning(self, "전환 작업 확인 필요",
-                                describe_core_failure(message) or sanitize_local_diagnostic(message) or self.label_status.text())
+                self.label_status.setText(translate_text("교체 결과를 확인하지 못했습니다 · 원본·백업·복사본 상태를 확인하세요"))
+            if not known_unchanged:  # stopped or not: what the swap did is unknown, so it is never only a status line
+                self._show_failure(translate_text("교체 결과를 확인하지 못했습니다"), "\n\n".join(filter(None, [
+                    translate_text("교체가 끝났는지 확인하지 못했습니다. 원본·백업·복사본 상태를 Import 보고서와 DB에서 확인하세요."),
+                    cause])), message)
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 
@@ -1985,7 +2097,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.import_audit["promotion_plan"] = {key: safe_plan.get(key) for key in (
             "plan_digest", "can_promote", "original_target", "candidate_target", "backup_namespace", "summary", "blockers")}
         # The target changed since the copy was made: the same reasons a stop before the copy names.
-        stops = describe_copy_blockers(safe_plan.get("copy_blockers"))
+        stops = describe_copy_blockers(safe_plan.get("copy_blockers"), unknown=_PLAN_BLOCKED_UNKNOWN)
         if stops:
             self.import_audit["promotion_plan"]["blockers"] = stops
 
@@ -2046,12 +2158,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 f.write("Rust DB Core Import Log\n")
                 f.write("=" * 70 + "\n\n")
 
-                f.write(f"Dump 폴더: {safe(self.last_input_dir)}\n")
+                f.write(f"덤프 폴더: {safe(self.last_input_dir)}\n")
                 target_schema = (
                     safe(self.last_import_context.get("namespace") or self.last_target_schema or "unknown")
                 )
-                target_label = "요청한 원본 스키마" if self.last_import_mode == "safe" else "대상 스키마"
-                f.write(f"{target_label}: {target_schema}\n")
+                f.write(f"넣을 곳: {target_schema}\n")
                 context = self.last_import_context
                 f.write(f"Target engine: {safe(context.get('engine') or 'unknown')}\n")
                 f.write(f"Effective endpoint: {safe(context.get('host') or 'unknown')}:{safe(context.get('port') or 'unknown')}\n")
@@ -2088,7 +2199,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                     f.write(f"Backup namespace: {safe(self.import_audit.get('backup_namespace') or 'unknown')}\n")
                     f.write(f"Operator choice: {safe(self.import_audit.get('operator_choice') or 'pending')}\n")
                     f.write(f"Promotion result: {safe(json.dumps(self.import_audit.get('promotion_result') or {}, ensure_ascii=False))}\n")
-                f.write(f"Import 모드: {safe(_mode_text(self.last_import_mode))}\n")
+                f.write(f"실행 방식: {safe(_mode_text(self.last_import_mode))}\n")
                 if self.import_success is None:
                     result_label = "진행 중"
                 else:
@@ -2149,17 +2260,21 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if self._cancel_requested:  # 이미 중지 요청됨: 닫기만 추가로 예약할 수 있다
             self._close_after_cancel = self._close_after_cancel or close_after
             return True
-        if getattr(self, "_previewing", False):  # 실행 전 대상 확인은 읽기만 하므로 묻지 않고 멈춘다
+        stage = getattr(self, "_promotion_action", "")
+        # The check before a run and the check before a swap only read the target: they stop without asking.
+        if getattr(self, "_previewing", False) or stage == "plan":
             self._cancel_requested = True
             self._close_after_cancel = close_after
             self.worker.cancel()
             return True
         cancel_text = (
-            "대상 전환이 실행 중입니다. 취소하면 전환 결과를 확인하지 못할 수 있습니다. 원본·백업·복원 대상의 상태를 보고서와 DB에서 확인해야 합니다. 취소하시겠습니까?"
-            if getattr(self, "_promotion_action", "") == "confirm" else
-            "전환 검토(읽기 전용)가 실행 중입니다. 취소해도 기존 대상은 변경되지 않습니다. 취소하시겠습니까?"
-            if getattr(self, "_promotion_action", "") == "plan" else
-            "Import가 실행 중입니다.\n취소하면 전용 Rust DB Core 프로세스를 종료합니다.\n대상 스키마에 일부 데이터가 반영되었을 수 있습니다.\n\n취소하시겠습니까?"
+            "교체하는 중입니다. 지금 중지하면 교체가 끝났는지 알 수 없게 될 수 있습니다. "
+            "원본·백업·복사본 상태를 Import 보고서와 DB에서 확인해야 합니다. 중지하시겠습니까?"
+            if stage == "confirm" else
+            "복사본에 넣는 중입니다. 지금 중지해도 원본은 그대로입니다. 중지하시겠습니까?"
+            if getattr(self, "last_import_mode", "") == "safe" else
+            "Import가 실행 중입니다.\n지금 중지하면 이미 덮어쓴 테이블은 되돌리지 않고, 작업 중이던 테이블은 비어 있을 수 있습니다.\n\n"
+            "중지하시겠습니까?"
         )
         reply = QMessageBox.question(
             self,
@@ -2174,11 +2289,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.import_audit = getattr(self, "import_audit", {})
         self.import_audit["ui_cancel_requested"] = True
         self.import_audit["ui_cancel_stage"] = (
-            "promotion_confirm" if getattr(self, "_promotion_action", "") == "confirm"
-            else "promotion_plan" if getattr(self, "_promotion_action", "") == "plan"
+            "promotion_confirm" if stage == "confirm"
             else "safe_restore" if getattr(self, "last_import_mode", "") == "safe" else "import"
         )
-        self._add_log("Import 취소 요청: 전용 Rust DB Core 프로세스 종료를 요청했습니다.")
+        self._add_log("Import 중지 요청")
         self.worker.cancel()
         self.btn_stop.setEnabled(False)
         self.btn_stop.setText("중지 중…")

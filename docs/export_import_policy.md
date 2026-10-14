@@ -36,9 +36,9 @@ or forced. There are no mode choices.
 | Setting | Default | Sends |
 | --- | --- | --- |
 | (default) | always | `mode: "replace"` into the dump's own database (PostgreSQL: schema), shown read-only on the target line: `host:port / DB`, on PostgreSQL `host:port / DB / schema` (`postgres` when the connection names no database) |
-| 다른 DB 이름으로 넣기 (PostgreSQL: 다른 스키마 이름으로 넣기) | off | that name as the target database (schema). Forced on, with its name field on the target line, when the dump names no database of this engine (another engine's dump, or a legacy PostgreSQL dump without `source_schema`) |
-| 먼저 복사본에서 검증하고 교체 | off | `mode: "safe"`; a verified copy whose promotion plan is clean is swapped in without another question (below). Disabled for another engine's dump |
-| 타임존 직접 정하기 | off | offered only for a legacy dump without `source_timezone`: 한국 시간(+09:00) and 세계 표준시(UTC) send `timezone_sql`, 서버 기본값 sends `use_source_timezone: false`. Current dumps are written in UTC and record it, so for them the setting is disabled |
+| 다른 DB 이름으로 넣기 (PostgreSQL: 다른 스키마 이름으로 넣기) | off | that name as the target database (schema). The name field starts empty whenever it appears, so no existing database is ever picked for the user; an empty name starts nothing. Forced on, with its name field on the target line and one line saying why, when the dump names no database of this engine (another engine's dump, or a legacy PostgreSQL dump without `source_schema`) |
+| 먼저 복사본에서 검증하고 교체 | off | `mode: "safe"`; a verified copy whose promotion plan is clean is swapped in without another question (below). Disabled for another engine's dump. The description under the target line follows it: with it off, tables are dropped and recreated one at a time and a stop leaves the table in progress possibly empty; with it on, the original stays as it is until the swap |
+| 시간대 직접 정하기 | off | offered only for a legacy dump without `source_timezone`: 한국 시간(+09:00) and 세계 표준시(UTC) send `timezone_sql`, 대상 서버 기본값 sends `use_source_timezone: false`. Current dumps are written in UTC and record it, so for them the setting is disabled |
 | 동시 작업 수 | 8 (1-16) | `threads` |
 
 The thread count and the verify-in-copy setting are remembered. The other name
@@ -161,39 +161,61 @@ takes their place and the rest of the preview is still returned. `warnings`
 ### Before and after a run in the Import dialog
 
 Every run (also "같은 설정으로 다시 Import") starts with `dump.import_preview`; a
-preview that fails or is refused starts no import. The one confirmation, the
-plan dialog, appears when the run would overwrite at least one existing table,
-when the preview has a blocker, or when it warns that the imported data itself
-may be off: triggers that disappear, views the account may not replace or that
-may break, FK parents that are not checked, a dump without one point in time
-(`snapshot_policy` `mysql_parallel_unsynchronized_snapshots` or the legacy
-`mysql_parallel_no_backup_lock_consistent_snapshot`), or a legacy dump without a
-chosen timezone. Otherwise the import starts at once. A production profile
-always gets the plan dialog and must type the target name; staging and
-unclassified profiles start on its Cancel button; development gets no colored
-warning. The dialog names the environment in Korean (운영, 스테이징, 개발,
-미분류), one warning line (덮어쓴 테이블은 되돌릴 수 없습니다; with
-verify-in-copy, 교체 전 테이블은 백업 DB에 남습니다; with nothing to overwrite,
-새로 만들기만 합니다), the target with "(새로 만듭니다)" when it is missing, the
-settings that are on, the tables to overwrite, create and leave alone (each list
-opens from its count), the warnings in Korean, FK parents added at export (only
-those that are also in the dump; the rest as left out by the core) and the
-`postgres` fallback, and behind "자세히" the kept target-only FKs, the view
-counts and the core's own text. A blocker disables its start button;
-`copy_blockers` count only with verify-in-copy on, followed by a line that
-turning it off lets the run go ahead.
+preview that fails, is refused, or returns anything but a `dry_run: true` result
+with `replace`, `create` and `blockers` lists starts no import (an error without
+a code shows one plain sentence and keeps the raw text behind "자세히"). While
+the preview runs, the start and rerun buttons are off and a second start is
+ignored; an answer from an earlier preview is dropped. Closing the window or
+stopping during the preview stops it without asking, and an answer that arrives
+after that starts nothing. The one confirmation, the plan dialog, appears only
+when the run would overwrite at least one existing table or view (user decision
+F12, on every environment), when the preview has a blocker, or when it warns
+that the imported data itself may be off: triggers that disappear, views the
+account may not replace or that may break, FKs whose parent is not in the dump
+(worded apart when the parent is missing from the target too), a dump without
+one point in time (`snapshot_policy` `mysql_parallel_unsynchronized_snapshots`
+or the legacy `mysql_parallel_no_backup_lock_consistent_snapshot`), or a legacy
+dump without a chosen timezone. Otherwise the import starts at once. When the
+dialog appears, a production profile must type the DB (PostgreSQL: schema) name;
+staging and unclassified profiles start on its Cancel button; development gets
+no colored warning. The dialog names the environment in Korean (운영, 스테이징,
+개발, 미분류), one warning line (덮어쓴 테이블은 되돌릴 수 없습니다; with
+verify-in-copy, 교체 전 테이블은 백업 DB(PostgreSQL: 백업 스키마)에 남습니다; with
+only existing views replaced, 기존 뷰 N개를 바꾸고, 나머지는 새로 만듭니다; with
+nothing to overwrite, 새로 만들기만 합니다), the target (with the profile name in
+front of a tunnel's local `host:port`) and "(새로 만듭니다)" when it is missing,
+the settings in use, the tables to overwrite (with verify-in-copy: to swap),
+create and leave as they are (each list opens from its count and scrolls), the
+warnings in Korean, FK parents added at export (only those that are also in the
+dump; the rest as not in the dump) and the `postgres` fallback, and behind
+"자세히" the kept target-only FKs, the view counts and the core's own text. A
+blocker, also one the application cannot read, disables its start button, and
+the run never starts while one is listed; `copy_blockers` count only with
+verify-in-copy on, followed by a line that turning it off lets the run go ahead.
 
 Success opens no window. The status line and the log say "덤프 테이블 N개를
-교체했습니다", "새 DB(스키마) {name}을 만들어 넣었습니다", or after a swap
-"교체했습니다. 이전 테이블은 {backup}에 있습니다". A verify-in-copy run that
-verifies its copy but cannot swap it (`ready_for_review`, or a promotion plan
-that is blocked or fails) shows one window with only a Close button: the copy
-it verified, the reasons in Korean, that the original is unchanged, and that the
-copy is cleaned up from the job list's "복원 백업 관리". The job list labels the
-run from its result: `Import · 덤프 테이블 교체`, plus ` · 복사본 검증` when a
-copy (and after a swap, a backup) was made, ` · 새 DB 생성` when the run created
-the database, and ` · 대상 {name}` for another name; records with ` · 복사본 검증`,
-and older ones that start with "안전 복원" or "덮어쓰기", open backup management.
+넣었습니다" (N counts every dump table, overwritten or new), "새 DB(스키마)를
+만들어 넣었습니다: {name}", or after a swap "교체했습니다. 이전 테이블은 백업
+DB(스키마) {backup}에 있습니다". A verify-in-copy run that verifies its copy but
+cannot swap it (`ready_for_review`, a promotion plan that is blocked or fails,
+or a swap the core refused with the original unchanged) shows one window: the
+copy it verified, the reasons in Korean (those the core gave only as text are
+in the run log on screen), that the original is unchanged, a "복원 백업 관리"
+button and Close. "복원 백업 관리" in the window, and the same button under the
+table list after any run that made a copy, open backup management with this
+session's credentials. Only a swap whose outcome is unknown shows a separate
+warning. The stop question names what a stop leaves behind: overwritten tables
+stay and the table in progress may be empty (default), the original is unchanged
+(loading the copy), or the swap's outcome may become unknown (swapping); the
+read-only checks stop without asking. The job list labels the run from its
+result: `Import · 덤프 테이블 교체`, plus ` · 복사본 검증` as soon as the core made
+a copy (also on the running record, so a run the app never finished still opens
+backup management), ` · 새 DB 생성` (PostgreSQL: ` · 새 스키마 생성`) when the run
+created the database, and ` · 대상 {name}` for another name; records with
+` · 복사본 검증`, and older ones that start with "안전 복원" or "덮어쓰기", open
+backup management. Without a saved profile (an Import opened from the main
+menu) or saved credentials, the job list asks for the DB account instead of
+refusing.
 
 ### Failure texts
 
@@ -302,8 +324,8 @@ Backup namespaces do not represent an independently complete full-database backu
 
 ### Backup lifecycle (`restore.backups`)
 
-The Core command `restore.backups` (UI: the job list's "복원 백업 관리" on an Import
-record that made a copy) works from the
+The Core command `restore.backups` (UI: "복원 백업 관리" in the Import dialog after a
+run that made a copy, or the job list's on such a record) works from the
 safe-restore reports (every attempt's, and the single report of earlier
 versions) and promotion journals stored in the dump directories passed as
 `input_dirs`; a namespace that only follows the `tf_backup_` naming is listed as

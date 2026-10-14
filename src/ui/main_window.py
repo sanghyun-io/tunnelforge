@@ -694,8 +694,9 @@ class TunnelManagerUI(QMainWindow):
                       manage_backups=self.open_job_backups).exec()
 
     def open_job_backups(self, record):
-        """작업 목록의 Import 기록 → 복원 백업 관리. 앱을 다시 켠 뒤에도 그 Dump 폴더의 저널과
-        보고서의 원래 대상(자격 증명 없음) + 프로필에 저장된 자격 증명으로 연다."""
+        """작업 목록의 Import 기록 → 복원 백업 관리. 앱을 다시 켠 뒤에도 그 덤프 폴더의 저널과
+        보고서의 원래 대상(자격 증명 없음) + 프로필에 저장된 자격 증명으로 연다. 프로필이 없거나
+        (주 메뉴에서 연 Import) 자격 증명을 저장하지 않았으면 DB 계정을 묻는다."""
         import json
         from src.core.connection_trust import apply_registered_tls
         from src.exporters.rust_dump_exporter import restore_target_connection_info
@@ -707,23 +708,32 @@ class TunnelManagerUI(QMainWindow):
             report = {}
         original = restore_target_connection_info(report.get('original_target') if isinstance(report, dict) else None)
         if not original:
-            QMessageBox.information(self, "백업 관리", "이 기록의 Dump 폴더에서 안전 복원 보고서를 찾을 수 없습니다.")
+            QMessageBox.information(self, "백업 관리", "이 기록의 덤프 폴더에서 Import 보고서를 찾을 수 없습니다.")
             return
         tunnel = next((t for t in self.config_mgr.load_config().get('tunnels', [])
                        if record.profile_id and t.get('id') == record.profile_id), None)
-        if tunnel is None:
-            QMessageBox.information(self, "백업 관리", "이 기록의 연결 프로필을 찾을 수 없습니다.")
+        # Without a profile the report's own host:port is used as it is (a direct connection, or a tunnel still up).
+        if tunnel is not None and not self._ensure_tunnel_running(tunnel, prompt=True):
             return
-        if not self._ensure_tunnel_running(tunnel, prompt=True):
-            return
-        user, password = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        user, password = self.config_mgr.get_tunnel_credentials(tunnel['id']) if tunnel is not None else ("", "")
         if not user:
-            QMessageBox.warning(self, "백업 관리", "DB 자격 증명이 저장되어 있지 않습니다.")
-            return
+            user, password = self._ask_db_credentials(f"{original.get('host')}:{original.get('port')}")
+            if not user:
+                return
         original.update(user=user, password=password)
         dialog = BackupLifecycleDialog(apply_registered_tls(original), [os.path.dirname(record.report_path)], self)
         dialog.refresh()
         dialog.exec()
+
+    def _ask_db_credentials(self, endpoint: str):
+        """The DB account for one action; nothing is saved. ('', '') when the user cancels."""
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+        title = translate_text("DB 계정 입력")
+        user, ok = QInputDialog.getText(self, title, translate_text("{}에 접속할 DB 사용자:").format(endpoint))
+        if not ok or not user.strip():
+            return "", ""
+        password, ok = QInputDialog.getText(self, title, translate_text("비밀번호:"), QLineEdit.EchoMode.Password)
+        return (user.strip(), password) if ok else ("", "")
 
     def reopen_job_dialog(self, record):
         """작업 목록에서 원래 대화상자를 연다. Export 만 이전 설정으로 화면을 채우고, 나머지는 설정 없이 연다
