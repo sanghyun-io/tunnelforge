@@ -36,23 +36,24 @@ struct Target {
     triggers: Vec<(String, String)>,
 }
 
-fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
-    let input_dir = request.payload.get("input_dir").and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty()).ok_or("dump.import_preview requires input_dir")?;
-    let manifest = read_dump_manifest(Path::new(input_dir))?;
-    let (data_format, compression) = super::supported_dump_format(&manifest)?;
-    let engine = endpoint.engine.as_str();
-    // A timezone the import would refuse is a bad request, not a property of the target.
-    super::import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), engine)?;
-    let selected: BTreeSet<String> = string_list(request.payload.get("tables")).into_iter().collect();
+/// What the dump alone decides, before the target is read.
+struct DumpFindings {
+    /// The selected tables, in the order the import replaces them.
+    tables: Vec<DumpTableManifest>,
+    blockers: Vec<Value>,
+    warnings: Vec<Value>,
+    copy_blockers: Vec<Value>,
+}
 
+fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &str, strict: bool) -> Result<DumpFindings, String> {
+    let (data_format, compression) = super::supported_dump_format(manifest)?;
     let mut blockers = Vec::new();
-    let mut warnings = super::coded_source_dump_warnings(&manifest).into_iter()
+    let mut warnings = super::coded_source_dump_warnings(manifest).into_iter()
         .map(|(code, detail)| warning(code, detail)).collect::<Vec<_>>();
-    if let Err(err) = super::check_mysql_spatial_import(&manifest, &selected, engine) {
+    if let Err(err) = super::check_mysql_spatial_import(manifest, selected, engine) {
         blockers.push(issue("spatial_unsupported", None, err));
     }
-    match super::import_table_ddls(&manifest, &selected, engine) {
+    match super::import_table_ddls(manifest, selected, engine) {
         Ok((_, untranslatable)) => blockers.extend(untranslatable.into_iter()
             .map(|(table, reason)| issue("untranslatable_table", Some(table.as_str()), reason))),
         Err(err) => blockers.push(issue("dump_invalid", None, err)),
@@ -62,14 +63,31 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     if tables.is_empty() {
         blockers.push(issue("no_tables", None, "dump.import found no tables to import"));
     }
-    let strict = request.payload.get("strict_manifest").and_then(Value::as_bool).unwrap_or(true);
     match validate_dump_import_manifest_strictness(&tables, strict, &data_format, &compression) {
         Ok(legacy) => warnings.extend(legacy.into_iter().map(|detail| warning("legacy_dump", detail))),
         Err(err) => blockers.push(issue("dump_invalid", None, err)),
     }
-    for (table, problem) in super::cross_engine_temporal_refusals(&manifest, &tables, engine) {
+    for (table, problem) in super::cross_engine_temporal_refusals(manifest, &tables, engine) {
         blockers.push(issue("temporal_unsupported", Some(table.as_str()), problem));
     }
+    let mut copy_blockers = super::safe_restore::copy_refusals(manifest, engine).into_iter()
+        .map(|(code, detail)| issue(code, None, detail)).collect::<Vec<_>>();
+    if !selected.is_empty() {
+        copy_blockers.push(issue("partial_table_filter", None, "safe restore requires the complete dump; partial table filters are not supported"));
+    }
+    Ok(DumpFindings { tables: dependency_ordered_dump_tables(&manifest.schema, tables), blockers, warnings, copy_blockers })
+}
+
+fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
+    let input_dir = request.payload.get("input_dir").and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty()).ok_or("dump.import_preview requires input_dir")?;
+    let manifest = read_dump_manifest(Path::new(input_dir))?;
+    let engine = endpoint.engine.as_str();
+    let selected: BTreeSet<String> = string_list(request.payload.get("tables")).into_iter().collect();
+    let strict = request.payload.get("strict_manifest").and_then(Value::as_bool).unwrap_or(true);
+    let DumpFindings { tables, mut blockers, mut warnings, copy_blockers } = dump_findings(&manifest, &selected, engine, strict)?;
+    // A timezone the import would refuse is a bad request, not a property of the target.
+    super::import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), engine)?;
     let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
     let import_schema = NormalizedSchema {
         tables: manifest.schema.tables.iter().filter(|table| names.contains(&table.name)).cloned().collect(),
@@ -80,11 +98,6 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     } else {
         Vec::new()
     };
-    let mut copy_blockers = super::safe_restore::copy_refusals(&manifest, engine).into_iter()
-        .map(|(code, detail)| issue(code, None, detail)).collect::<Vec<_>>();
-    if !selected.is_empty() {
-        copy_blockers.push(issue("partial_dump", None, "safe restore requires the complete dump; partial table filters are not supported"));
-    }
 
     let schema = endpoint_schema(endpoint);
     let mut admin = super::safe_restore::maintenance_connection(endpoint)?;
@@ -93,6 +106,8 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     drop(admin);
     if !exists {
         let kind = if engine == "mysql" { "database" } else { "schema" };
+        // dump.import does not create the namespace yet: it stops at its connection or DDL probe.
+        blockers.push(issue("namespace_missing", None, format!("the {kind} {schema} does not exist and the import does not create it")));
         match can_create {
             Some(false) => blockers.push(issue("create_privilege_missing", None,
                 format!("the {kind} {schema} does not exist and this account cannot create it"))),
@@ -143,16 +158,30 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             for (code, table, detail) in super::postgres_drop_dependents(client, &schema, &names)? {
                 blockers.push(issue(code, Some(table.as_str()), detail));
             }
+            // DROP VIEW, like DROP TABLE, needs the view's or the schema's owner.
+            may_not_replace = client.query(
+                "SELECT c.relname, pg_get_userbyid(c.relowner)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('v','m') AND NOT pg_has_role(c.relowner,'USAGE') AND NOT pg_has_role(n.nspowner,'USAGE') ORDER BY 1",
+                &[&schema, &views_replace],
+            ).map_err(|err| format!("view owner inspection failed: {err}"))?
+                .iter().map(|row| json!({"name": row.get::<_, String>(0), "definer": row.get::<_, String>(1)})).collect();
         }
         kept_children = super::surviving_foreign_keys(adapter, &schema, &import_schema)?.into_iter()
             .map(|fk| json!({"table": fk.child, "constraint": fk.constraint, "parent": fk.parent})).collect();
-        if let Err(err) = validate_target_check_names(adapter, &schema, &import_schema) {
-            blockers.push(issue("check_name_collision", None, err));
+        for (code, table, detail) in target_check_name_problems(adapter, &schema, &import_schema)? {
+            blockers.push(issue(code, Some(table.as_str()), detail));
         }
         for (name, kind) in super::non_table_name_collisions(adapter, &schema, &import_schema)? {
             blockers.push(issue("name_collision", Some(name.as_str()), kind));
         }
         if let LiveAdapter::MySql(conn) = adapter {
+            // The DDL probe drops tables of its own, which only a database-wide DROP grant covers.
+            match mysql_grants_allow(conn, "DROP", Some(schema.as_str())) {
+                Some(true) => {}
+                Some(false) => blockers.push(issue("drop_privilege_missing", None,
+                    format!("this account has no DROP privilege on the database {schema}"))),
+                None => warnings.push(warning("drop_privilege_unproven",
+                    format!("this account's grants do not show whether it can drop tables in {schema}"))),
+            }
             // TF-182: DROP VIEW fails with ERROR 1227 when the view's DEFINER has SYSTEM_USER and
             // this account does not. Which definers have it is not visible, so any other one may.
             if !replaced_views.is_empty() && mysql_grants_allow(conn, "SYSTEM_USER", None) != Some(true) {
@@ -232,12 +261,18 @@ fn can_create_namespace(admin: &mut LiveAdapter, endpoint: &Endpoint) -> Result<
 
 fn mysql_grants_allow(conn: &mut mysql::PooledConn, privilege: &str, database: Option<&str>) -> Option<bool> {
     let grants: Vec<String> = conn.query("SHOW GRANTS FOR CURRENT_USER").ok()?;
-    grants_allow(&grants, privilege, database)
+    // With partial_revokes on, `%` and `_` in database grants are plain characters. Servers
+    // before 8.0.16 have no such variable and always treat them as wildcards.
+    let wildcards = conn.query_first::<i64, _>("SELECT @@global.partial_revokes").ok().flatten() != Some(1);
+    let folds = mysql_folds_table_names(conn).ok()?;
+    let fold = |text: &str| if folds { text.to_lowercase() } else { text.to_string() };
+    let grants = grants.iter().map(|grant| fold(grant)).collect::<Vec<_>>();
+    grants_allow(&grants, privilege, database.map(fold).as_deref(), wildcards)
 }
 
 /// Whether SHOW GRANTS gives `privilege` on `*.*`, or on a database pattern matching `database`.
 /// None when a partial revoke, or a role whose grants are not listed, could change the answer.
-fn grants_allow(grants: &[String], privilege: &str, database: Option<&str>) -> Option<bool> {
+fn grants_allow(grants: &[String], privilege: &str, database: Option<&str>, wildcards: bool) -> Option<bool> {
     let (mut granted, mut roles) = (false, false);
     for grant in grants {
         let grant = grant.trim();
@@ -255,26 +290,27 @@ fn grants_allow(grants: &[String], privilege: &str, database: Option<&str>) -> O
         let Some(to) = upper[on..].find(" TO ").map(|offset| on + offset) else { continue };
         let scope = grant[on + 4..to].trim();
         let applies = scope == "*.*" || database.is_some_and(|database| {
-            scope.strip_suffix(".*").is_some_and(|pattern| grant_pattern_matches(pattern, database))
+            scope.strip_suffix(".*").is_some_and(|pattern| grant_pattern_matches(pattern, database, wildcards))
         });
         granted |= applies && upper[6..on].split(',').map(str::trim).any(|name| name == "ALL PRIVILEGES" || name == privilege);
     }
     if granted { Some(true) } else if roles { None } else { Some(false) }
 }
 
-/// A database grant pattern: backquoted, `%` and `_` are wildcards and `\` escapes.
-fn grant_pattern_matches(pattern: &str, name: &str) -> bool {
-    fn matches(pattern: &[char], name: &[char]) -> bool {
+/// A database grant pattern: backquoted, `\` escapes, and `%` and `_` are wildcards unless
+/// partial_revokes makes them plain characters.
+fn grant_pattern_matches(pattern: &str, name: &str, wildcards: bool) -> bool {
+    fn matches(pattern: &[char], name: &[char], wildcards: bool) -> bool {
         match pattern {
             [] => name.is_empty(),
-            ['%', rest @ ..] => (0..=name.len()).any(|skip| matches(rest, &name[skip..])),
-            ['_', rest @ ..] => !name.is_empty() && matches(rest, &name[1..]),
-            ['\\', literal, rest @ ..] | [literal, rest @ ..] => name.first() == Some(literal) && matches(rest, &name[1..]),
+            ['%', rest @ ..] if wildcards => (0..=name.len()).any(|skip| matches(rest, &name[skip..], wildcards)),
+            ['_', rest @ ..] if wildcards => !name.is_empty() && matches(rest, &name[1..], wildcards),
+            ['\\', literal, rest @ ..] | [literal, rest @ ..] => name.first() == Some(literal) && matches(rest, &name[1..], wildcards),
         }
     }
     let pattern = pattern.strip_prefix('`').and_then(|inner| inner.strip_suffix('`'))
         .map(|inner| inner.replace("``", "`")).unwrap_or_else(|| pattern.to_string());
-    matches(&pattern.chars().collect::<Vec<_>>(), &name.chars().collect::<Vec<_>>())
+    matches(&pattern.chars().collect::<Vec<_>>(), &name.chars().collect::<Vec<_>>(), wildcards)
 }
 
 #[cfg(test)]
@@ -286,32 +322,139 @@ mod tests {
     fn grants_decide_create_and_system_user_or_say_they_cannot() {
         let grants = |lines: &[&str]| lines.iter().map(|line| line.to_string()).collect::<Vec<_>>();
         let global = grants(&["GRANT SELECT, CREATE, DROP ON *.* TO `u`@`%`"]);
-        assert_eq!(grants_allow(&global, "CREATE", Some("anything")), Some(true));
-        assert_eq!(grants_allow(&global, "SYSTEM_USER", None), Some(false));
+        assert_eq!(grants_allow(&global, "CREATE", Some("anything"), true), Some(true));
+        assert_eq!(grants_allow(&global, "SYSTEM_USER", None, true), Some(false));
         let scoped = grants(&["GRANT USAGE ON *.* TO `u`@`%`", "GRANT ALL PRIVILEGES ON `app\\_%`.* TO `u`@`%`"]);
-        assert_eq!(grants_allow(&scoped, "CREATE", Some("app_new")), Some(true));
-        assert_eq!(grants_allow(&scoped, "CREATE", Some("appXnew")), Some(false), "an escaped _ is literal");
-        assert_eq!(grants_allow(&scoped, "CREATE", Some("other")), Some(false));
-        assert_eq!(grants_allow(&scoped, "SYSTEM_USER", None), Some(false), "a database grant never gives a global privilege");
-        assert_eq!(grants_allow(&grants(&["GRANT CREATE VIEW, CREATE ROUTINE ON *.* TO `u`@`%`"]), "CREATE", Some("app")), Some(false));
-        assert_eq!(grants_allow(&grants(&["GRANT APPLICATION_PASSWORD_ADMIN,SYSTEM_USER ON *.* TO `root`@`%`"]), "SYSTEM_USER", None), Some(true));
-        assert_eq!(grants_allow(&grants(&["GRANT USAGE ON *.* TO `u`@`%`", "GRANT `dba`@`%` TO `u`@`%`"]), "CREATE", Some("app")), None);
-        assert_eq!(grants_allow(&grants(&["GRANT CREATE ON *.* TO `u`@`%`", "REVOKE CREATE ON `app`.* FROM `u`@`%`"]), "CREATE", Some("app")), None);
-        assert!(grant_pattern_matches("`a``b`", "a`b"));
-        assert!(grant_pattern_matches("`tf_test`", "tf-test"), "an unescaped _ matches any character, as in MySQL");
+        assert_eq!(grants_allow(&scoped, "CREATE", Some("app_new"), true), Some(true));
+        assert_eq!(grants_allow(&scoped, "CREATE", Some("appXnew"), true), Some(false), "an escaped _ is literal");
+        assert_eq!(grants_allow(&scoped, "CREATE", Some("other"), true), Some(false));
+        assert_eq!(grants_allow(&scoped, "SYSTEM_USER", None, true), Some(false), "a database grant never gives a global privilege");
+        assert_eq!(grants_allow(&grants(&["GRANT CREATE VIEW, CREATE ROUTINE ON *.* TO `u`@`%`"]), "CREATE", Some("app"), true), Some(false));
+        assert_eq!(grants_allow(&grants(&["GRANT APPLICATION_PASSWORD_ADMIN,SYSTEM_USER ON *.* TO `root`@`%`"]), "SYSTEM_USER", None, true), Some(true));
+        assert_eq!(grants_allow(&grants(&["GRANT USAGE ON *.* TO `u`@`%`", "GRANT `dba`@`%` TO `u`@`%`"]), "CREATE", Some("app"), true), None);
+        assert_eq!(grants_allow(&grants(&["GRANT CREATE ON *.* TO `u`@`%`", "REVOKE CREATE ON `app`.* FROM `u`@`%`"]), "CREATE", Some("app"), true), None);
+        assert_eq!(grants_allow(&grants(&["GRANT DROP ON `app`.`orders` TO `u`@`%`"]), "DROP", Some("app"), true), Some(false), "a table grant is not database-wide");
+        assert!(grant_pattern_matches("`a``b`", "a`b", true));
+        assert!(grant_pattern_matches("`tf_test`", "tf-test", true), "an unescaped _ matches any character, as in MySQL");
+    }
+
+    #[test]
+    fn partial_revokes_make_grant_wildcards_plain_characters() {
+        let grants = vec!["GRANT ALL PRIVILEGES ON `app_%`.* TO `u`@`%`".to_string()];
+        assert_eq!(grants_allow(&grants, "CREATE", Some("app_new"), true), Some(true));
+        assert_eq!(grants_allow(&grants, "CREATE", Some("app_new"), false), Some(false));
+        assert_eq!(grants_allow(&grants, "CREATE", Some("app_%"), false), Some(true));
+        assert!(grant_pattern_matches("`app\\_%`", "app_%", false), "an escape still names the character itself");
+        assert!(!grant_pattern_matches("`tf_test`", "tf-test", false));
     }
 
     #[test]
     fn manifest_warnings_get_stable_codes() {
-        for (text, code) in [
-            ("Workers used independent snapshots without a shared lock; cross-table and cross-chunk point-in-time consistency is not guaranteed.", "unsynchronized_snapshot"),
-            ("View definitions were collected outside the table data snapshot; their consistency with that snapshot is not guaranteed.", "views_outside_snapshot"),
-            ("Object not exported: trigger:orders:trg", "omitted_object"),
-            ("Non-transactional tables excluded from export: logs", "omitted_object"),
-            ("View definitions could not be collected: denied", "source_dump_warning"),
-        ] {
-            assert_eq!(super::super::manifest_warning_code(text), code, "{text}");
+        let (_, _, unsynchronized) = dump_manifest_consistency_metadata("mysql", "mysql_parallel_unsynchronized_snapshots");
+        let mut cases = unsynchronized.into_iter().map(|text| (text, "unsynchronized_snapshot")).collect::<Vec<_>>();
+        cases.extend([
+            // Written by exports before the shared-lock wording.
+            (format!("{WARNING_UNSYNCHRONIZED_SNAPSHOTS}; cross-table and cross-chunk consistency is not guaranteed."), "unsynchronized_snapshot"),
+            (format!("{WARNING_VIEWS_OUTSIDE_SNAPSHOT}; their consistency with that snapshot is not guaranteed."), "views_outside_snapshot"),
+            (format!("{WARNING_OBJECT_NOT_EXPORTED} trigger:orders:trg"), "omitted_object"),
+            (format!("{WARNING_NON_TRANSACTIONAL_EXCLUDED} logs"), "omitted_object"),
+            ("View definitions could not be collected: denied".to_string(), "source_dump_warning"),
+        ]);
+        assert_eq!(cases.len(), 6);
+        for (text, code) in cases {
+            assert_eq!(super::super::manifest_warning_code(&text), code, "{text}");
         }
+    }
+
+    fn users() -> NormalizedTable {
+        crate::adapters::test_support::schema().tables.remove(0)
+    }
+
+    fn with_column(mut table: NormalizedTable, name: &str, type_name: &str) -> NormalizedTable {
+        let mut column = table.columns[1].clone();
+        column.name = name.into();
+        column.type_name = type_name.into();
+        table.columns.push(column);
+        table
+    }
+
+    fn manifest(source_engine: &str, format_version: u32, tables: Vec<NormalizedTable>) -> DumpManifest {
+        DumpManifest {
+            format: "tunnelforge-dump".into(), format_version, data_format: "jsonl".into(), compression: "none".into(),
+            source_engine: source_engine.into(), database: "app".into(), source_schema: Some("app".into()), source_timezone: Some("UTC".into()),
+            snapshot_policy: "mysql_single_connection_consistent_snapshot".into(), strict_export: true, manifest_warnings: vec![],
+            chunk_size: 100, created_unix_seconds: 1, views: vec![],
+            tables: tables.iter().map(|table| DumpTableManifest {
+                name: table.name.clone(), path: table.name.clone(), rows: 0, chunks: 0, chunk_sha256: BTreeMap::new(),
+            }).collect(),
+            schema: NormalizedSchema { tables },
+        }
+    }
+
+    fn codes(items: &[Value]) -> Vec<&str> {
+        items.iter().map(|item| item["code"].as_str().unwrap()).collect()
+    }
+
+    fn findings(manifest: &DumpManifest, selected: &[&str], engine: &str, strict: bool) -> DumpFindings {
+        let selected = selected.iter().map(|name| name.to_string()).collect();
+        dump_findings(manifest, &selected, engine, strict).unwrap()
+    }
+
+    #[test]
+    fn a_clean_same_engine_dump_has_no_findings() {
+        let found = findings(&manifest("mysql", 5, vec![users()]), &[], "mysql", true);
+        assert_eq!(found.blockers, Vec::<Value>::new());
+        assert_eq!(found.warnings, Vec::<Value>::new());
+        assert_eq!(found.copy_blockers, Vec::<Value>::new());
+    }
+
+    #[test]
+    fn cross_engine_dumps_report_what_the_other_engine_cannot_take() {
+        let found = findings(&manifest("postgresql", 5, vec![with_column(users(), "starts", "time with time zone")]), &[], "mysql", true);
+        let temporal = found.blockers.iter().find(|item| item["code"] == "temporal_unsupported").unwrap_or_else(|| panic!("{:?}", found.blockers));
+        assert_eq!(temporal["table"], "users");
+        assert_eq!(codes(&found.copy_blockers), ["cross_engine"]);
+
+        let mut on_update = with_column(users(), "touched", "timestamp");
+        on_update.columns[2].on_update = Some("CURRENT_TIMESTAMP".into());
+        on_update.name = "audit".into();
+        let found = findings(&manifest("mysql", 5, vec![with_column(users(), "spot", "point"), on_update]), &[], "postgresql", true);
+        assert!(codes(&found.blockers).contains(&"spatial_unsupported"), "{:?}", found.blockers);
+        assert!(found.blockers.iter().any(|item| item["code"] == "untranslatable_table" && item["table"] == "audit"), "{:?}", found.blockers);
+        assert_eq!(codes(&found.copy_blockers), ["cross_engine"]);
+    }
+
+    #[test]
+    fn legacy_dumps_report_their_limits() {
+        let mut legacy = manifest("mysql", 3, vec![with_column(users(), "flags", "bit(8)")]);
+        legacy.source_timezone = None;
+        legacy.strict_export = false;
+        legacy.snapshot_policy = "mysql_parallel_unsynchronized_snapshots".into();
+        legacy.tables[0].rows = 1;
+        legacy.tables[0].chunks = 1;
+        let found = findings(&legacy, &[], "mysql", false);
+        assert_eq!(found.blockers, Vec::<Value>::new());
+        assert_eq!(codes(&found.warnings), ["unsynchronized_snapshot", "not_strict", "legacy_timezone", "legacy_dump"]);
+        assert_eq!(codes(&found.copy_blockers), ["legacy_bit_unverifiable"]);
+        // A strict import refuses the missing chunk digests outright.
+        assert_eq!(codes(&findings(&legacy, &[], "mysql", true).blockers), ["dump_invalid"]);
+    }
+
+    #[test]
+    fn table_filters_and_empty_selections_are_reported() {
+        let mut parent = users();
+        parent.name = "parent".into();
+        let mut child = users();
+        child.name = "child".into();
+        child.foreign_keys.push(crate::adapters::test_support::fk("fk_child_parent", "parent"));
+        let dump = manifest("mysql", 5, vec![child, parent]);
+        let whole = findings(&dump, &[], "mysql", true);
+        assert_eq!(whole.tables.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), ["parent", "child"], "the order the import replaces them");
+        let filtered = findings(&dump, &["child"], "mysql", true);
+        assert_eq!(codes(&filtered.copy_blockers), ["partial_table_filter"]);
+        assert_eq!(filtered.tables.len(), 1);
+        assert_eq!(codes(&findings(&dump, &["ghost"], "mysql", true).blockers), ["dump_invalid", "no_tables"]);
+        assert_eq!(codes(&findings(&manifest("mysql", 5, vec![]), &[], "mysql", true).blockers), ["no_tables"]);
     }
 
     #[test]
@@ -319,16 +462,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tunnelforge-preview-{}-{}", std::process::id(), current_unix_seconds()));
         std::fs::create_dir_all(&dir).unwrap();
         // The chunk is declared but absent: reading it would fail before the target is reached.
-        let manifest = DumpManifest {
-            format: "tunnelforge-dump".into(), format_version: 3, data_format: "tsv".into(), compression: "none".into(),
-            source_engine: "mysql".into(), database: "app".into(), source_schema: Some("app".into()), source_timezone: Some("UTC".into()),
-            schema: crate::adapters::test_support::schema(), snapshot_policy: "mysql_single_connection_consistent_snapshot".into(),
-            strict_export: true, manifest_warnings: vec![], chunk_size: 100, created_unix_seconds: 1, views: vec![],
-            tables: vec![DumpTableManifest {
-                name: "users".into(), path: "users".into(), rows: 1, chunks: 1,
-                chunk_sha256: BTreeMap::from([("chunk_000001.tsv".into(), "0".repeat(64))]),
-            }],
-        };
+        let mut manifest = manifest("mysql", 3, vec![users()]);
+        manifest.data_format = "tsv".into();
+        manifest.tables[0].rows = 1;
+        manifest.tables[0].chunks = 1;
+        manifest.tables[0].chunk_sha256 = BTreeMap::from([("chunk_000001.tsv".into(), "0".repeat(64))]);
         write_dump_manifest(&dir, &manifest).unwrap();
         let payload = json!({"input_dir": dir.to_string_lossy(), "target": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "root", "password": "secret-value", "database": "app"}});
         let mut events = Vec::new();
@@ -339,7 +477,7 @@ mod tests {
         assert_eq!(events[0]["event"], "error");
         assert_eq!(events[0]["request_id"], "p-1");
         let message = events[0]["message"].as_str().unwrap();
-        assert!(!message.contains("chunk") && !message.contains("secret-value"), "{message}");
+        assert!(!message.contains("chunk"), "{message}");
         assert!(!report_written, "a preview must not write an import report");
     }
 }

@@ -179,16 +179,13 @@ fn coded_source_dump_warnings(manifest: &DumpManifest) -> Vec<(&'static str, Str
     warnings
 }
 
-/// Export writes these texts into the manifest (`dump.rs`, `adapters.rs`).
 fn manifest_warning_code(warning: &str) -> &'static str {
-    if warning.contains("independent snapshots") {
+    if warning.starts_with(WARNING_UNSYNCHRONIZED_SNAPSHOTS) {
         "unsynchronized_snapshot"
-    } else if warning.contains("outside the table data snapshot") {
+    } else if warning.starts_with(WARNING_VIEWS_OUTSIDE_SNAPSHOT) {
         "views_outside_snapshot"
-    } else if warning.starts_with("Object not exported:") || warning.starts_with("Non-transactional tables excluded") {
+    } else if warning.starts_with(WARNING_OBJECT_NOT_EXPORTED) || warning.starts_with(WARNING_NON_TRANSACTIONAL_EXCLUDED) {
         "omitted_object"
-    } else if warning.contains("visibility") {
-        "visibility_unproven"
     } else {
         "source_dump_warning"
     }
@@ -976,10 +973,18 @@ fn validate_postgres_drop_dependencies(adapter: &mut LiveAdapter, schema: &str, 
 }
 
 /// Everything that would make DROP TABLE of the import set fail, as `(code, dumped table, detail)`.
-/// Import-set children in the same schema are not listed: their FK is dropped just before the
-/// parent is replaced (replace_target_table).
+/// `names` is the order the import drops the tables in. Import-set children in the same schema
+/// are not listed: their FK is dropped just before the parent is replaced (replace_target_table).
 fn postgres_drop_dependents(client: &mut postgres::Client, schema: &str, names: &[String]) -> Result<Vec<(&'static str, String, String)>, String> {
     let mut dependents = Vec::new();
+    for row in client.query(
+        "SELECT c.relname, pg_get_userbyid(c.relowner)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','p') AND NOT pg_has_role(c.relowner,'USAGE') AND NOT pg_has_role(n.nspowner,'USAGE') ORDER BY 1",
+        &[&schema, &names],
+    ).map_err(|err| format!("Owner inspection failed: {err}"))? {
+        let (table, owner): (String, String) = (row.get(0), row.get(1));
+        let detail = format!("Table {schema}.{table} belongs to {owner}; only its owner or the schema owner can drop it");
+        dependents.push(("drop_privilege_missing", table, detail));
+    }
     for row in client.query(
         "SELECT DISTINCT vn.nspname,v.relname,source.relname FROM pg_depend d JOIN pg_rewrite r ON r.oid=d.objid JOIN pg_class v ON v.oid=r.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_class source ON source.oid=d.refobjid JOIN pg_namespace sn ON sn.oid=source.relnamespace WHERE d.classid='pg_rewrite'::regclass AND d.refclassid='pg_class'::regclass AND v.relkind IN ('v','m') AND v.oid<>source.oid AND sn.nspname=$1 AND source.relname=ANY($2::text[]) ORDER BY 3,1,2",
         &[&schema, &names],
@@ -998,24 +1003,35 @@ fn postgres_drop_dependents(client: &mut postgres::Client, schema: &str, names: 
             dependents.push(("target_only_fk_child", parent, detail));
         }
     }
-    // Any other object outside the import set that depends on something DROP TABLE removes with
-    // the table (an owned sequence used by another table's default, a column of the table's row
-    // type, an inheriting table, a policy or function body naming it). Views and FKs, with the
-    // triggers an FK creates, are listed above.
+    // Any other object that depends on something DROP TABLE removes with a table (an owned
+    // sequence used by another table's default or a view, a column of the table's row type, an
+    // inheriting table, a policy or function body naming it), unless it is already gone: the
+    // tables are dropped one by one in `names` order. Views over a dumped table and FKs to one,
+    // with their partition clones and FK triggers, are listed above or dropped first.
     for row in client.query(
-        "WITH RECURSIVE dropped(classid, objid, root) AS (
-            SELECT 'pg_class'::regclass::oid, c.oid, c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        "WITH RECURSIVE dropped(classid, objid, root, seed) AS (
+            SELECT 'pg_class'::regclass::oid, c.oid, c.relname::text, true FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
              WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','p')
             UNION
-            SELECT d.classid, d.objid, p.root FROM pg_depend d JOIN dropped p ON p.classid=d.refclassid AND p.objid=d.refobjid
-             WHERE d.deptype IN ('a','i'))
-         SELECT DISTINCT p.root, pg_describe_object(d.classid,d.objid,d.objsubid), pg_describe_object(d.refclassid,d.refobjid,d.refobjsubid)
+            SELECT d.classid, d.objid, p.root, false FROM pg_depend d JOIN dropped p ON p.classid=d.refclassid AND p.objid=d.refobjid
+             WHERE d.deptype IN ('a','i')),
+         listed_fk(oid) AS (
+            SELECT k.oid FROM pg_constraint k JOIN dropped s ON s.seed AND s.objid=k.confrelid WHERE k.contype='f' AND k.conparentid=0
+            UNION
+            SELECT k.oid FROM pg_constraint k JOIN listed_fk f ON k.conparentid=f.oid)
+         SELECT DISTINCT p.root,
+                COALESCE(pg_describe_object(d.classid,d.objid,d.objsubid), d.classid::regclass::text || ' ' || d.objid::text),
+                COALESCE(pg_describe_object(d.refclassid,d.refobjid,d.refobjsubid), d.refclassid::regclass::text || ' ' || d.refobjid::text)
          FROM pg_depend d JOIN dropped p ON p.classid=d.refclassid AND p.objid=d.refobjid
          WHERE d.deptype='n'
-           AND NOT EXISTS (SELECT 1 FROM dropped x WHERE x.classid=d.classid AND x.objid=d.objid)
-           AND NOT EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_class v ON v.oid=r.ev_class WHERE d.classid='pg_rewrite'::regclass AND r.oid=d.objid AND v.relkind IN ('v','m'))
-           AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE d.classid='pg_constraint'::regclass AND k.oid=d.objid AND k.contype='f')
-           AND NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_constraint k ON k.oid=t.tgconstraint WHERE d.classid='pg_trigger'::regclass AND t.oid=d.objid AND k.contype='f')
+           AND NOT EXISTS (SELECT 1 FROM dropped x WHERE x.classid=d.classid AND x.objid=d.objid
+                            AND array_position($2::text[], x.root) <= array_position($2::text[], p.root))
+           AND NOT EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_class v ON v.oid=r.ev_class
+                            JOIN pg_depend vd ON vd.classid='pg_rewrite'::regclass AND vd.objid=r.oid AND vd.refclassid='pg_class'::regclass
+                            JOIN dropped s ON s.seed AND s.objid=vd.refobjid
+                           WHERE d.classid='pg_rewrite'::regclass AND r.oid=d.objid AND v.relkind IN ('v','m'))
+           AND NOT (d.classid='pg_constraint'::regclass AND d.objid IN (SELECT oid FROM listed_fk))
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN listed_fk f ON f.oid=t.tgconstraint WHERE d.classid='pg_trigger'::regclass AND t.oid=d.objid)
          ORDER BY 1,2,3",
         &[&schema, &names],
     ).map_err(|err| format!("Dependency inspection failed: {err}"))? {

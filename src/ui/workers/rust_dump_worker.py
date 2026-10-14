@@ -101,12 +101,12 @@ class RustDumpWorker(QThread):
                 message = CANCELLED_MESSAGE
                 if self.task_type == "import":
                     self.import_finished.emit(False, message, {})
-                elif self.task_type == "import_preview":
-                    self.preview_finished.emit(False, message, {})
-                self.finished.emit(False, message)
             else:
-                self.error_code = classify_error_code(getattr(e, "error_code", None), str(e))
-                self.finished.emit(False, str(e))
+                message = str(e)
+                self.error_code = classify_error_code(getattr(e, "error_code", None), message)
+            if self.task_type == "import_preview":
+                self.preview_finished.emit(False, message, {})
+            self.finished.emit(False, message)
         finally:
             self._active_runner = None
 
@@ -214,5 +214,5 @@ class RustDumpWorker(QThread):
         )
         self.error_code = getattr(importer, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)
-        self.preview_finished.emit(success, msg, preview)
+        self.preview_finished.emit(success, msg, {} if self._cancel_requested else preview)
         self.finished.emit(success, msg)

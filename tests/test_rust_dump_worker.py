@@ -1,7 +1,7 @@
 import pytest
 
 from src.exporters.rust_dump_exporter import RustDumpConfig
-from src.ui.workers.rust_dump_worker import RustDumpWorker
+from src.ui.workers.rust_dump_worker import CANCELLED_MESSAGE, RustDumpWorker
 
 
 @pytest.mark.parametrize(
@@ -102,4 +102,40 @@ def test_import_preview_worker_forwards_import_options_and_emits_the_plan(monkey
     assert captured["args"] == ("C:/tmp/dump", "app", 4, "SET SESSION time_zone = '+09:00'")
     assert captured["kwargs"] == {"use_source_timezone": False}
     assert emitted == [(True, "", plan)]
+
+
+def test_import_preview_worker_answers_when_the_importer_cannot_start(monkeypatch):
+    class BrokenImporter:
+        def __init__(self, config):
+            raise FileNotFoundError("tunnelforge-core not found")
+
+    monkeypatch.setattr("src.ui.workers.rust_dump_worker.RustDumpImporter", BrokenImporter)
+    worker = RustDumpWorker("import_preview", RustDumpConfig("localhost", 3306, "root", "password"), input_dir="C:/tmp/dump")
+    emitted = []
+    worker.preview_finished.connect(lambda *args: emitted.append(args))
+
+    worker.run()
+
+    assert emitted == [(False, "tunnelforge-core not found", {})]
+
+
+def test_cancelled_import_preview_sends_no_plan(monkeypatch):
+    class FakeImporter:
+        last_error_code = None
+
+        def __init__(self, config):
+            pass
+
+        def preview_import(self, *args, **kwargs):
+            worker.cancel()
+            return True, "", {"dry_run": True, "replace": ["users"], "blockers": []}
+
+    monkeypatch.setattr("src.ui.workers.rust_dump_worker.RustDumpImporter", FakeImporter)
+    worker = RustDumpWorker("import_preview", RustDumpConfig("localhost", 3306, "root", "password"), input_dir="C:/tmp/dump")
+    emitted = []
+    worker.preview_finished.connect(lambda *args: emitted.append(args))
+
+    worker.run()
+
+    assert emitted == [(False, CANCELLED_MESSAGE, {})]
 

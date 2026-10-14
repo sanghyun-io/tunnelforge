@@ -81,11 +81,13 @@ live target table), and all probes are then removed. A rejected definition, a
 missing REFERENCES privilege, or an FK that no longer fits a parent outside the
 dump stops the import with the target unchanged. A view or other non-table
 object that already uses a selected table's name is refused the same way.
-On PostgreSQL, anything outside the import set that DROP TABLE would refuse
-over is also found first: a view, a target-only FK child, and any other
-`pg_depend` dependent, such as another table's default that uses a sequence a
-selected table owns, a column of a selected table's row type, an inheriting
-table, or a policy or function body naming the table.
+On PostgreSQL, anything that DROP TABLE would refuse over is also found first:
+a table the account neither owns nor owns the schema of, a view, a target-only
+FK child, and any other `pg_depend` dependent, such as a default or view that
+uses a sequence a selected table owns, a column of a selected table's row type,
+an inheriting table, or a policy or function body naming the table. Tables are
+dropped one by one in dependency order, so a dependent that is itself a selected
+table counts only when its table is dropped after the one it depends on.
 
 ### Preview (`dump.import_preview`)
 
@@ -96,29 +98,36 @@ command, and the application refuses to preview with a core that does not, since
 an older core ignores unknown `dump.import` fields.
 
 The result lists the dump tables that would be replaced (`replace`) or created
-(`create`), target tables left alone (`untouched`), kept target-only children
-(`kept_children`), FKs to parents outside the dump and whether the target has
-them (`external_parents`), view changes (`views`: `replace`, `create`,
-`may_not_replace` for views under another DEFINER when the account lacks
-SYSTEM_USER, `may_break` for MySQL target-only views over replaced tables, from
+(`create`) in the order the import takes them, target tables left alone
+(`untouched`), kept target-only children (`kept_children`), FKs to parents
+outside the dump and whether the target has them (`external_parents`), view
+changes (`views`: `replace`, `create`, `may_not_replace` for views the account
+may not drop: on MySQL under another DEFINER when the account lacks SYSTEM_USER,
+on PostgreSQL owned by a role the account cannot act as, `may_break` for MySQL
+target-only views over replaced tables, from
 `information_schema.VIEW_TABLE_USAGE`), the triggers that disappear with replaced
 tables (`triggers_dropped`), and the dump's `strict_export`, `snapshot_policy`
 and `source_timezone`. When the namespace is missing, every table is under
 `create` and `target.can_create` says whether the account may create it (`null`
-when its grants cannot tell, for example with roles or partial revokes).
+when its grants cannot tell, for example with roles or partial revokes). The
+import does not create a missing namespace yet, so the preview then also
+reports `namespace_missing`.
 
 `blockers` (`{code, table, detail}`) are what the import refuses before its first
 DROP: `dump_invalid`, `untranslatable_table`, `spatial_unsupported`,
-`temporal_unsupported`, `no_tables`, the PostgreSQL dependents above
-(`dependent_view`, `target_only_fk_child`, `dependent_object`),
-`check_name_collision`, `name_collision`, `create_privilege_missing`, and on
-PostgreSQL `external_parent_missing` (MySQL adds such an FK with
+`temporal_unsupported`, `no_tables`, `namespace_missing`, the PostgreSQL
+dependents above (`drop_privilege_missing`, `dependent_view`,
+`target_only_fk_child`, `dependent_object`), `check_name_collision`,
+`name_collision`, `create_privilege_missing`, on MySQL `drop_privilege_missing`
+when the account has no database-wide DROP grant (the DDL probe drops its own
+tables), and on PostgreSQL `external_parent_missing` (MySQL adds such an FK with
 `foreign_key_checks=0`). `copy_blockers` are what `safe` refuses on top of that
-(`legacy_bit_unverifiable`, `cross_engine`, `partial_dump`). `warnings`
+(`legacy_bit_unverifiable`, `cross_engine`, and `partial_table_filter` when the
+request carries a `tables` filter; a partial export is not refused). `warnings`
 (`{code, detail}`) map the manifest's texts to `unsynchronized_snapshot`,
-`views_outside_snapshot`, `omitted_object`, `visibility_unproven` or
-`source_dump_warning`, and add `not_strict`, `legacy_timezone`, `legacy_dump`,
-`create_privilege_unproven` and `view_dependencies_unknown`.
+`views_outside_snapshot`, `omitted_object` or `source_dump_warning`, and add
+`not_strict`, `legacy_timezone`, `legacy_dump`, `create_privilege_unproven`,
+`drop_privilege_unproven` and `view_dependencies_unknown`.
 
 ### Safe restoration and destination names
 

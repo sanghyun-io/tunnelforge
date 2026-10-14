@@ -742,7 +742,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         match collect_views(endpoint) {
             Ok(views) => {
                 if !views.is_empty() {
-                    view_warning = Some("View definitions were collected outside the table data snapshot; their consistency with that snapshot is not guaranteed.".to_string());
+                    view_warning = Some(format!("{WARNING_VIEWS_OUTSIDE_SNAPSHOT}; their consistency with that snapshot is not guaranteed."));
                 }
                 views
             }
@@ -896,7 +896,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     let inspection = inspect_live(&endpoint)?;
     let mut export_warnings: Vec<String> = inspection.unsupported_objects.iter()
         .filter(|object| !object.starts_with("view:"))
-        .map(|object| format!("Object not exported: {object}"))
+        .map(|object| format!("{WARNING_OBJECT_NOT_EXPORTED} {object}"))
         .collect();
     let mut schema = inspection.schema;
     if !options.selected_tables.is_empty() {
@@ -1031,7 +1031,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             ));
         }
         if !non_txn.is_empty() {
-            export_warnings.push(format!("Non-transactional tables excluded from export: {}", non_txn.join(", ")));
+            export_warnings.push(format!("{WARNING_NON_TRANSACTIONAL_EXCLUDED} {}", non_txn.join(", ")));
             let excluded: BTreeSet<String> = non_txn.iter().cloned().collect();
             schema.tables.retain(|table| !excluded.contains(&table.name));
             emit(json!({

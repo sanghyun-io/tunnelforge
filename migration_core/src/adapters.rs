@@ -925,6 +925,12 @@ fn default_snapshot_policy() -> String {
     "unknown".to_string()
 }
 
+/// How export's manifest warnings begin; import codes them by these (manifest_warning_code).
+pub(crate) const WARNING_UNSYNCHRONIZED_SNAPSHOTS: &str = "Workers used independent snapshots";
+pub(crate) const WARNING_VIEWS_OUTSIDE_SNAPSHOT: &str = "View definitions were collected outside the table data snapshot";
+pub(crate) const WARNING_OBJECT_NOT_EXPORTED: &str = "Object not exported:";
+pub(crate) const WARNING_NON_TRANSACTIONAL_EXCLUDED: &str = "Non-transactional tables excluded from export:";
+
 pub(crate) fn dump_manifest_consistency_metadata(
     engine: &str,
     mysql_snapshot_policy: &str,
@@ -933,10 +939,9 @@ pub(crate) fn dump_manifest_consistency_metadata(
         let unsynchronized =
             mysql_snapshot_policy == "mysql_parallel_unsynchronized_snapshots";
         let warnings = if unsynchronized {
-            vec![
-                "Workers used independent snapshots without a shared lock; cross-table and cross-chunk point-in-time consistency is not guaranteed."
-                    .to_string(),
-            ]
+            vec![format!(
+                "{WARNING_UNSYNCHRONIZED_SNAPSHOTS} without a shared lock; cross-table and cross-chunk point-in-time consistency is not guaranteed."
+            )]
         } else {
             Vec::new()
         };
