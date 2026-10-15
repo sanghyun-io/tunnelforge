@@ -1058,10 +1058,11 @@ pub(crate) fn mysql_definition_has_residual_definer(sql: &str) -> bool {
 
 /// View 정의가 단일 `CREATE [OR REPLACE] VIEW ...` 문인지 가볍게 검증한다.
 ///
-/// 주목적은 PostgreSQL `batch_execute` 경로다 — 이 드라이버는 세미콜론으로 구분된
-/// multi-statement를 모두 실행하므로, 변조된 manifest가 `CREATE VIEW x AS ...; DROP TABLE y; GRANT ...`
-/// 같은 SQL 체인을 심으면 그대로 실행된다. MySQL `query_drop`은 기본적으로 multi-statement를
-/// 거부하지만, 일관성과 방어를 위해 양쪽 엔진 모두에 동일한 shape 검증을 적용한다.
+/// PostgreSQL `batch_execute`도, MySQL `query_drop`도 세미콜론으로 구분된 multi-statement를
+/// 모두 실행한다(vendored mysql 드라이버는 CLIENT_MULTI_STATEMENTS를 기본으로 켠다;
+/// 끄는 연결은 `mysql_single_statement_conn`뿐이다). 그래서 변조된 manifest가
+/// `CREATE VIEW x AS ...; DROP TABLE y; GRANT ...` 같은 SQL 체인을 심으면 그대로 실행되므로,
+/// 양쪽 엔진 모두에 동일한 shape 검증을 적용한다.
 ///
 /// 허용: 문자열 리터럴/식별자/주석 바깥의 세미콜론이 끝에만(또는 없음) 존재하고,
 /// 첫 유효 토큰이 `CREATE`인 경우. 그 외(추가 statement, CREATE 아닌 시작)는 거부한다.
