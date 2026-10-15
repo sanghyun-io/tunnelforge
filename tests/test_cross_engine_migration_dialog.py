@@ -2120,3 +2120,25 @@ def test_generated_columns_inspection_explains_cross_engine_blocker():
         assert dialog._payload()["unsupported_objects"] == ["generated_column:orders:total"]
     finally:
         dialog.close()
+
+
+def test_other_unsupported_objects_do_not_claim_generated_column_blocker():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({"event": "result", "command": "inspect", "success": True,
+                           "unsupported_objects": ["view:report", "trigger:orders:audit"]})
+        assert "사전 점검 대상" in dialog.txt_log.toPlainText()
+        assert "계산 열" not in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_generated_column_issue_type_label_is_translated():
+    from src.core import i18n
+    from src.ui.dialogs.cross_engine_migration_dialog import _ISSUE_TYPE_LABELS
+    assert _ISSUE_TYPE_LABELS["unsupported_generated_column"] == "계산 열 미지원"
+    i18n.set_language("en")
+    try:
+        assert i18n.translate_text(_ISSUE_TYPE_LABELS["unsupported_generated_column"]) == "Unsupported generated column"
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)

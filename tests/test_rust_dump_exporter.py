@@ -1889,7 +1889,7 @@ def test_every_code_the_core_can_emit_has_a_korean_sentence():
     ("non_transactional_table:logs:MEMORY",
      "테이블 logs: MEMORY 엔진이라 다른 테이블과 같은 시점으로 읽을 수 없습니다. 빼고 내보내면 이 테이블이 통째로 빠집니다"),
     ("unsupported_index:orders:idx_name", "테이블 orders: 인덱스(idx_name)는 덤프에 담을 수 없습니다"),
-    ("generated_column:orders:total", "테이블 orders: 계산 열 total의 정의를 안전하게 보존할 수 있는지 확인하지 못했습니다"),
+    ("generated_column:orders:total", "테이블 orders: 계산 열 total의 정의를 덤프에 담을 수 없습니다"),
     ("cross_schema_fk:orders:fk_other", "테이블 orders: 외래 키(fk_other)가 다른 DB나 스키마의 테이블을 가리켜 덤프에 담을 수 없습니다"),
     ("routine:fn_total", "저장 프로시저·함수 fn_total: 덤프에 담을 수 없습니다"),
     ("event:ev_nightly", "예약 이벤트 ev_nightly: 덤프에 담을 수 없습니다"),
@@ -1935,10 +1935,12 @@ def test_generated_refusal_reason_has_plain_korean_and_english():
     object_id = "generated_column:orders:total"
     line = describe_export_refusal([object_id], {object_id: "generated_column_unproven"})[0]
     assert line.startswith("테이블 orders:")
+    assert "계산 열 total의 식을" in line
     assert "SHOW CREATE TABLE" in line and "확인하지 못했습니다" in line
     assert "generated_column_unproven" not in line
     i18n.set_language("en")
     try:
-        assert "Could not safely decode" in i18n.translate_text(line.partition(": ")[2])
+        english = describe_export_refusal([object_id], {object_id: "generated_column_unproven"})[0]
+        assert "Could not safely decode generated column total" in english
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)

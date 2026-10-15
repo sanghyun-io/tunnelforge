@@ -618,7 +618,7 @@ PostgreSQL 13.23 / 18.4 (`live_export_contract`,
 `unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds`): the
 preserved core, triggers, routines, events, materialized views, MEMORY tables,
 default refusal, opt-in and a strict export/import round trip. The lossy-definition
-rows (generated columns, CHECK, defaults, advanced indexes, cross-schema FKs)
+rows (unproven generated columns, CHECK, defaults, advanced indexes, cross-schema FKs)
 come from the existing inspection and its earlier fixtures. Other versions are not
 claimed.
 
@@ -626,11 +626,17 @@ claimed.
 | --- | --- | --- |
 | Tables, rows, PK/UNIQUE/secondary indexes, supported FKs, comments, supported defaults | Preserved | Preserved |
 | Views (full export only) | Preserved as separately captured definitions; persistent warning, `strict_export=false` | Same |
+| INVISIBLE columns | Preserved with explicit read/load/INSERT column lists (format 6) | Refused before DROP on import/migration |
 | Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Refused before export; **not waivable** |
 | Unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
 | Triggers on an exported table | Refused before export; waivable | Same |
 | Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not part of a table subset, so a subset export neither refuses nor warns about them | Same (no events; materialized views apply) |
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
+
+INVISIBLE columns (MySQL 8.0.23+) retain their visibility through format 6,
+including invisible generated columns. Reads and loads name these columns
+explicitly; `SELECT *` does not include them. Safe verification also compares
+visibility. Dumps containing invisible columns require a MySQL target.
 
 ### Generated columns (MySQL -> MySQL)
 
@@ -640,20 +646,21 @@ SHOW CREATE TABLE line. The manifest stores the decoded expression without the
 outer AS parentheses; parentheses belonging to the expression remain. Unproven
 columns remain refused (`generated_column_unproven`, not waivable). This includes
 literal emoji when SHOW CREATE prints them as `????` (observed on 8.0/8.4).
-PostgreSQL
-export and imports/migrations across engines refuse generated columns before DROP.
+PostgreSQL export and imports/migrations across engines refuse generated columns
+before DROP.
 
 Data chunks retain generated values. Import skips those fields in LOAD DATA and
 INSERT, so MySQL recalculates them. Format 6 readers preserve the expression,
-VIRTUAL/STORED kind, indexes and supported FKs; dumps without these columns retain
-the previous format version. Formats 1-5 remain readable.
+VIRTUAL/STORED kind, indexes and supported FKs. Dumps without generated or invisible
+columns retain the previous format version. Formats 1-5 remain readable.
 
 Import uses strict SQL mode. Rows originally accepted under a loose mode may fail
 when a STORED expression is recalculated (for example a truncated CAST). A replace
 failure can occur after that table was dropped/recreated; use safe restore to keep
 the original untouched. Safe verification compares the recalculated values with
 the dump, so expression output differences between server versions stop the switch
-with a content mismatch. No result is silently accepted in either case.
+with a content mismatch. Replace mode reports recalculation errors but does not
+compare recalculated generated values with the values in the dump; safe mode does.
 
 Default behavior: when the selected scope contains any refused object, `dump.run`
 fails before the target directory or any dump file is created, with

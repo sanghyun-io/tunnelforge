@@ -509,15 +509,10 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             return;
         }
         // Reject before target schema creation or cleanup, even when preflight was bypassed.
-        let mut generated_refusals: Vec<String> = schema.tables.iter()
-            .filter_map(|table| validate_generated_column_direction(table, &source_endpoint.engine, &target_endpoint.engine).err()).collect();
-        if source_endpoint.engine != "mysql" || target_endpoint.engine != "mysql" {
-            generated_refusals.extend(unsupported_objects(&request.payload).into_iter()
-                .filter(|object| object.starts_with("generated_column:"))
-                .map(|object| format!("cannot translate generated column {object} across database engines")));
-        }
-        if !generated_refusals.is_empty() {
-            emit(json!({"event":"error","request_id":request.request_id,"message":generated_refusals.join("; ")}));
+        let column_refusals = mysql_column_migration_issues(&schema, &source_endpoint.engine, &target_endpoint.engine, &unsupported_objects(&request.payload));
+        if !column_refusals.is_empty() {
+            let messages = column_refusals.iter().map(|issue| issue.message.as_str()).collect::<Vec<_>>();
+            emit(json!({"event":"error","request_id":request.request_id,"message":messages.join("; ")}));
             return;
         }
         // Preflight blocks these too; migrate itself must not copy geometry it cannot keep.
@@ -889,6 +884,29 @@ fn target_not_empty_issue(location: String) -> MigrationIssue {
     }
 }
 
+fn mysql_column_migration_issues(schema: &NormalizedSchema, source: &str, target: &str, unsupported: &[String]) -> Vec<MigrationIssue> {
+    let mut issues = BTreeMap::new();
+    let issue = |table: &str, column: &str, kind: &str, message: String| MigrationIssue {
+        issue_type: Some(kind.into()), severity: "error".into(), location: format!("{table}.{column}"), message,
+        suggestion: "Exclude this table or convert the column in the source before migrating.".into(),
+        blocking: true, table_name: Some(table.into()), column_name: Some(column.into()),
+    };
+    for table in &schema.tables {
+        for (column, kind, message) in mysql_column_direction_refusals(table, source, target) {
+            issues.insert((table.name.clone(), column.name.clone()), issue(&table.name, &column.name, kind, message));
+        }
+    }
+    if source != "mysql" || target != "mysql" {
+        for object in unsupported {
+            if let Some((table, column)) = object.strip_prefix("generated_column:").and_then(|rest| rest.split_once(':')) {
+                issues.entry((table.into(), column.into())).or_insert_with(|| issue(table, column, "unsupported_generated_column",
+                    format!("cannot translate generated column {table}.{column} from {source} to {target}")));
+            }
+        }
+    }
+    issues.into_values().collect()
+}
+
 pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
     let source = read_engine(payload, "source_engine");
     let target = read_engine(payload, "target_engine");
@@ -961,15 +979,13 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
                     }
                 }
             }
-            if let Err(message) = validate_generated_column_direction(table, &source, &target)
-                .and_then(|()| validate_target_foreign_key_actions(table, &target)) {
-                let generated = message.contains("generated column");
+            if let Err(message) = validate_target_foreign_key_actions(table, &target) {
                 issues.push(MigrationIssue {
-                    issue_type: Some(if generated { "unsupported_generated_column" } else { "unsupported_fk_action" }.to_string()),
+                    issue_type: Some("unsupported_fk_action".to_string()),
                     severity: "error".to_string(),
                     location: table.name.clone(),
                     message,
-                    suggestion: if generated { "Exclude this table or convert the generated column in the source before migrating." } else { "Choose a supported target or explicitly revise the source foreign key action before migrating." }.to_string(),
+                    suggestion: "Choose a supported target or explicitly revise the source foreign key action before migrating.".to_string(),
                     blocking: true,
                     table_name: Some(table.name.clone()),
                     column_name: None,
@@ -978,15 +994,16 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
         }
     }
 
+    issues.extend(mysql_column_migration_issues(&parse_schema(&payload["schema"]).unwrap_or_default(), &source, &target, &unsupported_objects(payload)));
     for object_name in unsupported_objects(payload) {
-        let generated = object_name.starts_with("generated_column:");
+        if object_name.starts_with("generated_column:") { continue; }
         issues.push(MigrationIssue {
-            issue_type: generated.then(|| "unsupported_generated_column".to_string()),
-            severity: if generated { "error" } else { "warning" }.to_string(),
+            issue_type: None,
+            severity: "warning".to_string(),
             location: object_name.clone(),
-            message: if generated { format!("cannot translate generated column {object_name} across database engines") } else { "object is report-only in cross-engine v1".to_string() },
-            suggestion: if generated { "Exclude this table or convert the generated column in the source before migrating." } else { "Review and recreate this object manually after table data is moved." }.to_string(),
-            blocking: generated,
+            message: "object is report-only in cross-engine v1".to_string(),
+            suggestion: "Review and recreate this object manually after table data is moved.".to_string(),
+            blocking: false,
             table_name: None,
             column_name: None,
         });
@@ -1989,6 +2006,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generated_migration_reports_each_column_once() {
+        let schema: NormalizedSchema=serde_json::from_value(json!({"tables":[{"name":"t","columns":[
+            {"name":"g","type":"int","generated":{"expression":"1","stored":true}},
+            {"name":"h","type":"int","generated":{"expression":"2","stored":false}},
+            {"name":"x","type":"int","invisible":true}
+        ]}]})).unwrap();
+        let inventory=vec!["generated_column:t:g".into(),"generated_column:t:h".into()];
+        let issues=mysql_column_migration_issues(&schema,"mysql","postgresql",&inventory);
+        assert_eq!(issues.len(),3,"{issues:?}");
+        for name in ["g","h","x"] {
+            assert_eq!(issues.iter().filter(|issue|issue.column_name.as_deref()==Some(name)).count(),1);
+        }
+        let preflight=preflight_issues(&json!({"source_engine":"mysql","target_engine":"postgresql","schema":schema,"unsupported_objects":inventory}));
+        assert_eq!(preflight.iter().filter(|issue|issue.issue_type.as_deref()==Some("unsupported_generated_column")).count(),2);
+    }
+
+    #[test]
     fn generated_inventory_blocks_preflight_and_migrate_before_connecting() {
         let payload = json!({"source_engine":"postgresql","target_engine":"mysql",
             "source":{"engine":"postgresql","host":"127.0.0.1","port":1,"user":"unused","password":"","database":"app"},
@@ -2471,6 +2505,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "id".to_string(),
@@ -2483,6 +2518,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "name".to_string(),
@@ -2495,6 +2531,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2568,6 +2605,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "enabled".to_string(),
@@ -2580,6 +2618,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2619,6 +2658,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "event_date".to_string(),
@@ -2631,6 +2671,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "event_time".to_string(),
@@ -2643,6 +2684,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "created_at".to_string(),
@@ -2655,6 +2697,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2704,6 +2747,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "amount".to_string(),
@@ -2716,6 +2760,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2755,6 +2800,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "message".to_string(),
@@ -2767,6 +2813,7 @@ mod tests {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),

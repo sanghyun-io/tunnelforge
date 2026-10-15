@@ -640,6 +640,7 @@ mod keyset_guard_tests {
                     default_is_expression: false,
                     on_update: None,
                     generated: None,
+                    invisible: false,
                 })
                 .collect(),
             indexes: Vec::new(),

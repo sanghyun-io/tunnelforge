@@ -1042,6 +1042,7 @@ fn verify_schema(
                     != canonical_type(&column.type_name, engine)
                 || source.nullable != column.nullable
                 || source.primary_key != column.primary_key
+                || source.invisible != column.invisible
                 || source.unique && !column.unique
             {
                 return Err(mismatch(&format!("column {} definition", source.name)));
@@ -1154,6 +1155,15 @@ mod tests {
         assert_eq!(report["success"],false);
         assert_eq!(report["candidate_created"],false);
         assert!(report["message"].as_str().unwrap().contains("unsupported dump manifest format"),"{report}");
+    }
+
+    #[test]
+    fn verify_schema_compares_column_visibility() {
+        let expected: NormalizedSchema=serde_json::from_value(json!({"tables":[{"name":"t","columns":[{"name":"x","type":"int","invisible":true}]}]})).unwrap();
+        let mut actual=expected.clone();
+        assert!(verify_schema(&expected,&actual,"mysql").is_ok());
+        actual.tables[0].columns[0].invisible=false;
+        assert!(verify_schema(&expected,&actual,"mysql").unwrap_err().contains("column x definition"));
     }
 
     #[test]

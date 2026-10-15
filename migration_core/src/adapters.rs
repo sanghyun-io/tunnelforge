@@ -119,6 +119,9 @@ pub struct NormalizedColumn {
     pub unique: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated: Option<NormalizedGenerated>,
+    /// MySQL 8.0.23+ column visibility. Omitted for legacy/visible columns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invisible: bool,
 }
 
 /// A proven MySQL generated column. `expression` is decoded SQL without the
@@ -1037,6 +1040,7 @@ pub(crate) mod test_support {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "name".to_string(),
@@ -1049,6 +1053,7 @@ pub(crate) mod test_support {
                         default_is_expression: false,
                         on_update: None,
                         generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),
@@ -1218,6 +1223,7 @@ pub(crate) mod test_support {
                 default_is_expression: false,
                 on_update: None,
                 generated: None,
+                invisible: false,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),

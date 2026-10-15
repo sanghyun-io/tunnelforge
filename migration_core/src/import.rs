@@ -113,7 +113,7 @@ fn import_table_ddls(
                     return Err(invalid(format!("duplicate column {} in table {}", column.name, table.name)));
                 }
             }
-            if let Err(reason) = validate_generated_column_direction(definition, &manifest.source_engine, target_engine)
+            if let Err(reason) = validate_mysql_column_direction(definition, &manifest.source_engine, target_engine)
                 .and_then(|()| validate_target_foreign_key_actions(definition, target_engine)) {
                 untranslatable.push((table.name.clone(), reason));
                 continue;

@@ -1858,3 +1858,29 @@ def test_advanced_toggles_are_locked_while_running(monkeypatch, tmp_path):
         assert not dialog.btn_export.isEnabled()
     finally:
         dialog.close()
+
+
+def test_generated_refusal_reason_reaches_finished_dialog_and_saved_log(monkeypatch):
+    from src.core import i18n
+    for language in ["ko", "en"]:
+        i18n.set_language(language)
+        dialog = _dialog(monkeypatch)
+        dialog.worker = _finished_worker(refusal={
+            "objects": ["generated_column:orders:total"], "bypassable": False,
+            "reasons": {"generated_column:orders:total": "generated_column_unproven"},
+        })
+        try:
+            dialog.on_finished(False, "dump.run refused")
+            boxes = dialog.findChildren(QMessageBox)
+            assert len(boxes) == 1
+            text = boxes[0].text()
+            expected = "계산 열 total의 식을" if language == "ko" else "generated column total"
+            assert expected in text and "SHOW CREATE TABLE" in text
+            assert "orders" in text and "generated_column_unproven" not in text
+            saved = next(entry for entry in dialog.log_entries if "SHOW CREATE TABLE" in entry)
+            assert expected in saved
+            boxes[0].close()
+        finally:
+            dialog.worker = None
+            dialog.close()
+            i18n.set_language(i18n.DEFAULT_LANGUAGE)

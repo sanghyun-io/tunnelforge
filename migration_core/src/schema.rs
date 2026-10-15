@@ -285,7 +285,7 @@ impl InspectAdapter for MysqlInspectAdapter {
             let definition = create.and_then(|row| row.get::<String, _>("Create Table"));
             for column in &mut table.columns {
                 if let (Some((raw, stored)), Some(create)) = (self.generated.get(&column.name), definition.as_deref()) {
-                    column.generated = mysql_generation_expression(raw, &column.name, create)
+                    column.generated = mysql_generation_expression(raw, &column.name, create, *stored)
                         .map(|expression| NormalizedGenerated { expression, stored: *stored });
                 }
             }
@@ -394,6 +394,7 @@ impl InspectAdapter for MysqlInspectAdapter {
                         default_is_expression: extra.contains("DEFAULT_GENERATED"),
                         on_update,
                         generated: None,
+                        invisible: extra.split_whitespace().any(|word| word == "INVISIBLE"),
                     }
                 },
             )
@@ -559,12 +560,36 @@ pub(crate) fn mysql_check_clause(raw: &str) -> Option<String> {
 /// Match only this column's SHOW CREATE line; another column cannot prove it.
 /// I_S may include parentheses belonging to the expression. Do not strip those:
 /// SHOW CREATE adds one further AS (...) pair on both MySQL 8.0 and 8.4.
-pub(crate) fn mysql_generation_expression(raw: &str, column: &str, create: &str) -> Option<String> {
+pub(crate) fn mysql_generation_expression(raw: &str, column: &str, create: &str, stored: bool) -> Option<String> {
     let prefix = format!("{} ", quote_ident("mysql", column));
     let line = create.lines().find(|line| line.trim_start().starts_with(&prefix))?;
+    // Locate the first clause outside identifiers/literals, never a COMMENT or ENUM value.
+    let bytes = line.as_bytes();
+    let marker = b" GENERATED ALWAYS AS (";
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let quote = bytes[i];
+            i += 1;
+            loop {
+                let byte = *bytes.get(i)?;
+                i += 1;
+                if byte == b'\\' && quote != b'`' { i += 1; }
+                else if byte == quote {
+                    if bytes.get(i) == Some(&quote) { i += 1; } else { break; }
+                }
+            }
+        } else if bytes[i..].starts_with(marker) { break; }
+        else { i += 1; }
+    }
+    let clause = line.get(i..)?;
+    let storage = if stored { "STORED" } else { "VIRTUAL" };
     [Some(raw.to_string()), mysql_check_clause(raw)].into_iter().flatten()
-        .find(|expression| is_safe_check_expression(expression)
-            && line.contains(&format!(" GENERATED ALWAYS AS ({expression})")))
+        .find(|expression| {
+            let expected = format!(" GENERATED ALWAYS AS ({expression}) {storage}");
+            is_safe_check_expression(expression) && clause.strip_prefix(&expected)
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', ',']))
+        })
 }
 
 fn inspect_mysql_deprecated_engines_sql() -> &'static str {
@@ -622,6 +647,7 @@ impl InspectAdapter for PostgresInspectAdapter {
                     default_is_expression: false,
                     on_update: None,
                     generated: None,
+                    invisible: false,
                 }
             })
             .collect())
@@ -1277,16 +1303,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generated_expression_ignores_comment_enum_and_checks_storage() {
+        let create = "CREATE TABLE `t` (\n  `g` int GENERATED ALWAYS AS (`a` + 2) STORED COMMENT ' GENERATED ALWAYS AS (`a` + 1) STORED',\n  `plain` int COMMENT ' GENERATED ALWAYS AS (`a` + 1) STORED',\n  `e` enum(' GENERATED ALWAYS AS (fake) STORED') GENERATED ALWAYS AS ('ok') VIRTUAL\n)";
+        assert_eq!(mysql_generation_expression("`a` + 1", "g", create, true),None);
+        assert_eq!(mysql_generation_expression("`a` + 1", "plain", create, true),None);
+        assert_eq!(mysql_generation_expression("`a` + 2", "g", create, false),None);
+        assert_eq!(mysql_generation_expression("`a` + 2", "g", create, true).as_deref(),Some("`a` + 2"));
+        assert_eq!(mysql_generation_expression("'ok'", "e", create, false).as_deref(),Some("'ok'"));
+    }
+
+    #[test]
     fn generated_expression_requires_own_column_and_safe_decoded_sql() {
         let create = "CREATE TABLE `t` (\n  `a` int,\n  `g` int GENERATED ALWAYS AS ((`a` + 1)) STORED,\n  `txt` text GENERATED ALWAYS AS (concat(`a`,_utf8mb4'한글')) VIRTUAL\n)";
-        assert_eq!(mysql_generation_expression("(`a` + 1)", "g", create).as_deref(), Some("(`a` + 1)"));
-        assert_eq!(mysql_generation_expression("(`a` + 1)", "a", create), None);
-        assert_eq!(mysql_generation_expression("`a` + 1", "g", create), None);
+        assert_eq!(mysql_generation_expression("(`a` + 1)", "g", create, true).as_deref(), Some("(`a` + 1)"));
+        assert_eq!(mysql_generation_expression("(`a` + 1)", "a", create, true), None);
+        assert_eq!(mysql_generation_expression("`a` + 1", "g", create, true), None);
         let decoded = "concat(`a`,_utf8mb4'한글')";
         let escaped: String = decoded.bytes().map(char::from).collect();
-        assert_eq!(mysql_generation_expression(&escaped, "txt", create).as_deref(), Some(decoded));
+        assert_eq!(mysql_generation_expression(&escaped, "txt", create, false).as_deref(), Some(decoded));
         for expression in ["`a`; DROP TABLE t", "@a", "`a` + 2"] {
-            assert_eq!(mysql_generation_expression(expression, "g", create), None);
+            assert_eq!(mysql_generation_expression(expression, "g", create, true), None);
         }
     }
 

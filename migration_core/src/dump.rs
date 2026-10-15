@@ -547,9 +547,7 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
             });
             if let Some(refusal) = refusal {
                 event["error_code"] = json!("unsupported_objects");
-                let reasons: BTreeMap<_, _> = refusal.objects.iter().filter(|id| id.starts_with("generated_column:"))
-                    .map(|id| (id, "generated_column_unproven")).collect();
-                event["reasons"] = json!(reasons);
+                event["reasons"] = json!(refusal.reasons);
                 event["objects"] = json!(refusal.objects);
                 event["bypassable"] = json!(refusal.bypassable);
             }
@@ -562,6 +560,7 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DumpRefusal {
     pub(crate) objects: Vec<String>,
+    pub(crate) reasons: BTreeMap<String, String>,
     /// True when only omittable objects (triggers, routines, events, ...) are
     /// involved, so "table data only (incomplete)" may proceed. Lossy table
     /// definitions are never bypassable.
@@ -1013,7 +1012,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         format: "tunnelforge-dump".to_string(),
         // Older readers ignore namespace, timezone and ON UPDATE metadata. Fail
         // their version gate instead of silently restoring different semantics.
-        format_version: if schema.tables.iter().any(|table| table.columns.iter().any(|column| column.generated.is_some())) { 6 } else if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
+        format_version: if schema.tables.iter().any(|table| table.columns.iter().any(|column| column.generated.is_some() || column.invisible)) { 6 } else if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
         data_format: options.data_format.clone(),
         compression: options.compression.clone(),
         source_engine: endpoint.engine.clone(),
@@ -1074,7 +1073,7 @@ fn dump_scope_refusal(
     if listed.is_empty() {
         None
     } else {
-        Some(DumpRefusal { objects: listed, bypassable })
+        Some(DumpRefusal { objects: listed, reasons: BTreeMap::new(), bypassable })
     }
 }
 
@@ -1248,7 +1247,11 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     if endpoint.engine == "mysql" {
         scope_objects.extend(mysql_non_transactional_objects(&endpoint, &schema)?);
     }
-    if let Some(refusal) = dump_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete) {
+    if let Some(mut refusal) = dump_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete) {
+        if endpoint.engine == "mysql" {
+            refusal.reasons = refusal.objects.iter().filter(|id| id.starts_with("generated_column:"))
+                .map(|id| (id.clone(), "generated_column_unproven".to_string())).collect();
+        }
         let message = format!(
             "dump.run refused: the selected scope contains objects the dump cannot preserve ({}): {}",
             if refusal.bypassable { "an export without these objects is possible" } else { "table definitions would be lossy" },

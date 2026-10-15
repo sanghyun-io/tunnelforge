@@ -144,6 +144,7 @@ fn stress_table() -> NormalizedTable {
                 default_is_expression: false,
                 on_update: None,
                 generated: None,
+                invisible: false,
             },
             NormalizedColumn {
                 name: "name".to_string(),
@@ -156,6 +157,7 @@ fn stress_table() -> NormalizedTable {
                 default_is_expression: false,
                 on_update: None,
                 generated: None,
+                invisible: false,
             },
             NormalizedColumn {
                 name: "amount".to_string(),
@@ -168,6 +170,7 @@ fn stress_table() -> NormalizedTable {
                 default_is_expression: false,
                 on_update: None,
                 generated: None,
+                invisible: false,
             },
         ],
         indexes: Vec::new(),

@@ -64,6 +64,8 @@ _ISSUE_TYPE_LABELS = {
     "unsupported_temporal_value": "날짜/시간 값 범위 초과",
     "temporal_scan_failed": "날짜/시간 값 검사 실패",
     "unsupported_fk_action": "FK 동작 미지원",
+    "unsupported_generated_column": "계산 열 미지원",
+    "unsupported_invisible_column": "숨김 열 미지원",
 }
 
 _WIZARD_STYLESHEET = """
@@ -1097,8 +1099,10 @@ class CrossEngineMigrationDialog(QDialog):
             self.unsupported_objects = [str(item) for item in unsupported_objects]
             if self.unsupported_objects:
                 self._append_log(
-                    translate_text("지원 제외 객체 {}개를 사전 점검 대상으로 저장했습니다. 계산 열은 다른 DB 엔진으로 이관할 수 없어 실행을 차단합니다.").format(len(self.unsupported_objects))
+                    translate_text("지원 제외 객체 {}개를 사전 점검 대상으로 저장했습니다.").format(len(self.unsupported_objects))
                 )
+            if any(item.startswith("generated_column:") for item in self.unsupported_objects):
+                self._append_log(translate_text("계산 열은 다른 DB 엔진으로 이관할 수 없어 실행을 차단합니다."))
         elif command == "inspect":
             self.unsupported_objects = []
         if schema is not None:
