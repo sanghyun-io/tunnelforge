@@ -2440,6 +2440,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "id".to_string(),
@@ -2451,6 +2452,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "name".to_string(),
@@ -2462,6 +2464,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2534,6 +2537,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "enabled".to_string(),
@@ -2545,6 +2549,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2583,6 +2588,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "event_date".to_string(),
@@ -2594,6 +2600,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "event_time".to_string(),
@@ -2605,6 +2612,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "created_at".to_string(),
@@ -2616,6 +2624,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2664,6 +2673,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "amount".to_string(),
@@ -2675,6 +2685,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2713,6 +2724,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "message".to_string(),
@@ -2724,6 +2736,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                 ],
                 indexes: Vec::new(),

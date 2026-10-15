@@ -2348,6 +2348,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn supported_dump_format_still_rejects_format_six() {
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".into(),
+            format_version: 6,
+            data_format: "tsv".into(),
+            compression: "none".into(),
+            source_engine: "mysql".into(),
+            source_schema: None,
+            source_timezone: None,
+            database: "app".into(),
+            schema: NormalizedSchema::default(),
+            snapshot_policy: "connection_consistent".into(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
+            chunk_size: 1,
+            created_unix_seconds: 1,
+            tables: Vec::new(),
+            views: Vec::new(),
+            stored_programs: Vec::new(),
+        };
+        assert_eq!(supported_dump_format(&manifest).unwrap_err(), "unsupported dump manifest format");
+    }
+
+    #[test]
     #[ignore = "requires a disposable MySQL server via TF_MYSQL_HOST"]
     fn mysql_cleanup_restores_global_after_import_connection_dies() {
         let endpoint = Endpoint {
@@ -2505,6 +2529,7 @@ mod tests {
             source_engine: "mysql".into(), database: "app".into(), source_schema: None, source_timezone: None,
             schema: tables, snapshot_policy: "connection_consistent".into(), strict_export: true, manifest_warnings: vec![],
             chunk_size: 100, created_unix_seconds: 1, views: vec![], tables: vec![entry("users"), entry("other")],
+        stored_programs: Vec::new(),
         };
         let err = validate_import_metadata(&manifest, &BTreeSet::new(), "postgresql").unwrap_err();
         assert!(err.contains("2 tables cannot be created on postgresql"), "{err}");
@@ -2527,6 +2552,7 @@ mod tests {
                 strict_export: true, manifest_warnings: vec![], chunk_size: 100,
                 created_unix_seconds: 1, views: vec![],
                 tables: vec![DumpTableManifest { name: "users".into(), path: "users".into(), rows: 0, chunks: 0, chunk_sha256: BTreeMap::new() }],
+            stored_programs: Vec::new(),
             };
             let expected = match defect {
                 "wrong_checksum" => {

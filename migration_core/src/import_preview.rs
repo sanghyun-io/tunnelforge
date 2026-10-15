@@ -479,6 +479,7 @@ mod tests {
                 name: table.name.clone(), path: table.name.clone(), rows: 0, chunks: 0, chunk_sha256: BTreeMap::new(),
             }).collect(),
             schema: NormalizedSchema { tables },
+            stored_programs: Vec::new(),
         }
     }
 

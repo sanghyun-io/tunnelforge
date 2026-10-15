@@ -2236,6 +2236,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2317,6 +2318,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -2358,6 +2360,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -2379,6 +2382,7 @@ mod tests {
                             comment: None,
                             default_is_expression: false,
                             on_update: None,
+                            generated: None,
                         },
                         NormalizedColumn {
                             name: "user_id".to_string(),
@@ -2390,6 +2394,7 @@ mod tests {
                             comment: None,
                             default_is_expression: false,
                             on_update: None,
+                            generated: None,
                         },
                     ],
                     indexes: vec![NormalizedIndex {
@@ -2443,6 +2448,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -2470,6 +2476,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: vec![NormalizedIndex {
                         name: "ux_cr_industry_briefs_slug".to_string(),
@@ -2535,6 +2542,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
@@ -2583,6 +2591,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -2603,6 +2612,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -2659,6 +2669,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
@@ -2709,6 +2720,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
@@ -2751,6 +2763,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -2772,6 +2785,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: vec![NormalizedIndex {
                         name: "idx_df_evaluation_results_audit_category_code".to_string(),
@@ -2818,6 +2832,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_login_attempts_user_id".to_string(),
@@ -2874,6 +2889,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -2896,6 +2912,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -2936,6 +2953,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "enabled".to_string(),
@@ -2947,6 +2965,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2970,6 +2989,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -3044,6 +3064,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
                 NormalizedColumn {
                     name: "payload".to_string(),
@@ -3055,6 +3076,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
             ],
             indexes: Vec::new(),
@@ -3152,6 +3174,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3172,6 +3195,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3356,6 +3380,7 @@ mod tests {
             comment: None,
             default_is_expression: false,
             on_update: None,
+            generated: None,
         });
         assert!(
             generate_table_ddl(&table, "mysql", "mysql").is_none(),
@@ -3378,6 +3403,7 @@ mod tests {
             comment: None,
             default_is_expression: false,
             on_update: None,
+            generated: None,
         });
         assert!(
             generate_table_ddl(&table, "postgresql", "mysql").is_none(),
@@ -3433,6 +3459,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3713,6 +3740,7 @@ mod binary_keyset_tests {
             comment: None,
             default_is_expression: false,
             on_update: None,
+                generated: None,
         }
     }
 

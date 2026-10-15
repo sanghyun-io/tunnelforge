@@ -374,6 +374,7 @@ impl InspectAdapter for MysqlInspectAdapter {
                         comment: if column_comment.is_empty() { None } else { Some(column_comment) },
                         default_is_expression: extra.contains("DEFAULT_GENERATED"),
                         on_update,
+                        generated: None,
                     }
                 },
             )
@@ -590,6 +591,7 @@ impl InspectAdapter for PostgresInspectAdapter {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 }
             })
             .collect())

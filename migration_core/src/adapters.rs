@@ -117,6 +117,14 @@ pub struct NormalizedColumn {
     pub primary_key: bool,
     #[serde(default)]
     pub unique: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<NormalizedGenerated>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedGenerated {
+    pub expression: String,
+    pub stored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,6 +272,37 @@ pub struct DumpManifest {
     pub tables: Vec<DumpTableManifest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<NormalizedView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stored_programs: Vec<NormalizedStoredProgram>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedStoredProgram {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_order: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    pub definition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_set_client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation_connection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -981,6 +1020,7 @@ pub(crate) mod test_support {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                     NormalizedColumn {
                         name: "name".to_string(),
@@ -992,6 +1032,7 @@ pub(crate) mod test_support {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     },
                 ],
                 indexes: Vec::new(),
@@ -1160,6 +1201,7 @@ pub(crate) mod test_support {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -1423,6 +1465,7 @@ mod tests {
                 name: "ref_vendor_codes_view".to_string(),
                 definition: "CREATE VIEW `ref_vendor_codes_view` AS select 1".to_string(),
             }],
+        stored_programs: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         assert!(json.contains("ref_vendor_codes_view"));
@@ -1449,6 +1492,7 @@ mod tests {
             created_unix_seconds: 1,
             tables: Vec::new(),
             views: Vec::new(),
+        stored_programs: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         // skip_serializing_if 로 빈 views는 직렬화되지 않아 기존 dump와 바이트 호환.

@@ -1077,6 +1077,50 @@ fn read_jsonl_rows(path: &Path, compression: &str) -> Result<Vec<Value>, String>
 mod tests {
     use super::*;
 
+    /// A format 5 manifest exactly as the v2.19 writer serializes it, every optional field set.
+    const V5_MANIFEST: &str = r#"{"format":"tunnelforge-dump","format_version":5,"data_format":"tsv","compression":"zstd","source_engine":"mysql","source_schema":"app","source_timezone":"UTC","database":"app","schema":{"tables":[{"name":"places","columns":[{"name":"id","type":"bigint unsigned auto_increment","default":null,"default_is_expression":false,"nullable":false,"primary_key":true,"unique":false},{"name":"updated_at","type":"timestamp","default":"CURRENT_TIMESTAMP","on_update":"CURRENT_TIMESTAMP","comment":"마지막 수정","default_is_expression":true,"nullable":false,"primary_key":false,"unique":false},{"name":"spot","type":"point","default":null,"default_is_expression":false,"nullable":false,"primary_key":false,"unique":false},{"name":"flags","type":"bit(8)","default":"b'0'","default_is_expression":false,"nullable":true,"primary_key":false,"unique":false}],"indexes":[{"name":"spot_idx","columns":["spot"],"column_prefixes":[null],"unique":false,"spatial":true},{"name":"flags_idx","columns":["flags"],"column_prefixes":[null],"unique":false,"visible":false}],"foreign_keys":[{"name":"fk_owner","columns":["id"],"referenced_table":"owners","referenced_columns":["id"],"on_delete":"CASCADE"}],"table_collation":"utf8mb4_0900_ai_ci","auto_increment":42,"comment":"장소","checks":[{"name":"flags_chk","expression":"(`flags` <> 0)","enforced":true}]}]},"snapshot_policy":"connection_consistent","strict_export":true,"manifest_warnings":[],"chunk_size":1000,"created_unix_seconds":1760000000,"tables":[{"name":"places","path":"0001_places","rows":2,"chunks":1,"chunk_sha256":{"chunk_000001.tsv.zst":"0000000000000000000000000000000000000000000000000000000000000000"}}],"views":[{"name":"v_places","definition":"select `places`.`id` AS `id` from `places`"}]}"#;
+
+    #[test]
+    fn v5_manifest_without_new_objects_reserializes_byte_identically() {
+        // Old dumps keep their bytes, and with them the safe-restore plan and proof digests.
+        let manifest: DumpManifest = serde_json::from_str(V5_MANIFEST).unwrap();
+        let again = serde_json::to_string(&manifest).unwrap();
+        assert_eq!(again, V5_MANIFEST);
+        assert!(!again.contains("\"generated\"") && !again.contains("\"stored_programs\""), "{again}");
+    }
+
+    #[test]
+    fn generated_columns_and_stored_programs_serde_round_trip() {
+        let mut manifest: DumpManifest = serde_json::from_str(V5_MANIFEST).unwrap();
+        manifest.schema.tables[0].columns[0].generated = Some(NormalizedGenerated {
+            expression: "(`id` + 1)".into(),
+            stored: true,
+        });
+        manifest.stored_programs.push(NormalizedStoredProgram {
+            kind: "TRIGGER".into(),
+            name: "places_before_insert".into(),
+            table: Some("places".into()),
+            action_order: Some(2),
+            timing: Some("BEFORE".into()),
+            event: Some("INSERT".into()),
+            definition: "CREATE DEFINER=`u`@`h` TRIGGER ...".into(),
+            sql_mode: Some("STRICT_TRANS_TABLES".into()),
+            character_set_client: Some("utf8mb4".into()),
+            collation_connection: Some("utf8mb4_0900_ai_ci".into()),
+            database_collation: Some("utf8mb4_0900_ai_ci".into()),
+            time_zone: None,
+            definer: Some("u@h".into()),
+            status: None,
+        });
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let decoded: DumpManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.schema.tables[0].columns[0].generated.as_ref().unwrap().expression, "(`id` + 1)");
+        assert_eq!(decoded.stored_programs[0].timing.as_deref(), Some("BEFORE"));
+        assert_eq!(decoded.stored_programs[0].event.as_deref(), Some("INSERT"));
+    }
+
     #[test]
     fn legacy_mysql_defaults_normalize_only_old_string_column_representation() {
         for (version, engine) in [(1, "mysql"), (2, "mysql"), (3, "mysql"), (1, "postgresql"), (2, "postgresql")] {
@@ -1236,6 +1280,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
+        stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
         assert_eq!(read_dump_manifest(&dir).unwrap(), manifest);
@@ -1281,6 +1326,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
+        stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
 
@@ -1336,6 +1382,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
+        stored_programs: Vec::new(),
         };
 
         let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
@@ -1375,6 +1422,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
+        stored_programs: Vec::new(),
         };
 
         let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
@@ -1417,6 +1465,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: checksums,
             }],
+        stored_programs: Vec::new(),
         };
 
         let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
@@ -1566,6 +1615,7 @@ mod tests {
                 chunk_sha256: BTreeMap::new(),
             }],
             views: Vec::new(),
+        stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
 
@@ -1666,6 +1716,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -1687,6 +1738,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -1730,6 +1782,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -1751,6 +1804,7 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -1842,6 +1896,7 @@ mod tests {
             created_unix_seconds: 1,
             views: Vec::new(),
             tables: Vec::new(),
+        stored_programs: Vec::new(),
         };
 
         write_dump_manifest(&dir, &manifest).unwrap();
@@ -1917,6 +1972,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
                 NormalizedColumn {
                     name: "body".to_string(),
@@ -1928,6 +1984,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
                 NormalizedColumn {
                     name: "empty".to_string(),
@@ -1939,6 +1996,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
             ],
             indexes: Vec::new(),
@@ -1976,6 +2034,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2013,6 +2072,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
                 NormalizedColumn {
                     name: "notes".to_string(),
@@ -2024,6 +2084,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
             ],
             indexes: Vec::new(),
@@ -2146,6 +2207,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
                 NormalizedColumn {
                     name: "tenant_id".to_string(),
@@ -2157,6 +2219,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
             ],
             indexes: Vec::new(),
@@ -2185,6 +2248,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
                 NormalizedColumn {
                     name: "id".to_string(),
@@ -2196,6 +2260,7 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
                 },
             ],
             indexes: Vec::new(),
@@ -2223,6 +2288,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2249,6 +2315,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2281,6 +2348,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2309,6 +2377,7 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),

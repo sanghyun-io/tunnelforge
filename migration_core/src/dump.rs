@@ -1025,6 +1025,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         created_unix_seconds: current_unix_seconds(),
         tables: table_manifests,
         views,
+        stored_programs: Vec::new(),
     };
     write_dump_manifest(output_path, &manifest)?;
     Ok((manifest, views_count))
@@ -2761,6 +2762,7 @@ mod tests {
             created_unix_seconds: 1,
             views: Vec::new(),
             tables: Vec::new(),
+            stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
         fs::write(dir.join("old_chunk.tsv"), b"old").unwrap();
