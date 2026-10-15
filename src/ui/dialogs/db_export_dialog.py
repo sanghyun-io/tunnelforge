@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QListWidget, QListWidgetItem, QGroupBox,
     QFileDialog, QMessageBox, QProgressBar,
     QWidget, QAbstractItemView,
-    QSplitter, QScrollArea, QApplication
+    QSplitter, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
@@ -25,7 +25,7 @@ from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component, safe_output_dir
 from src.exporters.rust_dump_exporter import (
-    RustDumpChecker, RustDumpExporter, build_rust_dump_config, check_rust_dump,
+    RustDumpChecker, build_rust_dump_config, check_rust_dump,
     DEFAULT_DUMP_COMPRESSION, DEFAULT_DUMP_THREADS,
     describe_export_refusal, fk_parent_closure, fk_parents_outside, LOSSY_REFUSAL_KINDS,
 )
@@ -36,7 +36,7 @@ from src.ui.workers.error_reporting_worker import (
     sanitize_local_diagnostic_json,
 )
 from src.ui.dialogs.job_recording import begin_export_job, finish_export_job
-from src.ui.workers.rust_dump_worker import RustDumpWorker
+from src.ui.workers.rust_dump_worker import FkParentsWorker, RustDumpWorker
 
 logger = get_logger("db_dialogs")
 
@@ -53,6 +53,9 @@ _PARTIAL_EXPORT_NOTE = "일부 테이블만 내보낼 때는 테이블만 담습
 _PARTIAL_EXPORT_NOTE_POSTGRESQL = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수는 빠집니다."
 _FK_AUTO_TOOLTIP = "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는 테이블의 체크를 풀면 다시 고를 수 있습니다."
 _FK_NOTICE_EXAMPLES = 3
+# 연결된 부모 테이블을 읽는 스레드. 창을 닫아도 실행 중인 스레드가 파괴되지 않게 끝날 때까지 잡아 둔다.
+# ponytail: 앱을 종료하는 순간 읽는 중이면 기다리지 않는다; 종료 시 크래시가 보이면 quit 가드에 넣을 것.
+_RUNNING_FK_LOOKUPS: set = set()
 
 # 기억하는 고급 설정 (Import 대화상자처럼 실행할 때 저장한다). 고른 테이블은 기억하지 않는다.
 # '시점 일관성 포기'와 '담을 수 없는 객체 빼기'는 기억하지 않는다: Import 가 다른 DB 이름과 시간대를
@@ -341,8 +344,9 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._snapshot_method = ""
         self._omitted_objects: List[str] = []
 
-        # 연결된 부모 테이블 (fetch_fk_parents 결과는 스키마마다 한 번만 읽는다; None = 읽지 못함)
+        # 연결된 부모 테이블 (fetch_fk_parents 결과는 스키마마다 한 번만 읽는다; 읽지 못하면 캐시하지 않는다)
         self._fk_cache: Dict[str, Optional[dict]] = {}
+        self._fk_pending: set = set()  # 백그라운드에서 읽는 중인 스키마
         self._fk_auto_added: set = set()
         self._fk_outside: Optional[List[dict]] = []
         self._syncing_tables = False
@@ -1010,26 +1014,30 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             item.checkState() == Qt.CheckState.Checked for item in self._table_items())
 
     def _fk_parent_map(self) -> Optional[dict]:
-        """이 스키마의 외래 키 부모 (fetch_fk_parents), 스키마마다 한 번 읽는다. 읽지 못하면 None 이고,
-        다음 변경 때 다시 읽는다."""
+        """이 스키마의 외래 키 부모 (fetch_fk_parents), 스키마마다 한 번 읽는다.
+
+        큰 스키마는 읽는 데 오래 걸려 첫 체크 해제에서 목록이 멈췄으므로, 처음 필요할 때 백그라운드에서
+        자기 core 로 읽는다. 읽는 동안과 읽지 못했을 때는 None 이고, 읽지 못했으면 다음 변경 때 다시 읽는다."""
         schema = self.combo_schema.currentText()
-        if schema in self._fk_cache:
-            return self._fk_cache[schema]
-        facade = getattr(self.connector, "facade", None)
-        if facade is None:
-            return None
-        # ponytail: schema.inspect runs on the UI thread over the shared facade (a wait cursor while it
-        # does, once per schema); move it to a QThread with its own core if large schemas freeze the list.
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            deps = RustDumpExporter(build_rust_dump_config(self.connector), facade=facade).fetch_fk_parents(schema)
-        except Exception as exc:
-            logger.warning("Export FK parent lookup failed: %s", exc)
-            return None
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._fk_cache[schema] = deps
-        return deps
+        if schema not in self._fk_cache and schema not in self._fk_pending and self.connector:
+            self._fk_pending.add(schema)
+            lookup = FkParentsWorker(build_rust_dump_config(self.connector), schema)
+            lookup.loaded.connect(self._on_fk_parents_loaded)
+            _RUNNING_FK_LOOKUPS.add(lookup)
+            lookup.finished.connect(lambda lookup=lookup: (lookup.wait(), _RUNNING_FK_LOOKUPS.discard(lookup)))
+            lookup.start()
+        return self._fk_cache.get(schema)
+
+    def _on_fk_parents_loaded(self, schema: str, deps) -> None:
+        self._fk_pending.discard(schema)
+        if deps is not None:
+            self._fk_cache[schema] = deps
+        if schema != self.combo_schema.currentText():
+            return
+        if deps is None:  # 실패만 알린다. 여기서 다시 계산하면 곧바로 또 읽어 끝없이 반복한다; 다음 변경 때 다시 읽는다
+            self._update_table_notes()
+        else:
+            self._refresh_table_state()
 
     def _refresh_table_state(self, *_):
         """Recomputes the FK parents of the checked tables on every change, whatever the toggle says.
@@ -1071,7 +1079,9 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         partial = not self._is_full_export()
         self.lbl_partial_note.setVisible(partial)
         note = ""
-        if partial and self._fk_outside is None:
+        if partial and self._fk_outside is None and self.combo_schema.currentText() in self._fk_pending:
+            note = translate_text("연결된 부모 테이블을 확인하는 중입니다.")
+        elif partial and self._fk_outside is None:
             note = translate_text(
                 "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다."
                 if self.chk_include_fk.isChecked()

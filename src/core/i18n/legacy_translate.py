@@ -395,6 +395,7 @@ _EN_TEXT_TRANSLATIONS = {
     "담을 수 없는 객체 빼기": "Leave out objects the dump cannot keep",
     "폴더 이름({})": "Folder name ({})",
     "폴더 이름(비우면 export_시각)": "Folder name (export_<time> if empty)",
+    "연결된 부모 테이블을 확인하는 중입니다.": "Checking the linked parent tables.",
     "연결된 부모 테이블을 확인하지 못했습니다. 고른 테이블만 내보냅니다.": "The linked parent tables could not be checked. Only the checked tables are exported.",
     "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다.": "The linked parent tables could not be checked. They are checked again and included when the export starts.",
     "연결된 부모 테이블 자동 추가 {}개: {}": "Linked parent tables added automatically ({}): {}",

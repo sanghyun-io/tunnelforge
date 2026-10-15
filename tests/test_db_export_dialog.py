@@ -6,10 +6,10 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from src.exporters.rust_dump_exporter import RustDumpConfig, describe_snapshot_method
+from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter, describe_snapshot_method
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 from src.ui.dialogs.db_export_dialog import (
@@ -1448,11 +1448,45 @@ class _CapturingWorker:
         return False
 
 
+class _FkLookup(QObject):
+    """Stands in for FkParentsWorker: reads through the test connector's facade at once, or, while
+    ``held``, only when ``answer()`` is called (what the user sees while a large schema is read)."""
+
+    loaded = pyqtSignal(str, object)
+    finished = pyqtSignal()
+    facade = None
+    held = False
+    waiting = []
+
+    def __init__(self, config, schema):
+        super().__init__()
+        self.config, self.schema = config, schema
+
+    def start(self):
+        if _FkLookup.held:
+            _FkLookup.waiting.append(self)
+        else:
+            self.answer()
+
+    def answer(self):
+        try:
+            deps = RustDumpExporter(self.config, facade=_FkLookup.facade).fetch_fk_parents(self.schema)
+        except Exception:
+            deps = None
+        self.loaded.emit(self.schema, deps)
+        self.finished.emit()
+
+    def wait(self):
+        return True
+
+
 def _toggles_dialog(monkeypatch, tmp_path, settings=None, engine="mysql"):
     QApplication.instance() or QApplication([])
     monkeypatch.setattr("src.ui.dialogs.db_export_dialog.check_rust_dump", lambda: (True, "ok"))
     monkeypatch.setattr("src.ui.dialogs.db_export_dialog.RustDumpWorker", _CapturingWorker)
+    monkeypatch.setattr("src.ui.dialogs.db_export_dialog.FkParentsWorker", _FkLookup)
     _CapturingWorker.created = []
+    _FkLookup.held, _FkLookup.waiting = False, []
     store = {"rust_dump_export_base_dir": str(tmp_path), **(settings or {})}
     config_manager = MagicMock()
     config_manager.get_app_setting.side_effect = lambda key, default=None: store.get(key, default)
@@ -1461,6 +1495,7 @@ def _toggles_dialog(monkeypatch, tmp_path, settings=None, engine="mysql"):
     connector.get_schemas.return_value = ["app"]
     connector.get_tables.return_value = ["customers", "items", "logs", "orders"]
     connector.facade = _FkFacade()
+    _FkLookup.facade = connector.facade
     dialog = RustDumpExportDialog(connector=connector, config_manager=config_manager, connection_info="conn")
     dialog._test_store = store
     return dialog
@@ -1610,6 +1645,22 @@ def test_fk_toggle_on_disables_auto_added_parents(monkeypatch, tmp_path):
         _uncheck(dialog, "items")
         assert dialog.get_selected_tables() == [] and _enabled(items["orders"]) and _enabled(items["customers"])
         assert items["orders"].toolTip() == ""
+    finally:
+        dialog.close()
+
+
+def test_first_uncheck_does_not_wait_for_the_fk_lookup(monkeypatch, tmp_path):
+    # On a large schema the lookup takes long; it ran on the UI thread and froze the first uncheck.
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    _FkLookup.held = True
+    try:
+        _uncheck(dialog, "customers", "logs")
+        assert dialog.get_selected_tables() == ["items", "orders"], "the uncheck takes effect at once"
+        assert dialog.lbl_fk_note.text() == "연결된 부모 테이블을 확인하는 중입니다."
+        assert len(_FkLookup.waiting) == 1, "one lookup per schema however many changes come in"
+        _FkLookup.waiting[0].answer()
+        assert "(orders → customers)" in dialog.lbl_fk_note.text()
+        assert dialog.connector.facade.calls == 1
     finally:
         dialog.close()
 

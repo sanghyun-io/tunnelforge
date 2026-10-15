@@ -221,11 +221,9 @@ def test_partial_export_scope_records_the_selected_tables_for_rerun(history):
         dialog.close()
 
 
-def test_rerun_tables_hold_only_the_users_own_picks(history):
+def test_rerun_tables_hold_only_the_users_own_picks(history, fk_parents):
     dialog = make_export()
-    dialog.connector.facade.inspect_schema.return_value = {"tables": [
-        {"name": "a", "foreign_keys": [{"name": "fk_a_b", "referenced_table": "b"}]},
-        {"name": "b", "foreign_keys": []}, {"name": "c", "foreign_keys": []}]}
+    fk_parents["a"] = [("fk_a_b", "b")]
     try:
         dialog.chk_include_fk.setChecked(True)
         dialog.list_tables.item(1).setCheckState(Qt.CheckState.Unchecked)
