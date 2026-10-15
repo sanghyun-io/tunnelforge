@@ -57,7 +57,8 @@ FINAL_STATUSES = (STATUS_COMPLETED, STATUS_PARTIAL, STATUS_FAILED, STATUS_CANCEL
                   STATUS_SKIPPED)
 
 # 재실행 설정에 허용하는 키 (비밀/연결 정보는 구조적으로 들어올 수 없다)
-_RERUN_KEYS = ('schema', 'scope', 'tables', 'compression', 'threads', 'snapshot_mode', 'include_fk_parents')
+# include_fk_parents 는 더 이상 남기지 않는다: 예전 기록의 값이 연결된 부모 테이블 자동 추가를 되살리지 않도록.
+_RERUN_KEYS = ('schema', 'scope', 'tables', 'compression', 'threads', 'snapshot_mode')
 _SECRET_KEY_RE = re.compile(r'pass|secret|token|credential|pwd|key|user|host|uri|dsn', re.IGNORECASE)
 
 _WRITE_LOCK = threading.RLock()

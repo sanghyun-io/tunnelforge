@@ -2,16 +2,16 @@
 Rust DB Core 기반 Export 다이얼로그
 """
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QSpinBox, QPushButton, QComboBox,
     QCheckBox, QListWidget, QListWidgetItem, QGroupBox,
-    QFileDialog, QMessageBox, QProgressBar, QApplication,
-    QRadioButton, QButtonGroup, QWidget, QAbstractItemView,
-    QSplitter, QScrollArea
+    QFileDialog, QMessageBox, QProgressBar,
+    QWidget, QAbstractItemView,
+    QSplitter, QScrollArea, QApplication
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
-from typing import List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 import json
 import os
@@ -25,10 +25,9 @@ from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component, safe_output_dir
 from src.exporters.rust_dump_exporter import (
-    RustDumpChecker, build_rust_dump_config, check_rust_dump,
-    DEFAULT_DUMP_COMPRESSION, MYSQL_PRIVILEGE_LOCK_TABLES,
-    is_mysql_parallel_snapshot_privilege_error,
-    mysql_parallel_snapshot_denied_privilege
+    RustDumpChecker, RustDumpExporter, build_rust_dump_config, check_rust_dump,
+    DEFAULT_DUMP_COMPRESSION, DEFAULT_DUMP_THREADS,
+    describe_export_refusal, fk_parent_closure, fk_parents_outside, LOSSY_REFUSAL_KINDS,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.workers.error_reporting_worker import (
@@ -42,38 +41,31 @@ from src.ui.workers.rust_dump_worker import RustDumpWorker
 logger = get_logger("db_dialogs")
 
 
-# 권한 안내 버튼 objectName -> (버튼 문구, 다시 시도할 mysql_snapshot_mode)
-_MYSQL_PRIVILEGE_CHOICES = {
-    "mysql_parallel_table_lock_continue": ("병렬로 계속 (테이블 락, 권장)", "parallel_table_lock"),
-    "mysql_parallel_unsynchronized_continue": (
-        "병렬로 계속 (시점 일관성 보장 안 함)", "parallel_unsynchronized"
-    ),
-    "mysql_single_connection_continue": ("단일 연결로 계속", "single_connection"),
-}
-# 재시도 mysql_snapshot_mode -> (실행 로그, 상태 표시)
-_MYSQL_RETRY_MESSAGES = {
-    "parallel_table_lock": (
-        "전역 락 권한 없음: 테이블 읽기 락 공유 스냅샷(병렬)으로 다시 시도합니다.",
-        "테이블 락 공유 스냅샷(병렬)으로 다시 시도 중...",
-    ),
-    "parallel_unsynchronized": (
-        "사용자 선택: 워커별 독립 스냅샷(병렬)으로 다시 시도합니다. "
-        "테이블 간 시점 일관성은 보장되지 않습니다.",
-        "독립 스냅샷(병렬, 시점 일관성 미보장)으로 다시 시도 중...",
-    ),
-    "single_connection": (
-        "병렬 Export 권한 없음: 단일 연결 일관 스냅샷으로 다시 시도합니다.",
-        "단일 연결 일관 스냅샷으로 다시 시도 중...",
-    ),
-}
 _UNSYNCHRONIZED_EXPORT_WARNING = (
-    "워커별 독립 스냅샷으로 내보냈습니다. 테이블 간 시점 일관성이 보장되지 않습니다."
+    "테이블마다 다른 시점에 읽었습니다. 테이블 간 시점 일관성이 보장되지 않습니다."
 )
 _INCOMPLETE_EXPORT_WARNING = (
-    "일부 객체를 제외한 불완전 Export입니다. 나머지 테이블의 구조와 데이터는 모두 내보냈으며, "
-    "제외된 객체는 결과 로그와 manifest 경고를 확인하세요."
+    "일부 객체를 빼고 내보냈습니다(불완전 Export). 나머지 테이블의 구조와 데이터는 모두 담았습니다. "
+    "빠진 객체는 실행 로그의 'Export 경고' 줄에서 볼 수 있습니다."
 )
 _INCOMPLETE_EXPORT_LIST_LIMIT = 10
+_PARTIAL_EXPORT_NOTE = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
+_PARTIAL_EXPORT_NOTE_POSTGRESQL = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수는 빠집니다."
+_FK_AUTO_TOOLTIP = "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는 테이블의 체크를 풀면 다시 고를 수 있습니다."
+_FK_NOTICE_EXAMPLES = 3
+
+# 기억하는 고급 설정 (Import 대화상자처럼 실행할 때 저장한다). 고른 테이블은 기억하지 않는다.
+# '시점 일관성 포기'와 '담을 수 없는 객체 빼기'는 기억하지 않는다: Import 가 다른 DB 이름과 시간대를
+# 기억하지 않듯, 한 번 켠 값이 다음 백업을 묻지 않고 덜 완전하게 만들면 안 된다.
+_PERSISTED_EXPORT_OPTIONS = (
+    "rust_dump_export_threads",
+    "rust_dump_export_compression",
+    "rust_dump_export_include_fk_parents",
+    # 예전 '자동 지정/수동 지정' 설정과 같은 키: 'manual' 이면 '폴더 이름 직접 정하기'가 켜진다.
+    "rust_dump_export_folder_mode",
+    "rust_dump_export_folder_manual_name",
+)
+_COMPRESSION_CHOICES = (("압축 안 함", "none"), ("압축(zstd)", "zstd"))
 
 
 _EXPORT_TELEMETRY_TYPES = {
@@ -342,8 +334,18 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._error_report_workers: List[object] = []
         self._cancel_requested = False
         self._close_after_cancel = False
+        # 이번 실행에서 담을 수 없는 객체를 뺄지: 고급 설정 토글, 또는 거부 뒤 사용자가 고른 경우.
         self._allow_incomplete = False
-        self._snapshot_mode = "parallel_strict"
+        # Core 결과에서 정해진다 (RustDumpWorker.export_run): 실제로 쓴 방법, 그 한 줄 설명, 뺀 객체.
+        self._snapshot_mode = "auto"
+        self._snapshot_method = ""
+        self._omitted_objects: List[str] = []
+
+        # 연결된 부모 테이블 (fetch_fk_parents 결과는 스키마마다 한 번만 읽는다; None = 읽지 못함)
+        self._fk_cache: Dict[str, Optional[dict]] = {}
+        self._fk_auto_added: set = set()
+        self._fk_outside: Optional[List[dict]] = []
+        self._syncing_tables = False
 
         # 로그 수집용 변수
         self.log_entries: List[str] = []
@@ -399,12 +401,13 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         container_layout = QVBoxLayout(self.config_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.addWidget(self._build_status_group())
-        container_layout.addWidget(self._build_export_type_group())
         container_layout.addWidget(self._build_schema_section())
+        container_layout.addWidget(self._build_advanced_section())
         container_layout.addWidget(self._build_output_folder_group())
 
-        self._load_naming_settings()
+        self._load_export_options()
         self._update_output_dir_preview()
+        self._update_advanced_summary()
 
         config_layout.addWidget(self.config_container)
         config_layout.addStretch()
@@ -446,32 +449,13 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         status_layout.addWidget(status_label)
         return status_group
 
-    def _build_export_type_group(self):
-        type_group = QGroupBox("Export 유형")
-        type_layout = QVBoxLayout(type_group)
-
-        self.btn_type_group = QButtonGroup(self)
-
-        self.radio_full = QRadioButton("전체 스키마 Export")
-        self.radio_full.setChecked(True)
-        self.radio_partial = QRadioButton("선택 테이블 Export")
-
-        self.btn_type_group.addButton(self.radio_full)
-        self.btn_type_group.addButton(self.radio_partial)
-
-        self.radio_full.toggled.connect(self.on_type_changed)
-
-        type_layout.addWidget(self.radio_full)
-        type_layout.addWidget(self.radio_partial)
-        return type_group
-
     def _build_schema_section(self):
         section = QWidget()
         section_layout = QVBoxLayout(section)
         section_layout.setContentsMargins(0, 0, 0, 0)
 
         schema_layout = QHBoxLayout()
-        schema_layout.addWidget(QLabel("Schema:"))
+        schema_layout.addWidget(QLabel("스키마:" if self._engine() == "postgresql" else "DB:"))
         self.combo_schema = QComboBox()
         self.combo_schema.setMinimumWidth(300)
         self.combo_schema.currentTextChanged.connect(self.on_schema_changed)
@@ -516,41 +500,181 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         filter_layout.addWidget(self.label_table_count)
         table_layout.addLayout(filter_layout)
 
+        # 체크박스만 쓴다: 줄 선택(파란 강조)은 담을지 여부와 상관없어 헷갈린다.
         self.list_tables = QListWidget()
-        self.list_tables.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.list_tables.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.list_tables.setMaximumHeight(150)
         self.list_tables.setMinimumHeight(100)  # 낮은 창에서는 눌리지 않고 설정 영역이 스크롤된다
-        self.list_tables.itemChanged.connect(self._update_table_count)
+        self.list_tables.itemChanged.connect(self._refresh_table_state)
         table_layout.addWidget(self.list_tables)
 
-        self.chk_include_fk = QCheckBox("FK 의존성 테이블 자동 포함")
-        self.chk_include_fk.setChecked(True)
-        table_layout.addWidget(self.chk_include_fk)
+        self.lbl_partial_note = QLabel(self._partial_note())
+        self.lbl_partial_note.setWordWrap(True)
+        self.lbl_partial_note.setStyleSheet("color: #7f8c8d;")
+        self.lbl_partial_note.setVisible(False)
+        table_layout.addWidget(self.lbl_partial_note)
+        # 연결된 부모 테이블: 자동으로 더한 것, 또는 (토글이 꺼져 있을 때) 고르지 않은 부모를 가리키는 테이블.
+        self.lbl_fk_note = QLabel()
+        self.lbl_fk_note.setWordWrap(True)
+        self.lbl_fk_note.setStyleSheet("color: #b45309;")
+        self.lbl_fk_note.setVisible(False)
+        table_layout.addWidget(self.lbl_fk_note)
 
-        self.table_group.setVisible(False)
         section_layout.addWidget(self.table_group)
+        return section
 
-        option_group = QGroupBox("Export 옵션")
-        option_layout = QFormLayout(option_group)
+    def _build_advanced_section(self):
+        """'고급 설정 열기/닫기' (Import 대화상자와 같은 모양), 처음에는 닫혀 있고 옆 줄에 켜진 설정을 적는다."""
+        section = QWidget()
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
 
+        button_line = QHBoxLayout()
+        self.btn_advanced = QPushButton("고급 설정 열기")
+        self.btn_advanced.clicked.connect(self._toggle_advanced_options)
+        self.lbl_advanced_summary = QLabel()
+        self.lbl_advanced_summary.setStyleSheet("color: #2c3e50;")
+        button_line.addWidget(self.btn_advanced)
+        button_line.addWidget(self.lbl_advanced_summary)
+        button_line.addStretch()
+        section_layout.addLayout(button_line)
+
+        self.advanced_panel = QGroupBox("고급 설정")
+        panel_layout = QVBoxLayout(self.advanced_panel)
+
+        self.chk_include_fk = QCheckBox("연결된 부모 테이블 함께 담기")
+        self.chk_include_fk.setToolTip("고른 테이블이 외래 키로 가리키는 부모 테이블을 자동으로 체크하고, 필요한 동안 잠가 둡니다. "
+                                       "모든 테이블을 고른 전체 Export에는 영향이 없습니다.")
+        self.chk_include_fk.toggled.connect(self._refresh_table_state)
+        self.chk_include_fk.toggled.connect(self._update_advanced_summary)
+        panel_layout.addWidget(self.chk_include_fk)
+
+        # MySQL 만: 잠금으로 같은 시점을 맞출 수 없을 때 연결 하나 대신 여러 연결로 나눠 읽는다.
+        self.chk_unsynchronized = QCheckBox("시점 일관성 포기하고 더 빠르게")
+        self.chk_unsynchronized.setToolTip("잠금으로 모든 테이블을 같은 시점에 맞춰 읽을 수 없을 때, 연결 하나로 천천히 읽는 대신 "
+                                           "여러 연결로 나눠 빠르게 읽습니다. 테이블마다 읽은 시점이 달라 서로 맞지 않을 수 있습니다.")
+        self.chk_unsynchronized.toggled.connect(self._update_advanced_summary)
+        self.chk_unsynchronized.setVisible(self._engine() != "postgresql")
+        panel_layout.addWidget(self.chk_unsynchronized)
+
+        self.chk_allow_incomplete = QCheckBox("담을 수 없는 객체는 빼고 내보내기")
+        self.chk_allow_incomplete.setToolTip("트리거·저장 프로시저·예약 이벤트처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 "
+                                             "묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. "
+                                             "결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 "
+                                             "빼고 내보낼 수 없습니다.")
+        self.chk_allow_incomplete.toggled.connect(self._update_advanced_summary)
+        panel_layout.addWidget(self.chk_allow_incomplete)
+
+        options_line = QHBoxLayout()
+        options_line.addWidget(QLabel("동시 작업 수:"))
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 16)
-        self.spin_threads.setValue(8)
-        self.spin_threads.setToolTip(
-            "MySQL은 모든 워커가 같은 일관 스냅샷을 사용합니다. "
-            "시작 시 쓰기 잠금을 최대 2초 안에 잠깐 획득해 즉시 해제하고, "
-            "Export 중 일반 조회/입력/수정은 계속 가능하며 DDL만 제한됩니다."
-        )
-        option_layout.addRow("병렬 스레드:", self.spin_threads)
-
+        self.spin_threads.setValue(DEFAULT_DUMP_THREADS)
+        self.spin_threads.valueChanged.connect(self._update_advanced_summary)
+        options_line.addWidget(self.spin_threads)
+        options_line.addSpacing(16)
+        options_line.addWidget(QLabel("압축:"))
         self.combo_compression = QComboBox()
-        self.combo_compression.addItems(["none", "zstd"])
-        self.combo_compression.setCurrentText(DEFAULT_DUMP_COMPRESSION)
-        self.combo_compression.setToolTip("Rust DB Core dump 압축 방식입니다. zstd는 디스크 사용량을 줄이고 import 시 스트리밍 해제됩니다.")
-        option_layout.addRow("압축 방식:", self.combo_compression)
+        # QComboBox 항목은 Qt 번역 훅을 거치지 않는다.
+        for text, value in _COMPRESSION_CHOICES:
+            self.combo_compression.addItem(translate_text(text), value)
+        self.combo_compression.setCurrentIndex(self.combo_compression.findData(DEFAULT_DUMP_COMPRESSION))
+        self.combo_compression.setToolTip("압축하면 덤프 폴더가 작아지고, Import 할 때 읽으면서 풉니다.")
+        self.combo_compression.currentIndexChanged.connect(self._update_advanced_summary)
+        options_line.addWidget(self.combo_compression)
+        options_line.addStretch()
+        panel_layout.addLayout(options_line)
 
-        section_layout.addWidget(option_group)
+        folder_line = QHBoxLayout()
+        self.chk_manual_folder = QCheckBox("폴더 이름 직접 정하기")
+        self.chk_manual_folder.setToolTip("끄면 폴더 이름은 연결 이름, DB 이름, 시작 시각으로 정합니다.")
+        self.chk_manual_folder.toggled.connect(self._on_manual_folder_toggled)
+        self.input_manual_folder = QLineEdit()
+        self.input_manual_folder.setPlaceholderText("폴더 이름 입력")
+        self.input_manual_folder.setEnabled(False)
+        self.input_manual_folder.textChanged.connect(self._update_output_dir_preview)
+        self.input_manual_folder.textChanged.connect(self._update_advanced_summary)
+        folder_line.addWidget(self.chk_manual_folder)
+        folder_line.addWidget(self.input_manual_folder, 1)
+        panel_layout.addLayout(folder_line)
+
+        self.advanced_panel.setVisible(False)
+        section_layout.addWidget(self.advanced_panel)
         return section
+
+    def _toggle_advanced_options(self):
+        visible = self.advanced_panel.isHidden()
+        self.advanced_panel.setVisible(visible)
+        self.btn_advanced.setText("고급 설정 닫기" if visible else "고급 설정 열기")
+
+    def _on_manual_folder_toggled(self, checked: bool):
+        self.input_manual_folder.setEnabled(checked)
+        self._update_output_dir_preview()
+        self._update_advanced_summary()
+
+    def _engine(self) -> str:
+        return build_rust_dump_config(self.connector).engine
+
+    def _namespace_noun(self) -> str:
+        """What the selector picks: a PostgreSQL schema, a MySQL database."""
+        return "스키마" if self._engine() == "postgresql" else "DB"
+
+    def _partial_note(self) -> str:
+        return _PARTIAL_EXPORT_NOTE_POSTGRESQL if self._engine() == "postgresql" else _PARTIAL_EXPORT_NOTE
+
+    def _compression(self) -> str:
+        return self.combo_compression.currentData() or DEFAULT_DUMP_COMPRESSION
+
+    def _snapshot_fallback(self) -> str:
+        """Where the core's automatic choice ends when no lock gives one point in time (MySQL)."""
+        unsynchronized = self.chk_unsynchronized.isChecked() and self._engine() != "postgresql"
+        return "parallel_unsynchronized" if unsynchronized else "single_connection"
+
+    def _advanced_summary(self) -> str:
+        """Every Advanced setting that is on (or not at its default), in one line."""
+        items = []
+        if self.chk_include_fk.isChecked():
+            items.append(translate_text("연결된 부모 테이블 함께 담기"))
+        if self._snapshot_fallback() == "parallel_unsynchronized":
+            items.append(translate_text("시점 일관성 포기 허용"))
+        if self.chk_allow_incomplete.isChecked():
+            items.append(translate_text("담을 수 없는 객체 빼기"))
+        if self.spin_threads.value() != DEFAULT_DUMP_THREADS:
+            items.append(translate_text("동시 작업 {}개").format(self.spin_threads.value()))
+        if self._compression() != DEFAULT_DUMP_COMPRESSION:
+            items.append(translate_text(self.combo_compression.currentText()))
+        if self.chk_manual_folder.isChecked():
+            name = self.input_manual_folder.text().strip()
+            items.append(translate_text("폴더 이름({})").format(name) if name else translate_text("폴더 이름(비우면 export_시각)"))
+        return translate_text("적용 중인 고급 설정: {}").format(", ".join(items)) if items else ""
+
+    def _update_advanced_summary(self, *_):
+        self.lbl_advanced_summary.setText(self._advanced_summary())
+
+    def _load_export_options(self):
+        """기억한 고급 설정. 형식이 맞지 않는 값(예전/손으로 고친 설정)은 무시한다."""
+        if not self.config_manager:
+            return
+        get = self.config_manager.get_app_setting
+        threads = get("rust_dump_export_threads", DEFAULT_DUMP_THREADS)
+        if type(threads) is int and 1 <= threads <= 16:
+            self.spin_threads.setValue(threads)
+        index = self.combo_compression.findData(get("rust_dump_export_compression", DEFAULT_DUMP_COMPRESSION))
+        if index >= 0:
+            self.combo_compression.setCurrentIndex(index)
+        self.chk_include_fk.setChecked(get("rust_dump_export_include_fk_parents", False) is True)
+        manual_name = get("rust_dump_export_folder_manual_name", "")
+        self.input_manual_folder.setText(manual_name if isinstance(manual_name, str) else "")
+        self.chk_manual_folder.setChecked(get("rust_dump_export_folder_mode", "auto") == "manual")
+
+    def _persisted_export_options(self) -> dict:
+        return dict(zip(_PERSISTED_EXPORT_OPTIONS, (
+            self.spin_threads.value(),
+            self._compression(),
+            self.chk_include_fk.isChecked(),
+            "manual" if self.chk_manual_folder.isChecked() else "auto",
+            self.input_manual_folder.text(),
+        )))
 
     def _build_output_folder_group(self):
         folder_group = QGroupBox("출력 폴더 설정")
@@ -574,46 +698,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         base_layout.addWidget(btn_browse_base)
         folder_main_layout.addLayout(base_layout)
 
-        naming_layout = QHBoxLayout()
-        naming_layout.addWidget(QLabel("폴더 이름:"))
-
-        self.radio_auto_naming = QRadioButton("자동 지정")
-        self.radio_auto_naming.setChecked(True)
-        self.radio_auto_naming.toggled.connect(self._on_naming_mode_changed)
-        naming_layout.addWidget(self.radio_auto_naming)
-
-        self.chk_name = QCheckBox("name")
-        self.chk_name.setChecked(True)
-        self.chk_name.setToolTip("연결 정보 (터널명 또는 host_port)")
-        self.chk_name.toggled.connect(self._on_naming_option_changed)
-
-        self.chk_schema = QCheckBox("schema")
-        self.chk_schema.setChecked(True)
-        self.chk_schema.toggled.connect(self._on_naming_option_changed)
-
-        self.chk_timestamp = QCheckBox("timestamp")
-        self.chk_timestamp.setChecked(True)
-        self.chk_timestamp.toggled.connect(self._on_naming_option_changed)
-
-        naming_layout.addWidget(self.chk_name)
-        naming_layout.addWidget(self.chk_schema)
-        naming_layout.addWidget(self.chk_timestamp)
-
-        # 수동 지정 라디오
-        self.radio_manual_naming = QRadioButton("수동 지정:")
-        self.radio_manual_naming.toggled.connect(self._on_naming_mode_changed)
-        naming_layout.addWidget(self.radio_manual_naming)
-
-        self.input_manual_folder = QLineEdit()
-        self.input_manual_folder.setPlaceholderText("폴더명 입력...")
-        self.input_manual_folder.setEnabled(False)
-        self.input_manual_folder.setMaximumWidth(150)
-        self.input_manual_folder.textChanged.connect(self._update_output_dir_preview)
-        naming_layout.addWidget(self.input_manual_folder)
-
-        naming_layout.addStretch()
-        folder_main_layout.addLayout(naming_layout)
-
+        # 폴더 이름은 연결 이름 + DB 이름 + 시작 시각으로 정한다 (고급 설정에서 직접 정할 수 있다).
         preview_layout = QHBoxLayout()
         preview_layout.addWidget(QLabel("최종 경로:"))
         self.input_output_dir = QLineEdit()
@@ -777,41 +862,12 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         return os.path.join(os.path.expanduser("~"), "Desktop")
 
     def _generate_output_dir(self, schema: str = "") -> str:
-        """
-        동적 출력 폴더명 생성
-        설정에 따라 name, schema, timestamp 조합
-        """
+        """출력 폴더: 직접 정한 이름, 아니면 연결 이름 + DB 이름 + 시각."""
         base_dir = self._get_base_output_dir()
-
-        # 수동 모드일 경우
-        if hasattr(self, 'radio_manual_naming') and self.radio_manual_naming.isChecked():
-            manual_name = self.input_manual_folder.text().strip()
-            if manual_name:
-                return safe_output_dir(base_dir, manual_name)
-            return safe_output_dir(base_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-
-        # 자동 모드
-        parts = []
-
-        # name (연결 정보)
-        if hasattr(self, 'chk_name') and self.chk_name.isChecked() and self.connection_info:
-            parts.append(self.connection_info)
-
-        # schema
-        if hasattr(self, 'chk_schema') and self.chk_schema.isChecked() and schema:
-            parts.append(schema)
-
-        # timestamp
-        if hasattr(self, 'chk_timestamp') and self.chk_timestamp.isChecked():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            parts.append(timestamp)
-
-        # 모두 비활성화된 경우 기본값
-        if not parts:
-            parts.append(f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-
-        folder_name = "_".join(parts)
-        return safe_output_dir(base_dir, folder_name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.chk_manual_folder.isChecked():
+            return safe_output_dir(base_dir, self.input_manual_folder.text().strip() or f"export_{timestamp}")
+        return safe_output_dir(base_dir, "_".join([part for part in (self.connection_info, schema) if part] + [timestamp]))
 
     def _unique_output_dir(self, path: str) -> str:
         """이미 존재하는 폴더면 `_2`, `_3`, ... 을 붙여 충돌하지 않는 경로를 반환."""
@@ -824,71 +880,9 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 return candidate
             counter += 1
 
-    def _load_naming_settings(self):
-        """폴더 네이밍 설정 로드"""
-        if not self.config_manager:
-            return
-
-        mode = self.config_manager.get_app_setting('rust_dump_export_folder_mode', 'auto')
-        use_name = self.config_manager.get_app_setting('rust_dump_export_folder_use_name', True)
-        use_schema = self.config_manager.get_app_setting('rust_dump_export_folder_use_schema', True)
-        use_timestamp = self.config_manager.get_app_setting('rust_dump_export_folder_use_timestamp', True)
-        manual_name = self.config_manager.get_app_setting('rust_dump_export_folder_manual_name', '')
-
-        if mode == 'manual':
-            self.radio_manual_naming.setChecked(True)
-            self.input_manual_folder.setText(manual_name)
-        else:
-            self.radio_auto_naming.setChecked(True)
-
-        self.chk_name.setChecked(use_name)
-        self.chk_schema.setChecked(use_schema)
-        self.chk_timestamp.setChecked(use_timestamp)
-
-    def _save_naming_settings(self):
-        """폴더 네이밍 설정 저장"""
-        if not self.config_manager:
-            return
-
-        mode = 'manual' if self.radio_manual_naming.isChecked() else 'auto'
-        self.config_manager.set_app_setting('rust_dump_export_folder_mode', mode)
-        self.config_manager.set_app_setting('rust_dump_export_folder_use_name', self.chk_name.isChecked())
-        self.config_manager.set_app_setting('rust_dump_export_folder_use_schema', self.chk_schema.isChecked())
-        self.config_manager.set_app_setting('rust_dump_export_folder_use_timestamp', self.chk_timestamp.isChecked())
-        self.config_manager.set_app_setting('rust_dump_export_folder_manual_name', self.input_manual_folder.text())
-
-    def _on_naming_mode_changed(self):
-        """폴더 네이밍 모드 변경 시"""
-        is_auto = self.radio_auto_naming.isChecked()
-
-        # 자동 옵션 활성화/비활성화
-        self.chk_name.setEnabled(is_auto)
-        self.chk_schema.setEnabled(is_auto)
-        self.chk_timestamp.setEnabled(is_auto)
-
-        # 수동 입력 활성화/비활성화
-        self.input_manual_folder.setEnabled(not is_auto)
-
-        self._save_naming_settings()
-        self._update_output_dir_preview()
-
-    def _on_naming_option_changed(self):
-        """자동 네이밍 옵션 변경 시"""
-        # 최소 하나는 선택되어야 함
-        if not self.chk_name.isChecked() and not self.chk_schema.isChecked() and not self.chk_timestamp.isChecked():
-            sender = self.sender()
-            if sender:
-                sender.setChecked(True)
-                QMessageBox.warning(self, "경고", "최소 하나의 옵션은 선택되어야 합니다.")
-            return
-
-        self._save_naming_settings()
-        self._update_output_dir_preview()
-
-    def _update_output_dir_preview(self):
+    def _update_output_dir_preview(self, *_):
         """출력 경로 미리보기 업데이트"""
-        schema = self.combo_schema.currentText() if hasattr(self, 'combo_schema') else ""
-        self.input_output_dir.setText(self._generate_output_dir(schema))
+        self.input_output_dir.setText(self._generate_output_dir(self.combo_schema.currentText()))
 
     def browse_base_dir(self):
         """기본 위치 선택"""
@@ -909,13 +903,10 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         guide = RustDumpChecker.get_install_guide()
         QMessageBox.information(self, "Rust DB Core 설치 가이드", guide)
 
-    def on_type_changed(self):
-        is_partial = self.radio_partial.isChecked()
-        self.table_group.setVisible(is_partial)
-
     def apply_job_rerun(self, rerun: dict) -> None:
-        """작업 목록의 이전 실행 설정으로 화면만 채운다 (스키마/범위/테이블/압축/스레드).
+        """작업 목록의 이전 실행 설정으로 화면만 채운다 (스키마/고른 테이블/압축/동시 작업 수).
 
+        예전 기록의 내보내는 방법과 '부모 테이블 함께 담기' 값은 쓰지 않는다: 지금 고급 설정을 따른다.
         실행은 사용자가 직접 시작하며, 그때 Core 의 사전 검증(지원 객체 거부 등)을 새로 거친다.
         """
         if not isinstance(rerun, dict):
@@ -925,22 +916,14 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             index = self.combo_schema.findText(schema)
             if index >= 0:
                 self.combo_schema.setCurrentIndex(index)
-        if rerun.get("scope") == "tables":
-            self.radio_partial.setChecked(True)
-            wanted = set(rerun.get("tables") or [])
-            for i in range(self.list_tables.count()):
-                item = self.list_tables.item(i)
-                item.setCheckState(Qt.CheckState.Checked if item.text() in wanted else Qt.CheckState.Unchecked)
-        else:
-            self.radio_full.setChecked(True)
+        wanted = set(rerun.get("tables") or []) if rerun.get("scope") == "tables" else None
+        self._set_table_checks(lambda item: wanted is None or item.text() in wanted, every=True)
         compression = rerun.get("compression")
-        if isinstance(compression, str) and self.combo_compression.findText(compression) >= 0:
-            self.combo_compression.setCurrentText(compression)
+        if isinstance(compression, str) and self.combo_compression.findData(compression) >= 0:
+            self.combo_compression.setCurrentIndex(self.combo_compression.findData(compression))
         threads = rerun.get("threads")
         if isinstance(threads, int) and not isinstance(threads, bool):
             self.spin_threads.setValue(threads)
-        if isinstance(rerun.get("include_fk_parents"), bool):
-            self.chk_include_fk.setChecked(rerun["include_fk_parents"])
 
     def load_schemas(self):
         self.combo_schema.clear()
@@ -951,93 +934,181 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.combo_schema.addItem(schema)
 
     def on_schema_changed(self, schema: str):
-        self.list_tables.clear()
-        self._update_table_count()
-        if not schema or not self.connector:
-            return
-        tables = self.connector.get_tables(schema)
-        for table in tables:
-            item = QListWidgetItem(table)
-            item.setCheckState(Qt.CheckState.Checked)
-            self.list_tables.addItem(item)
+        self._fk_auto_added = set()
+        self._syncing_tables = True  # 목록을 채우는 동안은 한 번에 다시 계산한다
+        try:
+            self.list_tables.clear()
+            if schema and self.connector:
+                for table in self.connector.get_tables(schema):
+                    item = QListWidgetItem(table)
+                    item.setCheckState(Qt.CheckState.Checked)
+                    self.list_tables.addItem(item)
+        finally:
+            self._syncing_tables = False
         self._apply_table_filter(self.input_table_filter.text())
-        self._update_table_count()
+        self._refresh_table_state()
 
         # 출력 폴더명 업데이트 (스키마 반영)
         self._update_output_dir_preview()
 
-    def _visible_table_items(self):
-        return [self.list_tables.item(i) for i in range(self.list_tables.count())
-                if not self.list_tables.item(i).isHidden()]
+    def _table_items(self) -> List[QListWidgetItem]:
+        return [self.list_tables.item(i) for i in range(self.list_tables.count())]
+
+    def _release_auto_added(self, item: QListWidgetItem) -> None:
+        """An FK parent the dialog added becomes an ordinary table again (enabled, no tooltip)."""
+        self._fk_auto_added.discard(item.text())
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+        item.setToolTip("")
+
+    def _set_table_checks(self, wanted, every: bool = False) -> None:
+        """Checks the (visible, unless ``every``) tables ``wanted(item)`` picks and unchecks the rest, then
+        recomputes the FK parents once. A table it picks becomes the user's own pick even when it had been
+        added as an FK parent; one it does not pick that was added is left to that recomputation."""
+        self._syncing_tables = True
+        try:
+            if every:  # a new set of picks: no table stays added for the old ones
+                for item in self._table_items():
+                    self._release_auto_added(item)
+            for item in self._table_items():
+                if not every and item.isHidden():
+                    continue
+                if wanted(item):
+                    if item.text() in self._fk_auto_added:
+                        self._release_auto_added(item)
+                    item.setCheckState(Qt.CheckState.Checked)
+                elif item.text() not in self._fk_auto_added:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+        finally:
+            self._syncing_tables = False
+        self._refresh_table_state()
 
     def select_all_tables(self):
         """전체 선택/해제는 필터에 보이는 테이블에만 적용한다 (필터가 없으면 전체)."""
-        for item in self._visible_table_items():
-            item.setCheckState(Qt.CheckState.Checked)
+        self._set_table_checks(lambda _item: True)
 
     def deselect_all_tables(self):
-        for item in self._visible_table_items():
-            item.setCheckState(Qt.CheckState.Unchecked)
+        self._set_table_checks(lambda _item: False)
 
     def _apply_table_filter(self, text: str = ""):
         needle = (text or "").strip().lower()
-        for i in range(self.list_tables.count()):
-            item = self.list_tables.item(i)
+        for item in self._table_items():
             item.setHidden(bool(needle) and needle not in item.text().lower())
 
-    def _update_table_count(self, *_):
-        total = self.list_tables.count()
-        checked = sum(1 for i in range(total) if self.list_tables.item(i).checkState() == Qt.CheckState.Checked)
-        self.label_table_count.setText(f"{checked}/{total} 선택")
-
     def get_selected_tables(self) -> List[str]:
-        tables = []
-        for i in range(self.list_tables.count()):
-            item = self.list_tables.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                tables.append(item.text())
-        return tables
+        """체크된 테이블 전부 (자동으로 더한 부모 테이블 포함): Export 에 보내는 목록 그대로."""
+        return [item.text() for item in self._table_items() if item.checkState() == Qt.CheckState.Checked]
+
+    def _picked_tables(self) -> List[str]:
+        """사용자가 직접 고른 테이블 (자동으로 더한 부모 테이블 제외)."""
+        return [name for name in self.get_selected_tables() if name not in self._fk_auto_added]
+
+    def _is_full_export(self) -> bool:
+        """사용자가 모든 테이블을 체크했으면 전체 Export 다 (뷰·저장 프로시저·예약 이벤트까지).
+
+        체크를 푼 테이블이 부모 테이블로 다시 담겼으면 모두 체크되어 있어도 고른 테이블 Export 다."""
+        return not self._fk_auto_added and all(
+            item.checkState() == Qt.CheckState.Checked for item in self._table_items())
+
+    def _fk_parent_map(self) -> Optional[dict]:
+        """이 스키마의 외래 키 부모 (fetch_fk_parents), 스키마마다 한 번 읽는다. 읽지 못하면 None 이고,
+        다음 변경 때 다시 읽는다."""
+        schema = self.combo_schema.currentText()
+        if schema in self._fk_cache:
+            return self._fk_cache[schema]
+        facade = getattr(self.connector, "facade", None)
+        if facade is None:
+            return None
+        # ponytail: schema.inspect runs on the UI thread over the shared facade (a wait cursor while it
+        # does, once per schema); move it to a QThread with its own core if large schemas freeze the list.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            deps = RustDumpExporter(build_rust_dump_config(self.connector), facade=facade).fetch_fk_parents(schema)
+        except Exception as exc:
+            logger.warning("Export FK parent lookup failed: %s", exc)
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._fk_cache[schema] = deps
+        return deps
+
+    def _refresh_table_state(self, *_):
+        """Recomputes the FK parents of the checked tables on every change, whatever the toggle says.
+
+        Toggle on: the parents a checked table needs are checked and disabled while it needs them.
+        Toggle off: nothing is checked for the user; one line names the tables whose parent stays out."""
+        if self._syncing_tables:
+            return
+        items = self._table_items()
+        picks = self._picked_tables()
+        # Everything checked by the user: no parent can be missing, so the FKs are not read.
+        deps = self._fk_parent_map() if len(picks) < len(items) else {}
+        names = {item.text() for item in items}
+        added = set()
+        if self.chk_include_fk.isChecked() and deps:
+            added = set(fk_parent_closure(picks, deps)[1]) & names
+        self._syncing_tables = True
+        try:
+            for item in items:
+                name = item.text()
+                if name in added:
+                    item.setCheckState(Qt.CheckState.Checked)
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                    item.setToolTip(translate_text(_FK_AUTO_TOOLTIP))
+                elif name in self._fk_auto_added:  # no checked table needs it any more: back to the user's choice
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+                    item.setToolTip("")
+        finally:
+            self._syncing_tables = False
+        self._fk_auto_added = added
+        self._fk_outside = None if deps is None else fk_parents_outside(self.get_selected_tables(), deps)
+        self._update_table_notes()
+
+    def _update_table_notes(self):
+        total = self.list_tables.count()
+        checked = len(self.get_selected_tables())
+        self.label_table_count.setText(f"{checked}/{total} 선택")
+        partial = not self._is_full_export()
+        self.lbl_partial_note.setVisible(partial)
+        note = ""
+        if partial and self._fk_outside is None:
+            note = translate_text(
+                "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다."
+                if self.chk_include_fk.isChecked()
+                else "연결된 부모 테이블을 확인하지 못했습니다. 고른 테이블만 내보냅니다.")
+        elif self._fk_auto_added:
+            note = translate_text("연결된 부모 테이블 자동 추가 {}개: {}").format(
+                len(self._fk_auto_added), ", ".join(sorted(self._fk_auto_added)))
+        elif partial and self._fk_outside:
+            children = sorted({item["child"] for item in self._fk_outside})
+            pairs = ", ".join(f"{item['child']} → {item['parent']}" for item in self._fk_outside[:_FK_NOTICE_EXAMPLES])
+            if len(self._fk_outside) > _FK_NOTICE_EXAMPLES:
+                pairs += " " + translate_text("외 {}개").format(len(self._fk_outside) - _FK_NOTICE_EXAMPLES)
+            note = translate_text(
+                "고른 테이블 {}개의 연결된 부모 테이블이 체크되어 있지 않습니다 ({}). 고른 테이블만 내보냅니다. "
+                "함께 담으려면 고급 설정에서 '연결된 부모 테이블 함께 담기'를 켜세요.").format(len(children), pairs)
+        self.lbl_fk_note.setText(note)
+        self.lbl_fk_note.setVisible(bool(note))
 
     def set_ui_enabled(self, enabled: bool):
         """Export 진행 중 UI 요소 활성화/비활성화"""
-        self.radio_full.setEnabled(enabled)
-        self.radio_partial.setEnabled(enabled)
         self.combo_schema.setEnabled(enabled)
         self.table_group.setEnabled(enabled)
-        self.spin_threads.setEnabled(enabled)
-        self.combo_compression.setEnabled(enabled)
+        self.advanced_panel.setEnabled(enabled)
         self.btn_export.setEnabled(enabled)
-
-        # 폴더 설정 UI
         self.input_base_dir.setEnabled(enabled)
-        self.radio_auto_naming.setEnabled(enabled)
-        self.radio_manual_naming.setEnabled(enabled)
-        if enabled:
-            # 모드에 따라 옵션 활성화
-            is_auto = self.radio_auto_naming.isChecked()
-            self.chk_name.setEnabled(is_auto)
-            self.chk_schema.setEnabled(is_auto)
-            self.chk_timestamp.setEnabled(is_auto)
-            self.input_manual_folder.setEnabled(not is_auto)
-        else:
-            self.chk_name.setEnabled(False)
-            self.chk_schema.setEnabled(False)
-            self.chk_timestamp.setEnabled(False)
-            self.input_manual_folder.setEnabled(False)
 
     def do_export(self):
         schema = self.combo_schema.currentText()
 
         if not schema:
-            QMessageBox.warning(self, "오류", "스키마를 선택하세요.")
+            QMessageBox.warning(self, "오류", "스키마를 선택하세요." if self._engine() == "postgresql" else "DB를 선택하세요.")
             return
 
-        # 일부 테이블 Export 시 테이블 확인
-        if self.radio_partial.isChecked():
-            tables = self.get_selected_tables()
-            if not tables:
-                QMessageBox.warning(self, "오류", "최소 하나의 테이블을 선택하세요.")
-                return
+        # 모두 체크되어 있으면 전체 Export, 아니면 체크한 테이블만
+        if not self._is_full_export() and not self.get_selected_tables():
+            QMessageBox.warning(self, "오류", "테이블을 하나 이상 고르세요.")
+            return
 
         output_dir = self._resolve_output_dir(schema)
 
@@ -1047,10 +1118,10 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         self.input_output_dir.setText(output_dir)
 
-        # 설정 저장
+        # 설정 저장 (고급 설정은 Import 처럼 실행할 때 기억한다)
         if self.config_manager:
-            self.config_manager.set_app_setting('rust_dump_export_dir', output_dir)
-            self.config_manager.set_app_setting('rust_dump_last_dump_dir', output_dir)
+            self.config_manager.set_app_settings({'rust_dump_export_dir': output_dir, 'rust_dump_last_dump_dir': output_dir,
+                                                  **self._persisted_export_options()})
 
         self._reset_export_state(schema)
 
@@ -1058,13 +1129,17 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._add_log(f"{'='*60}")
         self._add_log("Rust DB Core Export 시작")
         self._add_log(f"시작 시간: {self.export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        self._add_log(f"스키마: {schema}")
-        self._add_log(f"Export 유형: {'전체 스키마' if self.radio_full.isChecked() else '선택 테이블'}")
-        if self.radio_partial.isChecked():
+        self._add_log(f"{self._namespace_noun()}: {schema}")
+        self._add_log(f"Export 범위: {'전체' if self._is_full_export() else '고른 테이블'}")
+        if self.export_tables:
             self._add_log(f"선택 테이블: {', '.join(self.export_tables)}")
+        if self.export_tables and self._fk_auto_added:
+            self._add_log(f"연결된 부모 테이블 자동 추가: {', '.join(sorted(self._fk_auto_added))}")
+        if self._advanced_summary():
+            self._add_log(self._advanced_summary())
         self._add_log(f"출력 폴더: {output_dir}")
-        self._add_log(f"병렬 스레드: {self.spin_threads.value()}")
-        self._add_log(f"압축 방식: {self.combo_compression.currentText()}")
+        self._add_log(f"동시 작업 수: {self.spin_threads.value()}")
+        self._add_log(f"압축 방식: {self._compression()}")
         self._add_log(f"{'='*60}")
 
         # UI 상태 변경 - 모든 입력 비활성화
@@ -1103,8 +1178,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # 생성된 값이라 타임스탬프가 오래됐을 수 있어, 같은 세션에서 연속 Export
         # 시 동일 폴더를 재사용하는 문제가 있었다.
         output_dir = self.input_output_dir.text()
-        is_auto_mode = not self.radio_manual_naming.isChecked()
-        if is_auto_mode and self.chk_timestamp.isChecked():
+        if not self.chk_manual_folder.isChecked():
             output_dir = self._generate_output_dir(schema)
         return self._unique_output_dir(output_dir)
 
@@ -1116,7 +1190,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.export_end_time = None
         self.export_success = None
         self.export_schema = schema
-        self.export_tables = self.get_selected_tables() if self.radio_partial.isChecked() else []
+        self.export_tables = [] if self._is_full_export() else self.get_selected_tables()
         self.export_table_totals = {}
         self.export_table_done = {}
         self.export_table_status = {}
@@ -1131,45 +1205,39 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_save_log.setEnabled(False)
         self._cancel_requested = False
         self._close_after_cancel = False
-        self._allow_incomplete = False
-        self._snapshot_mode = "parallel_strict"
+        self._allow_incomplete = self.chk_allow_incomplete.isChecked()
+        self._snapshot_mode = "auto"
+        self._snapshot_method = ""
+        self._omitted_objects = []
 
-    def _build_worker(
-        self,
-        schema: str,
-        output_dir: str,
-        mysql_snapshot_mode: str = "parallel_strict",
-    ):
+    def _build_worker(self, schema: str, output_dir: str):
+        """The core picks the MySQL method ("auto"); without a lock that gives one point in time it reads
+        over one connection, or in parallel without one when '시점 일관성 포기' is on. No privilege question."""
         config = build_rust_dump_config(self.connector)
-        self._snapshot_mode = mysql_snapshot_mode
-        threads = (
-            1 if mysql_snapshot_mode == "single_connection"
-            else self.spin_threads.value()
+        options = dict(
+            schema=schema,
+            output_dir=output_dir,
+            threads=self.spin_threads.value(),
+            compression=self._compression(),
+            mysql_snapshot_mode="auto",
+            mysql_snapshot_fallback=self._snapshot_fallback(),
+            allow_incomplete=self._allow_incomplete,
         )
-        if self.radio_full.isChecked():
-            return RustDumpWorker(
-                "export_schema", config,
-                schema=schema,
-                output_dir=output_dir,
-                threads=threads,
-                compression=self.combo_compression.currentText(),
-                mysql_snapshot_mode=mysql_snapshot_mode,
-                allow_incomplete=self._allow_incomplete,
-            )
+        if self._is_full_export():
+            return RustDumpWorker("export_schema", config, **options)
+        # Exactly the checked tables: the parents the toggle added are already among them. When the FKs
+        # could not be read here, the worker reads them again with the toggle on (and fails if it cannot).
         return RustDumpWorker(
             "export_tables", config,
-            schema=schema,
             tables=self.get_selected_tables(),
-            output_dir=output_dir,
-            threads=threads,
-            compression=self.combo_compression.currentText(),
-            include_fk_parents=self.chk_include_fk.isChecked(),
-            mysql_snapshot_mode=mysql_snapshot_mode,
-            allow_incomplete=self._allow_incomplete,
+            include_fk_parents=self.chk_include_fk.isChecked() and self._fk_outside is None,
+            auto_added_tables=sorted(self._fk_auto_added),
+            fk_parents_outside_dump=self._fk_outside,
+            **options,
         )
 
     def _start_export_worker(self, worker: RustDumpWorker) -> None:
-        if self._job_id is None:  # 재시도(권한 대체/불완전 선택)는 같은 작업으로 기록한다
+        if self._job_id is None:  # 불완전 선택 뒤 다시 실행해도 같은 작업으로 기록한다
             self._job_id = begin_export_job(self)
         self.worker = worker
         worker.progress.connect(self.on_progress)
@@ -1180,93 +1248,39 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         worker.finished.connect(self.on_finished)
         worker.start()
 
-    def _create_mysql_privilege_dialog(self, table_lock_denied: bool = False) -> QMessageBox:
-        message_box = QMessageBox(self)
-        message_box.setIcon(QMessageBox.Icon.Warning)
-        if table_lock_denied:
-            message_box.setWindowTitle("일관 병렬 Export 불가")
-            message_box.setText(
-                "이 계정은 내보낼 테이블의 LOCK TABLES 권한도 없어, "
-                "모든 워커가 같은 시점을 보는 병렬 Export를 할 수 없습니다.\n\n"
-                "단일 연결로 계속하면 느리지만 모든 테이블을 같은 시점으로 내보냅니다. "
-                "병렬로 계속하면 빠르지만 워커마다 스냅샷 시점이 달라 "
-                "테이블 사이의 데이터가 서로 맞지 않을 수 있습니다.\n\n"
-                "LOCK TABLES 권한이나 전역 권한(RELOAD, BACKUP_ADMIN)을 받으면 "
-                "일관된 병렬 Export를 사용할 수 있습니다."
-            )
-            names = [
-                "mysql_single_connection_continue",
-                "mysql_parallel_unsynchronized_continue",
-            ]
-        else:
-            message_box.setWindowTitle("병렬 Export 권한 필요")
-            message_box.setText(
-                "병렬 일관 스냅샷에 필요한 MySQL 전역 락 권한(RELOAD, BACKUP_ADMIN)이 없습니다.\n\n"
-                "권장 방식은 내보낼 테이블만 잠깐(최대 2초) 잠가 모든 워커가 같은 시점의 "
-                "데이터를 보게 한 뒤 바로 해제합니다. 그동안 해당 테이블의 쓰기는 대기합니다.\n\n"
-                "계정에 전역 권한을 부여하면 다음 Export부터 이 질문 없이 진행합니다."
-            )
-            names = [
-                "mysql_parallel_table_lock_continue",
-                "mysql_parallel_unsynchronized_continue",
-                "mysql_single_connection_continue",
-            ]
-        for name in names:
-            button = message_box.addButton(
-                translate_text(_MYSQL_PRIVILEGE_CHOICES[name][0]),
-                QMessageBox.ButtonRole.AcceptRole,
-            )
-            button.setObjectName(name)
-            if name == names[0]:
-                message_box.setDefaultButton(button)
-        cancel_button = message_box.addButton(
-            translate_text("취소"),
-            QMessageBox.ButtonRole.RejectRole,
-        )
-        cancel_button.setObjectName("mysql_privilege_cancel")
-        message_box.setEscapeButton(cancel_button)
-        return message_box
-
-    def _prompt_mysql_privilege_action(self, table_lock_denied: bool = False) -> str:
-        """다시 시도할 mysql_snapshot_mode, 또는 "cancel"을 반환한다."""
-        message_box = self._create_mysql_privilege_dialog(table_lock_denied)
-        message_box.exec()
-        clicked = message_box.clickedButton()
-        object_name = clicked.objectName() if clicked is not None else ""
-        return _MYSQL_PRIVILEGE_CHOICES.get(object_name, ("", "cancel"))[1]
-
-    def _retry_with_snapshot_mode(self, mysql_snapshot_mode: str) -> None:
-        log_message, status = _MYSQL_RETRY_MESSAGES[mysql_snapshot_mode]
-        self._add_log(log_message)
-        self.set_ui_enabled(False)
-        self.collapse_config_section()
-        self.label_status.setText(status)
-        worker = self._build_worker(
-            self.export_schema,
-            self.input_output_dir.text(),
-            mysql_snapshot_mode=mysql_snapshot_mode,
-        )
-        self._start_export_worker(worker)
-
-    def _prompt_incomplete_export(self, objects: List[str]) -> bool:
-        """지원되지 않는 객체 목록을 보여주고 불완전 Export를 명시적으로 선택받는다."""
-        message_box = QMessageBox(self)
-        message_box.setIcon(QMessageBox.Icon.Warning)
-        message_box.setWindowTitle("Export 범위에 보존할 수 없는 객체가 있습니다")
-        # setDetailedText 의 "Show Details..." 버튼은 번역되지 않아 목록을 본문에 싣는다.
+    def _refusal_lines(self, objects: List[str]) -> List[str]:
+        """One plain sentence per refused object, up to the list limit plus a count of the rest."""
         limit = _INCOMPLETE_EXPORT_LIST_LIMIT
-        listed = [f"• {name}" for name in objects[:limit]]
+        listed = [f"• {line}" for line in describe_export_refusal(objects[:limit])]
         if len(objects) > limit:
             listed.append(translate_text("외 {}개").format(len(objects) - limit))
+        return listed
+
+    def _add_details_button(self, box: QMessageBox, title: str, details: str) -> None:
+        """'자세히': the core's own codes, beside the window (setDetailedText's button is never translated)."""
+        more = box.addButton(translate_text("자세히"), QMessageBox.ButtonRole.ActionRole)
+        more.setObjectName("export_refusal_details")
+        more.clicked.disconnect()  # QMessageBox closes on any of its buttons; this one keeps the window open.
+        more.clicked.connect(lambda: QMessageBox.information(self, title, details))
+
+    def _prompt_incomplete_export(self, objects: List[str]) -> bool:
+        """덤프에 담을 수 없는 객체를 읽을 수 있는 문장으로 보여주고 불완전 Export를 명시적으로 선택받는다.
+
+        '담을 수 없는 객체는 빼고 내보내기'가 꺼져 있을 때만 묻는다."""
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Icon.Warning)
+        message_box.setTextFormat(Qt.TextFormat.PlainText)
+        title = translate_text("덤프에 담을 수 없는 객체가 있습니다")
+        message_box.setWindowTitle(title)
         message_box.setText(
             translate_text(
-                "선택한 범위에 이 덤프 형식이 보존할 수 없는 객체가 있어 Export를 시작하지 않았습니다 "
-                "(파일은 생성되지 않았습니다).\n\n"
-                "'이 객체 없이 내보내기 (불완전)'를 선택하면 아래 객체만 빼고 "
-                "나머지 테이블의 구조와 데이터는 모두 내보냅니다. 결과는 완전한 백업이 아닙니다.\n\n"
-                "제외할 객체:"
+                "덤프에 담을 수 없는 객체가 있어 Export를 시작하지 않았습니다. 아직 파일은 만들지 않았습니다.\n\n"
+                "'이 객체 없이 내보내기 (불완전)'를 누르면 아래 객체만 빼고 "
+                "나머지 테이블의 구조와 데이터는 모두 내보냅니다. 완전한 백업은 아닙니다. "
+                "고급 설정에서 '담을 수 없는 객체는 빼고 내보내기'를 켜 두면 다음부터 묻지 않습니다.\n\n"
+                "뺄 객체:"
             )
-            + "\n" + "\n".join(listed)
+            + "\n" + "\n".join(self._refusal_lines(objects))
         )
         proceed_button = message_box.addButton(
             translate_text("이 객체 없이 내보내기 (불완전)"),
@@ -1277,10 +1291,40 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             translate_text("취소"), QMessageBox.ButtonRole.RejectRole
         )
         cancel_button.setObjectName("export_incomplete_cancel")
+        self._add_details_button(message_box, title, "\n".join(objects))
         message_box.setDefaultButton(cancel_button)
         message_box.setEscapeButton(cancel_button)
         message_box.exec()
         return message_box.clickedButton() is proceed_button
+
+    def _show_lossy_refusal(self, objects: List[str]) -> QMessageBox:
+        """테이블 정의가 바뀌는 객체: 빼고 내보낼 수 없으니 이유만 보여 주고 닫기만 둔다.
+
+        Core 는 뺄 수 있는 객체(트리거, InnoDB 가 아닌 테이블, 루틴·이벤트)도 같은 목록 뒤에 붙인다: 따로 보여 준다."""
+        lossy = [item for item in objects if str(item).partition(":")[0] in LOSSY_REFUSAL_KINDS] or objects
+        others = [item for item in objects if item not in lossy]
+        box = QMessageBox(self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        title = translate_text("Export를 시작하지 않았습니다")
+        box.setWindowTitle(title)
+        hint = translate_text("목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다.")
+        if not self.export_tables:  # a full export becomes a table export once a table is unchecked
+            hint += " " + translate_text(self._partial_note())
+        box.setText(
+            translate_text("덤프에 그대로 담을 수 없는 테이블 정의가 있어 Export를 시작하지 않았습니다. "
+                           "아직 파일은 만들지 않았습니다.")
+            + "\n\n" + "\n".join(self._refusal_lines(lossy))
+            + ("\n\n" + translate_text("그 밖에 빼고 내보낼 수 있는 객체:") + "\n" + "\n".join(self._refusal_lines(others))
+               if others else "")
+            + "\n\n" + hint
+        )
+        close_button = box.addButton(translate_text("닫기"), QMessageBox.ButtonRole.RejectRole)
+        close_button.setObjectName("export_refusal_close")
+        self._add_details_button(box, title, "\n".join(objects))
+        box.open()
+        return box
 
     def _retry_allow_incomplete(self) -> None:
         self._allow_incomplete = True
@@ -1288,11 +1332,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.set_ui_enabled(False)
         self.collapse_config_section()
         self.label_status.setText("일부 객체를 제외한 Export (불완전) 진행 중...")
-        worker = self._build_worker(
-            self.export_schema,
-            self.input_output_dir.text(),
-            mysql_snapshot_mode=self._snapshot_mode,
-        )
+        worker = self._build_worker(self.export_schema, self.input_output_dir.text())
         self._start_export_worker(worker)
 
     def _add_log(self, msg: str):
@@ -1334,34 +1374,29 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def on_finished(self, success: bool, message: str):
         message = sanitize_local_diagnostic(message)
-        handled_privilege_failure = False
+        # The core refused before writing anything: objects the dump cannot keep. No privilege question
+        # ever: a missing privilege only moved the core on to the next method (mysql_snapshot_mode "auto").
         refusal = getattr(self.worker, "export_refusal", None)
-        if (
-            not success
-            and not self._allow_incomplete
-            and isinstance(refusal, dict)
-            and refusal.get("bypassable")
-            and self._prompt_incomplete_export(list(refusal.get("objects") or []))
-        ):
-            self._retry_allow_incomplete()
-            return
-        # 권한 질문은 Export당 최대 두 번: parallel_strict 실패 후 한 번, 테이블 락까지
-        # 거부되면 한 번 더. 독립 스냅샷/단일 연결 모드는 다시 묻지 않는다.
-        table_lock_denied = (
-            self._snapshot_mode == "parallel_table_lock"
-            and mysql_parallel_snapshot_denied_privilege(message) == MYSQL_PRIVILEGE_LOCK_TABLES
-        )
-        if (
-            not success
-            and (self._snapshot_mode == "parallel_strict" or table_lock_denied)
-            and is_mysql_parallel_snapshot_privilege_error(message)
-        ):
-            retry_mode = self._prompt_mysql_privilege_action(table_lock_denied)
-            if retry_mode != "cancel":
-                self._retry_with_snapshot_mode(retry_mode)
+        refused = (not success and not self._cancel_requested and isinstance(refusal, dict)
+                   and bool(refusal.get("objects")))
+        if refused and refusal.get("bypassable") and not self._allow_incomplete:
+            if self._prompt_incomplete_export(list(refusal["objects"])):
+                self._retry_allow_incomplete()
                 return
-            handled_privilege_failure = True
-            self._add_log("병렬 Export 권한 안내에서 취소를 선택했습니다.")
+            self._add_log("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다 (사용자가 취소).")
+        if refused:
+            # 작업 목록과 저장한 로그에는 읽을 수 있는 문장만 남긴다. Core 원문은 앱 로그에만 둔다.
+            logger.info("Export refused by the core: %s", message)
+            objects = list(refusal["objects"])
+            message = " ".join([translate_text("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다."),
+                                "; ".join(describe_export_refusal(objects[:_INCOMPLETE_EXPORT_LIST_LIMIT]))])
+            if len(objects) > _INCOMPLETE_EXPORT_LIST_LIMIT:
+                message += " " + translate_text("외 {}개").format(len(objects) - _INCOMPLETE_EXPORT_LIST_LIMIT)
+        run = getattr(self.worker, "export_run", None)
+        if success and isinstance(run, dict):
+            self._snapshot_mode = run.get("mode") or self._snapshot_mode
+            self._snapshot_method = str(run.get("method") or "")
+            self._omitted_objects = [str(item) for item in run.get("omitted") or []]
 
         # 로그 기록
         self.export_end_time = datetime.now()
@@ -1386,7 +1421,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         unsynchronized = self._snapshot_mode == "parallel_unsynchronized"
         if success:
-            self.txt_log.addItem(f"✅ 완료: {message}")
+            # message 는 Core 가 실제로 쓴 방법으로 끝난다 ("Export 완료: 테이블 3개, 행 100개 · 같은 시점으로 내보냄 · ...").
+            self.txt_log.addItem(f"✅ {message}")
             if unsynchronized:
                 self.txt_log.addItem(f"⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}")
                 self._add_log(f"⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}")
@@ -1409,16 +1445,23 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             if total_count > 0:
                 self.label_tables.setText(f"📋 테이블: {done_count} / {total_count} 완료")
             self._show_export_done(
-                f"✅ Export가 완료되었습니다.\n\n폴더: {self.input_output_dir.text()}"
-                + (f"\n\n⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}" if unsynchronized else "")
-                + (f"\n\n⚠️ {_INCOMPLETE_EXPORT_WARNING}" if self._allow_incomplete else "")
+                translate_text("✅ Export가 완료되었습니다.\n\n폴더: {}").format(self.input_output_dir.text())
+                + ("\n" + translate_text("내보낸 방법: {}").format(self._snapshot_method) if self._snapshot_method else "")
+                + (f"\n\n⚠️ {translate_text(_UNSYNCHRONIZED_EXPORT_WARNING)}" if unsynchronized else "")
+                + (f"\n\n⚠️ {translate_text(_INCOMPLETE_EXPORT_WARNING)}" if self._omitted_objects else "")
             )
         else:
-            self.txt_log.addItem(f"❌ 실패: {message}")
-            self.label_data.setText("📦 데이터: Export 실패")
+            self.txt_log.addItem(
+                "❌ " + translate_text("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다.") if refused
+                else f"❌ 실패: {message}"
+            )
+            self.label_data.setText("📦 데이터: -" if refused else "📦 데이터: Export 실패")
             self.label_estimated_rows.setText("📐 예상 전체: -")
             self.label_speed.setText("⚡ 속도: -")
-            self.label_status.setText("⏹ Export 취소됨" if self._cancel_requested else "❌ Export 실패")
+            self.label_status.setText(
+                "⏹ Export 취소됨" if self._cancel_requested
+                else "⏹ Export를 시작하지 않았습니다" if refused else "❌ Export 실패"
+            )
             # 테이블 완료 수 계산
             done_count = sum(1 for item in self.table_items.values()
                            if item.text().startswith("✅"))
@@ -1428,8 +1471,10 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
             if self._cancel_requested:
                 self._add_log("Export가 취소되었습니다.")
-            elif handled_privilege_failure:
-                self._add_log("병렬 Export 권한 부족으로 작업을 중단했습니다.")
+            elif refused:
+                # 덤프에 담을 수 없는 것은 앱 오류가 아니다: 오류 보고 없이 이유만 보여 준다.
+                if not refusal.get("bypassable"):
+                    self._show_lossy_refusal(list(refusal["objects"]))
             else:
                 QMessageBox.warning(self, "Export 실패", f"❌ {message}")
 
@@ -1680,8 +1725,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 f.write("Rust DB Core Export Log\n")
                 f.write("=" * 70 + "\n\n")
 
-                f.write(f"스키마: {safe(self.export_schema)}\n")
-                f.write(f"Export 유형: {'전체 스키마' if self.radio_full.isChecked() else '선택 테이블'}\n")
+                f.write(f"{self._namespace_noun()}: {safe(self.export_schema)}\n")
+                f.write(f"Export 범위: {'고른 테이블' if self.export_tables else '전체'}\n")
                 if self.export_tables:
                     f.write(
                         f"선택 테이블: "

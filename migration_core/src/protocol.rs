@@ -434,6 +434,8 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "query.cancel",
             "query.explain",
             "dump.run",
+            // dump.run takes mysql_snapshot_mode "auto" (with mysql_snapshot_fallback).
+            "dump.run.mysql_snapshot_auto",
             "dump.import",
             "dump.import_preview",
             "dump.promote",
@@ -847,6 +849,10 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("dump.run")));
+        assert!(result["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dump.run.mysql_snapshot_auto")), "the application asks for it before sending auto");
         assert!(result["capabilities"]
             .as_array()
             .unwrap()

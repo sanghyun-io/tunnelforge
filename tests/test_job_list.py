@@ -84,23 +84,33 @@ def start_export(dialog, schema="app"):
     return worker
 
 
+def finished_worker(mode=None, method="", omitted=()):
+    """The worker after a successful export: the core's result as RustDumpWorker.export_run holds it."""
+    worker = idle_worker()
+    worker.export_refusal = None
+    worker.export_run = {"mode": mode, "method": method, "omitted": list(omitted)}
+    return worker
+
+
 def test_export_run_is_recorded_with_profile_target_and_actual_mode(history):
     dialog = make_export()
     try:
-        dialog.combo_compression.setCurrentText("none")
+        dialog.combo_compression.setCurrentIndex(dialog.combo_compression.findData("none"))
         dialog.spin_threads.setValue(3)
         start_export(dialog)
         running = only(history)
         assert running.status == jh.STATUS_RUNNING and running.kind == jh.KIND_EXPORT_FULL
         assert (running.profile_id, running.profile_name, running.target) == ("prof-1", "Prod", "app")
-        assert "일관 스냅샷(병렬)" in running.mode and "스레드 3" in running.mode and "압축 안 함" in running.mode
-        assert "snapshot=" not in running.mode and running.rerun["snapshot_mode"] == "parallel_strict"
+        assert running.mode == "전체 · 내보내는 방법 자동 선택 · 동시 작업 3개 · 압축 안 함"
+        assert "snapshot_mode" not in running.rerun and "include_fk_parents" not in running.rerun
         dialog.export_total_tables = 3
         dialog.export_table_done = {"a": 10, "b": 5}
         dialog.input_output_dir.setText("C:/exports/app_1")
+        dialog.worker = finished_worker("parallel_table_lock", "같은 시점으로 내보냄 · 동시 작업 3개 (잠금 권한이 없어 테이블만 잠깐 잠금)")
         dialog.on_finished(True, "done")
         done = only(history)
         assert done.status == jh.STATUS_COMPLETED and done.finished_at
+        assert done.mode == "전체 · 같은 시점으로 내보냄 · 동시 작업 3개 (잠금 권한이 없어 테이블만 잠깐 잠금) · 압축 안 함"
         assert done.report_path.replace("\\", "/") == "C:/exports/app_1/_tunnelforge_dump.json"
         assert done.details == {"tables": 3, "rows": 15}
         assert done.rerun["schema"] == "app" and done.rerun["scope"] == "full" and done.rerun["compression"] == "none"
@@ -108,46 +118,77 @@ def test_export_run_is_recorded_with_profile_target_and_actual_mode(history):
         dialog.close()
 
 
-@pytest.mark.parametrize("cancel, incomplete, success, expected", [
-    (False, False, False, jh.STATUS_FAILED),
-    (True, False, False, jh.STATUS_CANCELLED),
-    (False, True, True, jh.STATUS_PARTIAL),
+@pytest.mark.parametrize("cancel, omitted, success, expected", [
+    (False, (), False, jh.STATUS_FAILED),
+    (True, (), False, jh.STATUS_CANCELLED),
+    (False, ("Object not exported: trigger:t:trg",), True, jh.STATUS_PARTIAL),
+    # '빼고 내보내기' was on, but nothing had to be left out: a complete export.
+    (False, (), True, jh.STATUS_COMPLETED),
 ])
-def test_export_failure_cancel_and_incomplete_choice_statuses(history, cancel, incomplete, success, expected):
+def test_export_failure_cancel_and_incomplete_choice_statuses(history, cancel, omitted, success, expected):
     dialog = make_export()
     try:
+        dialog.chk_allow_incomplete.setChecked(True)
         start_export(dialog)
         dialog._cancel_requested = cancel
-        dialog._allow_incomplete = incomplete
+        dialog.worker = finished_worker("parallel_strict", omitted=omitted)
         dialog.on_finished(success, "mysql://admin:hunter2@db/app: boom password=hunter2")
         record = only(history)
         assert record.status == expected
         if not success:
             assert "hunter2" not in record.error_summary
-        if incomplete:
-            assert "불완전 Export" in record.mode or record.rerun is not None
+        assert ("불완전 Export" in record.mode) is bool(omitted)
     finally:
         dialog.close()
 
 
-@pytest.mark.parametrize("mode, incomplete, actual", [
-    ("parallel_table_lock", False, "전체 · 테이블 락 공유 스냅샷(병렬) · zstd 압축 · 스레드 8"),
-    ("parallel_unsynchronized", True,
-     "전체 · 독립 스냅샷(병렬, 시점 일관성 미보장) · zstd 압축 · 스레드 8 · 불완전 Export(일부 객체 제외)"),
-    ("single_connection", False, "전체 · 일관 스냅샷(단일 연결) · zstd 압축 · 스레드 1"),
+@pytest.mark.parametrize("bypassable, expected", [
+    (True, jh.STATUS_CANCELLED),  # the user chose 취소 in the "빼고 내보낼까요" window
+    (False, jh.STATUS_FAILED),
 ])
-def test_export_retry_records_the_mode_that_actually_ran(history, mode, incomplete, actual):
+def test_a_refused_export_is_recorded_in_sentences(history, monkeypatch, bypassable, expected):
+    from PyQt6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: None)  # 취소: nothing clicked
+    monkeypatch.setattr(QMessageBox, "open", lambda box: None)
+    dialog = make_export()
+    try:
+        start_export(dialog)
+        worker = idle_worker()
+        worker.export_run = None
+        worker.export_refusal = {"objects": ["trigger:orders:trg"] if bypassable else ["generated_column:orders:total"],
+                                 "bypassable": bypassable}
+        dialog.worker = worker
+        dialog.on_finished(False, "Rust DB Core export 오류: dump.run refused: the selected scope contains objects")
+        record = only(history)
+        assert record.status == expected
+        assert record.error_summary.startswith("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다. 테이블 orders: ")
+        assert "dump.run refused" not in record.error_summary
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("mode, method, unsynchronized, actual", [
+    ("parallel_strict", "같은 시점으로 내보냄 · 동시 작업 8개", False,
+     "전체 · 같은 시점으로 내보냄 · 동시 작업 8개 · 압축(zstd)"),
+    ("parallel_unsynchronized", "테이블마다 시점이 다를 수 있음 · 동시 작업 8개 (잠금 권한이 없어 시점을 맞추지 않고 나눠 읽음)", True,
+     "전체 · 테이블마다 시점이 다를 수 있음 · 동시 작업 8개 (잠금 권한이 없어 시점을 맞추지 않고 나눠 읽음) · 압축(zstd)"),
+    ("single_connection", "같은 시점으로 내보냄 · 동시 작업 1개 (잠금 권한이 없어 연결 하나로 읽음)", False,
+     "전체 · 같은 시점으로 내보냄 · 동시 작업 1개 (잠금 권한이 없어 연결 하나로 읽음) · 압축(zstd)"),
+])
+def test_export_records_the_method_the_core_actually_used(history, mode, method, unsynchronized, actual):
     dialog = make_export()
     try:
         dialog.spin_threads.setValue(8)
+        dialog.chk_unsynchronized.setChecked(unsynchronized)
         start_export(dialog)
-        dialog._snapshot_mode = mode  # the privilege / incomplete retry rebuilt the worker
-        dialog._allow_incomplete = incomplete
+        assert only(history).mode == ("전체 · 내보내는 방법 자동 선택(시점 일관성 포기 허용) · 동시 작업 8개 · 압축(zstd)"
+                                      if unsynchronized else "전체 · 내보내는 방법 자동 선택 · 동시 작업 8개 · 압축(zstd)")
+        dialog.worker = finished_worker(mode, method)
         dialog.on_finished(True, "ok")
         record = only(history)
-        assert record.mode == actual, "the mode column shows the mode that actually ran"
+        assert record.mode == actual, "the mode column shows the method the core used"
         assert "actual_mode" not in record.details
-        assert record.rerun["snapshot_mode"] == "parallel_strict"
     finally:
         dialog.close()
 
@@ -156,7 +197,7 @@ def test_export_retries_stay_one_job_and_a_new_run_starts_a_new_one(history):
     dialog = make_export()
     try:
         start_export(dialog)
-        dialog._start_export_worker(idle_worker())  # privilege / incomplete retry reuses the worker slot
+        dialog._start_export_worker(idle_worker())  # the incomplete-export retry reuses the worker slot
         assert len(history.list()) == 1
         dialog.on_finished(False, "failed")
         start_export(dialog)
@@ -170,7 +211,6 @@ def test_partial_export_scope_records_the_selected_tables_for_rerun(history):
     dialog = make_export()
     try:
         dialog.combo_schema.setCurrentIndex(0)
-        dialog.radio_partial.setChecked(True)
         dialog.list_tables.item(1).setCheckState(Qt.CheckState.Unchecked)
         start_export(dialog)
         record = only(history)
@@ -181,18 +221,36 @@ def test_partial_export_scope_records_the_selected_tables_for_rerun(history):
         dialog.close()
 
 
+def test_rerun_tables_hold_only_the_users_own_picks(history):
+    dialog = make_export()
+    dialog.connector.facade.inspect_schema.return_value = {"tables": [
+        {"name": "a", "foreign_keys": [{"name": "fk_a_b", "referenced_table": "b"}]},
+        {"name": "b", "foreign_keys": []}, {"name": "c", "foreign_keys": []}]}
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        dialog.list_tables.item(1).setCheckState(Qt.CheckState.Unchecked)
+        dialog.list_tables.item(2).setCheckState(Qt.CheckState.Unchecked)
+        assert dialog.get_selected_tables() == ["a", "b"], "b is added as a's parent"
+        start_export(dialog)
+        record = only(history)
+        assert record.rerun["tables"] == ["a"] and "테이블 2개" in record.mode
+        dialog.on_finished(True, "ok")
+    finally:
+        dialog.close()
+
+
 def test_export_dialog_prefills_from_a_rerun_record_without_starting(history):
     dialog = make_export()
     try:
         dialog.apply_job_rerun({"schema": "other", "scope": "tables", "tables": ["b"], "compression": "none",
-                                "threads": 2, "include_fk_parents": False})
-        assert dialog.combo_schema.currentText() == "other" and dialog.radio_partial.isChecked()
+                                "threads": 2, "include_fk_parents": True})
+        assert dialog.combo_schema.currentText() == "other" and not dialog._is_full_export()
         assert dialog.get_selected_tables() == ["b"]
-        assert dialog.combo_compression.currentText() == "none" and dialog.spin_threads.value() == 2
-        assert dialog.chk_include_fk.isChecked() is False
+        assert dialog._compression() == "none" and dialog.spin_threads.value() == 2
+        assert dialog.chk_include_fk.isChecked() is False, "an old record's FK choice is ignored"
         assert history.list() == [], "prefilling must not start or record anything"
         dialog.apply_job_rerun({"schema": "missing", "scope": "full"})
-        assert dialog.radio_full.isChecked() and dialog.combo_schema.currentText() == "other"
+        assert dialog._is_full_export() and dialog.combo_schema.currentText() == "other"
         dialog.apply_job_rerun(None)
     finally:
         dialog.close()

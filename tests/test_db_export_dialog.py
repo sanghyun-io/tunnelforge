@@ -1,13 +1,15 @@
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from src.exporters.rust_dump_exporter import RustDumpConfig
+from src.exporters.rust_dump_exporter import RustDumpConfig, describe_snapshot_method
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 from src.ui.dialogs.db_export_dialog import (
@@ -119,11 +121,14 @@ def test_rust_dump_export_dialog_defaults_to_zstd():
     app = QApplication.instance() or QApplication([])
     dialog = RustDumpExportDialog()
 
-    assert dialog.combo_compression.currentText() == "zstd"
+    assert dialog._compression() == "zstd"
+    assert [dialog.combo_compression.itemText(i) for i in range(dialog.combo_compression.count())] == [
+        "압축 안 함", "압축(zstd)"]
+    assert dialog.combo_compression.currentText() == "압축(zstd)"
     dialog.close()
 
 
-def _privilege_dialog(monkeypatch):
+def _dialog(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(
         "src.ui.dialogs.db_export_dialog.check_rust_dump",
@@ -143,177 +148,23 @@ def _privilege_dialog(monkeypatch):
     return dialog
 
 
-def _privilege_marker(privilege):
-    return (
-        "Rust DB Core export 오류: "
-        f"MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:{privilege}:ERROR 1227"
-    )
-
-
 def _buttons_by_name(message_box):
     return {button.objectName(): button for button in message_box.buttons()}
 
 
-def test_first_mysql_privilege_dialog_recommends_table_lock(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
-    try:
-        message_box = dialog._create_mysql_privilege_dialog()
-        buttons = _buttons_by_name(message_box)
-
-        assert message_box.windowTitle() == "병렬 Export 권한 필요"
-        assert {name: button.text() for name, button in buttons.items()} == {
-            "mysql_parallel_table_lock_continue": "병렬로 계속 (테이블 락, 권장)",
-            "mysql_parallel_unsynchronized_continue": "병렬로 계속 (시점 일관성 보장 안 함)",
-            "mysql_single_connection_continue": "단일 연결로 계속",
-            "mysql_privilege_cancel": "취소",
-        }
-        assert message_box.defaultButton().objectName() == "mysql_parallel_table_lock_continue"
-        assert message_box.escapeButton().objectName() == "mysql_privilege_cancel"
-        for expected in ("RELOAD", "BACKUP_ADMIN", "최대 2초", "쓰기는 대기"):
-            assert expected in message_box.text()
-    finally:
-        dialog.close()
-
-
-def test_lock_tables_denied_dialog_drops_the_table_lock_option(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
-    try:
-        message_box = dialog._create_mysql_privilege_dialog(table_lock_denied=True)
-        buttons = _buttons_by_name(message_box)
-
-        assert set(buttons) == {
-            "mysql_single_connection_continue",
-            "mysql_parallel_unsynchronized_continue",
-            "mysql_privilege_cancel",
-        }
-        assert message_box.defaultButton().objectName() == "mysql_single_connection_continue"
-        assert message_box.escapeButton().objectName() == "mysql_privilege_cancel"
-        assert "LOCK TABLES" in message_box.text()
-    finally:
-        dialog.close()
-
-
-@pytest.mark.parametrize("object_name, expected", [
-    ("mysql_parallel_table_lock_continue", "parallel_table_lock"),
-    ("mysql_parallel_unsynchronized_continue", "parallel_unsynchronized"),
-    ("mysql_single_connection_continue", "single_connection"),
-    ("mysql_privilege_cancel", "cancel"),
-])
-def test_mysql_privilege_prompt_returns_the_mode_of_the_clicked_button(
-    monkeypatch, object_name, expected
-):
-    dialog = _privilege_dialog(monkeypatch)
-    # exec() 대신 버튼을 눌러 모달 대기 없이 선택을 재현한다.
-    monkeypatch.setattr(
-        QMessageBox, "exec", lambda box: _buttons_by_name(box)[object_name].click()
-    )
-    try:
-        assert dialog._prompt_mysql_privilege_action() == expected
-    finally:
-        dialog.close()
-
-
-@pytest.mark.parametrize("denied", ["BACKUP_ADMIN", "FLUSH_TABLES_OR_RELOAD", ""])
-@pytest.mark.parametrize("mode, threads", [
-    ("parallel_table_lock", 6),
-    ("parallel_unsynchronized", 6),
-    ("single_connection", 1),
-])
-def test_strict_privilege_failure_retries_with_the_chosen_mode(monkeypatch, denied, mode, threads):
-    dialog = _privilege_dialog(monkeypatch)
-    dialog._prompt_mysql_privilege_action = MagicMock(return_value=mode)
-    try:
-        dialog.on_finished(False, _privilege_marker(denied))
-
-        dialog._prompt_mysql_privilege_action.assert_called_once_with(False)
-        worker = dialog._start_export_worker.call_args.args[0]
-        assert worker.kwargs["mysql_snapshot_mode"] == mode
-        assert worker.kwargs["threads"] == threads
-        assert worker.kwargs["output_dir"] == "C:/tmp/tunnelforge-export"
-        assert dialog._snapshot_mode == mode
-        dialog._report_error_anonymously.assert_not_called()
-    finally:
-        dialog.close()
-
-
-def test_lock_tables_denial_asks_once_more_and_never_a_third_time(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
-    dialog._prompt_mysql_privilege_action = MagicMock(
-        side_effect=["parallel_table_lock", "parallel_unsynchronized"]
-    )
-    try:
-        dialog.on_finished(False, _privilege_marker("BACKUP_ADMIN"))
-        assert dialog._snapshot_mode == "parallel_table_lock"
-        dialog.on_finished(False, _privilege_marker("LOCK_TABLES"))
-        assert dialog._snapshot_mode == "parallel_unsynchronized"
-        dialog.on_finished(False, _privilege_marker("LOCK_TABLES"))
-
-        assert [c.args for c in dialog._prompt_mysql_privilege_action.call_args_list] == [
-            (False,), (True,)
-        ]
-        assert dialog._start_export_worker.call_count == 2
-        dialog._report_error_anonymously.assert_called_once()
-    finally:
-        dialog.close()
-
-
-@pytest.mark.parametrize("mode, denied", [
-    ("parallel_unsynchronized", "LOCK_TABLES"),
-    ("single_connection", "BACKUP_ADMIN"),
-    ("parallel_table_lock", "BACKUP_ADMIN"),
-])
-def test_modes_after_the_prompts_never_prompt_again(monkeypatch, mode, denied):
-    dialog = _privilege_dialog(monkeypatch)
-    dialog._snapshot_mode = mode
-    dialog._prompt_mysql_privilege_action = MagicMock()
-    try:
-        dialog.on_finished(False, _privilege_marker(denied))
-
-        dialog._prompt_mysql_privilege_action.assert_not_called()
-        dialog._start_export_worker.assert_not_called()
-        dialog._report_error_anonymously.assert_called_once()
-    finally:
-        dialog.close()
-
-
-def test_privilege_cancel_stops_without_error_report(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
-    dialog._prompt_mysql_privilege_action = MagicMock(return_value="cancel")
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
-        lambda *_args: pytest.fail("cancel must not show a generic failure"),
-    )
-    try:
-        dialog.on_finished(False, _privilege_marker("BACKUP_ADMIN"))
-
-        dialog._start_export_worker.assert_not_called()
-        dialog._report_error_anonymously.assert_not_called()
-        assert dialog.export_success is False
-    finally:
-        dialog.close()
-
-
-def test_new_export_and_rerun_start_from_the_strict_snapshot(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
+def _finished_worker(mode=None, method="", omitted=(), refusal=None):
+    """A worker as RustDumpWorker leaves it: the core's result (export_run) or its refusal."""
     worker = MagicMock()
     worker.isRunning.return_value = False  # a truthy isRunning() makes close() wait on a modal box
-    dialog._build_worker = MagicMock(return_value=worker)
-    try:
-        dialog.combo_schema.addItem("app")
-        dialog._snapshot_mode = "parallel_unsynchronized"
-        dialog.apply_job_rerun({"schema": "app", "scope": "full", "snapshot_mode": "parallel_unsynchronized"})
-        dialog.do_export()
-
-        assert dialog._snapshot_mode == "parallel_strict"
-        assert "mysql_snapshot_mode" not in dialog._build_worker.call_args.kwargs
-    finally:
-        dialog.close()
+    worker.export_run = {"mode": mode, "method": method, "omitted": list(omitted)}
+    worker.export_refusal = refusal
+    return worker
 
 
 def test_unsynchronized_export_completion_warns_about_consistency(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
+    dialog = _dialog(monkeypatch)
     dialog._show_export_done = MagicMock()
-    dialog._snapshot_mode = "parallel_unsynchronized"
+    dialog.worker = _finished_worker("parallel_unsynchronized", "테이블마다 시점이 다를 수 있음 · 동시 작업 6개")
     try:
         dialog.on_finished(True, "Rust DB Core export 완료")
 
@@ -322,19 +173,40 @@ def test_unsynchronized_export_completion_warns_about_consistency(monkeypatch):
         visible = [dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count())]
         assert any("시점 일관성이 보장되지 않습니다" in line for line in visible)
         assert any("시점 일관성이 보장되지 않습니다" in line for line in dialog.log_entries)
+        assert dialog._snapshot_mode == "parallel_unsynchronized", "the method comes from the core's result"
     finally:
+        dialog.worker = None
         dialog.close()
 
 
 def test_consistent_export_completion_has_no_consistency_warning(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
+    dialog = _dialog(monkeypatch)
     dialog._show_export_done = MagicMock()
-    dialog._snapshot_mode = "parallel_table_lock"
+    dialog.worker = _finished_worker("parallel_table_lock", "같은 시점으로 내보냄 · 동시 작업 6개 (잠금 권한이 없어 테이블만 잠깐 잠금)")
     try:
         dialog.on_finished(True, "Rust DB Core export 완료")
 
         assert "시점 일관성" not in dialog._show_export_done.call_args.args[0]
     finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_export_completion_names_the_snapshot_method(monkeypatch):
+    dialog = _dialog(monkeypatch)
+    dialog._show_export_done = MagicMock()
+    method = "같은 시점으로 내보냄 · 동시 작업 1개 (잠금 권한이 없어 연결 하나로 읽음)"
+    dialog.worker = _finished_worker("single_connection", method)
+    try:
+        # The exporter's message already ends with the method (RustDumpExporter._run_rust_dump).
+        dialog.on_finished(True, f"Export 완료: 테이블 1개, 행 2개 · {method}")
+
+        assert f"\n내보낸 방법: {method}" in dialog._show_export_done.call_args.args[0]
+        visible = [dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count())]
+        assert visible == [f"✅ Export 완료: 테이블 1개, 행 2개 · {method}"], "the method is in the run log once"
+        assert sum(method in entry for entry in dialog.log_entries) == 1, "and once in the saved log"
+    finally:
+        dialog.worker = None
         dialog.close()
 
 
@@ -349,7 +221,7 @@ def _box_snapshot(box):
 
 
 def _capture_incomplete_prompt(monkeypatch, objects, click_proceed=False):
-    dialog = _privilege_dialog(monkeypatch)
+    dialog = _dialog(monkeypatch)
     captured = []
 
     def fake_exec(box):
@@ -373,12 +245,14 @@ def test_incomplete_export_prompt_lists_objects_inline_up_to_ten(monkeypatch):
     text = box["text"]
     assert "이 객체 없이 내보내기 (불완전)" in text
     assert "구조와 데이터는 모두 내보냅니다" in text
-    assert "테이블 데이터만" not in text
-    assert all(f"• {name}" in text for name in objects[:10])
+    assert "'담을 수 없는 객체는 빼고 내보내기'를 켜 두면 다음부터 묻지 않습니다" in text
+    assert all(f"• 테이블 t: 트리거(trg{i})는 덤프에 담을 수 없습니다" in text for i in range(10))
+    assert "trigger:t:" not in text, "the core's codes stay behind '자세히'"
     assert "trg10" not in text and "trg11" not in text
     assert text.rstrip().endswith("외 2개")
     assert box["detailed"] == ""
     assert box["buttons"]["export_incomplete_proceed"] == "이 객체 없이 내보내기 (불완전)"
+    assert box["buttons"]["export_refusal_details"] == "자세히"
     assert box["default"] == "export_incomplete_cancel"
 
 
@@ -386,61 +260,97 @@ def test_incomplete_export_prompt_short_list_and_proceed(monkeypatch):
     answer, box = _capture_incomplete_prompt(monkeypatch, ["routine:fn"], click_proceed=True)
 
     assert answer is True
-    assert box["text"].rstrip().endswith("제외할 객체:\n• routine:fn")
+    assert box["text"].rstrip().endswith("뺄 객체:\n• 저장 프로시저·함수 fn: 덤프에 담을 수 없습니다")
 
 
 def test_incomplete_export_completion_says_structure_and_data_were_exported(monkeypatch):
-    dialog = _privilege_dialog(monkeypatch)
+    dialog = _dialog(monkeypatch)
     dialog._show_export_done = MagicMock()
-    dialog._allow_incomplete = True
+    dialog.worker = _finished_worker("parallel_strict", omitted=["Object not exported: trigger:t:trg"])
     try:
         dialog.on_finished(True, "ok")
 
         shown = dialog._show_export_done.call_args.args[0]
-        assert "일부 객체를 제외한 불완전 Export" in shown
-        assert "구조와 데이터는 모두 내보냈으며" in shown
+        assert "일부 객체를 빼고 내보냈습니다(불완전 Export)" in shown
+        assert "구조와 데이터는 모두 담았습니다" in shown
+        assert "실행 로그의 'Export 경고' 줄" in shown and "manifest" not in shown
     finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_allow_incomplete_toggle_with_nothing_left_out_is_a_complete_export(monkeypatch):
+    dialog = _dialog(monkeypatch)
+    dialog._show_export_done = MagicMock()
+    dialog.chk_allow_incomplete.setChecked(True)
+    dialog._reset_export_state("app")
+    dialog.worker = _finished_worker("parallel_strict")
+    try:
+        assert dialog._allow_incomplete is True
+        dialog.on_finished(True, "ok")
+
+        assert "불완전" not in dialog._show_export_done.call_args.args[0]
+    finally:
+        dialog.worker = None
         dialog.close()
 
 
 def test_new_export_strings_have_english_translations(monkeypatch):
     from src.core import i18n
+    from src.exporters.rust_dump_exporter import describe_export_refusal
     from src.ui.dialogs import db_export_dialog as module
     from src.ui.dialogs.job_recording import _SNAPSHOT_LABELS
 
     def has_hangul(value):
         return any("\uac00" <= char <= "\ud7a3" for char in value)
 
-    dialog = _privilege_dialog(monkeypatch)
+    dialog = _dialog(monkeypatch)
     try:
-        boxes = [
-            _box_snapshot(dialog._create_mysql_privilege_dialog()),
-            _box_snapshot(dialog._create_mysql_privilege_dialog(table_lock_denied=True)),
-        ]
-        korean = [box["text"] for box in boxes] + ["병렬 Export 권한 필요", "일관 병렬 Export 불가"]
-        korean += [label for label, _mode in module._MYSQL_PRIVILEGE_CHOICES.values()]
-        korean += [text for pair in module._MYSQL_RETRY_MESSAGES.values() for text in pair]
-        korean += [
-            f"✅ Export가 완료되었습니다.\n\n폴더: C:/x\n\n⚠️ {module._UNSYNCHRONIZED_EXPORT_WARNING}"
-            f"\n\n⚠️ {module._INCOMPLETE_EXPORT_WARNING}",
+        korean = [
+            module._UNSYNCHRONIZED_EXPORT_WARNING,
+            module._INCOMPLETE_EXPORT_WARNING,
+            module._PARTIAL_EXPORT_NOTE,
+            module._PARTIAL_EXPORT_NOTE_POSTGRESQL,
+            module._FK_AUTO_TOOLTIP,
+            "DB를 선택하세요.",
+            "테이블을 하나 이상 고르세요.",
+            "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다.",
             "이 객체 없이 내보내기 (불완전)",
             "사용자가 '이 객체 없이 내보내기 (불완전)'를 선택했습니다.",
             "일부 객체를 제외한 Export (불완전) 진행 중...",
-            _SNAPSHOT_LABELS["parallel_table_lock"],
-            _SNAPSHOT_LABELS["parallel_unsynchronized"],
+            *_SNAPSHOT_LABELS.values(),
             " · 불완전 Export(일부 객체 제외)",
-            "MySQL 테이블 락 공유 스냅샷",
-            "MySQL 병렬 독립 스냅샷 · 시점 일관성 미보장",
+            "전체 · 내보내는 방법 자동 선택(시점 일관성 포기 허용) · 동시 작업 8개 · 압축 안 함",
+            "스키마:",
+        ]
+        korean += [
+            describe_snapshot_method({"mysql_snapshot_mode": mode, "worker_count": 3, "snapshot_fallbacks": [{"reason": reason}]}, 8)
+            for mode in ("parallel_strict", "parallel_table_lock", "single_connection", "parallel_unsynchronized")
+            for reason in ("privilege", "unsupported", "connection_limit", "lock_timeout")
+        ]
+        # The core's log lines when the automatic choice moves on (dump.rs mysql_snapshot_fallback_message).
+        korean += [
+            f"{reason} 다음 방법으로 내보냅니다."
+            for reason in ("잠금 권한이 없어", "서버가 백업 잠금을 지원하지 않아", "동시 연결 수 제한 때문에", "잠금을 제때 얻지 못해")
         ]
         i18n.set_language("en")
         translated = {text: i18n.translate_text(text) for text in korean}
+        translated.update({
+            "summary": dialog._advanced_summary(),
+            "refusal": "\n".join(describe_export_refusal([
+                "trigger:t:trg", "generated_column:t:g", "event:e", "unsupported_index:t:i", "cross_schema_fk:t:f",
+                "non_transactional_table:t:MEMORY"])),
+        })
         english = []
         monkeypatch.setattr(QMessageBox, "exec", lambda box: english.append(_box_snapshot(box)))
         dialog._prompt_incomplete_export([f"trigger:t:trg{i}" for i in range(11)])
-        english += [
-            _box_snapshot(dialog._create_mysql_privilege_dialog()),
-            _box_snapshot(dialog._create_mysql_privilege_dialog(table_lock_denied=True)),
-        ]
+        english.append(_box_snapshot(dialog._show_lossy_refusal(["generated_column:t:g", "trigger:t:trg"])))
+        dialog.chk_include_fk.setChecked(True)
+        dialog.chk_unsynchronized.setChecked(True)
+        dialog.chk_allow_incomplete.setChecked(True)
+        dialog.chk_manual_folder.setChecked(True)
+        dialog.combo_compression.setCurrentIndex(0)
+        translated["summary on"] = dialog._advanced_summary()
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
         dialog.close()
@@ -448,6 +358,7 @@ def test_new_export_strings_have_english_translations(monkeypatch):
     assert [f"{source!r} -> {result!r}" for source, result in translated.items() if has_hangul(result)] == []
     for box in english:
         assert not any(has_hangul(text) for text in box["buttons"].values()), box["buttons"]
+        assert not has_hangul(box["text"]), box["text"]
     assert "Export without these objects (incomplete)" in english[0]["text"]
     assert english[0]["text"].endswith("and 1 more")
 
@@ -460,7 +371,7 @@ def test_rust_dump_export_dialog_rejects_parent_manual_folder(tmp_path):
     )
     dialog = RustDumpExportDialog(config_manager=config_manager)
 
-    dialog.radio_manual_naming.setChecked(True)
+    dialog.chk_manual_folder.setChecked(True)
     dialog.input_manual_folder.setText("..")
 
     generated = Path(dialog._generate_output_dir("dataflare")).resolve()
@@ -1274,12 +1185,14 @@ def _refusal_dialog(monkeypatch, refusal, prompt_answer):
         "src.ui.dialogs.db_export_dialog.check_rust_dump",
         lambda: (True, "Rust DB Core OK"),
     )
+    generic = []
     monkeypatch.setattr(
         "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
-        lambda *_args: None,
+        lambda *args: generic.append(args),
     )
     dialog = RustDumpExportDialog()
     dialog._test_app = app  # keep QApplication alive for the dialog's lifetime
+    dialog._generic_failures = generic
     failed_worker = MagicMock()
     failed_worker.isRunning.return_value = False
     failed_worker.export_refusal = refusal
@@ -1289,6 +1202,7 @@ def _refusal_dialog(monkeypatch, refusal, prompt_answer):
     dialog.export_schema = "app"
     dialog.input_output_dir.setText("C:/tmp/tunnelforge-export")
     dialog._prompt_incomplete_export = MagicMock(return_value=prompt_answer)
+    dialog._show_lossy_refusal = MagicMock()
     dialog._build_worker = MagicMock(return_value=retry_worker)
     dialog._start_export_worker = MagicMock()
     dialog._report_error_anonymously = MagicMock()
@@ -1304,9 +1218,7 @@ def test_bypassable_refusal_retries_only_after_explicit_incomplete_choice(monkey
 
         dialog._prompt_incomplete_export.assert_called_once_with(["trigger:t:trg"])
         assert dialog._allow_incomplete is True
-        dialog._build_worker.assert_called_once_with(
-            "app", "C:/tmp/tunnelforge-export", mysql_snapshot_mode="parallel_strict"
-        )
+        dialog._build_worker.assert_called_once_with("app", "C:/tmp/tunnelforge-export")
         dialog._start_export_worker.assert_called_once_with(retry_worker)
     finally:
         dialog.worker = None
@@ -1323,39 +1235,109 @@ def test_declining_incomplete_choice_does_not_retry(monkeypatch):
         assert dialog._allow_incomplete is False
         dialog._build_worker.assert_not_called()
         dialog._start_export_worker.assert_not_called()
+        assert dialog._generic_failures == [], "the user already answered the question"
+        dialog._report_error_anonymously.assert_not_called()
     finally:
         dialog.worker = None
         dialog.close()
 
 
-def test_lossy_definition_refusal_is_never_offered_as_incomplete_export(monkeypatch):
+def test_lossy_refusal_offers_no_proceed(monkeypatch):
     dialog, _ = _refusal_dialog(
-        monkeypatch, {"objects": ["generated_column:t:g"], "bypassable": False}, True
+        monkeypatch, {"objects": ["generated_column:t:g", "trigger:t:trg"], "bypassable": False}, True
     )
     try:
-        dialog.on_finished(False, "Rust DB Core export 오류: refused")
+        dialog.on_finished(False, "Rust DB Core export 오류: dump.run refused: ... generated_column:t:g")
 
         dialog._prompt_incomplete_export.assert_not_called()
         dialog._build_worker.assert_not_called()
+        dialog._show_lossy_refusal.assert_called_once_with(["generated_column:t:g", "trigger:t:trg"])
+        assert dialog._generic_failures == [], "no generic 'Export 실패' box"
+        dialog._report_error_anonymously.assert_not_called()
+        visible = [dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count())]
+        assert "❌ 담을 수 없는 객체가 있어 Export를 시작하지 않았습니다." in visible
+        assert not any("generated_column" in line for line in visible)
+        # The saved log keeps sentences, not the core's English text.
+        result = [entry for entry in dialog.log_entries if "결과 메시지:" in entry]
+        assert len(result) == 1 and result[0].endswith(
+            "결과 메시지: 담을 수 없는 객체가 있어 Export를 시작하지 않았습니다. "
+            "테이블 t: 계산 열 g의 정의를 덤프에 담을 수 없습니다; 테이블 t: 트리거(trg)는 덤프에 담을 수 없습니다")
+        assert not any("dump.run refused" in entry for entry in dialog.log_entries)
+        assert dialog.label_data.text() == "📦 데이터: -" and dialog.label_status.text() == "⏹ Export를 시작하지 않았습니다"
     finally:
         dialog.worker = None
         dialog.close()
 
 
-def test_incomplete_choice_survives_snapshot_fallback_worker_rebuild(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    dialog = RustDumpExportDialog()
-    dialog.radio_full.setChecked(True)
-    dialog._allow_incomplete = True
+def test_lossy_refusal_window_names_the_table_and_has_only_close(monkeypatch):
+    dialog = _dialog(monkeypatch)
     try:
-        worker = dialog._build_worker("app", "C:/tmp/x", mysql_snapshot_mode="single_connection")
-        assert worker.kwargs["allow_incomplete"] is True
-        assert worker.kwargs["mysql_snapshot_mode"] == "single_connection"
+        box = dialog._show_lossy_refusal(["generated_column:orders:total"])
+        snapshot = _box_snapshot(box)
+        box.close()
     finally:
+        dialog.close()
+
+    assert "• 테이블 orders: 계산 열 total의 정의를 덤프에 담을 수 없습니다" in snapshot["text"]
+    assert snapshot["text"].rstrip().endswith(
+        "목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다. "
+        "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."), "a full export says what unchecking costs"
+    assert "그 밖에" not in snapshot["text"]
+    assert "generated_column" not in snapshot["text"]
+    assert set(snapshot["buttons"]) == {"export_refusal_close", "export_refusal_details"}
+
+
+def test_lossy_refusal_lists_the_omittable_objects_apart(monkeypatch):
+    # The core puts the omittable objects after the lossy ones (dump_scope_refusal) when any is lossy.
+    dialog = _dialog(monkeypatch)
+    dialog.export_tables = ["orders", "logs"]  # already a table export: no word about views
+    try:
+        box = dialog._show_lossy_refusal(["generated_column:orders:total", "trigger:orders:trg", "deprecated_engine:logs:MyISAM"])
+        text = box.text()
+        box.close()
+    finally:
+        dialog.close()
+
+    lossy, _, rest = text.partition("그 밖에 빼고 내보낼 수 있는 객체:")
+    assert lossy.startswith("덤프에 그대로 담을 수 없는 테이블 정의가 있어 Export를 시작하지 않았습니다.")
+    assert "계산 열 total" in lossy and "trg" not in lossy and "MyISAM" not in lossy
+    assert "• 테이블 orders: 트리거(trg)는 덤프에 담을 수 없습니다" in rest
+    assert "• 테이블 logs: MyISAM 엔진이라 다른 테이블과 같은 시점으로 읽을 수 없습니다. 빼고 내보내면 이 테이블이 통째로 빠집니다" in rest
+    assert rest.rstrip().endswith("목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다.")
+
+
+def test_allow_incomplete_toggle_skips_prompt(monkeypatch):
+    dialog = _dialog(monkeypatch)
+    try:
+        dialog.chk_allow_incomplete.setChecked(True)
+        dialog._reset_export_state("app")
+        assert dialog._build_worker("app", "C:/tmp/x").kwargs["allow_incomplete"] is True
+        # The core waives the omittable objects itself, so only a lossy refusal can still come back.
+        dialog._prompt_incomplete_export = MagicMock()
+        dialog._show_lossy_refusal = MagicMock()
+        dialog.worker = _finished_worker(refusal={"objects": ["generated_column:t:g"], "bypassable": False})
+        dialog.on_finished(False, "refused")
+        dialog._prompt_incomplete_export.assert_not_called()
+        dialog._show_lossy_refusal.assert_called_once()
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_a_missing_privilege_never_opens_a_privilege_dialog(monkeypatch):
+    dialog = _dialog(monkeypatch)
+    dialog._build_worker = MagicMock()
+    try:
+        assert not any(hasattr(dialog, name) for name in (
+            "_create_mysql_privilege_dialog", "_prompt_mysql_privilege_action", "_retry_with_snapshot_mode"))
+        dialog.worker = _finished_worker()
+        dialog.worker.export_refusal = None
+        dialog.on_finished(False, "Rust DB Core export 오류: MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:LOCK_TABLES:ERROR 1044")
+
+        dialog._build_worker.assert_not_called()
+        dialog._report_error_anonymously.assert_called_once()
+    finally:
+        dialog.worker = None
         dialog.close()
 
 
@@ -1427,4 +1409,401 @@ def test_export_done_open_folder_button_is_translated(tmp_path):
         assert "📂 Open folder" in [b.text() for b in box.buttons()]
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
+        dialog.close()
+
+# ------------------------------------------------------------------ one table list, Advanced toggles
+
+class _FkFacade:
+    """schema.inspect of a schema where items -> orders -> customers; logs stands alone."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def inspect_schema(self, endpoint):
+        self.calls += 1
+        return {"tables": [
+            {"name": "customers", "foreign_keys": []},
+            {"name": "orders", "foreign_keys": [{"name": "fk_orders_customers", "referenced_table": "customers"}]},
+            {"name": "items", "foreign_keys": [{"name": "fk_items_orders", "referenced_table": "orders"}]},
+            {"name": "logs", "foreign_keys": []},
+        ]}
+
+
+class _CapturingWorker:
+    """Stands in for RustDumpWorker: records what the dialog would run."""
+
+    created = []
+
+    def __init__(self, task_type, config, **kwargs):
+        self.task_type, self.config, self.kwargs = task_type, config, kwargs
+        self.export_refusal = self.export_run = None
+        _CapturingWorker.created.append(self)
+        for name in ("progress", "table_progress", "detail_progress", "table_status", "raw_output", "finished"):
+            setattr(self, name, MagicMock())
+
+    def start(self):
+        pass
+
+    def isRunning(self):
+        return False
+
+
+def _toggles_dialog(monkeypatch, tmp_path, settings=None, engine="mysql"):
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_export_dialog.check_rust_dump", lambda: (True, "ok"))
+    monkeypatch.setattr("src.ui.dialogs.db_export_dialog.RustDumpWorker", _CapturingWorker)
+    _CapturingWorker.created = []
+    store = {"rust_dump_export_base_dir": str(tmp_path), **(settings or {})}
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: store.get(key, default)
+    config_manager.set_app_settings.side_effect = store.update
+    connector = MagicMock(host="127.0.0.1", port=3306, user="u", password="p", engine=engine, database="")
+    connector.get_schemas.return_value = ["app"]
+    connector.get_tables.return_value = ["customers", "items", "logs", "orders"]
+    connector.facade = _FkFacade()
+    dialog = RustDumpExportDialog(connector=connector, config_manager=config_manager, connection_info="conn")
+    dialog._test_store = store
+    return dialog
+
+
+def _items(dialog):
+    return {item.text(): item for item in dialog._table_items()}
+
+
+def _uncheck(dialog, *names):
+    for name in names:
+        _items(dialog)[name].setCheckState(Qt.CheckState.Unchecked)
+
+
+def _enabled(item):
+    return bool(item.flags() & Qt.ItemFlag.ItemIsEnabled)
+
+
+def test_table_list_is_checkbox_only_always_shown_and_starts_fully_checked(monkeypatch, tmp_path):
+    from PyQt6.QtWidgets import QAbstractItemView
+
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        assert dialog.list_tables.selectionMode() == QAbstractItemView.SelectionMode.NoSelection
+        assert not dialog.table_group.isHidden()
+        assert dialog.get_selected_tables() == ["customers", "items", "logs", "orders"]
+        assert dialog._is_full_export() and dialog.lbl_partial_note.isHidden()
+        assert not any(hasattr(dialog, name) for name in ("radio_full", "radio_partial", "btn_type_group",
+                                                          "radio_auto_naming", "radio_manual_naming", "chk_timestamp"))
+        assert dialog.connector.facade.calls == 0, "a full export never reads the FKs"
+    finally:
+        dialog.close()
+
+
+def test_all_checked_sends_full_scope(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        assert worker.task_type == "export_schema" and "tables" not in worker.kwargs
+    finally:
+        dialog.close()
+
+
+def test_export_sends_auto_snapshot_mode(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.spin_threads.setValue(5)
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        assert (worker.kwargs["mysql_snapshot_mode"], worker.kwargs["mysql_snapshot_fallback"]) == ("auto", "single_connection")
+        assert worker.kwargs["threads"] == 5, "the core lowers the worker count itself"
+        assert worker.kwargs["allow_incomplete"] is False
+    finally:
+        dialog.close()
+
+
+def test_unsynchronized_toggle_sets_fallback(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        assert dialog.chk_unsynchronized.isChecked() is False
+        dialog.chk_unsynchronized.setChecked(True)
+        dialog.do_export()
+        assert _CapturingWorker.created[0].kwargs["mysql_snapshot_fallback"] == "parallel_unsynchronized"
+    finally:
+        dialog.close()
+    postgres = _toggles_dialog(monkeypatch, tmp_path, settings={"rust_dump_export_unsynchronized": True}, engine="postgresql")
+    try:
+        assert postgres.chk_unsynchronized.isHidden(), "PostgreSQL has no such choice"
+        assert postgres._snapshot_fallback() == "single_connection"
+        assert "시점 일관성" not in postgres._advanced_summary()
+    finally:
+        postgres.close()
+
+
+def test_export_sends_exact_checked_list(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        _uncheck(dialog, "items", "logs")
+        assert not dialog.lbl_partial_note.isHidden()
+        assert dialog.lbl_partial_note.text() == "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        assert worker.task_type == "export_tables"
+        assert worker.kwargs["tables"] == ["customers", "orders"]
+        assert worker.kwargs["include_fk_parents"] is False
+        assert worker.kwargs["auto_added_tables"] == []
+        assert worker.kwargs["fk_parents_outside_dump"] == []
+    finally:
+        dialog.close()
+
+
+def test_fk_parent_toggle_defaults_off(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        assert dialog.chk_include_fk.isChecked() is False
+        assert dialog.advanced_panel.isHidden() and dialog.btn_advanced.text() == "고급 설정 열기"
+        assert dialog.lbl_advanced_summary.text() == ""
+    finally:
+        dialog.close()
+
+
+def test_fk_toggle_off_shows_missing_parent_notice_and_checks_nothing(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        _uncheck(dialog, "customers", "logs")
+        assert dialog.get_selected_tables() == ["items", "orders"], "nothing is checked for the user"
+        assert dialog.lbl_fk_note.text() == (
+            "고른 테이블 1개의 연결된 부모 테이블이 체크되어 있지 않습니다 (orders → customers). 고른 테이블만 내보냅니다. "
+            "함께 담으려면 고급 설정에서 '연결된 부모 테이블 함께 담기'를 켜세요.")
+        _uncheck(dialog, "orders")
+        assert "(items → orders)" in dialog.lbl_fk_note.text()
+        dialog._fk_outside = [{"child": f"c{i}", "constraint": "fk", "parent": "p"} for i in range(5)]
+        dialog._update_table_notes()
+        assert "(c0 → p, c1 → p, c2 → p 외 2개)" in dialog.lbl_fk_note.text()
+        dialog._refresh_table_state()
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        assert worker.kwargs["tables"] == ["items"]
+        assert worker.kwargs["fk_parents_outside_dump"] == [
+            {"child": "items", "constraint": "fk_items_orders", "parent": "orders"}]
+        assert dialog.connector.facade.calls == 1, "the FKs are read once per schema"
+    finally:
+        dialog.close()
+
+
+def test_fk_toggle_on_disables_auto_added_parents(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        _uncheck(dialog, "customers", "orders", "logs")
+        items = _items(dialog)
+        # items needs orders, which needs customers: both are checked again and locked while it needs them.
+        assert dialog.get_selected_tables() == ["customers", "items", "orders"]
+        assert not _enabled(items["orders"]) and not _enabled(items["customers"]) and _enabled(items["items"])
+        assert items["orders"].toolTip() == (
+            "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는 테이블의 체크를 풀면 다시 고를 수 있습니다.")
+        assert items["orders"].text() == "orders", "the table name stays the list text"
+        assert dialog.lbl_fk_note.text() == "연결된 부모 테이블 자동 추가 2개: customers, orders"
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        assert worker.kwargs["tables"] == ["customers", "items", "orders"]
+        assert (worker.kwargs["include_fk_parents"], worker.kwargs["auto_added_tables"]) == (False, ["customers", "orders"])
+        assert worker.kwargs["fk_parents_outside_dump"] == []
+        # Unchecking the child releases its parents back to what the user had chosen (unchecked).
+        dialog.set_ui_enabled(True)
+        _uncheck(dialog, "items")
+        assert dialog.get_selected_tables() == [] and _enabled(items["orders"]) and _enabled(items["customers"])
+        assert items["orders"].toolTip() == ""
+    finally:
+        dialog.close()
+
+
+def test_fk_lookup_failure_says_so_and_exports_the_checked_tables(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    dialog.connector.facade.inspect_schema = MagicMock(side_effect=RuntimeError("core down"))
+    try:
+        _uncheck(dialog, "customers")
+        assert dialog.lbl_fk_note.text() == "연결된 부모 테이블을 확인하지 못했습니다. 고른 테이블만 내보냅니다."
+        dialog.do_export()
+        assert _CapturingWorker.created[0].kwargs["tables"] == ["items", "logs", "orders"]
+        assert _CapturingWorker.created[0].kwargs["include_fk_parents"] is False, "the toggle is off"
+        assert _CapturingWorker.created[0].kwargs["fk_parents_outside_dump"] is None
+    finally:
+        dialog.close()
+
+
+def test_fk_lookup_failure_with_the_toggle_on_reads_them_again_in_the_worker(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    dialog.connector.facade.inspect_schema = MagicMock(side_effect=RuntimeError("core down"))
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        _uncheck(dialog, "customers")
+        assert dialog.lbl_fk_note.text() == (
+            "연결된 부모 테이블을 확인하지 못했습니다. Export를 시작할 때 다시 확인해 함께 담습니다.")
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        # The worker's own exporter reads the FKs and adds the parents, or fails the run if it cannot.
+        assert (worker.kwargs["tables"], worker.kwargs["include_fk_parents"]) == (["items", "logs", "orders"], True)
+    finally:
+        dialog.close()
+
+
+def test_fk_lookup_is_tried_again_after_a_failure(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    working = dialog.connector.facade.inspect_schema
+    dialog.connector.facade.inspect_schema = MagicMock(side_effect=RuntimeError("core down"))
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        _uncheck(dialog, "customers")
+        assert dialog.get_selected_tables() == ["items", "logs", "orders"]
+        dialog.connector.facade.inspect_schema = working  # the core is back
+        _uncheck(dialog, "logs")
+        assert dialog.get_selected_tables() == ["customers", "items", "orders"], "the parents are read on the next change"
+        assert dialog.lbl_fk_note.text() == "연결된 부모 테이블 자동 추가 1개: customers"
+    finally:
+        dialog.close()
+
+
+def test_unchecking_a_needed_parent_keeps_a_table_export_and_says_so(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        _uncheck(dialog, "customers")  # orders still needs it: checked again and locked
+        assert dialog.get_selected_tables() == ["customers", "items", "logs", "orders"]
+        assert not _enabled(_items(dialog)["customers"])
+        assert not dialog._is_full_export(), "the user unchecked a table: no views, routines or events"
+        assert not dialog.lbl_partial_note.isHidden()
+        assert dialog.lbl_fk_note.text() == "연결된 부모 테이블 자동 추가 1개: customers"
+        dialog.do_export()
+        (worker,) = _CapturingWorker.created
+        assert worker.task_type == "export_tables"
+        assert (worker.kwargs["tables"], worker.kwargs["auto_added_tables"]) == (["customers", "items", "logs", "orders"],
+                                                                                 ["customers"])
+    finally:
+        dialog.close()
+
+
+def test_select_all_makes_an_added_parent_the_users_own_pick(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        dialog.deselect_all_tables()
+        _items(dialog)["orders"].setCheckState(Qt.CheckState.Checked)
+        assert dialog._fk_auto_added == {"customers"}
+        dialog.select_all_tables()
+        assert dialog._fk_auto_added == set() and dialog._is_full_export()
+        assert _enabled(_items(dialog)["customers"]) and _items(dialog)["customers"].toolTip() == ""
+        _uncheck(dialog, "items", "orders")
+        assert dialog.get_selected_tables() == ["customers", "logs"], "'전체 선택' picked customers too"
+        dialog.chk_include_fk.setChecked(False)
+        assert dialog.get_selected_tables() == ["customers", "logs"]
+    finally:
+        dialog.close()
+
+
+def test_rerun_ignores_old_include_fk_parents(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.apply_job_rerun({"schema": "app", "scope": "tables", "tables": ["orders"], "include_fk_parents": True,
+                                "snapshot_mode": "parallel_unsynchronized", "compression": "none", "threads": 3})
+        assert dialog.chk_include_fk.isChecked() is False and dialog.chk_unsynchronized.isChecked() is False
+        assert dialog.get_selected_tables() == ["orders"], "the old record never adds parents"
+        assert (dialog._compression(), dialog.spin_threads.value()) == ("none", 3)
+        dialog.apply_job_rerun({"schema": "app", "scope": "full"})
+        assert dialog._is_full_export(), "a full rerun checks everything"
+    finally:
+        dialog.close()
+
+
+def test_rerun_with_the_toggle_on_adds_parents_of_the_users_own_picks(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path, settings={"rust_dump_export_include_fk_parents": True})
+    try:
+        dialog.apply_job_rerun({"schema": "app", "scope": "tables", "tables": ["orders"]})
+        assert dialog.get_selected_tables() == ["customers", "orders"] and dialog._picked_tables() == ["orders"]
+    finally:
+        dialog.close()
+
+
+def test_toggle_states_are_remembered_but_not_the_table_selection(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        dialog.chk_unsynchronized.setChecked(True)
+        dialog.chk_allow_incomplete.setChecked(True)
+        dialog.spin_threads.setValue(4)
+        dialog.combo_compression.setCurrentIndex(dialog.combo_compression.findData("none"))
+        _uncheck(dialog, "logs")
+        dialog.do_export()
+        store = dialog._test_store
+    finally:
+        dialog.close()
+    assert {key: store[key] for key in store if key.startswith("rust_dump_export_") and key != "rust_dump_export_base_dir"
+            and key != "rust_dump_export_dir"} == {
+        "rust_dump_export_threads": 4, "rust_dump_export_compression": "none",
+        "rust_dump_export_include_fk_parents": True, "rust_dump_export_folder_mode": "auto",
+        "rust_dump_export_folder_manual_name": "",
+    }, "giving up consistency or leaving objects out is chosen again for every run"
+    again = _toggles_dialog(monkeypatch, tmp_path, settings={
+        **store, "rust_dump_export_unsynchronized": True, "rust_dump_export_allow_incomplete": True})
+    try:
+        assert (again.chk_include_fk.isChecked(), again.chk_unsynchronized.isChecked(),
+                again.chk_allow_incomplete.isChecked()) == (True, False, False), "older saved values are not read"
+        assert (again.spin_threads.value(), again._compression()) == (4, "none")
+        assert again._is_full_export(), "the table list starts fully checked again"
+    finally:
+        again.close()
+
+
+def test_saved_values_of_the_wrong_type_are_ignored(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path, settings={
+        "rust_dump_export_threads": "8", "rust_dump_export_include_fk_parents": "yes",
+        "rust_dump_export_compression": "brotli", "rust_dump_export_folder_manual_name": 3})
+    try:
+        assert (dialog.spin_threads.value(), dialog.chk_include_fk.isChecked(), dialog._compression()) == (8, False, "zstd")
+        assert dialog.input_manual_folder.text() == ""
+    finally:
+        dialog.close()
+
+
+def test_manual_folder_name_setting_migrates(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path, settings={
+        "rust_dump_export_folder_mode": "manual", "rust_dump_export_folder_manual_name": "nightly",
+        "rust_dump_export_folder_use_timestamp": False, "rust_dump_export_folder_use_name": False})
+    try:
+        assert dialog.chk_manual_folder.isChecked() and dialog.input_manual_folder.text() == "nightly"
+        assert dialog.input_manual_folder.isEnabled()
+        assert Path(dialog.input_output_dir.text()).name == "nightly"
+        assert "폴더 이름(nightly)" in dialog.lbl_advanced_summary.text()
+    finally:
+        dialog.close()
+    automatic = _toggles_dialog(monkeypatch, tmp_path, settings={"rust_dump_export_folder_use_timestamp": False})
+    try:
+        # The old use_* switches are gone: the name is always connection + DB + time.
+        assert not automatic.chk_manual_folder.isChecked() and not automatic.input_manual_folder.isEnabled()
+        assert re.fullmatch(r"conn_app_\d{8}_\d{6}", Path(automatic.input_output_dir.text()).name)
+    finally:
+        automatic.close()
+
+
+def test_advanced_summary_lists_active_toggles(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.chk_include_fk.setChecked(True)
+        dialog.chk_unsynchronized.setChecked(True)
+        dialog.chk_allow_incomplete.setChecked(True)
+        dialog.spin_threads.setValue(2)
+        dialog.combo_compression.setCurrentIndex(dialog.combo_compression.findData("none"))
+        dialog.chk_manual_folder.setChecked(True)
+        assert dialog.lbl_advanced_summary.text() == (
+            "적용 중인 고급 설정: 연결된 부모 테이블 함께 담기, 시점 일관성 포기 허용, 담을 수 없는 객체 빼기, "
+            "동시 작업 2개, 압축 안 함, 폴더 이름(비우면 export_시각)")
+        dialog._toggle_advanced_options()
+        assert not dialog.advanced_panel.isHidden() and dialog.btn_advanced.text() == "고급 설정 닫기"
+    finally:
+        dialog.close()
+
+
+def test_advanced_toggles_are_locked_while_running(monkeypatch, tmp_path):
+    dialog = _toggles_dialog(monkeypatch, tmp_path)
+    try:
+        dialog.do_export()
+        assert not dialog.advanced_panel.isEnabled() and not dialog.table_group.isEnabled()
+        assert not dialog.btn_export.isEnabled()
+    finally:
         dialog.close()

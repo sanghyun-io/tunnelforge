@@ -421,7 +421,7 @@ class TestBackupScheduler:
             def __init__(self, config):
                 captured["config"] = config
 
-            def export_full_schema(self, schema, output_dir, threads):
+            def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode):
                 captured["schema"] = schema
                 captured["output_dir"] = output_dir
                 captured["threads"] = threads
@@ -468,7 +468,7 @@ class TestBackupScheduler:
             def __init__(self, config):
                 captured["config"] = config
 
-            def export_full_schema(self, schema, output_dir, threads):
+            def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode):
                 captured["schema"] = schema
                 captured["output_dir"] = output_dir
                 captured["threads"] = threads
@@ -519,7 +519,7 @@ class TestBackupScheduler:
             def __init__(self, config):
                 captured["config"] = config
 
-            def export_full_schema(self, schema, output_dir, threads):
+            def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode):
                 return True, "ok"
 
         self.mock_engine.is_running.return_value = False
@@ -555,7 +555,7 @@ class TestBackupScheduler:
             def __init__(self, config):
                 captured["constructed"] = True
 
-            def export_full_schema(self, schema, output_dir, threads):
+            def export_full_schema(self, schema, output_dir, threads, mysql_snapshot_mode):
                 return True, "ok"
 
         self.mock_engine.tunnel_configs = {"tunnel-001": {"db_engine": "mysql"}}

@@ -186,6 +186,8 @@ fn manifest_warning_code(warning: &str) -> &'static str {
         "views_outside_snapshot"
     } else if warning.starts_with(WARNING_OBJECT_NOT_EXPORTED) || warning.starts_with(WARNING_NON_TRANSACTIONAL_EXCLUDED) {
         "omitted_object"
+    } else if warning.starts_with(WARNING_VISIBILITY_UNPROVEN) {
+        "visibility_unproven"
     } else {
         "source_dump_warning"
     }
