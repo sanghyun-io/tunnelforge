@@ -10,6 +10,9 @@ from src.core.error_report_consent import ConsentState
 from src.ui.dialogs import settings
 from src.ui.dialogs.settings import SettingsDialog
 
+# 테스트마다 앱을 새로 만들면 앞 테스트의 앱이 사라진 뒤 두 번째 앱에서 프로세스가 죽는다(이 파일만 돌릴 때)
+_app = QApplication.instance() or QApplication([])
+
 
 ISSUE_URL = "https://github.com/sanghyun-io/tunnelforge/issues/42"
 
@@ -361,5 +364,24 @@ def test_general_tab_is_scrollable_so_all_groups_stay_reachable():
         assert general.widget().isAncestorOf(dialog.workspace_group)
         # 작은 창에서도 다이얼로그 최소 높이가 그룹 전체 높이에 끌려 커지지 않아야 한다
         assert dialog.minimumSizeHint().height() < 700
+    finally:
+        dialog.close()
+
+
+def test_update_download_buttons_keep_full_height_in_a_small_dialog():
+    # 다운로드를 시작하면 버튼·진행률이 나타난다. 정보 탭이 스크롤이 아니면 고정된 창 안에서 버튼이 납작해져 글자가 안 보였다.
+    dialog = SettingsDialog(config_manager=FakeConfigManager())
+    try:
+        dialog.show()
+        dialog.resize(600, 420)
+        dialog.tabs.setCurrentIndex(2)
+        dialog._on_update_checked(True, "9.9.9", "https://example.invalid/x", "")
+        dialog.btn_cancel_download.show()
+        dialog.download_progress.show()
+        dialog.download_detail_label.show()
+        _app.processEvents()
+
+        for button in (dialog.btn_download, dialog.btn_cancel_download):
+            assert button.height() >= button.minimumSizeHint().height()
     finally:
         dialog.close()
