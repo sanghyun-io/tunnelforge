@@ -508,6 +508,18 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
                 "message": "target cleanup cannot be combined with resume: it would drop tables the resume state skips as completed"}));
             return;
         }
+        // Reject before target schema creation or cleanup, even when preflight was bypassed.
+        let mut generated_refusals: Vec<String> = schema.tables.iter()
+            .filter_map(|table| validate_generated_column_direction(table, &source_endpoint.engine, &target_endpoint.engine).err()).collect();
+        if source_endpoint.engine != "mysql" || target_endpoint.engine != "mysql" {
+            generated_refusals.extend(unsupported_objects(&request.payload).into_iter()
+                .filter(|object| object.starts_with("generated_column:"))
+                .map(|object| format!("cannot translate generated column {object} across database engines")));
+        }
+        if !generated_refusals.is_empty() {
+            emit(json!({"event":"error","request_id":request.request_id,"message":generated_refusals.join("; ")}));
+            return;
+        }
         // Preflight blocks these too; migrate itself must not copy geometry it cannot keep.
         if source_endpoint.engine != target_endpoint.engine {
             let refused = schema.tables.iter()
@@ -949,13 +961,15 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
                     }
                 }
             }
-            if let Err(message) = validate_target_foreign_key_actions(table, &target) {
+            if let Err(message) = validate_generated_column_direction(table, &source, &target)
+                .and_then(|()| validate_target_foreign_key_actions(table, &target)) {
+                let generated = message.contains("generated column");
                 issues.push(MigrationIssue {
-                    issue_type: Some("unsupported_fk_action".to_string()),
+                    issue_type: Some(if generated { "unsupported_generated_column" } else { "unsupported_fk_action" }.to_string()),
                     severity: "error".to_string(),
                     location: table.name.clone(),
                     message,
-                    suggestion: "Choose a supported target or explicitly revise the source foreign key action before migrating.".to_string(),
+                    suggestion: if generated { "Exclude this table or convert the generated column in the source before migrating." } else { "Choose a supported target or explicitly revise the source foreign key action before migrating." }.to_string(),
                     blocking: true,
                     table_name: Some(table.name.clone()),
                     column_name: None,
@@ -965,14 +979,14 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
     }
 
     for object_name in unsupported_objects(payload) {
+        let generated = object_name.starts_with("generated_column:");
         issues.push(MigrationIssue {
-            issue_type: None,
-            severity: "warning".to_string(),
-            location: object_name,
-            message: "object is report-only in cross-engine v1".to_string(),
-            suggestion: "Review and recreate this object manually after table data is moved."
-                .to_string(),
-            blocking: false,
+            issue_type: generated.then(|| "unsupported_generated_column".to_string()),
+            severity: if generated { "error" } else { "warning" }.to_string(),
+            location: object_name.clone(),
+            message: if generated { format!("cannot translate generated column {object_name} across database engines") } else { "object is report-only in cross-engine v1".to_string() },
+            suggestion: if generated { "Exclude this table or convert the generated column in the source before migrating." } else { "Review and recreate this object manually after table data is moved." }.to_string(),
+            blocking: generated,
             table_name: None,
             column_name: None,
         });
@@ -1973,6 +1987,22 @@ pub fn compare_typed_digest_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_inventory_blocks_preflight_and_migrate_before_connecting() {
+        let payload = json!({"source_engine":"postgresql","target_engine":"mysql",
+            "source":{"engine":"postgresql","host":"127.0.0.1","port":1,"user":"unused","password":"","database":"app"},
+            "target":{"engine":"mysql","host":"127.0.0.1","port":1,"user":"unused","password":"","database":"app"},
+            "schema":{"tables":[]},"unsupported_objects":["generated_column:t:g"],
+            "execution_options":{"cleanup_before_migrate":true}});
+        let issues=preflight_issues(&payload);
+        assert!(issues.iter().any(|issue| issue.blocking && issue.issue_type.as_deref()==Some("unsupported_generated_column")));
+        let request=Request {command:"migrate".into(),request_id:None,payload};
+        let mut events=Vec::new();
+        migrate_streaming(&request,|event|events.push(event));
+        assert!(events.iter().any(|event|event["event"]=="error" && event["message"].as_str().unwrap_or_default().contains("cannot translate generated column")),"{events:?}");
+    }
+
     
     
     use serde_json::{json, Value};

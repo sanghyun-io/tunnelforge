@@ -604,7 +604,7 @@ when tables use MySQL `ON UPDATE` columns or CHECK expressions, which have no
 PostgreSQL translation yet; every such table is listed at once.
 
 The normalized format does not yet preserve every DB object. Selected tables
-with detected unrepresentable generated/custom-type/advanced-index/default/
+with detected unrepresentable custom-type/advanced-index/default/
 cross-schema-FK semantics are refused before export rather than producing a file
 that appears complete. PostgreSQL ALWAYS identities and custom/shared sequence
 semantics are also refused. Ordinary identity restoration uses `MAX(id)+1`, not
@@ -626,15 +626,40 @@ claimed.
 | --- | --- | --- |
 | Tables, rows, PK/UNIQUE/secondary indexes, supported FKs, comments, supported defaults | Preserved | Preserved |
 | Views (full export only) | Preserved as separately captured definitions; persistent warning, `strict_export=false` | Same |
-| Generated columns, unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
+| Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Refused before export; **not waivable** |
+| Unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
 | Triggers on an exported table | Refused before export; waivable | Same |
 | Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not part of a table subset, so a subset export neither refuses nor warns about them | Same (no events; materialized views apply) |
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
 
+### Generated columns (MySQL -> MySQL)
+
+Virtual and stored columns are captured only when the decoded generation expression
+passes the expression boundary check and appears verbatim in that column's own
+SHOW CREATE TABLE line. The manifest stores the decoded expression without the
+outer AS parentheses; parentheses belonging to the expression remain. Unproven
+columns remain refused (`generated_column_unproven`, not waivable). This includes
+literal emoji when SHOW CREATE prints them as `????` (observed on 8.0/8.4).
+PostgreSQL
+export and imports/migrations across engines refuse generated columns before DROP.
+
+Data chunks retain generated values. Import skips those fields in LOAD DATA and
+INSERT, so MySQL recalculates them. Format 6 readers preserve the expression,
+VIRTUAL/STORED kind, indexes and supported FKs; dumps without these columns retain
+the previous format version. Formats 1-5 remain readable.
+
+Import uses strict SQL mode. Rows originally accepted under a loose mode may fail
+when a STORED expression is recalculated (for example a truncated CAST). A replace
+failure can occur after that table was dropped/recreated; use safe restore to keep
+the original untouched. Safe verification compares the recalculated values with
+the dump, so expression output differences between server versions stop the switch
+with a content mismatch. No result is silently accepted in either case.
+
 Default behavior: when the selected scope contains any refused object, `dump.run`
 fails before the target directory or any dump file is created, with
 `error_code: "unsupported_objects"`, `objects` (one `kind:table:name` entry per
-object) and `bypassable`. Only the waivable objects can be omitted, and only by
+object), `bypassable`, and a `reasons` map for unproven generated columns. Only the
+waivable objects can be omitted, and only by
 the explicit choice "Export without these objects (incomplete)" (`allow_incomplete:
 true` in the `dump.run` payload; the dialog words the objects, up to 10 inline plus
 a count of the rest, before asking, or sends it from the start when its Advanced

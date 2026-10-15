@@ -209,7 +209,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         }
         let manifest = read_dump_manifest(path).map_err(|err| classified_import_error("dump_invalid", &err, None))?;
         state["dump_manifest_sha256"] = json!(sha256_file(&path.join("_tunnelforge_dump.json"))?);
-        if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
+        if !crate::dump_format::supported_manifest_version(&manifest) {
             return Err(classified_import_error("dump_invalid", "unsupported dump manifest format", None));
         }
         let refusals = copy_refusals(&manifest, &original.engine, false);
@@ -307,10 +307,13 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             .collect::<Vec<_>>();
         // Target-only tables and views linked to the dump stopped the run above; the swap leaves
         // the rest, and whatever belongs to them, where they are.
+        let held = if manifest.source_engine == "mysql" && original.engine == "mysql" {
+            crate::dump_format::held_object_ids(&manifest.schema, &manifest.stored_programs)
+        } else { BTreeSet::new() };
         let unrepresented = original_inspection
             .unsupported_objects
             .iter()
-            .filter(|object| !object.to_ascii_lowercase().starts_with("view:"))
+            .filter(|object| !object.to_ascii_lowercase().starts_with("view:") && !held.contains(*object))
             .filter(|object| object.split(':').nth(1).is_none_or(|table| !target_only.iter().any(|name| name == table)))
             .cloned()
             .collect::<Vec<_>>();
@@ -773,9 +776,12 @@ fn verify_candidate(
     let mut unsupported = inspection.unsupported_objects;
     unsupported.sort();
     unsupported.dedup();
+    let held = if manifest.source_engine == "mysql" && endpoint.engine == "mysql" {
+        crate::dump_format::held_object_ids(&manifest.schema, &manifest.stored_programs)
+    } else { BTreeSet::new() };
     let rejected = unsupported
         .iter()
-        .filter(|object| !object.starts_with("view:"))
+        .filter(|object| !object.starts_with("view:") && !held.contains(*object))
         .collect::<Vec<_>>();
     if !rejected.is_empty() {
         return Err(format!(
@@ -1040,6 +1046,11 @@ fn verify_schema(
             {
                 return Err(mismatch(&format!("column {} definition", source.name)));
             }
+            let generation = |column: &NormalizedColumn| column.generated.as_ref()
+                .map(|generated| (canonical_sql(&generated.expression), generated.stored));
+            if generation(source) != generation(column) {
+                return Err(mismatch(&format!("column {} generated expression/storage", source.name)));
+            }
             if canonical_default(source.default_value.as_deref())
                 != canonical_default(column.default_value.as_deref())
                 || canonical_default(source.on_update.as_deref())
@@ -1125,6 +1136,39 @@ fn verify_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_reader_refuses_next_format_before_connecting() {
+        let dir = std::env::temp_dir().join(format!("tf-format-gate-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = json!({"format":"tunnelforge-dump",
+            "format_version":crate::dump_format::MAX_SUPPORTED_DUMP_FORMAT_VERSION+1,
+            "source_engine":"mysql","database":"app","schema":{"tables":[]},
+            "chunk_size":1,"created_unix_seconds":1,"tables":[]});
+        std::fs::write(dir.join("_tunnelforge_dump.json"),manifest.to_string()).unwrap();
+        let request = Request { command:"dump.import".into(),request_id:None,
+            payload:json!({"target":{"engine":"mysql","host":"127.0.0.1","port":1,
+                "user":"unused","password":"","database":"app"},"input_dir":dir,"mode":"safe"}) };
+        let report=run(&request, |_|{}).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(report["success"],false);
+        assert_eq!(report["candidate_created"],false);
+        assert!(report["message"].as_str().unwrap().contains("unsupported dump manifest format"),"{report}");
+    }
+
+    #[test]
+    fn verify_schema_compares_generated_expression_and_storage() {
+        let expected: NormalizedSchema = serde_json::from_value(json!({"tables":[{"name":"t","columns":[
+            {"name":"g","type":"int","generated":{"expression":"`a` + 1","stored":true}}
+        ]}]})).unwrap();
+        let mut actual=expected.clone();
+        actual.tables[0].columns[0].generated.as_mut().unwrap().expression="`a`+1".into();
+        assert!(verify_schema(&expected,&actual,"mysql").is_ok());
+        actual.tables[0].columns[0].generated.as_mut().unwrap().stored=false;
+        assert!(verify_schema(&expected,&actual,"mysql").unwrap_err().contains("generated expression/storage"));
+        actual.tables[0].columns[0].generated=None;
+        assert!(verify_schema(&expected,&actual,"mysql").is_err());
+    }
 
     #[test]
     fn verified_plan_binds_original_namespace_candidate_and_content_proof() {

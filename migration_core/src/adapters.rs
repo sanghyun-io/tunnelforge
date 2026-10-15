@@ -121,6 +121,9 @@ pub struct NormalizedColumn {
     pub generated: Option<NormalizedGenerated>,
 }
 
+/// A proven MySQL generated column. `expression` is decoded SQL without the
+/// enclosing AS (...) parentheses (parentheses belonging to the expression stay).
+/// `stored`: true = STORED, false = VIRTUAL; supported only MySQL -> MySQL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedGenerated {
     pub expression: String,
@@ -276,6 +279,11 @@ pub struct DumpManifest {
     pub stored_programs: Vec<NormalizedStoredProgram>,
 }
 
+/// SHOW CREATE plus its creation context. `kind` is TRIGGER, PROCEDURE, FUNCTION,
+/// or EVENT. TRIGGER uses `table`, positive `action_order`, `timing` (BEFORE/AFTER)
+/// and `event` (INSERT/UPDATE/DELETE). EVENT uses `time_zone` and `status`
+/// (ENABLED/DISABLED/SLAVESIDE_DISABLED). Other kinds leave those fields absent.
+/// Session fields apply to all kinds; `definer` is report-only, never replayed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedStoredProgram {
     pub kind: String,
@@ -1473,7 +1481,7 @@ mod tests {
                 name: "ref_vendor_codes_view".to_string(),
                 definition: "CREATE VIEW `ref_vendor_codes_view` AS select 1".to_string(),
             }],
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         assert!(json.contains("ref_vendor_codes_view"));
@@ -1500,7 +1508,7 @@ mod tests {
             created_unix_seconds: 1,
             tables: Vec::new(),
             views: Vec::new(),
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         // skip_serializing_if 로 빈 views는 직렬화되지 않아 기존 dump와 바이트 호환.

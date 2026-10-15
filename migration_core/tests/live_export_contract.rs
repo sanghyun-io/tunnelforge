@@ -155,8 +155,15 @@ fn lossy_selected_schema_is_rejected_before_success_manifest() {
         let dir = std::env::temp_dir().join(format!("{name}_{}", endpoint.engine));
         let events = handle_request(Request { command: "dump.run".into(), request_id: None,
             payload: json!({"endpoint": endpoint, "tables": [name], "output_dir": dir}) });
-        assert!(events.iter().any(|event| event["event"] == "error" && event["message"].as_str().unwrap_or_default().contains("generated_column")), "{events:#?}");
-        assert!(!dir.join("_tunnelforge_dump.json").exists());
+        if endpoint.engine == "mysql" {
+            assert!(!events.iter().any(|event| event["event"] == "error"), "{events:#?}");
+            let restored = handle_request(Request { command: "dump.import".into(), request_id: None,
+                payload: json!({"target":endpoint,"input_dir":dir,"mode":"replace"}) });
+            assert!(!restored.iter().any(|event| event["event"] == "error"), "{restored:#?}");
+        } else {
+            assert!(events.iter().any(|event| event["event"] == "error" && event["message"].as_str().unwrap_or_default().contains("generated_column")), "{events:#?}");
+            assert!(!dir.join("_tunnelforge_dump.json").exists());
+        }
         admin.execute_sql(&format!("DROP TABLE {name}")).unwrap();
         if dir.exists() { fs::remove_dir_all(dir).unwrap(); }
     }

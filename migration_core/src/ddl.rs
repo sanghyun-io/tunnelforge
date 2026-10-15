@@ -94,6 +94,9 @@ pub(crate) fn validate_target_foreign_key_actions(table: &NormalizedTable, targe
         if !table.checks.is_empty() { return Err(format!("cannot translate MySQL CHECK expressions for table {} to {target}", table.name)); }
         if table.indexes.iter().any(|index| index.visible == Some(false)) { return Err(format!("cannot preserve invisible indexes for table {} on {target}",table.name)); }
         for column in &table.columns {
+            if column.generated.is_some() {
+                return Err(format!("cannot translate MySQL generated column {}.{} to {target}", table.name, column.name));
+            }
             if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| value.trim().eq_ignore_ascii_case("uuid()") || value.trim().eq_ignore_ascii_case("(uuid())")) {
                 return Err(format!("cannot translate MySQL UUID() expression default for {}.{} to {target}",table.name,column.name));
             }
@@ -122,6 +125,15 @@ pub(crate) fn validate_target_foreign_key_actions(table: &NormalizedTable, targe
     Ok(())
 }
 
+pub(crate) fn validate_generated_column_direction(table: &NormalizedTable, source: &str, target: &str) -> Result<(), String> {
+    if source != "mysql" || target != "mysql" {
+        if let Some(column) = table.columns.iter().find(|column| column.generated.is_some()) {
+            return Err(format!("cannot translate {source} generated column {}.{} to {target}; generated columns require MySQL -> MySQL", table.name, column.name));
+        }
+    }
+    Ok(())
+}
+
 pub fn generate_schema_ddl(
     schema: &NormalizedSchema,
     source: &str,
@@ -134,6 +146,7 @@ pub fn generate_schema_ddl(
         .tables
         .iter()
         .map(|table| {
+            validate_generated_column_direction(table, source, target)?;
             validate_target_foreign_key_actions(table, target)?;
             generate_table_ddl(table, source, target).ok_or_else(|| {
                 format!(
@@ -752,7 +765,7 @@ pub fn insert_rows_literal_sql_for_table(
     table: &NormalizedTable,
     rows: &[Value],
 ) -> String {
-    let column_names: Vec<&str> = table.columns.iter().map(|column| column.name.as_str()).collect();
+    let column_names: Vec<&str> = table.columns.iter().filter(|column| column.generated.is_none()).map(|column| column.name.as_str()).collect();
     let column_types: BTreeMap<&str, &str> = table
         .columns
         .iter()
@@ -1176,7 +1189,7 @@ pub fn inspect_columns_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
         "SELECT c.column_name, c.data_type, c.is_nullable, c.character_maximum_length, c.numeric_precision, c.numeric_scale, c.column_default, c.is_identity, pg_catalog.format_type(a.atttypid, a.atttypmod) FROM information_schema.columns c JOIN pg_catalog.pg_namespace n ON n.nspname=c.table_schema JOIN pg_catalog.pg_class t ON t.relnamespace=n.oid AND t.relname=c.table_name JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attname=c.column_name WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position"
     } else {
-        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra, COLUMN_COMMENT AS column_comment FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
+        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra, COLUMN_COMMENT AS column_comment, GENERATION_EXPRESSION FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
     }
 }
 
@@ -1344,7 +1357,11 @@ fn column_ddl_lines(
         if !is_safe_column_type(&mapped_type) {
             return None;
         }
-        let default_sql = if auto_increment {
+        let generated = column.generated.as_ref();
+        if let Some(generated) = generated {
+            if source != "mysql" || target != "mysql" || !is_safe_check_expression(&generated.expression) { return None; }
+        }
+        let default_sql = if auto_increment || generated.is_some() {
             String::new()
         } else if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| value.trim().trim_matches(['(',')']).eq_ignore_ascii_case("uuid")) {
             if target != "mysql" { return None; }
@@ -1355,13 +1372,15 @@ fn column_ddl_lines(
                 .unwrap_or(false) { return None; }
             default_clause(target, column.default_value.as_deref(), &column.type_name)
         };
-        let on_update_sql = if let Some(value) = &column.on_update {
+        let on_update_sql = if generated.is_some() { String::new() } else if let Some(value) = &column.on_update {
             let value = value.to_ascii_uppercase();
             if target != "mysql" || !is_safe_temporal_default_expression(&value) { return None; }
             format!(" ON UPDATE {value}")
         } else { String::new() };
         let null_sql = if column.nullable { "" } else { " NOT NULL" };
-        let generation_sql = if auto_increment && target == "postgresql" {
+        let generation_sql = if let Some(generated) = generated {
+            format!(" GENERATED ALWAYS AS ({}) {}", generated.expression, if generated.stored { "STORED" } else { "VIRTUAL" })
+        } else if auto_increment && target == "postgresql" {
             table.auto_increment.map(|counter| format!(" GENERATED BY DEFAULT AS IDENTITY (START WITH {counter})")).unwrap_or_else(|| " GENERATED BY DEFAULT AS IDENTITY".to_string())
         } else if auto_increment && target == "mysql" {
             " AUTO_INCREMENT".to_string()
@@ -2174,6 +2193,29 @@ fn temporal_type_with_precision(base: &str, source_type: &str, default_precision
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_column_ddl_and_insert_preserve_only_mysql_semantics() {
+        let mut table: NormalizedTable = serde_json::from_value(json!({"name":"t","columns":[
+            {"name":"a","type":"int"},
+            {"name":"g","type":"int auto_increment","nullable":false,"default":"3","on_update":"CURRENT_TIMESTAMP","generated":{"expression":"`a` + 1","stored":false},"comment":"generated"}
+        ]})).unwrap();
+        for stored in [false, true] {
+            table.columns[1].type_name = "int".into();
+            table.columns[1].generated.as_mut().unwrap().stored = stored;
+            let ddl = generate_table_ddl(&table,"mysql","mysql").unwrap();
+            assert!(ddl.contains(&format!("`g` int GENERATED ALWAYS AS (`a` + 1) {} NOT NULL COMMENT", if stored { "STORED" } else { "VIRTUAL" })), "{ddl}");
+            assert!(!ddl.contains("DEFAULT") && !ddl.contains("ON UPDATE") && !ddl.contains("AUTO_INCREMENT"), "{ddl}");
+        }
+        let sql = insert_rows_literal_sql_for_table("mysql", &table, &[json!({"a":2,"g":999})]);
+        assert!(sql.contains("(`a`) VALUES (2)"), "{sql}");
+        assert!(generate_table_ddl(&table,"mysql","postgresql").is_none());
+        assert!(generate_table_ddl(&table,"postgresql","mysql").is_none());
+        assert!(validate_generated_column_direction(&table,"postgresql","mysql").unwrap_err().contains("generated column t.g"));
+        assert!(validate_target_foreign_key_actions(&table,"postgresql").unwrap_err().contains("generated column t.g"));
+        table.columns[1].generated.as_mut().unwrap().expression = "1); DROP TABLE t; --".into();
+        assert!(generate_table_ddl(&table,"mysql","mysql").is_none());
+    }
 
     #[test]
     fn check_expression_validation_preserves_one_expression_boundary() {
@@ -3740,7 +3782,7 @@ mod binary_keyset_tests {
             comment: None,
             default_is_expression: false,
             on_update: None,
-                generated: None,
+            generated: None,
         }
     }
 

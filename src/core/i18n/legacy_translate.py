@@ -17,6 +17,9 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "계산 열 {}의 정의를 안전하게 보존할 수 있는지 확인하지 못했습니다": "Could not verify that generated column {} can be preserved safely",
+    "계산 열의 식을 안전하게 해석하고 원본 테이블 정의와 일치하는지 확인하지 못했습니다. 원본의 SHOW CREATE TABLE 정의와 생성식을 확인하세요.": "Could not safely decode the generated expression and match it to the original table definition. Check SHOW CREATE TABLE and the generation expression in the source.",
+    "지원 제외 객체 {}개를 사전 점검 대상으로 저장했습니다. 계산 열은 다른 DB 엔진으로 이관할 수 없어 실행을 차단합니다.": "Saved {} unsupported objects for preflight. Generated columns block execution because they cannot be migrated across database engines.",
     "⋯ 파일/히스토리": "⋯ File/History",
     "SQL 파일 열기/저장, 쿼리 히스토리": "Open/save SQL files, query history",
     "💾 다른 이름으로 저장 (Ctrl+Shift+S)": "💾 Save As (Ctrl+Shift+S)",

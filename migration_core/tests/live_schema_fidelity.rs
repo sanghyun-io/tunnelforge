@@ -113,8 +113,12 @@ fn unsupported_schema_features_are_rejected_before_export() {
         let opts=mysql::OptsBuilder::new().ip_or_hostname(Some(endpoint.host.clone())).user(Some(endpoint.user.clone())).pass(Some(endpoint.password.clone()));
         let mut conn=mysql::Pool::new(opts).unwrap().get_conn().unwrap(); let database=unique_name();
         conn.query_drop(format!("CREATE DATABASE {database}")).unwrap(); conn.query_drop(format!("USE {database}")).unwrap(); endpoint.database=database.clone();
+        conn.query_drop("CREATE TABLE sample (id int, doubled int GENERATED ALWAYS AS (id*2) STORED)").unwrap();
+        conn.query_drop("INSERT INTO sample(id) VALUES(2)").unwrap();
+        restore(&endpoint,&endpoint);
+        assert_eq!(conn.query_first::<i64,_>("SELECT doubled FROM sample").unwrap(),Some(4));
+        conn.query_drop("DROP TABLE sample").unwrap();
         for (ddl,marker) in [
-            ("CREATE TABLE sample (id int, doubled int GENERATED ALWAYS AS (id*2) STORED)","generated_column:sample:doubled"),
             ("CREATE TABLE sample (id int, token varchar(40) DEFAULT (lower(uuid())))","unsupported_default:sample:token"),
             // information_schema renders this literal as a lone 0xE9 byte (SHOW CREATE TABLE: '?').
             ("CREATE TABLE sample (id int, code varchar(10) CHARACTER SET latin1, CONSTRAINT latin1_code CHECK (code <> _latin1 X'E9'))","check_constraint:sample:latin1_code"),

@@ -1097,7 +1097,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.unsupported_objects = [str(item) for item in unsupported_objects]
             if self.unsupported_objects:
                 self._append_log(
-                    f"지원 제외 객체 {len(self.unsupported_objects)}개를 preflight warning 대상으로 저장했습니다."
+                    translate_text("지원 제외 객체 {}개를 사전 점검 대상으로 저장했습니다. 계산 열은 다른 DB 엔진으로 이관할 수 없어 실행을 차단합니다.").format(len(self.unsupported_objects))
                 )
         elif command == "inspect":
             self.unsupported_objects = []

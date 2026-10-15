@@ -113,7 +113,8 @@ fn import_table_ddls(
                     return Err(invalid(format!("duplicate column {} in table {}", column.name, table.name)));
                 }
             }
-            if let Err(reason) = validate_target_foreign_key_actions(definition, target_engine) {
+            if let Err(reason) = validate_generated_column_direction(definition, &manifest.source_engine, target_engine)
+                .and_then(|()| validate_target_foreign_key_actions(definition, target_engine)) {
                 untranslatable.push((table.name.clone(), reason));
                 continue;
             }
@@ -128,7 +129,7 @@ fn import_table_ddls(
 
 /// The manifest's (data_format, compression), refusing what this build cannot read.
 fn supported_dump_format(manifest: &DumpManifest) -> Result<(String, String), String> {
-    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4 | 5) {
+    if !crate::dump_format::supported_manifest_version(&manifest) {
         return Err("unsupported dump manifest format".to_string());
     }
     let data_format = manifest.data_format.to_ascii_lowercase();
@@ -2329,9 +2330,9 @@ pub fn load_data_local_infile_sql(
     table: &NormalizedTable,
     file_name: &str,
 ) -> String {
-    let columns = column_names(table)
+    let columns = table.columns
         .iter()
-        .map(|column| quote_ident(engine, column))
+        .map(|column| if column.generated.is_some() { "@tf_skip".to_string() } else { quote_ident(engine, &column.name) })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -2348,10 +2349,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supported_dump_format_still_rejects_format_six() {
+    fn load_data_skips_generated_fields_without_shifting_positions() {
+        let table: NormalizedTable = serde_json::from_value(json!({"name":"t","columns":[
+            {"name":"a","type":"int"}, {"name":"g","type":"int","generated":{"expression":"`a`+1","stored":true}},
+            {"name":"b","type":"int"}, {"name":"h","type":"int","generated":{"expression":"`a`+2","stored":false}}
+        ]})).unwrap();
+        assert!(load_data_local_infile_sql("mysql", &table,"chunk").ends_with("(`a`, @tf_skip, `b`, @tf_skip)"));
+    }
+
+    #[test]
+    fn supported_dump_format_rejects_next_version() {
         let manifest = DumpManifest {
             format: "tunnelforge-dump".into(),
-            format_version: 6,
+            format_version: crate::dump_format::MAX_SUPPORTED_DUMP_FORMAT_VERSION + 1,
             data_format: "tsv".into(),
             compression: "none".into(),
             source_engine: "mysql".into(),
@@ -2529,7 +2539,7 @@ mod tests {
             source_engine: "mysql".into(), database: "app".into(), source_schema: None, source_timezone: None,
             schema: tables, snapshot_policy: "connection_consistent".into(), strict_export: true, manifest_warnings: vec![],
             chunk_size: 100, created_unix_seconds: 1, views: vec![], tables: vec![entry("users"), entry("other")],
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
         let err = validate_import_metadata(&manifest, &BTreeSet::new(), "postgresql").unwrap_err();
         assert!(err.contains("2 tables cannot be created on postgresql"), "{err}");
@@ -2552,7 +2562,7 @@ mod tests {
                 strict_export: true, manifest_warnings: vec![], chunk_size: 100,
                 created_unix_seconds: 1, views: vec![],
                 tables: vec![DumpTableManifest { name: "users".into(), path: "users".into(), rows: 0, chunks: 0, chunk_sha256: BTreeMap::new() }],
-            stored_programs: Vec::new(),
+                stored_programs: Vec::new(),
             };
             let expected = match defect {
                 "wrong_checksum" => {

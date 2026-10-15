@@ -109,7 +109,7 @@ _TABLE_REFUSAL_REASONS = {
     "deprecated_engine": _WHOLE_TABLE_LEFT_OUT,
     "non_transactional_table": _WHOLE_TABLE_LEFT_OUT,
     # Definitions that would be lost: never left out
-    "generated_column": "계산 열 {}의 정의를 덤프에 담을 수 없습니다",
+    "generated_column": "계산 열 {}의 정의를 안전하게 보존할 수 있는지 확인하지 못했습니다",
     "check_constraint": "CHECK 제약 {}의 조건을 덤프에 담을 수 없습니다",
     "unsupported_default": "열 {}의 기본값을 덤프에 담을 수 없습니다",
     "custom_type": "열 {}의 사용자 정의 형식을 덤프에 담을 수 없습니다",
@@ -128,7 +128,7 @@ _SCHEMA_REFUSAL_REASONS = {
 _UNKNOWN_TABLE_REFUSAL = "이 객체는 담을 수 없습니다"
 
 
-def describe_export_refusal(objects: object) -> List[str]:
+def describe_export_refusal(objects: object, reasons: Optional[Dict[str, str]] = None) -> List[str]:
     """One plain sentence per refused object, e.g. "테이블 orders: 트리거(trg)는 덤프에 담을 수 없습니다".
 
     An unknown code still names its table; the codes themselves go behind "자세히"."""
@@ -139,7 +139,9 @@ def describe_export_refusal(objects: object) -> List[str]:
         if kind in _SCHEMA_REFUSAL_REASONS:
             lines.append(translate_text(_SCHEMA_REFUSAL_REASONS[kind]).format(rest))
         elif name:
-            reason = translate_text(_TABLE_REFUSAL_REASONS.get(kind, _UNKNOWN_TABLE_REFUSAL)).format(name)
+            code = (reasons or {}).get(str(item))
+            reason = (translate_text(CORE_CODE_SENTENCES[code]) if code in CORE_CODE_SENTENCES
+                      else translate_text(_TABLE_REFUSAL_REASONS.get(kind, _UNKNOWN_TABLE_REFUSAL)).format(name))
             lines.append(translate_text("테이블 {}: {}").format(table, reason))
         else:
             lines.append(f"{item}: {translate_text(_UNKNOWN_TABLE_REFUSAL)}")
@@ -418,6 +420,7 @@ class RustDumpExporter(_RustDumpClientBase):
                 self.last_refusal = {
                     "objects": [str(item) for item in event.get("objects") or []],
                     "bypassable": bool(event.get("bypassable")),
+                    **({"reasons": dict(event["reasons"])} if event.get("reasons") else {}),
                 }
             self._emit_core_event(
                 event,
@@ -624,6 +627,7 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "generated_column_unproven": "계산 열의 식을 안전하게 해석하고 원본 테이블 정의와 일치하는지 확인하지 못했습니다. 원본의 SHOW CREATE TABLE 정의와 생성식을 확인하세요.",
     **CONNECTION_ERROR_MESSAGES,
     # Import errors
     "load_failed": "이 테이블을 지우고 다시 만들거나 데이터를 넣는 중에 멈췄습니다.",

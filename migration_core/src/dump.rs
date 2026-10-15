@@ -547,6 +547,9 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
             });
             if let Some(refusal) = refusal {
                 event["error_code"] = json!("unsupported_objects");
+                let reasons: BTreeMap<_, _> = refusal.objects.iter().filter(|id| id.starts_with("generated_column:"))
+                    .map(|id| (id, "generated_column_unproven")).collect();
+                event["reasons"] = json!(reasons);
                 event["objects"] = json!(refusal.objects);
                 event["bypassable"] = json!(refusal.bypassable);
             }
@@ -1010,7 +1013,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         format: "tunnelforge-dump".to_string(),
         // Older readers ignore namespace, timezone and ON UPDATE metadata. Fail
         // their version gate instead of silently restoring different semantics.
-        format_version: if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
+        format_version: if schema.tables.iter().any(|table| table.columns.iter().any(|column| column.generated.is_some())) { 6 } else if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
         data_format: options.data_format.clone(),
         compression: options.compression.clone(),
         source_engine: endpoint.engine.clone(),
@@ -1239,7 +1242,9 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
     }
-    let mut scope_objects = inspection.unsupported_objects.clone();
+    let held = if endpoint.engine == "mysql" { crate::dump_format::held_object_ids(&schema, &[]) } else { BTreeSet::new() };
+    let unheld: Vec<String> = inspection.unsupported_objects.iter().filter(|object| !held.contains(*object)).cloned().collect();
+    let mut scope_objects = unheld.clone();
     if endpoint.engine == "mysql" {
         scope_objects.extend(mysql_non_transactional_objects(&endpoint, &schema)?);
     }
@@ -1253,7 +1258,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         return Err(message);
     }
     // Only objects inside the export scope make this dump incomplete (C5).
-    let mut export_warnings: Vec<String> = scoped_omitted_objects(&inspection.unsupported_objects, &schema, full_export)
+    let mut export_warnings: Vec<String> = scoped_omitted_objects(&unheld, &schema, full_export)
         .into_iter()
         .map(|object| format!("{WARNING_OBJECT_NOT_EXPORTED} {object}"))
         .collect();

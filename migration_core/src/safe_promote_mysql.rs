@@ -2186,8 +2186,8 @@ mod tests {
         let table = NormalizedTable {
             name: name.clone(),
             columns: vec![
-                NormalizedColumn { name: "id".into(), type_name: "int".into(), default_value: None, nullable: false, primary_key: true, unique: false, comment: None, default_is_expression: false, on_update: None, generated: None, },
-                NormalizedColumn { name: "g".into(), type_name: "geometry".into(), default_value: None, nullable: true, primary_key: false, unique: false, comment: None, default_is_expression: false, on_update: None, generated: None, },
+                NormalizedColumn { name: "id".into(), type_name: "int".into(), default_value: None, nullable: false, primary_key: true, unique: false, comment: None, default_is_expression: false, on_update: None, generated: None },
+                NormalizedColumn { name: "g".into(), type_name: "geometry".into(), default_value: None, nullable: true, primary_key: false, unique: false, comment: None, default_is_expression: false, on_update: None, generated: None },
             ],
             indexes: Vec::new(), foreign_keys: Vec::new(), table_collation: None, auto_increment: None, comment: None, checks: Vec::new(),
         };

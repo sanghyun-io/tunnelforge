@@ -13,6 +13,20 @@ use crate::*;
 /// 바이트 목표 기반 추정보다 실측에 가깝다고 보고 학습값을 신뢰한다.
 const LEARNED_PROFILE_LARGE_ROW_BYTES: u64 = 4_096;
 
+pub(crate) const MAX_SUPPORTED_DUMP_FORMAT_VERSION: u32 = 6;
+
+pub(crate) fn supported_manifest_version(manifest: &DumpManifest) -> bool {
+    manifest.format == "tunnelforge-dump"
+        && (1..=MAX_SUPPORTED_DUMP_FORMAT_VERSION).contains(&manifest.format_version)
+}
+
+/// Only captured schema objects are held. Program support is added by its reader PR.
+pub(crate) fn held_object_ids(schema: &NormalizedSchema, _programs: &[NormalizedStoredProgram]) -> BTreeSet<String> {
+    schema.tables.iter().flat_map(|table| table.columns.iter()
+        .filter(|column| column.generated.is_some())
+        .map(|column| format!("generated_column:{}:{}", table.name, column.name))).collect()
+}
+
 pub fn table_dependency_order(schema: &NormalizedSchema) -> Vec<String> {
     let (ordered, _) = table_dependency_order_indices(schema);
     ordered
@@ -1077,7 +1091,16 @@ fn read_jsonl_rows(path: &Path, compression: &str) -> Result<Vec<Value>, String>
 mod tests {
     use super::*;
 
-    /// A format 5 manifest exactly as the v2.19 writer serializes it, every optional field set.
+    #[test]
+    fn held_generated_ids_require_captured_expression() {
+        let schema: NormalizedSchema = serde_json::from_value(json!({"tables":[{"name":"t","columns":[
+            {"name":"a","type":"int"}, {"name":"g","type":"int","generated":{"expression":"`a`+1","stored":true}}
+        ]}]})).unwrap();
+        assert_eq!(held_object_ids(&schema,&[]), BTreeSet::from(["generated_column:t:g".into()]));
+    }
+
+    /// Compact v2.19-shaped format 5 fixture. Pins legacy field order and omission;
+    /// the on-disk writer uses pretty JSON, and optional fields need not all be set.
     const V5_MANIFEST: &str = r#"{"format":"tunnelforge-dump","format_version":5,"data_format":"tsv","compression":"zstd","source_engine":"mysql","source_schema":"app","source_timezone":"UTC","database":"app","schema":{"tables":[{"name":"places","columns":[{"name":"id","type":"bigint unsigned auto_increment","default":null,"default_is_expression":false,"nullable":false,"primary_key":true,"unique":false},{"name":"updated_at","type":"timestamp","default":"CURRENT_TIMESTAMP","on_update":"CURRENT_TIMESTAMP","comment":"마지막 수정","default_is_expression":true,"nullable":false,"primary_key":false,"unique":false},{"name":"spot","type":"point","default":null,"default_is_expression":false,"nullable":false,"primary_key":false,"unique":false},{"name":"flags","type":"bit(8)","default":"b'0'","default_is_expression":false,"nullable":true,"primary_key":false,"unique":false}],"indexes":[{"name":"spot_idx","columns":["spot"],"column_prefixes":[null],"unique":false,"spatial":true},{"name":"flags_idx","columns":["flags"],"column_prefixes":[null],"unique":false,"visible":false}],"foreign_keys":[{"name":"fk_owner","columns":["id"],"referenced_table":"owners","referenced_columns":["id"],"on_delete":"CASCADE"}],"table_collation":"utf8mb4_0900_ai_ci","auto_increment":42,"comment":"장소","checks":[{"name":"flags_chk","expression":"(`flags` <> 0)","enforced":true}]}]},"snapshot_policy":"connection_consistent","strict_export":true,"manifest_warnings":[],"chunk_size":1000,"created_unix_seconds":1760000000,"tables":[{"name":"places","path":"0001_places","rows":2,"chunks":1,"chunk_sha256":{"chunk_000001.tsv.zst":"0000000000000000000000000000000000000000000000000000000000000000"}}],"views":[{"name":"v_places","definition":"select `places`.`id` AS `id` from `places`"}]}"#;
 
     #[test]
@@ -1091,32 +1114,24 @@ mod tests {
 
     #[test]
     fn generated_columns_and_stored_programs_serde_round_trip() {
-        let mut manifest: DumpManifest = serde_json::from_str(V5_MANIFEST).unwrap();
-        manifest.schema.tables[0].columns[0].generated = Some(NormalizedGenerated {
-            expression: "(`id` + 1)".into(),
-            stored: true,
-        });
-        manifest.stored_programs.push(NormalizedStoredProgram {
-            kind: "TRIGGER".into(),
-            name: "places_before_insert".into(),
-            table: Some("places".into()),
-            action_order: Some(2),
-            timing: Some("BEFORE".into()),
-            event: Some("INSERT".into()),
-            definition: "CREATE DEFINER=`u`@`h` TRIGGER ...".into(),
-            sql_mode: Some("STRICT_TRANS_TABLES".into()),
-            character_set_client: Some("utf8mb4".into()),
-            collation_connection: Some("utf8mb4_0900_ai_ci".into()),
-            database_collation: Some("utf8mb4_0900_ai_ci".into()),
-            time_zone: None,
-            definer: Some("u@h".into()),
-            status: None,
-        });
+        let fields: Value = serde_json::from_str(r#"{
+            "generated": {"expression": "`id` + 1", "stored": true},
+            "stored_programs": [{"kind":"TRIGGER","name":"places_before_insert",
+                "table":"places","action_order":2,"timing":"BEFORE","event":"INSERT",
+                "definition":"CREATE DEFINER=`u`@`h` TRIGGER ...",
+                "sql_mode":"STRICT_TRANS_TABLES","character_set_client":"utf8mb4",
+                "collation_connection":"utf8mb4_0900_ai_ci",
+                "database_collation":"utf8mb4_0900_ai_ci","definer":"u@h"}]
+        }"#).unwrap();
+        let mut literal: Value = serde_json::from_str(V5_MANIFEST).unwrap();
+        literal["schema"]["tables"][0]["columns"][0]["generated"] = fields["generated"].clone();
+        literal["stored_programs"] = fields["stored_programs"].clone();
+        let manifest: DumpManifest = serde_json::from_value(literal).unwrap();
 
         let json = serde_json::to_string(&manifest).unwrap();
         let decoded: DumpManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, manifest);
-        assert_eq!(decoded.schema.tables[0].columns[0].generated.as_ref().unwrap().expression, "(`id` + 1)");
+        assert_eq!(decoded.schema.tables[0].columns[0].generated.as_ref().unwrap().expression, "`id` + 1");
         assert_eq!(decoded.stored_programs[0].timing.as_deref(), Some("BEFORE"));
         assert_eq!(decoded.stored_programs[0].event.as_deref(), Some("INSERT"));
     }
@@ -1280,7 +1295,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
         assert_eq!(read_dump_manifest(&dir).unwrap(), manifest);
@@ -1326,7 +1341,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
 
@@ -1382,7 +1397,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
 
         let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
@@ -1422,7 +1437,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: BTreeMap::new(),
             }],
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
 
         let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
@@ -1465,7 +1480,7 @@ mod tests {
                 chunks: 1,
                 chunk_sha256: checksums,
             }],
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
 
         let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
@@ -1615,7 +1630,7 @@ mod tests {
                 chunk_sha256: BTreeMap::new(),
             }],
             views: Vec::new(),
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
 
@@ -1896,7 +1911,7 @@ mod tests {
             created_unix_seconds: 1,
             views: Vec::new(),
             tables: Vec::new(),
-        stored_programs: Vec::new(),
+            stored_programs: Vec::new(),
         };
 
         write_dump_manifest(&dir, &manifest).unwrap();

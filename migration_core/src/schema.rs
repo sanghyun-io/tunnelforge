@@ -273,10 +273,24 @@ fn inspect_generic<A: InspectAdapter>(
 
 struct MysqlInspectAdapter {
     conn: mysql::PooledConn,
+    generated: BTreeMap<String, (String, bool)>,
 }
 
 impl InspectAdapter for MysqlInspectAdapter {
     fn enrich_table(&mut self, schema: &str, table: &mut NormalizedTable) -> Result<(), String> {
+        if !self.generated.is_empty() {
+            let create: Option<mysql::Row> = self.conn.query_first(format!(
+                "SHOW CREATE TABLE {}.{}", quote_ident("mysql", schema), quote_ident("mysql", &table.name)
+            )).map_err(|err| format!("mysql generated column inspect error: {err}"))?;
+            let definition = create.and_then(|row| row.get::<String, _>("Create Table"));
+            for column in &mut table.columns {
+                if let (Some((raw, stored)), Some(create)) = (self.generated.get(&column.name), definition.as_deref()) {
+                    column.generated = mysql_generation_expression(raw, &column.name, create)
+                        .map(|expression| NormalizedGenerated { expression, stored: *stored });
+                }
+            }
+            self.generated.clear();
+        }
         let options: Option<(Option<u64>, String)> = self.conn.exec_first(
             "SELECT AUTO_INCREMENT,TABLE_COMMENT FROM information_schema.tables WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", (schema,&table.name)
         ).map_err(|err| format!("mysql table options inspect error: {err}"))?;
@@ -338,6 +352,7 @@ impl InspectAdapter for MysqlInspectAdapter {
                     default_value,
                     extra,
                     column_comment,
+                    generation_expression,
                 ): (
                     String,
                     String,
@@ -347,7 +362,11 @@ impl InspectAdapter for MysqlInspectAdapter {
                     Option<String>,
                     String,
                     String,
+                    String,
                 )| {
+                    if extra.contains("VIRTUAL GENERATED") || extra.contains("STORED GENERATED") {
+                        self.generated.insert(name.clone(), (generation_expression, extra.contains("STORED GENERATED")));
+                    }
                     let type_name =
                         mysql_type_with_character_options(&type_name, character_set, collation);
                     let on_update = extra.to_ascii_lowercase().find("on update ")
@@ -435,7 +454,7 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     // 24-hour information_schema statistics cache.
     conn.query_drop("SET SESSION information_schema_stats_expiry=0")
         .map_err(|err| format!("mysql fresh metadata session error: {err}"))?;
-    let mut adapter = MysqlInspectAdapter { conn };
+    let mut adapter = MysqlInspectAdapter { conn, generated: BTreeMap::new() };
     inspect_generic(&mut adapter, &schema_name)
 }
 
@@ -535,6 +554,17 @@ pub(crate) fn mysql_check_clause(raw: &str) -> Option<String> {
         bytes.push(u8::try_from(u32::from(ch)).ok()?);
     }
     String::from_utf8(bytes).ok()
+}
+
+/// Match only this column's SHOW CREATE line; another column cannot prove it.
+/// I_S may include parentheses belonging to the expression. Do not strip those:
+/// SHOW CREATE adds one further AS (...) pair on both MySQL 8.0 and 8.4.
+pub(crate) fn mysql_generation_expression(raw: &str, column: &str, create: &str) -> Option<String> {
+    let prefix = format!("{} ", quote_ident("mysql", column));
+    let line = create.lines().find(|line| line.trim_start().starts_with(&prefix))?;
+    [Some(raw.to_string()), mysql_check_clause(raw)].into_iter().flatten()
+        .find(|expression| is_safe_check_expression(expression)
+            && line.contains(&format!(" GENERATED ALWAYS AS ({expression})")))
 }
 
 fn inspect_mysql_deprecated_engines_sql() -> &'static str {
@@ -1245,6 +1275,21 @@ pub(crate) fn validate_import_view_target(sql: &str, expected: &str, engine: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_expression_requires_own_column_and_safe_decoded_sql() {
+        let create = "CREATE TABLE `t` (\n  `a` int,\n  `g` int GENERATED ALWAYS AS ((`a` + 1)) STORED,\n  `txt` text GENERATED ALWAYS AS (concat(`a`,_utf8mb4'한글')) VIRTUAL\n)";
+        assert_eq!(mysql_generation_expression("(`a` + 1)", "g", create).as_deref(), Some("(`a` + 1)"));
+        assert_eq!(mysql_generation_expression("(`a` + 1)", "a", create), None);
+        assert_eq!(mysql_generation_expression("`a` + 1", "g", create), None);
+        let decoded = "concat(`a`,_utf8mb4'한글')";
+        let escaped: String = decoded.bytes().map(char::from).collect();
+        assert_eq!(mysql_generation_expression(&escaped, "txt", create).as_deref(), Some(decoded));
+        for expression in ["`a`; DROP TABLE t", "@a", "`a` + 2"] {
+            assert_eq!(mysql_generation_expression(expression, "g", create), None);
+        }
+    }
+
     
     
     
