@@ -128,6 +128,8 @@ class SettingsDialog(QDialog):
         self._original_theme_type = ThemeManager.instance().current_theme_type
         self._theme_saved = False
         self.init_ui()
+        # 탭이 모두 스크롤이라 기본 높이가 작다. 정보 탭의 다운로드 영역(약 530px)까지 스크롤 없이 보이게 연다.
+        self.resize(600, 560)
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -170,8 +172,15 @@ class SettingsDialog(QDialog):
         self.workspace_group = WorkspaceRecoverySettingsGroup(self.config_mgr)
         layout.addWidget(self.workspace_group)
         layout.addStretch()
+        return self._scrollable(tab)
 
-        # 그룹이 많아 작은 화면에서 잘리지 않도록 스크롤로 감싼다
+    @staticmethod
+    def _scrollable(tab: QWidget) -> QScrollArea:
+        """탭 내용을 스크롤로 감싼다.
+
+        다이얼로그 최소 크기를 직접 정해 두어 레이아웃이 창을 키우지 않으므로,
+        스크롤 없이 내용이 늘면(업데이트 다운로드 버튼 등) 위젯이 납작하게 눌린다.
+        """
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -672,7 +681,7 @@ class SettingsDialog(QDialog):
 
         layout.addStretch()
 
-        return tab
+        return self._scrollable(tab)
 
     def _on_theme_changed(self, index: int):
         """테마 선택 변경 시 미리보기만 적용 (저장은 save_settings에서 처리)"""
