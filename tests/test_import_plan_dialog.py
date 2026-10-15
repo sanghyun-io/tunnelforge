@@ -7,6 +7,24 @@ from src.ui.dialogs.import_plan_dialog import ImportPlanDialog, describe_plan
 
 _app = QApplication.instance() or QApplication([])
 
+
+@pytest.mark.parametrize("code", ["programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced"])
+@pytest.mark.parametrize("warning_only", [False, True])
+def test_skipped_triggers_and_changed_definers_are_must_see_with_names(code, warning_only):
+    preview = {"warnings": [{"code": code, "detail": "sample.guard (old@host -> new@host)"}]}
+    if not warning_only:
+        preview[code] = ["sample.guard"]
+    plan = describe_plan(preview, False)
+    assert plan["must_see"] is True
+    assert "sample.guard" in "\n".join(plan["warnings"])
+    assert not plan["blockers"]
+
+
+def test_program_copy_refusal_is_a_plain_blocker():
+    plan = describe_plan({"copy_blockers": [{"code": "dump_programs_unsupported_in_copy"}]}, True)
+    assert plan["must_see"]
+    assert "트리거가 담긴 덤프" in plan["blockers"][0]
+
 PREVIEW = {
     "dry_run": True, "target": {"engine": "mysql", "database": "app", "schema": "app", "exists": True},
     "replace": ["users", "orders"], "create": ["audit"], "untouched": ["notes"],
@@ -48,7 +66,7 @@ def test_import_plan_dialog_lists_replace_create_untouched_and_warnings():
             button.click()
             assert label.isVisibleTo(dialog)
         warnings = dialog.label_warnings.text()
-        assert "- 덮어쓰면 사라지는 트리거: users.trg_users" in warnings
+        assert "- 덤프에서 다시 만들지 않아 사라지는 트리거: users.trg_users" in warnings
         assert "- 이 계정으로 지우지 못할 수 있는 뷰(다른 계정이 만듦): v_users (admin@%)" in warnings
         assert "- 교체 뒤 동작하지 않을 수 있는 뷰: v_notes → users" in warnings
         assert ("- 덤프에 없는 부모 테이블을 가리키는 외래 키입니다. 부모 테이블에 맞는 행이 있는지는 확인하지 않습니다: "
@@ -210,7 +228,7 @@ def test_copy_blockers_stop_only_verify_in_copy_and_say_how_to_go_on():
         assert not dialog.btn_execute.isEnabled()
         # Verified in a copy, the old tables go to a backup: "교체", never "덮어쓰기".
         assert dialog.lists["replace"][0].text() == "교체할 테이블 2개 ▸"
-        assert "- 교체하면 사라지는 트리거: users.trg_users" in dialog.label_warnings.text()
+        assert "- 덤프에서 다시 만들지 않아 사라지는 트리거: users.trg_users" in dialog.label_warnings.text()
     finally:
         dialog.close()
 

@@ -49,7 +49,7 @@ _INCOMPLETE_EXPORT_WARNING = (
     "빠진 객체는 실행 로그의 'Export 경고' 줄에서 볼 수 있습니다."
 )
 _INCOMPLETE_EXPORT_LIST_LIMIT = 10
-_PARTIAL_EXPORT_NOTE = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
+_PARTIAL_EXPORT_NOTE = "일부 테이블만 내보낼 때는 선택한 테이블과 트리거를 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
 _PARTIAL_EXPORT_NOTE_POSTGRESQL = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수는 빠집니다."
 _FK_AUTO_TOOLTIP = "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는 테이블의 체크를 풀면 다시 고를 수 있습니다."
 _FK_NOTICE_EXAMPLES = 3
@@ -562,7 +562,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         panel_layout.addWidget(self.chk_unsynchronized)
 
         self.chk_allow_incomplete = QCheckBox("담을 수 없는 객체는 빼고 내보내기")
-        self.chk_allow_incomplete.setToolTip("트리거·저장 프로시저·예약 이벤트처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 "
+        self.chk_allow_incomplete.setToolTip("저장 프로시저·예약 이벤트나 정의를 확인하지 못한 트리거처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 "
                                              "묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. "
                                              "결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 "
                                              "빼고 내보낼 수 없습니다.")

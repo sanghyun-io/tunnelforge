@@ -441,6 +441,8 @@ class RustDumpExporter(_RustDumpClientBase):
         message = f"Export 완료: 테이블 {table_count}개, 행 {rows:,}개"
         if view_count:
             message += f", 뷰 {view_count}개"
+        if result.get("triggers"):
+            message += f", 트리거 {int(result['triggers'])}개"
         method = describe_snapshot_method(result, effective_threads)
         if method:
             message += f" · {method}"
@@ -627,6 +629,22 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "program_create_failed": "데이터를 넣은 뒤 트리거를 만들다가 멈췄습니다. Import 보고서에서 트리거가 복원되지 않은 테이블을 확인하세요.",
+    "trigger_body_unproven": "트리거 {}의 본문이 원본 정의와 일치하는지 확인하지 못했습니다. SHOW CREATE TRIGGER와 ACTION_STATEMENT를 확인하세요.",
+    "program_definition_invalid": "저장 프로그램 {}의 종류, 실행 시점, 이벤트 또는 세션 설정을 안전하게 확인하지 못했습니다.",
+    "program_charset_unsupported": "저장 프로그램 {}의 문자셋으로 본문을 안전하게 복원할 수 없습니다. UTF-8로 다시 내보내세요.",
+    "trigger_name_conflict": "같은 이름의 트리거가 교체하지 않는 대상 테이블에 있습니다. 이름을 바꾼 뒤 다시 가져오세요.",
+    "trigger_binlog_privilege": "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다.",
+    "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
+    "program_probe_failed": "트리거를 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "program_source_schema_reference": "트리거 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
+    "dump_programs_unsupported_in_copy": "트리거가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 고급 설정의 '먼저 복사본에서 검증하고 교체'를 끄세요.",
+    "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거를 만들지 않습니다.",
+    "programs_skipped_partial": "선택하지 않은 테이블의 트리거는 만들지 않습니다.",
+    "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
+    "program_definer_replaced": "트리거 정의자가 가져오는 계정으로 바뀝니다.",
+    "program_database_collation_changed": "대상 DB의 기본 정렬 규칙이 트리거 원본과 다릅니다.",
+
     "generated_column_unproven": "계산 열 {}의 식을 안전하게 해석하고 원본 테이블 정의와 일치하는지 확인하지 못했습니다. 원본의 SHOW CREATE TABLE 정의와 생성식을 확인하세요.",
     **CONNECTION_ERROR_MESSAGES,
     # Import errors
@@ -808,6 +826,7 @@ class RustDumpImporter(_RustDumpClientBase):
         threads: int = DEFAULT_DUMP_THREADS,
         timezone_sql: Optional[str] = None,
         use_source_timezone: bool = True,
+        skip_triggers: bool = False,
     ) -> Tuple[bool, str, dict]:
         """What a replace import would do, read from the target without changing it.
 
@@ -827,6 +846,8 @@ class RustDumpImporter(_RustDumpClientBase):
             )
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, {}
+            if skip_triggers:
+                payload["skip_triggers"] = True
             if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):
                 return False, "Import 엔진이 이 버전보다 오래되어 실행 전 확인을 할 수 없습니다. TunnelForge를 다시 설치하세요.", {}
             return True, "", self.facade.preview_import(payload)
@@ -900,6 +921,7 @@ class RustDumpImporter(_RustDumpClientBase):
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
         use_source_timezone: bool = True,
         verify_only: bool = False,
+        skip_triggers: bool = False,
     ) -> Tuple[bool, str, dict]:
         """``import_mode`` is ``replace`` (the dialog's default) or ``safe`` (verify in a copy first); it has
         no default, so no caller falls into either one by accident. ``verify_only`` (safe mode): the copy is
@@ -933,6 +955,8 @@ class RustDumpImporter(_RustDumpClientBase):
             payload = self._import_payload(
                 input_dir, target_schema or source_schema, threads, timezone_sql, use_source_timezone,
             )
+            if payload is not None and skip_triggers:
+                payload["skip_triggers"] = True
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, import_results
             payload["mode"] = import_mode
@@ -998,6 +1022,11 @@ class RustDumpImporter(_RustDumpClientBase):
                         message += f"\n{blocker}"
             if views_imported:
                 message += f", View {len(views_imported)}개"
+            if result.get("programs_imported"):
+                message += f", 트리거 {len(result['programs_imported'])}개"
+            for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
+                if result.get(key):
+                    message += "\n" + describe_core_code(key) + " " + ", ".join(map(str, result[key]))
             if views_failed:
                 failed_names = ", ".join(
                     str(item.get("name", "")) for item in views_failed if isinstance(item, dict)

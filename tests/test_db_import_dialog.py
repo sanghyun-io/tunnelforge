@@ -104,6 +104,38 @@ def _imports(created):
     return [worker for worker in created if worker.task_type == "import"]
 
 
+def test_trigger_skip_toggle_is_shared_with_preview_and_never_persisted(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    preview = {**_NOTHING_OVERWRITTEN, "programs_skipped_toggle": ["trigger:sample:guard"],
+               "warnings": [{"code": "programs_skipped_toggle", "detail": "trigger:sample:guard"}]}
+    created = _fake_workers(monkeypatch, preview=preview)
+    shown = _fake_plan_dialog(monkeypatch, accept=True)
+    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    try:
+        assert not dialog.chk_skip_triggers.isChecked()
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.chk_skip_triggers.setChecked(True)
+        assert "트리거 없이" in dialog._advanced_summary()
+        assert "skip_triggers" not in dialog._persisted_import_options()
+        dialog.do_import()
+        assert shown[0]["plan"]["must_see"] is True
+        assert "sample:guard" in "\n".join(shown[0]["plan"]["warnings"])
+        assert all(worker.kwargs["skip_triggers"] is True for worker in created)
+    finally:
+        dialog.close()
+    fresh = RustDumpImportDialog()
+    try:
+        assert not fresh.chk_skip_triggers.isChecked()
+    finally:
+        fresh.close()
+
+
+def test_failure_report_names_tables_whose_triggers_were_lost(monkeypatch):
+    from src.ui.dialogs.db_import_dialog import _replace_failure_details
+    assert "트리거를 다시 만들지 못한 테이블: second" in _replace_failure_details({"tables_lost_triggers": ["second"]})
+
+
 @pytest.mark.parametrize("tunnel_config", [None, {"environment": "staging"}])
 def test_staging_shows_only_plan_dialog(monkeypatch, tmp_path, tunnel_config):
     """Staging and unclassified profiles get the one plan dialog, and no other prompt, before a run."""
@@ -1480,7 +1512,7 @@ def test_import_toggle_payloads(monkeypatch, tmp_path, setup, expected):
         dialog.do_import()
         preview, imported = created
         default = {"input_dir": str(tmp_path / "dump"), "import_mode": "replace", "target_schema": "app", "threads": 8,
-                   "timezone_sql": None, "use_source_timezone": True}
+                   "timezone_sql": None, "use_source_timezone": True, "skip_triggers": False}
         assert imported.kwargs == {**default, **expected}
         assert preview.kwargs == {key: value for key, value in imported.kwargs.items() if key != "import_mode"}
     finally:

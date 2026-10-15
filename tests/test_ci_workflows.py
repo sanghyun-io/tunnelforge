@@ -525,11 +525,11 @@ def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
     assert job['env']['TF_PROMOTE_MYSQL_HOST'] == job['env']['TF_MYSQL_HOST']
     assert job['services']['postgres']['env']['POSTGRES_DB'] == 'tf_test'
     commands = '\n'.join(step.get('run', '') for step in job['steps'])
-    fixtures = ['live_roundtrip', 'live_binary_keyset', 'live_keyset_pk_matrix', 'live_mysql_bit', 'live_mysql_spatial', 'live_mysql_objects', 'live_generated_columns', 'live_cross_engine_types', 'live_dump_cross_engine', 'live_schema_fidelity', 'live_schema_compare', 'live_upgrade_analyze', 'live_upgrade_fix', 'live_catalog',
+    fixtures = ['live_roundtrip', 'live_binary_keyset', 'live_keyset_pk_matrix', 'live_mysql_bit', 'live_mysql_spatial', 'live_mysql_objects', 'live_generated_columns', 'live_mysql_triggers', 'live_cross_engine_types', 'live_dump_cross_engine', 'live_schema_fidelity', 'live_schema_compare', 'live_upgrade_analyze', 'live_upgrade_fix', 'live_catalog',
                 'live_import_policy', 'live_foreign_key_actions', 'live_export_contract',
                 'live_fault_injection', 'live_safe_restore', 'live_backup_lifecycle', 'live_real_schema',
                 # The same import suites again against a MySQL 8.0 server on port 3307.
-                'live_import_policy', 'live_real_schema', 'live_mysql_objects', 'live_generated_columns']
+                'live_import_policy', 'live_real_schema', 'live_mysql_objects', 'live_generated_columns', 'live_mysql_triggers']
     assert re.findall(r'--test ([a-z_]+)', commands) == fixtures
     assert 'mysql:8.0' in commands and 'TF_MYSQL_PORT' in str(job['steps'])
     assert 'cargo test --manifest-path migration_core/Cargo.toml' in commands

@@ -9,6 +9,13 @@ from unittest.mock import patch, MagicMock
 class TestRustDumpChecker:
     """RustDumpChecker 클래스 테스트"""
 
+    def test_export_completion_reports_held_trigger_count(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+        facade = MagicMock()
+        facade.run_dump.return_value = {"success": True, "tables": 1, "rows_dumped": 2, "triggers": 3}
+        ok, message = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).export_full_schema("app", str(tmp_path))
+        assert ok and "트리거 3개" in message
+
     def test_export_surfaces_manifest_warnings(self, tmp_path):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
 
@@ -1044,15 +1051,16 @@ class TestRustDumpImporter:
         )
         return str(dump_dir)
 
+    @pytest.mark.parametrize("skip_triggers", [False, True])
     @pytest.mark.parametrize("import_mode", ["replace", "safe"])
-    def test_preview_payload_is_import_payload_without_mode(self, tmp_path, import_mode):
+    def test_preview_payload_is_import_payload_without_mode(self, tmp_path, import_mode, skip_triggers):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
 
         dump_dir = self._write_dump(tmp_path)
         facade = self._preview_facade(["dump.import", "dump.import_preview"])
         importer = RustDumpImporter(RustDumpConfig('localhost', 3306, 'root', 'password'), facade=facade)
         options = dict(target_schema="other", threads=4, timezone_sql="SET SESSION time_zone = '+09:00'",
-                       use_source_timezone=False)
+                       use_source_timezone=False, skip_triggers=skip_triggers)
 
         ok, message, preview = importer.preview_import(dump_dir, **options)
         importer.import_dump(dump_dir, import_mode=import_mode, **options)
@@ -1062,6 +1070,7 @@ class TestRustDumpImporter:
         assert "mode" not in facade.preview_payload
         assert facade.preview_payload == {key: value for key, value in facade.import_payload.items() if key != "mode"}
         assert facade.preview_payload["target"]["database"] == "other"
+        assert facade.import_payload.get("skip_triggers", False) is skip_triggers
 
     def test_preview_refused_without_core_capability(self, tmp_path):
         """A core built before the preview would not know the command; nothing is sent to it."""
@@ -1942,5 +1951,33 @@ def test_generated_refusal_reason_has_plain_korean_and_english():
     try:
         english = describe_export_refusal([object_id], {object_id: "generated_column_unproven"})[0]
         assert "Could not safely decode generated column total" in english
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("skipped", ["programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"])
+def test_import_reports_each_skipped_trigger_and_created_count(tmp_path, skipped):
+    from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter, CORE_CODE_SENTENCES
+    folder = tmp_path / "programs"
+    folder.mkdir()
+    (folder / "_tunnelforge_dump.json").write_text(json.dumps({"database": "app", "source_engine": "mysql", "tables": [{"name": "sample"}]}), encoding="utf-8")
+    facade = MagicMock()
+    facade.import_dump.return_value = {"success": True, "rows_imported": 1, "programs_imported": [{"name": "created"}],
+                                       skipped: ["trigger:sample:guard", "trigger:other:audit"]}
+    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace")
+    assert ok and "트리거 1개" in message
+    assert CORE_CODE_SENTENCES[skipped] in message and "sample:guard" in message and "other:audit" in message
+
+
+def test_trigger_refusal_reason_names_the_object_and_has_english_translation():
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+    object_id = "trigger:orders:guard"
+    line = describe_export_refusal([object_id], {object_id:"trigger_body_unproven"})[0]
+    assert "orders" in line and "guard" in line and "원본 정의와 일치" in line
+    i18n.set_language("en")
+    try:
+        line = describe_export_refusal([object_id], {object_id:"trigger_body_unproven"})[0]
+        assert "guard" in line and "Could not match" in line
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)

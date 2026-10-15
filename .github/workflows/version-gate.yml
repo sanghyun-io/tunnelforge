@@ -136,6 +136,7 @@ jobs:
             --test live_mysql_spatial \
             --test live_mysql_objects \
             --test live_generated_columns \
+            --test live_mysql_triggers \
             --test live_cross_engine_types \
             --test live_dump_cross_engine \
             --test live_schema_fidelity \
@@ -175,6 +176,7 @@ jobs:
             --test live_real_schema \
             --test live_mysql_objects \
             --test live_generated_columns \
+            --test live_mysql_triggers \
             -- --include-ignored --test-threads=1
 
       - name: Remove MySQL 8.0 server

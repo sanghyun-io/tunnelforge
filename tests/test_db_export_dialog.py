@@ -1281,7 +1281,7 @@ def test_lossy_refusal_window_names_the_table_and_has_only_close(monkeypatch):
     assert "• 테이블 orders: 계산 열 total의 정의를 덤프에 담을 수 없습니다" in snapshot["text"]
     assert snapshot["text"].rstrip().endswith(
         "목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다. "
-        "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."), "a full export says what unchecking costs"
+        "일부 테이블만 내보낼 때는 선택한 테이블과 트리거를 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."), "a full export says what unchecking costs"
     assert "그 밖에" not in snapshot["text"]
     assert "generated_column" not in snapshot["text"]
     assert set(snapshot["buttons"]) == {"export_refusal_close", "export_refusal_details"}
@@ -1576,7 +1576,7 @@ def test_export_sends_exact_checked_list(monkeypatch, tmp_path):
     try:
         _uncheck(dialog, "items", "logs")
         assert not dialog.lbl_partial_note.isHidden()
-        assert dialog.lbl_partial_note.text() == "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
+        assert dialog.lbl_partial_note.text() == "일부 테이블만 내보낼 때는 선택한 테이블과 트리거를 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
         dialog.do_export()
         (worker,) = _CapturingWorker.created
         assert worker.task_type == "export_tables"

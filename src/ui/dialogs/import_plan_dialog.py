@@ -65,7 +65,7 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         return f"{item.get('child')}.{item.get('constraint')} → {item.get('parent')}"
 
     for template, names in (
-        ("교체하면 사라지는 트리거: {}" if verify else "덮어쓰면 사라지는 트리거: {}",
+        ("덤프에서 다시 만들지 않아 사라지는 트리거: {}",
          [f"{item.get('table')}.{item.get('name')}" for item in _dicts(preview.get("triggers_dropped"))]),
         ("이 계정으로 지우지 못할 수 있는 뷰(다른 계정이 만듦): {}",
          [f"{item.get('name')} ({item.get('definer')})" for item in _dicts(views.get("may_not_replace"))]),
@@ -79,7 +79,10 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
             data_warnings.append(_line(template, names))
     for code in dict.fromkeys(str(item.get("code") or "") for item in _dicts(preview.get("warnings"))):
         sentence = describe_core_code(code) or translate_text(CORE_CODE_SENTENCES["source_dump_warning"])
-        if code == "unsynchronized_snapshot":
+        if code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced"):
+            names = _strings(preview.get(code)) or [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
+            data_warnings.append(f"- {sentence} " + sanitize_local_diagnostic(", ".join(names)))
+        elif code == "unsynchronized_snapshot":
             if preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:
                 data_warnings.append(f"- {sentence}")
         elif code == "legacy_timezone":
@@ -94,6 +97,15 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         else:
             notes.append(f"- {sentence}")
 
+    for code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced"):
+        if any(item.get("code") == code for item in _dicts(preview.get("warnings"))):
+            continue
+        names = _strings(preview.get(code))
+        if code == "program_definer_replaced":
+            names = [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
+        if names:
+            data_warnings.append("- " + describe_core_code(code) + " " + sanitize_local_diagnostic(", ".join(names)))
+
     details = []
     children = [f"{item.get('table')}.{item.get('constraint')} → {item.get('parent')}" for item in _dicts(preview.get("kept_children"))]
     if children:
@@ -101,6 +113,9 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
     replace_views, create_views = _strings(views.get("replace")), _strings(views.get("create"))
     if replace_views or create_views:
         details.append("- " + translate_text("교체할 뷰 {}개, 새로 만들 뷰 {}개").format(len(replace_views), len(create_views)))
+    programs = preview.get("programs") if isinstance(preview.get("programs"), dict) else {}
+    if programs.get("create"):
+        details.append(_line("만들 트리거: {}", _strings(programs.get("create"))))
     for key in ("blockers", "copy_blockers", "warnings"):
         items = preview.get(key) if isinstance(preview.get(key), list) else []
         details += [sanitize_local_diagnostic(f"{item.get('code')}: {item.get('detail')}" if isinstance(item, dict) else str(item))

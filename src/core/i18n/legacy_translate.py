@@ -17,6 +17,29 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "저장 프로시저·예약 이벤트나 정의를 확인하지 못한 트리거처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다.": "Export without asking by leaving out procedures, scheduled events, unproven triggers and non-InnoDB tables (such as MyISAM). Non-InnoDB tables are omitted entirely, including their definitions and rows. The result is not a complete backup. Objects whose omission changes a table definition, such as generated columns and CHECK constraints, cannot be left out.",
+    "만들 트리거: {}": "Triggers to create: {}",
+
+    "트리거를 다시 만들지 못한 테이블: {}": "Tables whose triggers were not recreated: {}",
+    "데이터를 넣은 뒤 트리거를 만들다가 멈췄습니다. Import 보고서에서 트리거가 복원되지 않은 테이블을 확인하세요.": "Trigger creation stopped after loading data. Check the Import report for tables whose triggers were not restored.",
+    "트리거 {}의 본문이 원본 정의와 일치하는지 확인하지 못했습니다. SHOW CREATE TRIGGER와 ACTION_STATEMENT를 확인하세요.": "Could not match trigger {} body to the original definition. Check SHOW CREATE TRIGGER and ACTION_STATEMENT.",
+    "저장 프로그램 {}의 종류, 실행 시점, 이벤트 또는 세션 설정을 안전하게 확인하지 못했습니다.": "Could not safely validate the kind, timing, event or session settings of stored program {}.",
+    "저장 프로그램 {}의 문자셋으로 본문을 안전하게 복원할 수 없습니다. UTF-8로 다시 내보내세요.": "Cannot safely restore stored program {} in its character set. Export again using UTF-8.",
+    "같은 이름의 트리거가 교체하지 않는 대상 테이블에 있습니다. 이름을 바꾼 뒤 다시 가져오세요.": "A trigger with the same name exists on a target table outside the replacement. Rename it before importing.",
+    "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다.": "Creating triggers requires log_bin_trust_function_creators=1 or SUPER privilege.",
+    "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.": "This account lacks the TRIGGER privilege to create triggers.",
+    "트리거를 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.": "The trigger could not be created, so import did not start. Target tables were unchanged.",
+    "트리거 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.": "A trigger body references the source database name. Import into the same database name or remove the qualifier from the definition.",
+    "트리거가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 고급 설정의 '먼저 복사본에서 검증하고 교체'를 끄세요.": "A dump containing triggers cannot yet be verified in a copy. Turn off 'Verify in a copy before replacing' in Advanced settings.",
+    "다른 DB 종류로 가져오므로 덤프의 트리거를 만들지 않습니다.": "Dump triggers will not be created when importing into a different database engine.",
+    "선택하지 않은 테이블의 트리거는 만들지 않습니다.": "Triggers of unselected tables will not be created.",
+    "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.": "Dump triggers will not be created because 'Import tables without triggers' is enabled.",
+    "트리거 정의자가 가져오는 계정으로 바뀝니다.": "The importing account will become the trigger definer.",
+    "대상 DB의 기본 정렬 규칙이 트리거 원본과 다릅니다.": "The target database default collation differs from the trigger source.",
+    "트리거 없이 테이블만 가져오기": "Import tables without triggers",
+    "덤프에서 다시 만들지 않아 사라지는 트리거: {}": "Triggers that will disappear because the dump does not recreate them: {}",
+    "일부 테이블만 내보낼 때는 선택한 테이블과 트리거를 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.": "A partial export includes selected tables and their triggers. Views, procedures, functions and events are left out.",
+
     "계산 열 {}의 정의를 안전하게 보존할 수 있는지 확인하지 못했습니다": "Could not verify that generated column {} can be preserved safely",
     "계산 열 {}의 식을 안전하게 해석하고 원본 테이블 정의와 일치하는지 확인하지 못했습니다. 원본의 SHOW CREATE TABLE 정의와 생성식을 확인하세요.": "Could not safely decode generated column {} and match its expression to the original table definition. Check SHOW CREATE TABLE and the generation expression in the source.",
     "지원 제외 객체 {}개를 사전 점검 대상으로 저장했습니다.": "Saved {} unsupported objects for preflight.",

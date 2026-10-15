@@ -71,7 +71,8 @@ def _capture_import_audit(audit: dict, event: dict):
             if isinstance(event.get(key), str):
                 audit[key] = event[key]
         for key in ("dropped_tables", "dropped_not_restored_tables", "unattempted_tables", "dropped_foreign_keys",
-                    "restored_foreign_keys"):
+                    "restored_foreign_keys", "triggers_created", "tables_lost_triggers", "programs_skipped_toggle",
+                    "programs_skipped_partial", "programs_skipped_cross_engine"):
             if isinstance(event.get(key), list):
                 audit[key] = event[key]
         target = event.get("target")
@@ -108,6 +109,9 @@ def _replace_failure_details(audit: dict) -> str:
     kept = [name for name in audit.get("unattempted_tables") or [] if isinstance(name, str)]
     if lost:
         lines.append(translate_text("삭제 후 복원되지 않은 테이블: {}").format(_names_preview(lost)))
+    trigger_losses = [name for name in audit.get("tables_lost_triggers") or [] if isinstance(name, str)]
+    if trigger_losses:
+        lines.append(translate_text("트리거를 다시 만들지 못한 테이블: {}").format(_names_preview(trigger_losses)))
     if kept and (audit.get("created_namespace") or audit.get("namespace_outcome_unknown")):
         # The target did not exist before this import, so these tables had no original data.
         lines.append(translate_text("아직 만들지 않은 테이블: {}").format(_names_preview(kept)))
@@ -675,6 +679,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         panel_layout.addWidget(self.chk_verify_copy)
         panel_layout.addWidget(self.lbl_verify_note)
 
+        self.chk_skip_triggers = QCheckBox("트리거 없이 테이블만 가져오기")
+        self.chk_skip_triggers.setChecked(False)
+        self.chk_skip_triggers.toggled.connect(self._update_advanced_summary)
+        panel_layout.addWidget(self.chk_skip_triggers)
+
         timezone_line = QHBoxLayout()
         self.chk_timezone = QCheckBox("시간대 직접 정하기")
         self.chk_timezone.toggled.connect(self._on_timezone_toggled)
@@ -1008,6 +1017,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _advanced_summary(self) -> str:
         """Every toggle that is on or forced, in one line."""
         items = []
+        if self.chk_skip_triggers.isChecked():
+            items.append(translate_text("트리거 없이 테이블만 가져오기"))
         if self._uses_other_name():
             word = _engine_word(build_rust_dump_config(self.connector).engine)
             name = self.combo_target_schema.currentText().strip()
@@ -1278,6 +1289,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             "other_name": name if other else "",
             "verify": verify,
             "import_mode": "safe" if verify else "replace",
+            "skip_triggers": self.chk_skip_triggers.isChecked(),
             "threads": self.spin_threads.value(),
             # 대상 서버 기본값 turns the dump's own timezone off; the other two choices set one.
             "timezone_sql": resolve_timezone_sql(engine, timezone) if timezone else None,
@@ -1289,7 +1301,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _worker_options(request: dict) -> dict:
         """The payload the preview and the import share; the import adds its mode."""
         return {key: request[key] for key in ("input_dir", "threads", "timezone_sql", "use_source_timezone")} | {
-            "target_schema": request["namespace"]}
+            "target_schema": request["namespace"], "skip_triggers": request.get("skip_triggers", False)}
 
     def do_import(self):
         """Check the input, ask the core what the run would do, confirm when needed, then import."""

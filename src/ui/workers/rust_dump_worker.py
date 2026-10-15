@@ -205,6 +205,7 @@ class RustDumpWorker(QThread):
             metadata_callback=self._on_metadata,
             table_chunk_progress_callback=self._on_table_chunk_progress,
             use_source_timezone=self.kwargs.get('use_source_timezone', True),
+            skip_triggers=self.kwargs.get('skip_triggers', False),
         )
         self.error_code = getattr(importer, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)
@@ -221,6 +222,7 @@ class RustDumpWorker(QThread):
             self.kwargs.get('threads', 8),
             self.kwargs.get('timezone_sql'),
             use_source_timezone=self.kwargs.get('use_source_timezone', True),
+            skip_triggers=self.kwargs.get('skip_triggers', False),
         )
         self.error_code = getattr(importer, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)

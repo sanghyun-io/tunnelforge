@@ -1,6 +1,7 @@
 //! `dump.import_preview`: what a replace import of this dump would do to the target. Read-only: it
 //! writes no report or journal, creates no probe tables and never reads chunk data.
 use crate::*;
+use crate::mysql_programs::*;
 use mysql::prelude::Queryable;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -45,7 +46,7 @@ struct DumpFindings {
     copy_blockers: Vec<Value>,
 }
 
-fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &str, strict: bool) -> Result<DumpFindings, String> {
+fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &str, strict: bool, target_schema: &str, skip_triggers: bool) -> Result<DumpFindings, String> {
     let (data_format, compression) = super::supported_dump_format(manifest)?;
     let mut blockers = Vec::new();
     let mut warnings = super::coded_source_dump_warnings(manifest).into_iter()
@@ -53,10 +54,10 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     if let Err(err) = super::check_mysql_spatial_import(manifest, selected, engine) {
         blockers.push(issue("spatial_unsupported", None, err));
     }
-    match super::import_table_ddls(manifest, selected, engine) {
+    match super::import_table_ddls(manifest, selected, engine, target_schema, skip_triggers) {
         Ok((_, untranslatable)) => blockers.extend(untranslatable.into_iter()
             .map(|(table, reason)| issue("untranslatable_table", Some(table.as_str()), reason))),
-        Err(err) => blockers.push(issue("dump_invalid", None, err)),
+        Err(err) => blockers.push(issue(if err.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else { "dump_invalid" }, None, err)),
     }
     let tables = manifest.tables.iter()
         .filter(|table| selected.is_empty() || selected.contains(&table.name)).cloned().collect::<Vec<_>>();
@@ -82,13 +83,28 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let engine = endpoint.engine.as_str();
     let selected: BTreeSet<String> = string_list(request.payload.get("tables")).into_iter().collect();
     let strict = request.payload.get("strict_manifest").and_then(Value::as_bool).unwrap_or(true);
-    let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict)?;
+    let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
+    let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict, &endpoint_schema(endpoint), skip_triggers)?;
     // A timezone the import would refuse is a bad request, not a property of the target.
     super::import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), engine)?;
     let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
     let import_schema = NormalizedSchema {
         tables: manifest.schema.tables.iter().filter(|table| names.contains(&table.name)).cloned().collect(),
     };
+    let mut programs = Vec::new();
+    let mut skipped_cross_engine = Vec::new();
+    let mut skipped_partial = Vec::new();
+    let mut skipped_toggle = Vec::new();
+    for p in &manifest.stored_programs {
+        let id = program_id(p);
+        if engine != "mysql" { skipped_cross_engine.push(id); }
+        else if p.table.as_ref().is_some_and(|t| !names.contains(t)) { skipped_partial.push(id); }
+        else if skip_triggers { skipped_toggle.push(id); }
+        else { programs.push(p); }
+    }
+    for (code, skipped) in [("programs_skipped_cross_engine", &skipped_cross_engine), ("programs_skipped_partial", &skipped_partial), ("programs_skipped_toggle", &skipped_toggle)] {
+        if !skipped.is_empty() { warnings.push(warning(code, skipped.join(", "))); }
+    }
     // Only a whole same-engine import replaces views (finalize_dump_import).
     let dump_views = if selected.is_empty() && manifest.source_engine == engine {
         manifest.views.iter().map(|view| view.name.clone()).collect::<Vec<_>>()
@@ -100,6 +116,23 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let mut admin = super::safe_restore::maintenance_connection(endpoint)?;
     let exists = super::safe_restore::target_namespace_exists(&mut admin, endpoint)?;
     let can_create = if exists { None } else { can_create_namespace(&mut admin, endpoint)? };
+    if let LiveAdapter::MySql(conn) = &mut admin {
+        if !programs.is_empty() {
+            let (log_bin, trusted): (bool, bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators")
+                .map_err(|err| format!("trigger binlog inspection failed: {err}"))?.ok_or("trigger binlog variables unreadable")?;
+            if trigger_binlog_blocked(log_bin, trusted, mysql_grants_allow(conn, "SUPER", None)) {
+                blockers.push(issue("trigger_binlog_privilege", None, "log_bin_trust_function_creators=1 or SUPER is required"));
+            }
+            if mysql_grants_allow(conn, "TRIGGER", Some(&endpoint.database)) == Some(false) {
+                blockers.push(issue("trigger_privilege_missing", None, "TRIGGER privilege is required"));
+            }
+            let current: Option<String> = conn.query_first("SELECT CURRENT_USER()")
+                .map_err(|err| format!("current account inspection failed: {err}"))?;
+            let changed = programs.iter().filter(|p| p.definer != current).map(|p| format!("{} ({} -> {})", p.name,
+                p.definer.as_deref().unwrap_or("?"), current.as_deref().unwrap_or("?"))).collect::<Vec<_>>();
+            if !changed.is_empty() { warnings.push(warning("program_definer_replaced", changed.join(", "))); }
+        }
+    }
     // A cross-engine dump is already refused as a whole.
     if exists && manifest.source_engine == engine {
         // Only verify-in-copy needs these checks, so a failed one does not fail the preview.
@@ -134,11 +167,15 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let replaced = replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
     let untouched = target.tables.iter().filter(|(name, partition)| !partition && !dumped.contains(&key(name)))
         .map(|(name, _)| name.clone()).collect::<Vec<_>>();
-    let triggers_dropped = target.triggers.iter().filter(|(table, _)| replaced.contains(&key(table)))
+    let triggers_dropped = target.triggers.iter().filter(|(table, name)| replaced.contains(&key(table))
+        && !programs.iter().any(|p| p.name.eq_ignore_ascii_case(name) && p.table.as_ref().is_some_and(|t| key(t)==key(table))))
         .map(|(table, name)| json!({"table": table, "name": name})).collect::<Vec<_>>();
     let target_views = target.views.iter().map(|(name, _)| key(name)).collect::<BTreeSet<_>>();
     let (views_replace, views_create): (Vec<String>, Vec<String>) = dump_views.into_iter().partition(|name| target_views.contains(&key(name)));
     let replaced_views = views_replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
+    for conflict in trigger_name_conflicts(&target.triggers, &programs, &names.iter().cloned().collect(), fold) {
+        blockers.push(issue("trigger_name_conflict", None, conflict));
+    }
 
     let mut external_parents = Vec::new();
     for table in &import_schema.tables {
@@ -221,6 +258,9 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         "kept_children": kept_children, "external_parents": external_parents,
         "views": {"replace": views_replace, "create": views_create, "may_not_replace": may_not_replace, "may_break": may_break},
         "triggers_dropped": triggers_dropped, "blockers": blockers, "warnings": warnings,
+        "programs": {"create":programs.iter().map(|p| program_id(p)).collect::<Vec<_>>()},
+        "programs_skipped_cross_engine": skipped_cross_engine, "programs_skipped_partial": skipped_partial,
+        "programs_skipped_toggle": skipped_toggle,
         "strict_export": manifest.strict_export, "snapshot_policy": manifest.snapshot_policy,
         "source_timezone": manifest.source_timezone, "copy_blockers": copy_blockers,
     }))
@@ -489,7 +529,7 @@ mod tests {
 
     fn findings(manifest: &DumpManifest, selected: &[&str], engine: &str, strict: bool) -> DumpFindings {
         let selected = selected.iter().map(|name| name.to_string()).collect();
-        dump_findings(manifest, &selected, engine, strict).unwrap()
+        dump_findings(manifest, &selected, engine, strict, "app", false).unwrap()
     }
 
     #[test]

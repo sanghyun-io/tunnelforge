@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use mysql::{prelude::Queryable, LocalInfileHandler};
 use crate::*;
+use crate::mysql_programs::*;
 
 #[path = "safe_restore.rs"]
 pub(crate) mod safe_restore;
@@ -47,8 +48,10 @@ fn validate_import_metadata(
     manifest: &DumpManifest,
     selected: &BTreeSet<String>,
     target_engine: &str,
+    target_schema: &str,
+    skip_triggers: bool,
 ) -> Result<BTreeMap<String, String>, String> {
-    let (ddls, untranslatable) = import_table_ddls(manifest, selected, target_engine)?;
+    let (ddls, untranslatable) = import_table_ddls(manifest, selected, target_engine, target_schema, skip_triggers)?;
     if !untranslatable.is_empty() {
         let reasons = untranslatable.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>();
         return Err(classified_import_error("export_invalid",
@@ -62,8 +65,27 @@ fn import_table_ddls(
     manifest: &DumpManifest,
     selected: &BTreeSet<String>,
     target_engine: &str,
+    target_schema: &str,
+    skip_triggers: bool,
 ) -> Result<(BTreeMap<String, String>, Vec<(String, String)>), String> {
     let invalid = |message: String| classified_import_error("export_invalid", &message, None);
+    let mut program_names = BTreeSet::new();
+    let mut program_orders = BTreeSet::new();
+    for p in &manifest.stored_programs {
+        if manifest.source_engine != "mysql" { return Err(invalid("stored programs require a MySQL source".into())) }
+        validate_trigger(p).map_err(invalid)?;
+        if target_engine == "mysql" && !skip_triggers
+            && (selected.is_empty() || p.table.as_ref().is_some_and(|t| selected.contains(t)))
+            && manifest.source_schema.as_deref().unwrap_or(&manifest.database) != target_schema
+            && references_source_schema(&p.definition, manifest.source_schema.as_deref().unwrap_or(&manifest.database)) {
+            return Err(classified_import_error("program_source_schema_reference", &format!("{} references the source database; import into the same database name or remove the qualifier from the definition", p.name), p.table.as_deref()));
+        }
+        if !manifest.tables.iter().any(|t| Some(&t.name) == p.table.as_ref())
+            || !program_names.insert(p.name.to_lowercase())
+            || !program_orders.insert((&p.table, &p.timing, &p.event, p.action_order)) {
+            return Err(invalid(format!("invalid or duplicate trigger {}", p.name)));
+        }
+    }
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
     for table in &manifest.tables {
@@ -195,6 +217,12 @@ fn manifest_warning_code(warning: &str) -> &'static str {
 }
 
 struct ImportJournal {
+    triggers_created: Vec<Value>,
+    trigger_tables: BTreeSet<String>,
+    triggers_completed_tables: BTreeSet<String>,
+    program_warnings: Vec<Value>,
+    programs_failed: Vec<Value>,
+    programs_skipped: BTreeMap<String, Vec<String>>,
     /// This attempt's own report file in the dump folder.
     report_path: std::path::PathBuf,
     target: Value,
@@ -228,6 +256,11 @@ impl ImportJournal {
             "dropped_not_restored_tables": self.dropped.iter().filter(|name| !self.loaded.contains(*name)).collect::<Vec<_>>(),
             "dropped_foreign_keys": self.dropped_foreign_keys,
             "restored_foreign_keys": self.restored_foreign_keys,
+            "triggers_created": self.triggers_created,
+            "tables_lost_triggers": self.dropped.iter().filter(|t| self.trigger_tables.contains(*t)
+                && !self.triggers_completed_tables.contains(*t)).collect::<Vec<_>>(),
+            "program_warnings": self.program_warnings,
+            "programs_failed": self.programs_failed,
             "failed_tables": failed, "unattempted_tables": unattempted,
             "pending_drop_table": self.pending_drop,
             "drop_outcome_unknown": self.pending_drop.is_some(),
@@ -241,6 +274,7 @@ impl ImportJournal {
             "partial_data_may_exist": self.current_table.is_some() && self.phase == "dump_import_data",
             "updated_unix_seconds": current_unix_seconds(),
         });
+        for (key, value) in &self.programs_skipped { report[key] = json!(value); }
         if let Some(context) = &self.safe_context {
             for (key, value) in context.as_object().into_iter().flatten() { report[key] = value.clone(); }
             report["mode"] = json!("safe");
@@ -277,6 +311,8 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
     let mode = request.payload.get("mode").or_else(|| request.payload.get("import_mode"))
         .and_then(Value::as_str).unwrap_or("replace");
     let mut journal = ImportJournal {
+        triggers_created: Vec::new(), trigger_tables: BTreeSet::new(), triggers_completed_tables: BTreeSet::new(), program_warnings: Vec::new(),
+        programs_failed: Vec::new(), programs_skipped: BTreeMap::new(),
         report_path: match report_path { Some(path) => path, None => new_dump_import_report_path(Path::new(input_dir))? },
         target: json!({"engine": endpoint.engine, "host": endpoint.host, "port": endpoint.port,
             "database": endpoint.database, "schema": endpoint_schema(&endpoint)}),
@@ -301,7 +337,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
     let mut report = match &result {
         Ok(result) => {
             let mut report = journal.report(result["status"].as_str().unwrap_or("completed"), None);
-            for key in ["success", "status", "data_imported", "message", "mode", "tables", "rows_imported", "chunks_imported", "imported_rows_by_table", "verification", "views_imported", "views_failed", "views_skipped_cross_engine"] {
+            for key in ["success", "status", "data_imported", "message", "mode", "tables", "rows_imported", "chunks_imported", "imported_rows_by_table", "verification", "views_imported", "views_failed", "views_skipped_cross_engine", "programs_imported", "programs_failed", "programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_warnings"] {
                 if let Some(value) = result.get(key) { report[key] = value.clone(); }
             }
             report["post_load_completed"] = result["success"].clone();
@@ -321,7 +357,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
     }
     let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
     for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed",
-        "namespace_creation_outcome_unknown", "namespace_created", "target"] {
+        "namespace_creation_outcome_unknown", "namespace_created", "target", "triggers_created", "tables_lost_triggers", "program_warnings", "programs_failed", "programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"] {
         summary[key] = report[key].clone();
     }
     emit(summary);
@@ -360,7 +396,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     let mysql_local_infile_policy = mysql_local_infile_policy_from_payload(&request.payload)?;
     let timezone_sql = import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), &endpoint.engine)?;
     check_mysql_spatial_import(&manifest, &selected, &endpoint.engine)?;
-    let table_ddls = validate_import_metadata(&manifest, &selected, &endpoint.engine)?;
+    let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
+    let table_ddls = validate_import_metadata(&manifest, &selected, &endpoint.engine, &endpoint_schema(&endpoint), skip_triggers)?;
     let tables: Vec<DumpTableManifest> = manifest
         .tables
         .iter()
@@ -382,6 +419,12 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     }
     let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
     journal.planned = tables.iter().map(|table| table.name.clone()).collect();
+    for p in &manifest.stored_programs {
+        let code = if endpoint.engine != "mysql" { Some("programs_skipped_cross_engine") }
+            else if p.table.as_ref().is_some_and(|t| !journal.planned.contains(t)) { Some("programs_skipped_partial") }
+            else if skip_triggers { Some("programs_skipped_toggle") } else { None };
+        if let Some(code) = code { journal.programs_skipped.entry(code.into()).or_default().push(program_id(p)); }
+    }
     journal.checkpoint()?;
     emit(json!({
         "event": "phase",
@@ -458,7 +501,21 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         let surviving = surviving_foreign_keys(&mut adapter, &target_schema, &import_schema)?;
         validate_target_check_names(&mut adapter, &target_schema, &import_schema)?;
         refuse_non_table_name_collisions(&mut adapter, &target_schema, &import_schema)?;
-        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, &surviving)?;
+        let planned_tables = tables.iter().map(|t| t.name.clone()).collect::<BTreeSet<_>>();
+        let programs = if endpoint.engine == "mysql" && !skip_triggers {
+            selected_triggers(&manifest.stored_programs, &planned_tables)
+        } else { Vec::new() };
+        if let LiveAdapter::MySql(conn) = &mut adapter {
+            let target = target_trigger_names(conn, &target_schema)?;
+            let conflicts = trigger_name_conflicts(&target, &programs, &planned_tables, mysql_folds_table_names(conn)?);
+            if !conflicts.is_empty() {
+                return Err(classified_import_error("trigger_name_conflict", &conflicts.join(", "), None));
+            }
+            journal.trigger_tables.extend(target.into_iter().filter(|(t, _)| planned_tables.contains(t)).map(|(t, _)| t));
+            journal.trigger_tables.extend(programs.iter().filter_map(|p| p.table.clone()));
+        }
+        let mut program_conn = if programs.is_empty() { None } else { Some(mysql_single_statement_conn(&endpoint)?) };
+        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, &surviving, &programs, program_conn.as_mut())?;
         journal.current_table = None;
         journal.phase = "dump_import_prepare".into();
         journal.checkpoint()?;
@@ -532,6 +589,20 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.phase = "dump_import_post_load".into();
             journal.checkpoint()?;
             complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
+            if let Some(conn) = program_conn.as_mut() {
+                journal.phase = "dump_import_triggers".into();
+                for p in programs.iter().filter(|p| p.table.as_deref() == Some(table.name.as_str())) {
+                    let warnings = create_trigger(conn, p, &p.name, &table.name).map_err(|err| {
+                        journal.programs_failed.push(json!({"table":table.name,"name":p.name,"error":err}));
+                        classified_import_error("program_create_failed", &err, Some(&table.name))
+                    })?;
+                    journal.triggers_created.push(json!({"table":table.name,"name":p.name}));
+                    journal.program_warnings.extend(warnings);
+                    journal.checkpoint()?;
+                }
+            }
+            // No dump trigger was omitted for this table (target-only triggers follow DROP TABLE).
+            if !skip_triggers { journal.triggers_completed_tables.insert(table.name.clone()); }
             journal.current_table = None;
             journal.checkpoint()?;
             emit(json!({
@@ -565,7 +636,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     journal.phase = "dump_import_post_load".into();
     journal.current_table = None;
     journal.checkpoint()?;
-    finalize_dump_import(
+    let mut result = finalize_dump_import(
         &mut adapter,
         &manifest,
         &tables,
@@ -583,7 +654,14 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             if let Some(phase) = event.get("phase").and_then(Value::as_str) { journal.phase = phase.into(); }
             emit(event);
         },
-    )
+    )?;
+    result["programs_imported"] = json!(journal.triggers_created);
+    result["programs_failed"] = json!(journal.programs_failed);
+    for key in ["programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"] {
+        result[key] = json!(journal.programs_skipped.get(key).cloned().unwrap_or_default());
+    }
+    result["program_warnings"] = json!(journal.program_warnings);
+    Ok(result)
 }
 
 /// Creates the target MySQL database or PostgreSQL schema when it is missing (a missing PostgreSQL
@@ -627,6 +705,7 @@ fn create_missing_target_namespace<F: FnMut(Value)>(
 fn probe_import_ddl(
     adapter: &mut LiveAdapter, schema: &NormalizedSchema, source_engine: &str, journal: &mut ImportJournal,
     surviving: &[SurvivingForeignKey],
+    programs: &[&NormalizedStoredProgram], mut program_conn: Option<&mut mysql::PooledConn>,
 ) -> Result<(), String> {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("cannot allocate DDL probe name: {err}"))?.as_nanos();
@@ -634,7 +713,15 @@ fn probe_import_ddl(
     let engine = adapter.engine();
     run_owned_ddl_probe(schema, source_engine, engine, surviving, &prefix,
         |table| { journal.current_table = Some(table.to_string()); journal.checkpoint() },
-        |sql| adapter.execute_sql(sql))
+        |sql| adapter.execute_sql(sql),
+        |table, probe| {
+            if let Some(conn) = program_conn.as_mut() {
+                for (index, p) in programs.iter().enumerate().filter(|(_, p)| p.table.as_deref() == Some(table)) {
+                    create_trigger(conn, p, &format!("{prefix}_t{index}"), probe)?;
+                }
+            }
+            Ok(())
+        })
 }
 
 /// A foreign key of a table the import keeps, referencing a table the import replaces.
@@ -694,6 +781,7 @@ fn run_owned_ddl_probe(
     schema: &NormalizedSchema, source_engine: &str, engine: &str, surviving: &[SurvivingForeignKey], prefix: &str,
     mut enter_table: impl FnMut(&str) -> Result<(), String>,
     mut execute: impl FnMut(&str) -> Result<(), String>,
+    mut probe_programs: impl FnMut(&str, &str) -> Result<(), String>,
 ) -> Result<(), String> {
     let probe_names = schema.tables.iter().enumerate()
         .map(|(index, table)| (table.name.as_str(), format!("{prefix}_{index}")))
@@ -746,6 +834,7 @@ fn run_owned_ddl_probe(
             for sql in secondary_index_ddl(&probe, engine) {
                 execute(&sql).map_err(|err| rejected("CREATE INDEX", &table.name, err))?;
             }
+            probe_programs(&table.name, &probe.name)?;
         }
         for table in &schema.tables {
             enter_table(&table.name)?;
@@ -2349,6 +2438,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn program_metadata_and_source_qualifiers_are_validated_before_selection_or_sql() {
+        let mut manifest: DumpManifest = serde_json::from_value(json!({
+            "format":"tunnelforge-dump", "format_version":7, "source_engine":"mysql", "database":"app", "source_schema":"app",
+            "schema":crate::adapters::test_support::schema(), "chunk_size":1,"created_unix_seconds":1,
+            "tables":[{"name":"users","path":"users","rows":0,"chunks":0}],
+            "stored_programs":[{"kind":"TRIGGER","name":"guard","table":"users","timing":"AFTER","event":"INSERT","action_order":1,
+                "definition":"INSERT INTO `app` . audit VALUES(NEW.id)","sql_mode":"","character_set_client":"utf8mb4","collation_connection":"utf8mb4_bin"}]
+        })).unwrap();
+        let all = BTreeSet::new();
+        let error = validate_import_metadata(&manifest,&all,"mysql","copy",false).unwrap_err();
+        assert!(error.starts_with("program_source_schema_reference:"),"{error}");
+        assert!(validate_import_metadata(&manifest,&all,"mysql","app",false).is_ok());
+        assert!(validate_import_metadata(&manifest,&all,"mysql","copy",true).is_ok());
+        assert!(validate_import_metadata(&manifest,&all,"postgresql","copy",false).is_ok());
+        for kind in ["FUNCTION","PROCEDURE","EVENT","TRIGGER; DROP TABLE users"] {
+            manifest.stored_programs[0].kind = kind.into();
+            assert!(validate_import_metadata(&manifest,&all,"mysql","app",true).unwrap_err().contains("program_definition_invalid"));
+        }
+        manifest.stored_programs[0].kind = "TRIGGER".into();
+        manifest.source_engine = "postgresql".into();
+        assert!(validate_import_metadata(&manifest,&all,"mysql","app",true).unwrap_err().contains("MySQL source"));
+    }
+
+    #[test]
+    fn trigger_probe_failure_cleans_owned_tables_before_returning_1419() {
+        let schema = crate::adapters::test_support::schema();
+        let mut statements = Vec::new();
+        let error = run_owned_ddl_probe(&schema,"mysql","mysql",&[],"p", |_| Ok(()),
+            |sql| { statements.push(sql.to_string()); Ok(()) },
+            |_,_| Err("trigger_binlog_privilege: log_bin_trust_function_creators=1 or SUPER".into())).unwrap_err();
+        assert!(error.starts_with("trigger_binlog_privilege:"));
+        assert_eq!(statements.last().unwrap(),"DROP TABLE IF EXISTS `p_0`");
+    }
+
+    #[test]
     fn load_data_skips_generated_fields_without_shifting_positions() {
         let table: NormalizedTable = serde_json::from_value(json!({"name":"t","columns":[
             {"name":"a","type":"int"}, {"name":"g","type":"int","generated":{"expression":"`a`+1","stored":true}},
@@ -2429,7 +2553,7 @@ mod tests {
             if sql.starts_with("CREATE TABLE `p_0`") {
                 Err("ERROR 3780: Referencing column 'c0' and referenced column 'id' in foreign key constraint 'p_s0' are incompatible.".into())
             } else { Ok(()) }
-        }).unwrap_err();
+        }, |_, _| Ok(())).unwrap_err();
         assert_eq!(statements[0], "CREATE TABLE `p_s0` (`c0` bigint unsigned NULL, CONSTRAINT `p_s0` FOREIGN KEY (`c0`) REFERENCES `p_0` (`id`))");
         assert!(err.starts_with("incompatible_surviving_fk:") && err.contains("orders.fk_user -> users") && err.contains("ERROR 3780"), "{err}");
         assert_eq!(statements.last().unwrap(), "DROP TABLE IF EXISTS `p_s0`");
@@ -2448,7 +2572,7 @@ mod tests {
             let result = run_owned_ddl_probe(&schema, "mysql", "mysql", &[], "p", |_| Ok(()), |sql| {
                 statements.push(sql.to_string());
                 if !fail.is_empty() && sql.contains(fail) { Err("denied".into()) } else { Ok(()) }
-            });
+            }, |_, _| Ok(()));
             (result, statements)
         };
 
@@ -2541,7 +2665,7 @@ mod tests {
             chunk_size: 100, created_unix_seconds: 1, views: vec![], tables: vec![entry("users"), entry("other")],
             stored_programs: Vec::new(),
         };
-        let err = validate_import_metadata(&manifest, &BTreeSet::new(), "postgresql").unwrap_err();
+        let err = validate_import_metadata(&manifest, &BTreeSet::new(), "postgresql", "public", false).unwrap_err();
         assert!(err.contains("2 tables cannot be created on postgresql"), "{err}");
         assert!(err.contains("ON UPDATE CURRENT_TIMESTAMP for users.name") && err.contains("other.name"), "{err}");
     }

@@ -492,7 +492,7 @@ or not at its default. There are no scope or snapshot choices.
   (`dump.run` without `tables`: tables plus views, routines and events); unchecking
   any table sends exactly the checked tables, and one line under the list says
   that views, stored procedures, functions and events are then left out
-  (`일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.`;
+  (`일부 테이블만 내보낼 때는 선택한 테이블과 트리거를 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.`;
   PostgreSQL leaves out "·이벤트"). A table the user unchecked that the FK toggle
   checks again as a parent keeps the run a table export, even when every box ends
   up checked. "다시 열기" from the job list with `scope: full` checks everything
@@ -610,10 +610,57 @@ that appears complete. PostgreSQL ALWAYS identities and custom/shared sequence
 semantics are also refused. Ordinary identity restoration uses `MAX(id)+1`, not
 the source's unused/deleted allocation gaps.
 
+### MySQL triggers (format 7, replace mode)
+
+The manifest's `stored_programs` holds each exported table's triggers. For a
+TRIGGER, `definition` is the exact `information_schema.TRIGGERS.ACTION_STATEMENT`
+suffix of `SHOW CREATE TRIGGER`'s named `SQL Original Statement` column. Capture
+fails closed if the body cannot be proven; refusal includes a per-object reason.
+Timing, event and positive ACTION_ORDER are structured fields, validated before
+SQL construction. Non-UTF-8 client charsets require an ASCII body and ASCII
+header identifiers, since the connection sends UTF-8 bytes. The exporter
+recaptures triggers at its MySQL DDL drift check and refuses a changed set or
+context. Only exported InnoDB tables' triggers survive scope filtering.
+
+Replace import loads data with no dump triggers installed, completes each table's
+indexes/FKs, then immediately creates that table's triggers in ACTION_ORDER.
+Thus INSERT/LOAD does not fire the triggers, and a failure on a later table leaves
+earlier tables protected. The import journal records `triggers_created`, each
+failed program, and `tables_lost_triggers` if a dropped table's triggers could not
+be restored. Replace remains non-atomic: the current table can be empty or lack
+its triggers after an error. A target-only trigger on a replaced table disappears
+with DROP TABLE; the plan lists those the dump will not recreate.
+
+CREATE uses rebuilt, quoted names and validated timing/event, with no DEFINER or
+FOLLOWS/PRECEDES. Each CREATE and its pre-change probe use a dedicated connection
+with CLIENT_MULTI_STATEMENTS disabled and the source sql_mode, client charset and
+connection collation. The importing account becomes the definer; changed definers
+are a must-see plan line. A changed database collation is reported, never altered.
+A dump contains executable trigger code and should come from a trusted source;
+the single-statement boundary prevents appended SQL chains, not a malicious body.
+
+Before replacement, owned table probes test every selected trigger's creation.
+A same-named trigger on an unselected target table blocks with
+`trigger_name_conflict`. A source-schema qualifier in a body blocks imports into
+a different schema with `program_source_schema_reference`; qualifiers are not
+rewritten. Preview checks TRIGGER grants, @@log_bin,
+@@log_bin_trust_function_creators and SUPER. Error 1419 is reported separately as
+`trigger_binlog_privilege`: set log_bin_trust_function_creators=1 or use an account
+with SUPER before retrying.
+
+Advanced **트리거 없이 테이블만 가져오기** is off by default and never persisted.
+It sends `skip_triggers=true` to preview and import, skips only the dump triggers,
+and reports every omitted trigger. Cross-engine imports and table-subset imports
+also report every skipped trigger. All three cases require seeing the plan even
+when no target table is overwritten. Verify-in-copy (including scheduled
+rehearsals) refuses a dump containing stored programs before making a copy with
+`dump_programs_unsupported_in_copy`, including when skip_triggers is set. Existing
+format 5/6 dumps without stored programs follow their previous paths.
+
 ### Object support table (Export)
 
-Only the scope below is officially supported; the format is not being extended to
-triggers, routines or events. Live-verified on MySQL 8.0.46 / 8.4.11 and
+Only the scope below is officially supported. MySQL triggers are preserved in
+format 7; routines and events remain outside the current reader/writer scope. Live-verified on MySQL 8.0.46 / 8.4.11 and
 PostgreSQL 13.23 / 18.4 (`live_export_contract`,
 `unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds`): the
 preserved core, triggers, routines, events, materialized views, MEMORY tables,
@@ -629,7 +676,7 @@ claimed.
 | INVISIBLE columns | Preserved with explicit read/load/INSERT column lists (format 6) | Refused before DROP on import/migration |
 | Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Refused before export; **not waivable** |
 | Unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
-| Triggers on an exported table | Refused before export; waivable | Same |
+| Triggers on an exported table | Preserved after body verification (format 7, replace mode) | Refused before export; waivable |
 | Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not part of a table subset, so a subset export neither refuses nor warns about them | Same (no events; materialized views apply) |
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
 
@@ -651,8 +698,8 @@ before DROP.
 
 Data chunks retain generated values. Import skips those fields in LOAD DATA and
 INSERT, so MySQL recalculates them. Format 6 readers preserve the expression,
-VIRTUAL/STORED kind, indexes and supported FKs. Dumps without generated or invisible
-columns retain the previous format version. Formats 1-5 remain readable.
+VIRTUAL/STORED kind, indexes and supported FKs. Dumps without generated/invisible
+columns or stored programs retain the previous format versions. Formats 1-6 remain readable.
 
 Import uses strict SQL mode. Rows originally accepted under a loose mode may fail
 when a STORED expression is recalculated (for example a truncated CAST). A replace
@@ -665,7 +712,8 @@ compare recalculated generated values with the values in the dump; safe mode doe
 Default behavior: when the selected scope contains any refused object, `dump.run`
 fails before the target directory or any dump file is created, with
 `error_code: "unsupported_objects"`, `objects` (one `kind:table:name` entry per
-object), `bypassable`, and a `reasons` map for unproven generated columns. Only the
+object), `bypassable`, and a `reasons` map for unproven generated columns and
+triggers. Only the
 waivable objects can be omitted, and only by
 the explicit choice "Export without these objects (incomplete)" (`allow_incomplete:
 true` in the `dump.run` payload; the dialog words the objects, up to 10 inline plus

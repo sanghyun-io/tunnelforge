@@ -282,7 +282,8 @@ pub struct DumpManifest {
     pub stored_programs: Vec<NormalizedStoredProgram>,
 }
 
-/// SHOW CREATE plus its creation context. `kind` is TRIGGER, PROCEDURE, FUNCTION,
+/// Definition plus its creation context. For TRIGGER, `definition` is the exact
+/// ACTION_STATEMENT suffix cross-checked against SHOW CREATE. `kind` is TRIGGER, PROCEDURE, FUNCTION,
 /// or EVENT. TRIGGER uses `table`, positive `action_order`, `timing` (BEFORE/AFTER)
 /// and `event` (INSERT/UPDATE/DELETE). EVENT uses `time_zone` and `status`
 /// (ENABLED/DISABLED/SLAVESIDE_DISABLED). Other kinds leave those fields absent.

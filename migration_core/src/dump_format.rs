@@ -13,18 +13,21 @@ use crate::*;
 /// 바이트 목표 기반 추정보다 실측에 가깝다고 보고 학습값을 신뢰한다.
 const LEARNED_PROFILE_LARGE_ROW_BYTES: u64 = 4_096;
 
-pub(crate) const MAX_SUPPORTED_DUMP_FORMAT_VERSION: u32 = 6;
+pub(crate) const MAX_SUPPORTED_DUMP_FORMAT_VERSION: u32 = 7;
 
 pub(crate) fn supported_manifest_version(manifest: &DumpManifest) -> bool {
     manifest.format == "tunnelforge-dump"
         && (1..=MAX_SUPPORTED_DUMP_FORMAT_VERSION).contains(&manifest.format_version)
 }
 
-/// Only captured schema objects are held. Program support is added by its reader PR.
-pub(crate) fn held_object_ids(schema: &NormalizedSchema, _programs: &[NormalizedStoredProgram]) -> BTreeSet<String> {
-    schema.tables.iter().flat_map(|table| table.columns.iter()
+/// Only captured schema objects are held.
+pub(crate) fn held_object_ids(schema: &NormalizedSchema, programs: &[NormalizedStoredProgram]) -> BTreeSet<String> {
+    let mut held: BTreeSet<String> = schema.tables.iter().flat_map(|table| table.columns.iter()
         .filter(|column| column.generated.is_some())
-        .map(|column| format!("generated_column:{}:{}", table.name, column.name))).collect()
+        .map(|column| format!("generated_column:{}:{}", table.name, column.name))).collect();
+    held.extend(programs.iter().filter(|p| crate::mysql_programs::validate_trigger(p).is_ok()
+        && schema.tables.iter().any(|t| Some(&t.name) == p.table.as_ref())).map(crate::mysql_programs::program_id));
+    held
 }
 
 pub fn table_dependency_order(schema: &NormalizedSchema) -> Vec<String> {
