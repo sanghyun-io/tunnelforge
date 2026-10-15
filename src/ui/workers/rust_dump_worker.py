@@ -3,10 +3,12 @@ import json
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.core.error_report_codes import classify_error_code
+from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
-    DEFAULT_DUMP_COMPRESSION, RustDumpConfig, RustDumpExporter, RustDumpImporter
+    DEFAULT_DUMP_COMPRESSION, RustDumpConfig, RustDumpExporter, RustDumpImporter, _shutdown_owned_facade
 )
 
+logger = get_logger(__name__)
 CANCELLED_MESSAGE = "작업이 취소되었습니다."
 
 
@@ -224,3 +226,29 @@ class RustDumpWorker(QThread):
         success, msg = self._is_cancelled_message(success, msg)
         self.preview_finished.emit(success, msg, {} if self._cancel_requested else preview)
         self.finished.emit(success, msg)
+
+
+class FkParentsWorker(QThread):
+    """Reads one schema's FK parents (a schema.inspect) on its own core, off the UI thread.
+
+    Large schemas take long to inspect; on the UI thread the Export table list froze on the first uncheck,
+    and on the shared core every other call would wait behind it."""
+    loaded = pyqtSignal(str, object)  # schema, {child: [(constraint, parent)]} or None when it could not be read
+
+    def __init__(self, config: RustDumpConfig, schema: str):
+        super().__init__()
+        self.config = config
+        self.schema = schema
+
+    def run(self):
+        exporter = None
+        deps = None
+        try:  # always answers, or the dialog would wait on the lookup forever
+            exporter = RustDumpExporter(self.config)
+            deps = exporter.fetch_fk_parents(self.schema)
+        except Exception as exc:
+            logger.warning("Export FK parent lookup failed: %s", exc)
+        finally:
+            if exporter is not None:
+                _shutdown_owned_facade(exporter.facade, exporter._owns_facade)
+        self.loaded.emit(self.schema, deps)

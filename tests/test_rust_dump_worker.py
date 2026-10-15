@@ -1,7 +1,34 @@
+from unittest.mock import MagicMock
+
 import pytest
 
 from src.exporters.rust_dump_exporter import RustDumpConfig
-from src.ui.workers.rust_dump_worker import CANCELLED_MESSAGE, RustDumpWorker
+from src.ui.workers.rust_dump_worker import CANCELLED_MESSAGE, FkParentsWorker, RustDumpWorker
+
+
+def test_fk_parents_worker_reads_on_its_own_core_and_always_answers(monkeypatch):
+    shutdowns = []
+
+    class FakeExporter:
+        def __init__(self, config):
+            if config == "no core":
+                raise RuntimeError("tunnelforge-core not found")
+            self.facade, self._owns_facade = MagicMock(), True
+            self.facade.client.shutdown.side_effect = lambda: shutdowns.append(config)
+
+        def fetch_fk_parents(self, schema):
+            if schema == "bad":
+                raise RuntimeError("core down")
+            return {"orders": [("fk_orders_customers", "customers")]}
+
+    monkeypatch.setattr("src.ui.workers.rust_dump_worker.RustDumpExporter", FakeExporter)
+    answers = []
+    for config, schema in (("cfg", "app"), ("cfg", "bad"), ("no core", "app")):
+        worker = FkParentsWorker(config, schema)
+        worker.loaded.connect(lambda schema, deps: answers.append((schema, deps)))
+        worker.run()
+    assert answers == [("app", {"orders": [("fk_orders_customers", "customers")]}), ("bad", None), ("app", None)]
+    assert shutdowns == ["cfg", "cfg"], "the core it started is shut down, even after a failure"
 
 
 @pytest.mark.parametrize(

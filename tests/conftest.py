@@ -11,6 +11,7 @@ if not os.environ.get("QT_QPA_PLATFORM"):  # 미설정/빈 값만 채운다
 import pytest
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -363,6 +364,45 @@ def isolate_workspace_store(tmp_path, monkeypatch):
     monkeypatch.setattr(sql_editor_workspace, "make_workspace_store",
                         lambda: workspace_store.WorkspaceStore(directory))
     yield
+
+
+class _NoFkLookup:
+    """Stands in for the Export dialog's FkParentsWorker: answers ``deps`` (no FK parents unless a test sets them
+    with the ``fk_parents`` fixture) at once, with no thread or core."""
+
+    deps: dict = {}
+
+    def __init__(self, config, schema):
+        self.schema = schema
+        self._loaded, self._finished = [], []
+        self.loaded = SimpleNamespace(connect=self._loaded.append)
+        self.finished = SimpleNamespace(connect=self._finished.append)
+
+    def start(self):
+        for slot in self._loaded:
+            slot(self.schema, dict(type(self).deps))
+        for slot in self._finished:
+            slot()
+
+    def wait(self):
+        return True
+
+
+@pytest.fixture(autouse=True)
+def isolate_export_fk_lookups(monkeypatch):
+    """The Export dialog reads FK parents on a background thread with its own core; tests never start one."""
+    from src.ui.dialogs import db_export_dialog
+
+    monkeypatch.setattr(db_export_dialog, "FkParentsWorker", _NoFkLookup)
+    yield
+
+
+@pytest.fixture
+def fk_parents(monkeypatch):
+    """What the Export dialog's FK lookups answer in this test: {child: [(constraint, parent)]}."""
+    answer = {}
+    monkeypatch.setattr(_NoFkLookup, "deps", answer)
+    return answer
 
 
 @pytest.fixture(autouse=True)
