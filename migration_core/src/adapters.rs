@@ -826,6 +826,14 @@ pub(crate) fn mysql_conn_raw(endpoint: &Endpoint) -> Result<mysql::PooledConn, m
     mysql::Pool::new(mysql_opts(endpoint))?.get_conn()
 }
 
+/// A connection without CLIENT_MULTI_STATEMENTS: the server refuses `a; b` chains, so a
+/// trigger/routine/event body (which has `;` inside BEGIN..END) runs only as the one CREATE sent.
+pub fn mysql_single_statement_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
+    mysql::Pool::new(mysql_opts(endpoint).multi_statements(false))
+        .and_then(|pool| pool.get_conn())
+        .map_err(|err| mysql_conn_error(endpoint, &err))
+}
+
 pub(crate) fn mysql_conn_error(endpoint: &Endpoint, err: &mysql::Error) -> String {
     let suffix = tls_error_suffix(classify_mysql_error(endpoint, err));
     format!("mysql connection error: {err}{suffix}")

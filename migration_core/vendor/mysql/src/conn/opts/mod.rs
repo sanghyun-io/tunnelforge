@@ -267,6 +267,9 @@ pub(crate) struct InnerOpts {
     /// by explicitly specifying it.
     max_allowed_packet: Option<usize>,
 
+    /// TunnelForge patch: ask for `CLIENT_MULTI_STATEMENTS` (defaults to `true`, upstream behaviour).
+    multi_statements: bool,
+
     /// For tests only
     #[cfg(test)]
     pub injected_socket: Option<String>,
@@ -305,6 +308,7 @@ impl Default for InnerOpts {
             connect_attrs: Some(HashMap::new()),
             secure_auth: true,
             enable_cleartext_plugin: false,
+            multi_statements: true,
             #[cfg(test)]
             injected_socket: None,
         }
@@ -569,6 +573,11 @@ impl Opts {
     /// ```
     pub fn get_enable_cleartext_plugin(&self) -> bool {
         self.0.enable_cleartext_plugin
+    }
+
+    /// TunnelForge patch: whether the handshake asks for `CLIENT_MULTI_STATEMENTS`.
+    pub fn get_multi_statements(&self) -> bool {
+        self.0.multi_statements
     }
 }
 
@@ -1140,6 +1149,14 @@ impl OptsBuilder {
     /// ```
     pub fn enable_cleartext_plugin(mut self, enable_cleartext_plugin: bool) -> Self {
         self.opts.0.enable_cleartext_plugin = enable_cleartext_plugin;
+        self
+    }
+
+    /// TunnelForge patch: `false` leaves `CLIENT_MULTI_STATEMENTS` out of the handshake, so the
+    /// server refuses a query that chains statements with `;`. `CLIENT_MULTI_RESULTS` stays on
+    /// (a `CALL` still returns its result sets).
+    pub fn multi_statements(mut self, multi_statements: bool) -> Self {
+        self.opts.0.multi_statements = multi_statements;
         self
     }
 }
