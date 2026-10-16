@@ -53,8 +53,11 @@ fn validate_import_metadata(
 ) -> Result<BTreeMap<String, String>, String> {
     let (ddls, untranslatable) = import_table_ddls(manifest, selected, target_engine, target_schema, skip_triggers)?;
     if !untranslatable.is_empty() {
+        let code = if untranslatable.iter().any(|(_, reason)| reason.starts_with("program_source_schema_reference:")) {
+            "program_source_schema_reference"
+        } else { "export_invalid" };
         let reasons = untranslatable.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>();
-        return Err(classified_import_error("export_invalid",
+        return Err(classified_import_error(code,
             &format!("{} tables cannot be created on {target_engine}: {}", reasons.len(), reasons.join("; ")), None));
     }
     Ok(ddls)
@@ -71,6 +74,7 @@ fn import_table_ddls(
     let invalid = |message: String| classified_import_error("export_invalid", &message, None);
     let mut program_names = BTreeSet::new();
     let mut program_orders = BTreeSet::new();
+    let mut untranslatable = Vec::new();
     for p in &manifest.stored_programs {
         if manifest.source_engine != "mysql" { return Err(invalid("stored programs require a MySQL source".into())) }
         validate_trigger(p).map_err(invalid)?;
@@ -78,7 +82,9 @@ fn import_table_ddls(
             && (selected.is_empty() || p.table.as_ref().is_some_and(|t| selected.contains(t)))
             && manifest.source_schema.as_deref().unwrap_or(&manifest.database) != target_schema
             && references_source_schema(&p.definition, manifest.source_schema.as_deref().unwrap_or(&manifest.database)) {
-            return Err(classified_import_error("program_source_schema_reference", &format!("{} references the source database; import into the same database name or remove the qualifier from the definition", p.name), p.table.as_deref()));
+            let object = format!("{}.{}", p.table.as_deref().unwrap(), p.name);
+            untranslatable.push((object.clone(), classified_import_error("program_source_schema_reference",
+                "trigger body references the source database; import into the same database name or remove the qualifier from the definition", Some(&object))));
         }
         if !manifest.tables.iter().any(|t| Some(&t.name) == p.table.as_ref())
             || !program_names.insert(p.name.to_lowercase())
@@ -121,7 +127,6 @@ fn import_table_ddls(
     }
     let mut ddls = BTreeMap::new();
     // Every table the target cannot take is reported at once, not one per attempt.
-    let mut untranslatable = Vec::new();
     for table in &manifest.tables {
         let definition = schema.get(table.name.as_str())
             .ok_or_else(|| invalid(format!("manifest schema missing table {}", table.name)))?;
@@ -231,6 +236,7 @@ struct ImportJournal {
     planned: Vec<String>,
     load_attempted: BTreeSet<String>,
     dropped: Vec<String>,
+    created: BTreeSet<String>,
     loaded: Vec<String>,
     current_table: Option<String>,
     pending_drop: Option<String>,
@@ -252,12 +258,12 @@ impl ImportJournal {
         let mut report = json!({
             "success": false, "status": status, "mode": self.mode, "target": self.target,
             "phase": self.phase, "planned_tables": self.planned,
-            "dropped_tables": self.dropped, "data_loaded_tables": self.loaded,
+            "dropped_tables": self.dropped, "created_tables": self.created, "data_loaded_tables": self.loaded,
             "dropped_not_restored_tables": self.dropped.iter().filter(|name| !self.loaded.contains(*name)).collect::<Vec<_>>(),
             "dropped_foreign_keys": self.dropped_foreign_keys,
             "restored_foreign_keys": self.restored_foreign_keys,
             "triggers_created": self.triggers_created,
-            "tables_lost_triggers": self.dropped.iter().filter(|t| self.trigger_tables.contains(*t)
+            "tables_lost_triggers": self.dropped.iter().chain(&self.created).collect::<BTreeSet<_>>().into_iter().filter(|t| self.trigger_tables.contains(*t)
                 && !self.triggers_completed_tables.contains(*t)).collect::<Vec<_>>(),
             "program_warnings": self.program_warnings,
             "programs_failed": self.programs_failed,
@@ -317,7 +323,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         target: json!({"engine": endpoint.engine, "host": endpoint.host, "port": endpoint.port,
             "database": endpoint.database, "schema": endpoint_schema(&endpoint)}),
         mode: mode.into(), phase: "dump_import_validation".into(), planned: Vec::new(),
-        load_attempted: BTreeSet::new(), dropped: Vec::new(), loaded: Vec::new(),
+        load_attempted: BTreeSet::new(), dropped: Vec::new(), created: BTreeSet::new(), loaded: Vec::new(),
         current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), restored_foreign_keys: Vec::new(),
         rows_imported: 0, chunks_imported: 0,
         namespace_creation_outcome_unknown: false, namespace_created: false,
@@ -357,7 +363,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
     }
     let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
     for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed",
-        "namespace_creation_outcome_unknown", "namespace_created", "target", "triggers_created", "tables_lost_triggers", "program_warnings", "programs_failed", "programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"] {
+        "namespace_creation_outcome_unknown", "namespace_created", "created_tables", "target", "triggers_created", "tables_lost_triggers", "program_warnings", "programs_failed", "programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"] {
         summary[key] = report[key].clone();
     }
     emit(summary);
@@ -507,15 +513,14 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         } else { Vec::new() };
         if let LiveAdapter::MySql(conn) = &mut adapter {
             let target = target_trigger_names(conn, &target_schema)?;
-            let conflicts = trigger_name_conflicts(&target, &programs, &planned_tables, mysql_folds_table_names(conn)?);
+            let conflicts = trigger_name_conflicts(&target, &programs, mysql_folds_table_names(conn)?);
             if !conflicts.is_empty() {
                 return Err(classified_import_error("trigger_name_conflict", &conflicts.join(", "), None));
             }
-            journal.trigger_tables.extend(target.into_iter().filter(|(t, _)| planned_tables.contains(t)).map(|(t, _)| t));
+            if !skip_triggers { journal.trigger_tables.extend(target.into_iter().filter(|(t, _)| planned_tables.contains(t)).map(|(t, _)| t)); }
             journal.trigger_tables.extend(programs.iter().filter_map(|p| p.table.clone()));
         }
-        let mut program_conn = if programs.is_empty() { None } else { Some(mysql_single_statement_conn(&endpoint)?) };
-        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, &surviving, &programs, program_conn.as_mut())?;
+        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, &surviving, &programs, &endpoint)?;
         journal.current_table = None;
         journal.phase = "dump_import_prepare".into();
         journal.checkpoint()?;
@@ -553,6 +558,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             adapter
                 .create_new_table(ddl)
                 .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
+            journal.created.insert(table.name.clone());
 
             journal.phase = "dump_import_data".into();
             journal.checkpoint()?;
@@ -589,10 +595,12 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.phase = "dump_import_post_load".into();
             journal.checkpoint()?;
             complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
-            if let Some(conn) = program_conn.as_mut() {
+            let table_programs = programs.iter().filter(|p| p.table.as_deref() == Some(table.name.as_str())).collect::<Vec<_>>();
+            if !table_programs.is_empty() {
                 journal.phase = "dump_import_triggers".into();
-                for p in programs.iter().filter(|p| p.table.as_deref() == Some(table.name.as_str())) {
-                    let warnings = create_trigger(conn, p, &p.name, &table.name).map_err(|err| {
+                let mut conn = import_trigger_connection(&endpoint).map_err(|err| classified_import_error("program_create_failed", &err, Some(&table.name)))?;
+                for p in table_programs {
+                    let warnings = create_trigger(&mut conn, p, &p.name, &table.name).map_err(|err| {
                         journal.programs_failed.push(json!({"table":table.name,"name":p.name,"error":err}));
                         classified_import_error("program_create_failed", &err, Some(&table.name))
                     })?;
@@ -705,23 +713,39 @@ fn create_missing_target_namespace<F: FnMut(Value)>(
 fn probe_import_ddl(
     adapter: &mut LiveAdapter, schema: &NormalizedSchema, source_engine: &str, journal: &mut ImportJournal,
     surviving: &[SurvivingForeignKey],
-    programs: &[&NormalizedStoredProgram], mut program_conn: Option<&mut mysql::PooledConn>,
+    programs: &[&NormalizedStoredProgram], endpoint: &Endpoint,
 ) -> Result<(), String> {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("cannot allocate DDL probe name: {err}"))?.as_nanos();
     let prefix = format!("tf_probe_{}_{nonce}", std::process::id());
     let engine = adapter.engine();
+    let mut program_conn = if programs.is_empty() { None } else { Some(import_trigger_connection(endpoint)
+        .map_err(|err| classified_import_error("program_probe_failed", &err, None))?) };
     run_owned_ddl_probe(schema, source_engine, engine, surviving, &prefix,
         |table| { journal.current_table = Some(table.to_string()); journal.checkpoint() },
         |sql| adapter.execute_sql(sql),
         |table, probe| {
             if let Some(conn) = program_conn.as_mut() {
                 for (index, p) in programs.iter().enumerate().filter(|(_, p)| p.table.as_deref() == Some(table)) {
-                    create_trigger(conn, p, &format!("{prefix}_t{index}"), probe)?;
+                    create_trigger(conn, p, &format!("{prefix}_t{index}"), probe)
+                        .map_err(|err| trigger_probe_error(&err, &p.name))?;
                 }
             }
             Ok(())
         })
+}
+
+fn trigger_probe_error(err: &str, name: &str) -> String {
+    if err.starts_with("trigger_binlog_privilege:") { return err.to_string() }
+    let detail = err.strip_prefix("program_create_failed: ").unwrap_or(err);
+    classified_import_error("program_probe_failed", detail, Some(name))
+}
+
+fn import_trigger_connection(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
+    let mut conn = mysql_single_statement_conn(endpoint)?;
+    conn.query_drop(format!("SET SESSION net_read_timeout={MYSQL_IMPORT_NET_TIMEOUT_SECS}, net_write_timeout={MYSQL_IMPORT_NET_TIMEOUT_SECS}, wait_timeout={MYSQL_IMPORT_WAIT_TIMEOUT_SECS}"))
+        .map_err(|err| trigger_create_error(&err))?;
+    Ok(conn)
 }
 
 /// A foreign key of a table the import keeps, referencing a table the import replaces.
@@ -2459,6 +2483,16 @@ mod tests {
         manifest.stored_programs[0].kind = "TRIGGER".into();
         manifest.source_engine = "postgresql".into();
         assert!(validate_import_metadata(&manifest,&all,"mysql","app",true).unwrap_err().contains("MySQL source"));
+    }
+
+    #[test]
+    fn trigger_probe_errors_never_claim_data_was_loaded() {
+        let error = trigger_probe_error("program_create_failed: invalid trigger body", "guard");
+        assert!(error.starts_with("program_probe_failed:"));
+        assert!(error.contains("guard") && error.contains("invalid trigger body"));
+        assert!(!error.contains("program_create_failed"));
+        let binlog = "trigger_binlog_privilege: log_bin_trust_function_creators=1 or SUPER";
+        assert_eq!(trigger_probe_error(binlog, "guard"), binlog);
     }
 
     #[test]

@@ -5,6 +5,11 @@ use mysql::prelude::Queryable;
 use crate::*;
 use crate::query::skip_sql_comment;
 
+fn mysql_on_update(extra: &str) -> Option<String> {
+    let start = extra.to_ascii_lowercase().find("on update ")?;
+    extra[start + "on update ".len()..].split_whitespace().next().map(str::to_string)
+}
+
 pub(crate) fn normalized_schema_diff(source: &NormalizedSchema, target: &NormalizedSchema) -> Vec<Value> {
     let source_tables: BTreeMap<String, &NormalizedTable> = source
         .tables
@@ -369,8 +374,7 @@ impl InspectAdapter for MysqlInspectAdapter {
                     }
                     let type_name =
                         mysql_type_with_character_options(&type_name, character_set, collation);
-                    let on_update = extra.to_ascii_lowercase().find("on update ")
-                        .map(|start| extra[start + "on update ".len()..].trim().to_string());
+                    let on_update = mysql_on_update(&extra);
                     // MySQL exposes literal strings without SQL quotes. Preserve empty
                     // strings, the word null, and function-looking text as literals.
                     let default_value = default_value.map(|value| {
@@ -1301,6 +1305,13 @@ pub(crate) fn validate_import_view_target(sql: &str, expected: &str, engine: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_update_extra_keeps_precision_and_excludes_visibility_flags() {
+        assert_eq!(mysql_on_update("DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3) INVISIBLE"), Some("CURRENT_TIMESTAMP(3)".into()));
+        assert_eq!(mysql_on_update("on update CURRENT_TIMESTAMP INVISIBLE"), Some("CURRENT_TIMESTAMP".into()));
+        assert_eq!(mysql_on_update("DEFAULT_GENERATED INVISIBLE"), None);
+    }
 
     #[test]
     fn generated_expression_ignores_comment_enum_and_checks_storage() {

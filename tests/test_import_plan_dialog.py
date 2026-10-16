@@ -24,6 +24,13 @@ def test_program_copy_refusal_is_a_plain_blocker():
     plan = describe_plan({"copy_blockers": [{"code": "dump_programs_unsupported_in_copy"}]}, True)
     assert plan["must_see"]
     assert "트리거가 담긴 덤프" in plan["blockers"][0]
+    assert " ".join(plan["blockers"]).count("끄면 진행할 수 있습니다") == 1
+
+
+@pytest.mark.parametrize("code", ["trigger_name_conflict", "program_source_schema_reference"])
+def test_trigger_blockers_name_the_affected_object(code):
+    plan = describe_plan({"blockers":[{"code":code, "table":"sample.guard"}]}, False)
+    assert "sample.guard" in plan["blockers"][0]
 
 PREVIEW = {
     "dry_run": True, "target": {"engine": "mysql", "database": "app", "schema": "app", "exists": True},

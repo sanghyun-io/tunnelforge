@@ -109,6 +109,7 @@ def test_trigger_dump_refusal_reaches_scheduled_rehearsal_report(env, monkeypatc
     outcome = run.run(schedule(), env.backup, conn(port=3307))
     assert outcome.ok is False
     assert CORE_CODE_SENTENCES["dump_programs_unsupported_in_copy"] in outcome.message
+    assert "끄면" not in outcome.message and "끄세요" not in outcome.message
     report = json.loads(open(os.path.join(env.backup, REPORT_NAME), encoding="utf-8").read())
     assert CORE_CODE_SENTENCES["dump_programs_unsupported_in_copy"] in json.dumps(report, ensure_ascii=False)
 

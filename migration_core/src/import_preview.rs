@@ -56,7 +56,7 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     }
     match super::import_table_ddls(manifest, selected, engine, target_schema, skip_triggers) {
         Ok((_, untranslatable)) => blockers.extend(untranslatable.into_iter()
-            .map(|(table, reason)| issue("untranslatable_table", Some(table.as_str()), reason))),
+            .map(|(table, reason)| issue(if reason.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else { "untranslatable_table" }, Some(table.as_str()), reason))),
         Err(err) => blockers.push(issue(if err.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else { "dump_invalid" }, None, err)),
     }
     let tables = manifest.tables.iter()
@@ -173,8 +173,8 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let target_views = target.views.iter().map(|(name, _)| key(name)).collect::<BTreeSet<_>>();
     let (views_replace, views_create): (Vec<String>, Vec<String>) = dump_views.into_iter().partition(|name| target_views.contains(&key(name)));
     let replaced_views = views_replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
-    for conflict in trigger_name_conflicts(&target.triggers, &programs, &names.iter().cloned().collect(), fold) {
-        blockers.push(issue("trigger_name_conflict", None, conflict));
+    for conflict in trigger_name_conflicts(&target.triggers, &programs, fold) {
+        blockers.push(issue("trigger_name_conflict", Some(&conflict), &conflict));
     }
 
     let mut external_parents = Vec::new();
@@ -538,6 +538,19 @@ mod tests {
         assert_eq!(found.blockers, Vec::<Value>::new());
         assert_eq!(found.warnings, Vec::<Value>::new());
         assert_eq!(found.copy_blockers, Vec::<Value>::new());
+    }
+
+    #[test]
+    fn preview_names_every_qualified_trigger_and_keeps_other_ddl_blockers() {
+        let mut m = manifest("mysql",7,vec![users()]);
+        for (name,event) in [("guard1","INSERT"),("guard2","UPDATE")] {
+            m.stored_programs.push(serde_json::from_value(json!({"kind":"TRIGGER","name":name,"table":"users","timing":"BEFORE","event":event,
+                "action_order":1,"definition":"INSERT INTO app.audit VALUES(NEW.id)","sql_mode":"","character_set_client":"utf8mb4","collation_connection":"utf8mb4_bin"})).unwrap());
+        }
+        m.schema.tables[0].columns[0].type_name = "bad); DROP TABLE users".into();
+        let found = dump_findings(&m,&BTreeSet::new(),"mysql",true,"copy",false).unwrap();
+        assert_eq!(codes(&found.blockers),["program_source_schema_reference","program_source_schema_reference","untranslatable_table"]);
+        assert_eq!(found.blockers[0]["table"],"users.guard1"); assert_eq!(found.blockers[1]["table"],"users.guard2");
     }
 
     #[test]

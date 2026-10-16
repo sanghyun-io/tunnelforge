@@ -17,20 +17,24 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "이 테이블의 정의로는 가져오기용 테이블을 만들 수 없어 내보내지 않았습니다. 원본 테이블 정의를 확인하세요.": "Export stopped because this table definition cannot be used to recreate the table on import. Check the source table definition.",
+    "트리거를 만들 때 서버가 경고를 보냈습니다.": "The server issued a warning while creating the trigger.",
+    "이 옵션을 켜면 덤프의 트리거를 만들지 않습니다. 교체하는 대상 테이블의 기존 트리거도 삭제되며 다시 만들지 않습니다.": "This option omits dump triggers. Existing triggers on replaced target tables are also deleted and are not recreated.",
+
     "저장 프로시저·예약 이벤트나 정의를 확인하지 못한 트리거처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다.": "Export without asking by leaving out procedures, scheduled events, unproven triggers and non-InnoDB tables (such as MyISAM). Non-InnoDB tables are omitted entirely, including their definitions and rows. The result is not a complete backup. Objects whose omission changes a table definition, such as generated columns and CHECK constraints, cannot be left out.",
     "만들 트리거: {}": "Triggers to create: {}",
 
     "트리거를 다시 만들지 못한 테이블: {}": "Tables whose triggers were not recreated: {}",
     "데이터를 넣은 뒤 트리거를 만들다가 멈췄습니다. Import 보고서에서 트리거가 복원되지 않은 테이블을 확인하세요.": "Trigger creation stopped after loading data. Check the Import report for tables whose triggers were not restored.",
-    "트리거 {}의 본문이 원본 정의와 일치하는지 확인하지 못했습니다. SHOW CREATE TRIGGER와 ACTION_STATEMENT를 확인하세요.": "Could not match trigger {} body to the original definition. Check SHOW CREATE TRIGGER and ACTION_STATEMENT.",
+    "트리거 {}의 본문이 원본과 같은지 확인하지 못해 담지 않았습니다. 원본 트리거 정의를 확인하세요.": "Could not match trigger {} body to the source, so it was not included. Check the original trigger definition.",
     "저장 프로그램 {}의 종류, 실행 시점, 이벤트 또는 세션 설정을 안전하게 확인하지 못했습니다.": "Could not safely validate the kind, timing, event or session settings of stored program {}.",
-    "저장 프로그램 {}의 문자셋으로 본문을 안전하게 복원할 수 없습니다. UTF-8로 다시 내보내세요.": "Cannot safely restore stored program {} in its character set. Export again using UTF-8.",
-    "같은 이름의 트리거가 교체하지 않는 대상 테이블에 있습니다. 이름을 바꾼 뒤 다시 가져오세요.": "A trigger with the same name exists on a target table outside the replacement. Rename it before importing.",
-    "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다.": "Creating triggers requires log_bin_trust_function_creators=1 or SUPER privilege.",
+    "트리거 {}의 문자셋으로는 정의를 안전하게 복원할 수 없습니다. 원본 트리거를 utf8mb4 문자셋으로 다시 만든 뒤 내보내세요.": "Cannot safely restore trigger {} in its character set. Recreate the source trigger with utf8mb4 before exporting.",
+    "같은 이름의 트리거가 대상의 다른 테이블에 있습니다. 그 트리거를 삭제하거나 다른 이름으로 다시 만든 뒤 가져오세요.": "A trigger with the same name exists on another target table. Drop it or recreate it under a different name before importing.",
+    "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다. 트리거를 제외하려면 고급 설정의 '트리거 없이 테이블만 가져오기'를 켜세요.": "Creating triggers requires log_bin_trust_function_creators=1 or SUPER privilege. To omit triggers, enable 'Import tables without triggers' in Advanced settings.",
     "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.": "This account lacks the TRIGGER privilege to create triggers.",
     "트리거를 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.": "The trigger could not be created, so import did not start. Target tables were unchanged.",
     "트리거 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.": "A trigger body references the source database name. Import into the same database name or remove the qualifier from the definition.",
-    "트리거가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 고급 설정의 '먼저 복사본에서 검증하고 교체'를 끄세요.": "A dump containing triggers cannot yet be verified in a copy. Turn off 'Verify in a copy before replacing' in Advanced settings.",
+    "트리거가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.": "A dump containing triggers cannot yet be verified in a copy.",
     "다른 DB 종류로 가져오므로 덤프의 트리거를 만들지 않습니다.": "Dump triggers will not be created when importing into a different database engine.",
     "선택하지 않은 테이블의 트리거는 만들지 않습니다.": "Triggers of unselected tables will not be created.",
     "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.": "Dump triggers will not be created because 'Import tables without triggers' is enabled.",

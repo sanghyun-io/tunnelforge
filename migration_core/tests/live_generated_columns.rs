@@ -217,7 +217,7 @@ fn invisible_plain_and_generated_columns_survive_all_load_paths_and_safe() {
         let Some(mut s) = Sandbox::new() else { return };
         let mut db = s.conn();
         let _infile = LocalInfile::enabled(&s.endpoint);
-        db.query_drop(format!("CREATE TABLE sample(id INT PRIMARY KEY INVISIBLE, label VARCHAR(20), x INT INVISIBLE, v INT GENERATED ALWAYS AS(id+1) VIRTUAL INVISIBLE, g INT GENERATED ALWAYS AS(x*2) STORED INVISIBLE {})",if blob {",body BLOB INVISIBLE"} else {""})).unwrap();
+        db.query_drop(format!("CREATE TABLE sample(id INT PRIMARY KEY INVISIBLE, label VARCHAR(20), x INT INVISIBLE, updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) INVISIBLE, v INT GENERATED ALWAYS AS(id+1) VIRTUAL INVISIBLE, g INT GENERATED ALWAYS AS(x*2) STORED INVISIBLE {})",if blob {",body BLOB INVISIBLE"} else {""})).unwrap();
         for id in 1..=9 {
             db.query_drop(format!("INSERT INTO sample(id,label,x{}) VALUES({id},'row',{id}{})",if blob {",body"} else {""},if blob {",X'00ff5c090a'"} else {""})).unwrap();
         }
@@ -226,6 +226,9 @@ fn invisible_plain_and_generated_columns_survive_all_load_paths_and_safe() {
         let expected = checksum(&mut db,"sample");
         let metadata = visibility(&mut db);
         assert_eq!(s.dump(format,threads)["format_version"],6);
+        let manifest = s.manifest();
+        let updated = manifest["schema"]["tables"][0]["columns"].as_array().unwrap().iter().find(|c| c["name"]=="updated_at").unwrap();
+        assert_eq!(updated["on_update"],"CURRENT_TIMESTAMP(3)");
         let imported=events("dump.import",json!({"target":s.endpoint,"input_dir":s.output,"mode":"replace","threads":threads}));
         assert!(!imported.iter().any(|event|event["event"]=="error"),"{imported:#?}");
         let strategy=if format=="jsonl" || blob {"insert_rows"} else {"parallel_load_data_local_infile"};

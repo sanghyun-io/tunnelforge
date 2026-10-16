@@ -85,6 +85,8 @@ pub(crate) fn references_source_schema(body: &str, schema: &str) -> bool {
     let schema = schema.to_lowercase();
     for qualifier in [quote_ident("mysql", &schema), format!("\"{}\"", schema.replace('"', "\"\"")), schema.clone()] {
         for (start, _) in body.match_indices(&qualifier) {
+            if qualifier == schema && body[..start].chars().next_back()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.')) { continue }
             let mut tail = &body[start + qualifier.len()..];
             loop {
                 tail = tail.trim_start();
@@ -116,10 +118,10 @@ pub(crate) fn target_trigger_names(conn: &mut mysql::PooledConn, schema: &str) -
         .map_err(|err| format!("target trigger inspection failed: {err}"))
 }
 
-pub(crate) fn trigger_name_conflicts(target: &[(String, String)], programs: &[&NormalizedStoredProgram], tables: &BTreeSet<String>, folds: bool) -> Vec<String> {
+pub(crate) fn trigger_name_conflicts(target: &[(String, String)], programs: &[&NormalizedStoredProgram], folds: bool) -> Vec<String> {
     let key = |s: &str| if folds { s.to_lowercase() } else { s.to_string() };
-    target.iter().filter(|(table, name)| !tables.iter().any(|t| key(t) == key(table))
-        && programs.iter().any(|p| p.name.to_lowercase() == name.to_lowercase()))
+    target.iter().filter(|(table, name)| programs.iter().any(|p| p.name.to_lowercase() == name.to_lowercase()
+        && p.table.as_deref().is_none_or(|dump_table| key(dump_table) != key(table))))
         .map(|(table, name)| format!("{table}.{name}")).collect()
 }
 
@@ -128,9 +130,9 @@ pub(crate) fn trigger_binlog_blocked(log_bin: bool, trusted: bool, super_grant: 
 }
 
 pub(crate) fn trigger_create_error(err: &mysql::Error) -> String {
-    let code = if matches!(err, mysql::Error::MySqlError(e) if e.code == 1419) { "trigger_binlog_privilege" } else { "program_probe_failed" };
+    let code = if matches!(err, mysql::Error::MySqlError(e) if e.code == 1419) { "trigger_binlog_privilege" } else { "program_create_failed" };
     if code == "trigger_binlog_privilege" {
-        format!("{code}: 트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다. {err}")
+        format!("{code}: 트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다. 트리거를 제외하려면 '트리거 없이 테이블만 가져오기'를 켜세요. {err}")
     } else { format!("{code}: {err}") }
 }
 
@@ -165,14 +167,24 @@ mod tests {
             assert!(references_source_schema(body, "src"), "{body}");
         }
         assert!(!references_source_schema("SET NEW.v=1", "src"));
+        for body in ["SELECT myapp.t", "SET NEW.url='x.app.example.com'", "SELECT other_app.t", "SELECT app2.t"] {
+            assert!(!references_source_schema(body, "app"), "{body}");
+        }
+        assert!(references_source_schema("SELECT app . t", "app"));
+        assert!(references_source_schema("SELECT `app` . `t`", "app"));
     }
     #[test]
     fn binlog_and_server_error_classification() {
-        for log in [false, true] { for trusted in [false, true] { for grant in [None,Some(false),Some(true)] {
-            assert_eq!(trigger_binlog_blocked(log,trusted,grant), log && !trusted && grant==Some(false));
-        } } }
+        for (log, trusted, grant, blocked) in [
+            (false,false,None,false), (false,false,Some(false),false), (false,false,Some(true),false),
+            (false,true,None,false), (false,true,Some(false),false), (false,true,Some(true),false),
+            (true,false,None,false), (true,false,Some(false),true), (true,false,Some(true),false),
+            (true,true,None,false), (true,true,Some(false),false), (true,true,Some(true),false),
+        ] { assert_eq!(trigger_binlog_blocked(log,trusted,grant), blocked); }
         let error = mysql::Error::MySqlError(mysql::MySqlError { state:"HY000".into(), message:"denied".into(), code:1419 });
         assert!(trigger_create_error(&error).starts_with("trigger_binlog_privilege:"));
+        let error = mysql::Error::MySqlError(mysql::MySqlError { state:"HY000".into(), message:"already exists".into(), code:1359 });
+        assert!(trigger_create_error(&error).starts_with("program_create_failed:"));
     }
 
     fn trigger() -> NormalizedStoredProgram {
@@ -215,7 +227,7 @@ mod tests {
         assert_eq!(selected.iter().map(|p|p.name.as_str()).collect::<Vec<_>>(),["z","a"]);
         let held = crate::dump_format::held_object_ids(&schema,&programs);
         assert_eq!(held,BTreeSet::from([format!("trigger:{table}:a"),format!("trigger:{table}:z")]));
-        assert_eq!(trigger_name_conflicts(&[("kept".into(),"A".into())],&selected,&tables,false),["kept.A"]);
-        assert!(trigger_name_conflicts(&[(table.clone(),"a".into())],&selected,&tables,false).is_empty());
+        assert_eq!(trigger_name_conflicts(&[("kept".into(),"A".into())],&selected,false),["kept.A"]);
+        assert!(trigger_name_conflicts(&[(table.clone(),"a".into())],&selected,false).is_empty());
     }
 }

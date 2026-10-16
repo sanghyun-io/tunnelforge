@@ -489,7 +489,7 @@ or not at its default. There are no scope or snapshot choices.
 
 - **One table list.** It is always shown (checkboxes only, no row selection) and
   starts with every table checked. All checked sends a full export
-  (`dump.run` without `tables`: tables plus views, routines and events); unchecking
+  (`dump.run` without `tables`: tables and their triggers plus views, routines and events); unchecking
   any table sends exactly the checked tables, and one line under the list says
   that views, stored procedures, functions and events are then left out
   (`일부 테이블만 내보낼 때는 선택한 테이블과 트리거를 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.`;
@@ -625,8 +625,10 @@ context. Only exported InnoDB tables' triggers survive scope filtering.
 Replace import loads data with no dump triggers installed, completes each table's
 indexes/FKs, then immediately creates that table's triggers in ACTION_ORDER.
 Thus INSERT/LOAD does not fire the triggers, and a failure on a later table leaves
-earlier tables protected. The import journal records `triggers_created`, each
-failed program, and `tables_lost_triggers` if a dropped table's triggers could not
+earlier tables protected. Each table opens a new, timeout-tuned trigger connection
+after its load; the probe connection is closed before loading begins. The import
+journal tracks created and dropped tables, records `triggers_created`, each
+failed program, and `tables_lost_triggers` if an affected table's triggers could not
 be restored. Replace remains non-atomic: the current table can be empty or lack
 its triggers after an error. A target-only trigger on a replaced table disappears
 with DROP TABLE; the plan lists those the dump will not recreate.
@@ -640,7 +642,7 @@ A dump contains executable trigger code and should come from a trusted source;
 the single-statement boundary prevents appended SQL chains, not a malicious body.
 
 Before replacement, owned table probes test every selected trigger's creation.
-A same-named trigger on an unselected target table blocks with
+A same-named trigger on any other target table (including another dumped table) blocks with
 `trigger_name_conflict`. A source-schema qualifier in a body blocks imports into
 a different schema with `program_source_schema_reference`; qualifiers are not
 rewritten. Preview checks TRIGGER grants, @@log_bin,
@@ -650,7 +652,9 @@ with SUPER before retrying.
 
 Advanced **트리거 없이 테이블만 가져오기** is off by default and never persisted.
 It sends `skip_triggers=true` to preview and import, skips only the dump triggers,
-and reports every omitted trigger. Cross-engine imports and table-subset imports
+and reports every omitted trigger separately from restoration failures. Existing
+triggers on replaced target tables are also removed. This toggle is disabled for
+PostgreSQL targets and verify-in-copy mode. Cross-engine imports and table-subset imports
 also report every skipped trigger. All three cases require seeing the plan even
 when no target table is overwritten. Verify-in-copy (including scheduled
 rehearsals) refuses a dump containing stored programs before making a copy with
@@ -673,8 +677,8 @@ claimed.
 | --- | --- | --- |
 | Tables, rows, PK/UNIQUE/secondary indexes, supported FKs, comments, supported defaults | Preserved | Preserved |
 | Views (full export only) | Preserved as separately captured definitions; persistent warning, `strict_export=false` | Same |
-| INVISIBLE columns | Preserved with explicit read/load/INSERT column lists (format 6) | Refused before DROP on import/migration |
-| Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Refused before export; **not waivable** |
+| INVISIBLE columns | Preserved with explicit read/load/INSERT column lists (format 6) | Non-MySQL targets: refused before DROP on import/migration |
+| Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Non-MySQL targets: refused before DROP on import/migration; PostgreSQL export remains refused |
 | Unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
 | Triggers on an exported table | Preserved after body verification (format 7, replace mode) | Refused before export; waivable |
 | Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not part of a table subset, so a subset export neither refuses nor warns about them | Same (no events; materialized views apply) |
@@ -700,6 +704,12 @@ Data chunks retain generated values. Import skips those fields in LOAD DATA and
 INSERT, so MySQL recalculates them. Format 6 readers preserve the expression,
 VIRTUAL/STORED kind, indexes and supported FKs. Dumps without generated/invisible
 columns or stored programs retain the previous format versions. Formats 1-6 remain readable.
+
+Before creating a MySQL dump directory, Export also checks that every table it
+will export can generate same-engine import DDL. Failure refuses even an
+incomplete opt-in with `table_definition_unrestorable` and a per-table reason.
+ON UPDATE metadata captures only the timestamp function token (including its
+precision); an INVISIBLE flag in EXTRA is kept separately.
 
 Import uses strict SQL mode. Rows originally accepted under a loose mode may fail
 when a STORED expression is recalculated (for example a truncated CAST). A replace

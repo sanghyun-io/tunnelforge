@@ -111,20 +111,23 @@ def test_trigger_skip_toggle_is_shared_with_preview_and_never_persisted(monkeypa
                "warnings": [{"code": "programs_skipped_toggle", "detail": "trigger:sample:guard"}]}
     created = _fake_workers(monkeypatch, preview=preview)
     shown = _fake_plan_dialog(monkeypatch, accept=True)
-    dialog = RustDumpImportDialog(tunnel_config={"environment": "development"})
+    values = {}
+    config = MagicMock()
+    config.get_app_setting.side_effect = lambda key, default=None: values.get(key, default)
+    config.set_app_setting.side_effect = lambda key, value: values.__setitem__(key, value)
+    dialog = RustDumpImportDialog(config_manager=config, tunnel_config={"environment": "development"})
     try:
         assert not dialog.chk_skip_triggers.isChecked()
         dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
         dialog.chk_skip_triggers.setChecked(True)
         assert "트리거 없이" in dialog._advanced_summary()
-        assert "skip_triggers" not in dialog._persisted_import_options()
         dialog.do_import()
         assert shown[0]["plan"]["must_see"] is True
         assert "sample:guard" in "\n".join(shown[0]["plan"]["warnings"])
         assert all(worker.kwargs["skip_triggers"] is True for worker in created)
     finally:
         dialog.close()
-    fresh = RustDumpImportDialog()
+    fresh = RustDumpImportDialog(config_manager=config)
     try:
         assert not fresh.chk_skip_triggers.isChecked()
     finally:
@@ -134,6 +137,35 @@ def test_trigger_skip_toggle_is_shared_with_preview_and_never_persisted(monkeypa
 def test_failure_report_names_tables_whose_triggers_were_lost(monkeypatch):
     from src.ui.dialogs.db_import_dialog import _replace_failure_details
     assert "트리거를 다시 만들지 못한 테이블: second" in _replace_failure_details({"tables_lost_triggers": ["second"]})
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgresql"])
+def test_trigger_skip_toggle_applies_only_to_mysql_replace(monkeypatch, engine):
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    connector = MagicMock(host="localhost", port=3306, user="root", password="pw", engine=engine, database="app")
+    connector.get_schemas.return_value = []
+    dialog = RustDumpImportDialog(connector=connector)
+    try:
+        assert "기존 트리거도 삭제" in dialog.chk_skip_triggers.toolTip()
+        assert dialog.chk_skip_triggers.isEnabled() is (engine == "mysql")
+        if engine == "mysql":
+            dialog.chk_skip_triggers.setChecked(True)
+        dialog.chk_verify_copy.setChecked(True)
+        assert not dialog.chk_skip_triggers.isEnabled() and not dialog.chk_skip_triggers.isChecked()
+        dialog.chk_verify_copy.setChecked(False)
+        assert dialog.chk_skip_triggers.isEnabled() is (engine == "mysql")
+        assert not dialog.chk_skip_triggers.isChecked()
+    finally:
+        dialog.close()
+
+
+def test_failed_import_report_shows_program_warnings():
+    from src.ui.dialogs.db_import_dialog import _capture_import_audit, _replace_failure_details
+    audit = {}
+    _capture_import_audit(audit, {"event":"import_report", "program_warnings":[{"code":"program_database_collation_changed", "name":"guard", "source":"utf8mb4_bin", "target":"utf8mb4_0900_ai_ci"}]})
+    text = _replace_failure_details(audit)
+    assert "guard" in text and "정렬 규칙" in text and "utf8mb4_bin" in text
 
 
 @pytest.mark.parametrize("tunnel_config", [None, {"environment": "staging"}])

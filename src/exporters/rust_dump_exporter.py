@@ -629,16 +629,18 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "table_definition_unrestorable": "이 테이블의 정의로는 가져오기용 테이블을 만들 수 없어 내보내지 않았습니다. 원본 테이블 정의를 확인하세요.",
+    "program_server_warning": "트리거를 만들 때 서버가 경고를 보냈습니다.",
     "program_create_failed": "데이터를 넣은 뒤 트리거를 만들다가 멈췄습니다. Import 보고서에서 트리거가 복원되지 않은 테이블을 확인하세요.",
-    "trigger_body_unproven": "트리거 {}의 본문이 원본 정의와 일치하는지 확인하지 못했습니다. SHOW CREATE TRIGGER와 ACTION_STATEMENT를 확인하세요.",
+    "trigger_body_unproven": "트리거 {}의 본문이 원본과 같은지 확인하지 못해 담지 않았습니다. 원본 트리거 정의를 확인하세요.",
     "program_definition_invalid": "저장 프로그램 {}의 종류, 실행 시점, 이벤트 또는 세션 설정을 안전하게 확인하지 못했습니다.",
-    "program_charset_unsupported": "저장 프로그램 {}의 문자셋으로 본문을 안전하게 복원할 수 없습니다. UTF-8로 다시 내보내세요.",
-    "trigger_name_conflict": "같은 이름의 트리거가 교체하지 않는 대상 테이블에 있습니다. 이름을 바꾼 뒤 다시 가져오세요.",
-    "trigger_binlog_privilege": "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다.",
+    "program_charset_unsupported": "트리거 {}의 문자셋으로는 정의를 안전하게 복원할 수 없습니다. 원본 트리거를 utf8mb4 문자셋으로 다시 만든 뒤 내보내세요.",
+    "trigger_name_conflict": "같은 이름의 트리거가 대상의 다른 테이블에 있습니다. 그 트리거를 삭제하거나 다른 이름으로 다시 만든 뒤 가져오세요.",
+    "trigger_binlog_privilege": "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다. 트리거를 제외하려면 고급 설정의 '트리거 없이 테이블만 가져오기'를 켜세요.",
     "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
     "program_probe_failed": "트리거를 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "program_source_schema_reference": "트리거 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
-    "dump_programs_unsupported_in_copy": "트리거가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 고급 설정의 '먼저 복사본에서 검증하고 교체'를 끄세요.",
+    "dump_programs_unsupported_in_copy": "트리거가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
     "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거를 만들지 않습니다.",
     "programs_skipped_partial": "선택하지 않은 테이블의 트리거는 만들지 않습니다.",
     "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
@@ -725,7 +727,24 @@ def describe_core_code(code: object, name: object = "") -> Optional[str]:
     if sentence is None:
         return None
     sentence = translate_text(sentence)
+    if "{}" in sentence:
+        return sentence.format(name)
     return f"{name}: {sentence}" if name else sentence
+
+
+def describe_program_warnings(items: object) -> List[str]:
+    lines = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        code, name = item.get("code"), item.get("name", "")
+        sentence = describe_core_code(code, name)
+        if sentence is None:
+            sentence = describe_core_code("program_server_warning", name) + f" ({code}): {item.get('message', '')}"
+        elif item.get("source") is not None and item.get("target") is not None:
+            sentence += f" ({item['source']} → {item['target']})"
+        lines.append(sentence)
+    return lines
 
 
 # How the core's manifest warnings begin (adapters.rs WARNING_*) and the code Import gives
@@ -994,7 +1013,9 @@ class RustDumpImporter(_RustDumpClientBase):
                     self.last_error_code = classify_error_code(result.get("error_code"), reason)
                     stops = describe_copy_blockers(result.get("copy_blockers"))
                     if stops:
-                        # Stopped before making a copy: one sentence per reason; the core's text is in the report.
+                        # Rehearsals have no interactive verify toggle.
+                        if not verify_only and any(item.get("code") == "dump_programs_unsupported_in_copy" for item in result.get("copy_blockers") or [] if isinstance(item, dict)):
+                            stops.append(translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."))
                         return False, "\n".join([describe_core_code("copy_refused"), *stops]), import_results
                     return False, "\n".join([reason, *(str(item) for item in result.get("blockers") or [])]), import_results
                 new_target = result.get("status") == "completed_new_target" and result.get("namespace_existed") is False and result.get("namespace_created") is True
@@ -1027,6 +1048,10 @@ class RustDumpImporter(_RustDumpClientBase):
             for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
                 if result.get(key):
                     message += "\n" + describe_core_code(key) + " " + ", ".join(map(str, result[key]))
+            for warning_line in describe_program_warnings(result.get("program_warnings")):
+                message += "\n" + warning_line
+                if progress_callback:
+                    progress_callback(warning_line)
             if views_failed:
                 failed_names = ", ".join(
                     str(item.get("name", "")) for item in views_failed if isinstance(item, dict)

@@ -131,6 +131,70 @@ fn name_conflict_is_visible_in_preview_and_refuses_unchanged() {
 }
 
 #[test]
+fn trigger_on_another_dumped_table_refuses_before_either_table_changes() {
+    let Some(s) = Sandbox::new() else { return }; let mut db = conn(&s.endpoint);
+    db.query_drop("CREATE TABLE a(id INT PRIMARY KEY); CREATE TABLE b(id INT PRIMARY KEY); INSERT INTO a VALUES(1); INSERT INTO b VALUES(2)").unwrap();
+    db.query_drop("CREATE TRIGGER trg BEFORE DELETE ON a FOR EACH ROW SIGNAL SQLSTATE '45000'").unwrap();
+    db.query_drop("CREATE TRIGGER a_guard BEFORE UPDATE ON a FOR EACH ROW SIGNAL SQLSTATE '45000'").unwrap();
+    s.dump("jsonl",Value::Null);
+    db.query_drop("DROP TRIGGER trg; CREATE TRIGGER trg BEFORE DELETE ON b FOR EACH ROW SIGNAL SQLSTATE '45000'; INSERT INTO a VALUES(91); INSERT INTO b VALUES(92)").unwrap();
+    let before = metadata(&mut db);
+    let preview = success(events("dump.import_preview",s.payload()));
+    assert!(preview["blockers"].as_array().unwrap().iter().any(|b| b["code"] == "trigger_name_conflict" && b["table"] == "b.trg"),"{preview}");
+    let output = events("dump.import",s.payload()); refused(&output,"trigger_name_conflict");
+    let report = output.iter().rev().find(|e| e["event"] == "import_report").unwrap();
+    assert_eq!(report["dropped_tables"],json!([]));
+    assert_eq!(metadata(&mut db),before);
+    assert_eq!(db.query::<i32,_>("SELECT id FROM a ORDER BY id").unwrap(),vec![1,91]);
+    assert_eq!(db.query::<i32,_>("SELECT id FROM b ORDER BY id").unwrap(),vec![2,92]);
+}
+
+struct WaitTimeout { endpoint: Endpoint, previous: u64 }
+impl Drop for WaitTimeout {
+    fn drop(&mut self) { let _ = conn(&self.endpoint).query_drop(format!("SET GLOBAL wait_timeout={}",self.previous)); }
+}
+
+#[test]
+fn short_wait_timeout_during_slow_load_does_not_lose_triggers() {
+    let Some(s) = Sandbox::new() else { return }; let mut db = conn(&s.endpoint); seed(&mut db); s.dump("jsonl",Value::Null);
+    let previous = db.query_first("SELECT @@GLOBAL.wait_timeout").unwrap().unwrap();
+    let _timeout = WaitTimeout { endpoint:s.endpoint.clone(), previous };
+    db.query_drop("SET GLOBAL wait_timeout=2").unwrap();
+    let mut slept = false; let mut output = Vec::new();
+    handle_request_streaming(Request { command:"dump.import".into(), request_id:None, payload:s.payload() }, |e| {
+        if !slept && e["event"] == "row_progress" {
+            std::thread::sleep(std::time::Duration::from_secs(5)); slept = true;
+        }
+        output.push(e);
+    });
+    assert!(slept); let result = success(output);
+    assert_eq!(result["programs_imported"].as_array().unwrap().len(),1);
+    assert_eq!(db.query::<i32,_>("SELECT v FROM sample ORDER BY id").unwrap(),vec![42,43]);
+    assert!(matches!(db.query_drop("DELETE FROM sample"),Err(mysql::Error::MySqlError(e)) if e.code==1644));
+}
+
+#[test]
+fn failed_trigger_on_a_newly_created_table_is_reported_as_a_loss() {
+    let Some(mut s) = Sandbox::new() else { return }; let mut db = conn(&s.endpoint); seed(&mut db); s.dump("jsonl",Value::Null);
+    let target = s.other(); let mut target_db = conn(&target); let mut payload = s.payload(); payload["target"] = json!(target);
+    let mut injected = false; let mut output = Vec::new();
+    handle_request_streaming(Request { command:"dump.import".into(), request_id:None, payload }, |e| {
+        if !injected && e["event"] == "row_progress" {
+            // A concurrent DDL race after the successful preflight forces a real CREATE failure.
+            target_db.query_drop("CREATE TABLE kept(id INT); CREATE TRIGGER guard_delete BEFORE DELETE ON kept FOR EACH ROW SIGNAL SQLSTATE '45000'").unwrap();
+            injected = true;
+        }
+        output.push(e);
+    });
+    assert!(injected); refused(&output,"program_create_failed");
+    assert!(!output.iter().any(|e| e["event"] == "error" && e["message"].as_str().unwrap().contains("program_probe_failed")));
+    let report = output.iter().rev().find(|e|e["event"] == "import_report").unwrap();
+    assert_eq!(report["dropped_tables"],json!([])); assert_eq!(report["created_tables"],json!(["sample"]));
+    assert_eq!(report["tables_lost_triggers"],json!(["sample"]));
+    assert_eq!(report["programs_failed"][0]["name"],"guard_delete");
+}
+
+#[test]
 fn source_qualified_body_blocks_different_schema_before_changes() {
     let Some(mut s) = Sandbox::new() else { return }; let mut db = conn(&s.endpoint); seed(&mut db);
     db.query_drop("CREATE TABLE audit(v INT)").unwrap();
@@ -195,6 +259,8 @@ fn partial_export_import_and_explicit_toggle_report_every_skipped_trigger() {
     let preview=success(events("dump.import_preview",payload.clone())); assert_eq!(preview["programs_skipped_toggle"],json!(["trigger:sample:guard_delete"]));
     assert_eq!(preview["triggers_dropped"].as_array().unwrap().len(),1);
     let imported=success(events("dump.import",payload)); assert_eq!(imported["programs_skipped_toggle"],json!(["trigger:sample:guard_delete"]));
+    let report:Value=serde_json::from_slice(&std::fs::read(imported["import_report"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(report["tables_lost_triggers"],json!([]));
     assert_eq!(metadata(&mut db)[0].0,"other_guard"); db.query_drop("DELETE FROM sample").unwrap();
     // Full dump, then import only one table: report the other table's trigger.
     std::fs::remove_dir_all(&s.output).unwrap(); seed_after_delete(&mut db); s.dump("jsonl",Value::Null);

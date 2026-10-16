@@ -28,7 +28,7 @@ from src.core.path_safety import safe_filename_component
 from src.core.production_guard import ProductionGuard
 from src.exporters.rust_dump_exporter import (
     DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure,
-    dump_original_namespace, restore_target_connection_info,
+    dump_original_namespace, restore_target_connection_info, describe_program_warnings,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.dialogs.import_plan_dialog import ImportPlanDialog, describe_plan, names_preview as _names_preview
@@ -72,7 +72,7 @@ def _capture_import_audit(audit: dict, event: dict):
                 audit[key] = event[key]
         for key in ("dropped_tables", "dropped_not_restored_tables", "unattempted_tables", "dropped_foreign_keys",
                     "restored_foreign_keys", "triggers_created", "tables_lost_triggers", "programs_skipped_toggle",
-                    "programs_skipped_partial", "programs_skipped_cross_engine"):
+                    "programs_skipped_partial", "programs_skipped_cross_engine", "program_warnings"):
             if isinstance(event.get(key), list):
                 audit[key] = event[key]
         target = event.get("target")
@@ -134,6 +134,7 @@ def _replace_failure_details(audit: dict) -> str:
         lines.append(translate_text("이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): {}").format(audit["created_namespace"]))
     if audit.get("namespace_outcome_unknown"):
         lines.append(translate_text("새 대상을 만들었는지 확인하지 못함: {}").format(audit["namespace_outcome_unknown"]))
+    lines.extend(describe_program_warnings(audit.get("program_warnings")))
     return "\n".join(lines)
 
 
@@ -681,8 +682,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         self.chk_skip_triggers = QCheckBox("트리거 없이 테이블만 가져오기")
         self.chk_skip_triggers.setChecked(False)
+        self.chk_skip_triggers.setToolTip("이 옵션을 켜면 덤프의 트리거를 만들지 않습니다. 교체하는 대상 테이블의 기존 트리거도 삭제되며 다시 만들지 않습니다.")
         self.chk_skip_triggers.toggled.connect(self._update_advanced_summary)
         panel_layout.addWidget(self.chk_skip_triggers)
+        self.chk_verify_copy.toggled.connect(self._update_trigger_options)
 
         timezone_line = QHBoxLayout()
         self.chk_timezone = QCheckBox("시간대 직접 정하기")
@@ -990,7 +993,14 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.chk_timezone.setEnabled(legacy)
         self.combo_timezone.setEnabled(legacy and self.chk_timezone.isChecked())
         self.lbl_timezone_note.setVisible(bool(manifest) and not legacy)
+        self._update_trigger_options()
         self._refresh_target_line()
+
+    def _update_trigger_options(self, *_):
+        allowed = build_rust_dump_config(self.connector).engine == "mysql" and not (self.chk_verify_copy.isChecked() and self._verify_allowed)
+        self.chk_skip_triggers.setEnabled(allowed)
+        if not allowed:
+            self.chk_skip_triggers.setChecked(False)
 
     def _uses_other_name(self) -> bool:
         return self.chk_other_name.isChecked()
@@ -1289,7 +1299,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             "other_name": name if other else "",
             "verify": verify,
             "import_mode": "safe" if verify else "replace",
-            "skip_triggers": self.chk_skip_triggers.isChecked(),
+            "skip_triggers": self.chk_skip_triggers.isEnabled() and self.chk_skip_triggers.isChecked(),
             "threads": self.spin_threads.value(),
             # 대상 서버 기본값 turns the dump's own timezone off; the other two choices set one.
             "timezone_sql": resolve_timezone_sql(engine, timezone) if timezone else None,

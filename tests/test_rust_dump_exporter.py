@@ -1964,9 +1964,18 @@ def test_import_reports_each_skipped_trigger_and_created_count(tmp_path, skipped
     facade = MagicMock()
     facade.import_dump.return_value = {"success": True, "rows_imported": 1, "programs_imported": [{"name": "created"}],
                                        skipped: ["trigger:sample:guard", "trigger:other:audit"]}
-    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace")
+    facade.import_dump.return_value["program_warnings"] = [
+        {"name":"guard", "code":"program_database_collation_changed", "source":"utf8mb4_bin", "target":"utf8mb4_0900_ai_ci"},
+        {"name":"guard", "code":1287, "message":"old syntax"},
+    ]
+    progress = []
+    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace", progress_callback=progress.append)
     assert ok and "트리거 1개" in message
     assert CORE_CODE_SENTENCES[skipped] in message and "sample:guard" in message and "other:audit" in message
+
+    assert "정렬 규칙" in message and "guard" in message and "utf8mb4_bin" in message
+    assert "1287" in message and "old syntax" in message
+    assert any("정렬 규칙" in line for line in progress)
 
 
 def test_trigger_refusal_reason_names_the_object_and_has_english_translation():
@@ -1974,10 +1983,29 @@ def test_trigger_refusal_reason_names_the_object_and_has_english_translation():
     from src.exporters.rust_dump_exporter import describe_export_refusal
     object_id = "trigger:orders:guard"
     line = describe_export_refusal([object_id], {object_id:"trigger_body_unproven"})[0]
-    assert "orders" in line and "guard" in line and "원본 정의와 일치" in line
+    assert "orders" in line and "guard" in line and "원본과 같은지" in line
+    assert "ACTION_STATEMENT" not in line and "SHOW CREATE" not in line
     i18n.set_language("en")
     try:
         line = describe_export_refusal([object_id], {object_id:"trigger_body_unproven"})[0]
         assert "guard" in line and "Could not match" in line
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+def test_named_core_code_formats_placeholder_and_actionable_trigger_guidance():
+    from src.exporters.rust_dump_exporter import describe_core_code, describe_core_failure
+    sentence = describe_core_code("generated_column_unproven", "total")
+    assert "total" in sentence and "{}" not in sentence
+    sentence = describe_core_failure("generated_column_unproven: total: cannot prove")
+    assert "total" in sentence and "{}" not in sentence
+    assert "트리거 없이 테이블만 가져오기" in describe_core_code("trigger_binlog_privilege")
+    assert "삭제하거나 다른 이름으로 다시" in describe_core_code("trigger_name_conflict")
+    assert "utf8mb4" in describe_core_code("program_charset_unsupported", "guard")
+    assert "다시 만든 뒤" in describe_core_code("program_charset_unsupported", "guard")
+
+
+def test_unrestorable_table_export_refusal_uses_its_plain_reason():
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+    text = describe_export_refusal(["table_definition:sample:DDL"], {"table_definition:sample:DDL":"table_definition_unrestorable"})[0]
+    assert "테이블 sample" in text and "내보내지 않았습니다" in text
