@@ -115,6 +115,7 @@ def test_trigger_skip_toggle_is_shared_with_preview_and_never_persisted(monkeypa
     config = MagicMock()
     config.get_app_setting.side_effect = lambda key, default=None: values.get(key, default)
     config.set_app_setting.side_effect = lambda key, value: values.__setitem__(key, value)
+    config.set_app_settings.side_effect = values.update
     dialog = RustDumpImportDialog(config_manager=config, tunnel_config={"environment": "development"})
     try:
         assert not dialog.chk_skip_triggers.isChecked()

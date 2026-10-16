@@ -136,7 +136,7 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             if programs.iter().any(|p|matches!(p.kind.as_str(),"PROCEDURE" | "FUNCTION")) && mysql_grants_allow(conn,"ALTER ROUTINE",Some(&endpoint.database))==Some(false) {
                 warnings.push(warning("program_probe_cleanup_unproven","ALTER ROUTINE is needed to remove routine probes"));
             }
-            if programs.iter().any(|p|p.kind=="FUNCTION") && log_bin && !trusted && mysql_grants_allow(conn,"SUPER",None)!=Some(true) {
+            if programs.iter().any(|p|p.kind=="FUNCTION" && function_binlog_preview_blocked(p,log_bin,trusted,mysql_grants_allow(conn,"SUPER",None))) {
                 warnings.push(warning("routine_binlog_unsafe","functions that fail binary log creation checks will be skipped"));
             }
             let current: Option<String> = conn.query_first("SELECT CURRENT_USER()")
@@ -156,7 +156,7 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     }
     let mut new_events_enabled = Vec::new();
     if !exists { if let LiveAdapter::MySql(conn) = &mut admin {
-        for p in programs.iter().filter(|p|p.kind=="EVENT") { if event_due_now(conn,p,None)? { new_events_enabled.push(p.name.clone()); } }
+        for p in programs.iter().filter(|p|p.kind=="EVENT") { if preview_event_due(conn,p,None,&mut warnings) { new_events_enabled.push(p.name.clone()); } }
     } }
     drop(admin);
     if !exists {
@@ -203,11 +203,15 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             let previous = target_programs.iter().find(|(k,n,_,_)| k==&p.kind && n.eq_ignore_ascii_case(&p.name));
             if let Some((_,_,definer,_)) = previous {
                 program_replace.push(program_id(p));
+                if p.kind!="EVENT" { warnings.push(warning("routine_grants_reset",format!("{} {}",p.kind,p.name))); }
+                if definer!=&current && !preserves_foreign_definer(conn) {
+                    warnings.push(warning("program_restore_definer_may_change",format!("{} {} ({definer} -> {current})",p.kind,p.name)));
+                }
                 if definer!=&current && mysql_grants_allow(conn,"SYSTEM_USER",None)!=Some(true) {
                     program_may_not_replace.push(json!({"name":p.name,"kind":p.kind,"definer":definer}));
                 }
             } else { program_create.push(program_id(p)); }
-            if p.kind=="EVENT" && event_due_now(conn,p,previous.and_then(|(_,_,_,status)|status.as_deref()))? { events_enabled.push(p.name.clone()); }
+            if p.kind=="EVENT" && preview_event_due(conn,p,previous.and_then(|(_,_,_,status)|status.as_deref()),&mut warnings) { events_enabled.push(p.name.clone()); }
         }
     } else if !exists { program_create = programs.iter().map(|p|program_id(p)).collect(); }
     if !events_enabled.is_empty() { warnings.push(warning("events_enabled",events_enabled.join(", "))); }
@@ -300,6 +304,14 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         "strict_export": manifest.strict_export, "snapshot_policy": manifest.snapshot_policy,
         "source_timezone": manifest.source_timezone, "copy_blockers": copy_blockers,
     }))
+}
+
+fn preview_event_due(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, target: Option<&str>, warnings: &mut Vec<Value>) -> bool {
+    let due=reset_program_context(conn).and_then(|()|event_due_now(conn,p,target));
+    match due {
+        Ok(due) => due,
+        Err(err) => { warnings.push(warning("program_session_unavailable",format!("{}: {err}",p.name))); false }
+    }
 }
 
 fn inspect_target(adapter: &mut LiveAdapter, schema: &str) -> Result<Target, String> {

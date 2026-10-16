@@ -17,6 +17,17 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "루틴 복원 중": "Restoring routine",
+    "이벤트 복원 중": "Restoring event",
+    "이전 정의를 복구하면서 정의자가 가져오는 계정으로 바뀌었습니다. 권한과 소유 계정을 확인하세요.": "The previous definition was restored under the importing account. Check its privileges and ownership.",
+    "다른 계정의 정의자를 지정할 권한이 없어 교체 실패 후 복구하면 정의자가 가져오는 계정으로 바뀔 수 있습니다.": "Restoring after replacement failure may change the definer to the importing account because permission to specify the original definer is missing.",
+    "대상의 이전 정의를 안전하게 복구할 수 있는지 확인하지 못해 이 객체는 교체하지 않았습니다. 보고서에서 세션 설정과 권한을 확인하세요.": "This object was not replaced because recovery of its previous definition could not be verified. Check session settings and privileges in the report.",
+    "과거의 일회성 이벤트를 서버가 생성 직후 삭제했습니다. 교체 실패로 처리하고 이전 정의 복구 결과를 보고합니다.": "The server immediately removed a past one-shot event. Replacement is treated as failed and previous-definition recovery is reported.",
+    "동명 루틴을 교체하면 그 루틴에 직접 부여한 EXECUTE·ALTER ROUTINE 권한이 사라질 수 있습니다. 필요한 권한을 다시 부여하세요.": "Replacing a same-named routine may remove its routine-level EXECUTE and ALTER ROUTINE grants. Regrant the required privileges.",
+    "이 객체의 원본 세션 설정을 대상에서 적용할 수 없습니다. 시간대 설정을 확인하세요. 이 객체는 교체 전에 설정을 다시 확인합니다.": "The source session settings cannot be applied on this target. Check its time zone configuration. Settings are checked again before replacing this object.",
+    "루틴 복원 중입니다.": "Restoring routines.",
+    "이벤트 복원 중입니다.": "Restoring events.",
+
     "원본 정의를 확인하지 못한 트리거·루틴·이벤트와 InnoDB가 아닌 테이블(MyISAM, MEMORY 등)을 묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다.": "Export without asking by leaving out unproven triggers, routines, events and non-InnoDB tables (MyISAM, MEMORY, etc.). Non-InnoDB tables are omitted entirely, including definitions and data. The result is not a complete backup. Objects whose omission changes table definitions, such as generated columns and CHECK constraints, cannot be left out.",
     "트리거·함수·구체화 뷰처럼 덤프에 담을 수 없는 객체를 묻지 않고 빼고 내보냅니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다.": "Export without asking by leaving out unsupported objects such as triggers, functions and materialized views. The result is not a complete backup. Objects whose omission changes table definitions, such as generated columns and CHECK constraints, cannot be left out.",
     "일부 테이블만 내보낼 때는 테이블과 그 트리거만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.": "A table-subset export contains only the tables and their triggers. Views, procedures, functions and events are left out.",
@@ -46,13 +57,11 @@ _EN_TEXT_TRANSLATIONS = {
     "교체할 저장 프로그램: {}": "Stored programs to replace: {}",
     "이전 정의 복구 성공": "Previous definition restored",
     "이전 정의 복구 실패": "Previous definition could not be restored",
-    "원본 정의를 확인하지 못한 트리거·루틴·이벤트와 InnoDB가 아닌 테이블(MyISAM 등)을 묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다.": "Export without asking by leaving out unproven triggers, routines, events and non-InnoDB tables (such as MyISAM). Non-InnoDB tables are omitted entirely, including definitions and rows. The result is not a complete backup. Objects whose omission changes table definitions, such as generated columns and CHECK constraints, cannot be left out.",
 
     "이 테이블의 정의로는 가져오기용 테이블을 만들 수 없어 내보내지 않았습니다. 원본 테이블 정의를 확인하세요.": "Export stopped because this table definition cannot be used to recreate the table on import. Check the source table definition.",
     "트리거를 만들 때 서버가 경고를 보냈습니다.": "The server issued a warning while creating the trigger.",
     "이 옵션을 켜면 덤프의 트리거를 만들지 않습니다. 교체하는 대상 테이블의 기존 트리거도 삭제되며 다시 만들지 않습니다.": "This option omits dump triggers. Existing triggers on replaced target tables are also deleted and are not recreated.",
 
-    "저장 프로시저·예약 이벤트나 정의를 확인하지 못한 트리거처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다.": "Export without asking by leaving out procedures, scheduled events, unproven triggers and non-InnoDB tables (such as MyISAM). Non-InnoDB tables are omitted entirely, including their definitions and rows. The result is not a complete backup. Objects whose omission changes a table definition, such as generated columns and CHECK constraints, cannot be left out.",
     "만들 트리거: {}": "Triggers to create: {}",
 
     "트리거를 다시 만들지 못한 테이블: {}": "Tables whose triggers were not recreated: {}",
@@ -447,7 +456,6 @@ _EN_TEXT_TRANSLATIONS = {
     "시점 일관성 포기하고 더 빠르게": "Give up point-in-time consistency for speed",
     "잠금으로 모든 테이블을 같은 시점에 맞춰 읽을 수 없을 때, 연결 하나로 천천히 읽는 대신 여러 연결로 나눠 빠르게 읽습니다. 테이블마다 읽은 시점이 달라 서로 맞지 않을 수 있습니다.": "When no lock lets every table be read at one point in time, reads quickly over several connections instead of slowly over one. Each table is then read at a different moment, so the tables may not match each other.",
     "담을 수 없는 객체는 빼고 내보내기": "Leave out objects the dump cannot keep",
-    "트리거·저장 프로시저·예약 이벤트처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다.": "Leaves out, without asking, what the dump cannot keep, such as triggers, stored procedures and scheduled events, and tables that are not InnoDB (MyISAM and so on). A table that is not InnoDB is left out entirely, structure and data. The result is not a complete backup. What would change a table's definition if left out, such as a generated column or a CHECK constraint, cannot be left out.",
     "압축:": "Compression:",
     "압축 안 함": "No compression",
     "압축(zstd)": "Compression (zstd)",

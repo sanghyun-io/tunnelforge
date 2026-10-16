@@ -630,6 +630,13 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "program_restore_definer_changed": "이전 정의를 복구하면서 정의자가 가져오는 계정으로 바뀌었습니다. 권한과 소유 계정을 확인하세요.",
+    "program_restore_definer_may_change": "다른 계정의 정의자를 지정할 권한이 없어 교체 실패 후 복구하면 정의자가 가져오는 계정으로 바뀔 수 있습니다.",
+    "program_restore_unavailable": "대상의 이전 정의를 안전하게 복구할 수 있는지 확인하지 못해 이 객체는 교체하지 않았습니다. 보고서에서 세션 설정과 권한을 확인하세요.",
+    "program_event_dropped": "과거의 일회성 이벤트를 서버가 생성 직후 삭제했습니다. 교체 실패로 처리하고 이전 정의 복구 결과를 보고합니다.",
+    "routine_grants_reset": "동명 루틴을 교체하면 그 루틴에 직접 부여한 EXECUTE·ALTER ROUTINE 권한이 사라질 수 있습니다. 필요한 권한을 다시 부여하세요.",
+    "program_session_unavailable": "이 객체의 원본 세션 설정을 대상에서 적용할 수 없습니다. 시간대 설정을 확인하세요. 이 객체는 교체 전에 설정을 다시 확인합니다.",
+
     "events_enabled": "가져온 뒤 바로 실행될 수 있는 이벤트가 있습니다. 이름과 일정을 확인하세요.",
     "routine_body_unreadable": "루틴 {}의 본문을 읽지 못해 담지 않았습니다. SHOW_ROUTINE 권한 또는 원본 소유 계정이 필요합니다.",
     "program_body_unreadable": "저장 프로그램 {}의 정의를 읽지 못했습니다. 원본 객체와 조회 권한을 확인하세요.",
@@ -739,7 +746,7 @@ def describe_core_code(code: object, name: object = "") -> Optional[str]:
         return None
     sentence = translate_text(sentence)
     if "{}" in sentence:
-        return sentence.format(name)
+        return sentence.format(name) if name else re.sub(r"\{\}(?:의|은|는|이|가|을|를)?\s*", "", sentence).strip()
     return f"{name}: {sentence}" if name else sentence
 
 

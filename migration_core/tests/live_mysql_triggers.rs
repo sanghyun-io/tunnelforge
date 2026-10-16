@@ -187,6 +187,8 @@ fn failed_trigger_on_a_newly_created_table_is_reported_as_a_loss() {
         output.push(e);
     });
     assert!(injected); refused(&output,"program_create_failed");
+    let error=output.iter().find(|e|e["event"]=="error").unwrap()["message"].as_str().unwrap();
+    assert_eq!(error.matches("program_create_failed:").count(),1,"{error}");
     assert!(!output.iter().any(|e| e["event"] == "error" && e["message"].as_str().unwrap().contains("program_probe_failed")));
     let report = output.iter().rev().find(|e|e["event"] == "import_report").unwrap();
     assert_eq!(report["dropped_tables"],json!([])); assert_eq!(report["created_tables"],json!(["sample"]));

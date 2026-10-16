@@ -689,14 +689,27 @@ log checks (1418/1419) is skipped with routine_binlog_unsafe and a partial resul
 its existing target function is kept. Other probe errors stop before replacement.
 Probe cleanup failures name leftover objects and the needed ALTER ROUTINE grant;
 no existing table is replaced after such a failure. Events are never probed.
+Replacing a routine can remove its routine-level EXECUTE/ALTER ROUTINE grants
+(mysql.procs_priv), even after previous-definition recovery. A must-see plan line
+names the replaced routines; regrant application permissions after replacement.
+This warning is also retained in the result. Database/global grants are separate.
+
+Every object's metadata lookup/SHOW CREATE starts with SET NAMES utf8mb4 and
+neutral sql_mode/time_zone. Source session settings are applied before DROP.
+A failed SET leaves the target object intact. Preview reports a bad event time
+zone as a named warning and continues inspecting other objects. Routine/event
+phases and per-object progress are emitted to the UI.
+
 Preview checks CREATE ROUTINE/ALTER ROUTINE/EVENT grants, reports possible
 SYSTEM_USER definer replacement restrictions, and warns about binlog function
-checks. Runtime probes remain authoritative.
+checks. Under binlog with trust=0, 1418 can affect SUPER accounts too; the plan
+warns about function creation checks regardless of SUPER (1419 additionally
+depends on privileges). Runtime probes remain authoritative.
 
 Event headers always CREATE with DISABLE, including definitions captured as
-DISABLE ON SLAVE. After creation, ALTER EVENT ENABLE runs only if a same-named
+DISABLE ON SLAVE (8.0) or DISABLE ON REPLICA (8.4). After creation, ALTER EVENT ENABLE runs only if a same-named
 target event was ENABLED, or a new event was ENABLED at the source. A target's
-DISABLED/SLAVESIDE_DISABLED state stays disabled. Enabled events with past AT or
+DISABLED/SLAVESIDE_DISABLED/REPLICA_SIDE_DISABLED state stays disabled. Enabled events with past AT or
 STARTS schedules are named and counted in a must-see plan line. Source-schema
 body references block a different-schema import before DROP, including routines
 and events; the importer never rewrites those references or enables such an event.
@@ -705,9 +718,17 @@ Before replacing a same-named routine/event, the importer saves its SHOW CREATE
 and session context. If replacement CREATE fails, it attempts to recreate the
 saved target definition on the same connection. The report includes
 previous_definition, previous_restored and restore_error, plus the replacement
-failure. Data remains committed and status is partial. SHOW WARNINGS after every
+failure. Recovery first replays the target's exact status/DEFINER without ALTER
+EVENT, which would transfer ownership. If specifying the old DEFINER fails with
+1227, it retries without DEFINER while preserving SQL SECURITY and the target's
+original status clause; previous_definer_preserved=false and a named warning
+report that ownership changed. The plan warns about this risk. Known missing
+CREATE privileges, unusable session settings, or a previous function that cannot
+pass binlog checks leave the target object untouched rather than risk its loss. Data remains committed and status is partial. SHOW WARNINGS after every
 CREATE is attached to the named object's report and surfaced in Import results.
-This includes past one-shot events MySQL immediately removes (1588). Replace is
+A past one-shot event MySQL immediately removes (1588) is a CREATE failure:
+it is never reported as imported, the result is partial, and the saved target
+definition is recovered when available. Replace is
 not atomic; previous-definition recovery can itself fail and is reported.
 Verify-in-copy and scheduled rehearsals still refuse all stored programs before
 creating a copy. Legacy format 5/6 and trigger-only format 7 paths stay supported.

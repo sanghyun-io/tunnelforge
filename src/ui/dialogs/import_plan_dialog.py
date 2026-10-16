@@ -89,6 +89,9 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
             if not enabled:
                 names = [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
                 data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(names), ", ".join(names)))
+        elif code in ("routine_grants_reset", "program_restore_definer_may_change", "program_session_unavailable"):
+            names = [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
+            data_warnings.append(f"- {sentence} " + sanitize_local_diagnostic(", ".join(names)))
         elif code in ("program_replace_privilege_unproven", "program_event_system_timezone", "routine_binlog_unsafe"):
             data_warnings.append(f"- {sentence}")
         elif code == "unsynchronized_snapshot":

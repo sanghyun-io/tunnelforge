@@ -61,7 +61,11 @@ fn full_export_all_tables_to_fresh_schema_restores_generated_triggers_routines_e
     let exported=s.dump(); assert_eq!(exported["format_version"],7); assert_eq!(exported["tables"],1); assert_eq!(exported["triggers"],1); assert_eq!(exported["routines"],3); assert_eq!(exported["events"],3);
     let target=s.other(false); let preview=success(events("dump.import_preview",s.payload(&target)));
     assert_eq!(preview["events_enabled"],json!(["enabled_job"]),"{preview}");
-    let imported=success(events("dump.import",s.payload(&target))); assert_eq!(imported["programs_imported"].as_array().unwrap().len(),7);
+    let stream=events("dump.import",s.payload(&target));
+    for phase in ["dump_import_routines","dump_import_events"] {
+        assert!(stream.iter().any(|e|e["event"]=="phase" && e["phase"]==phase && e["current"].as_u64().is_some() && e["name"].as_str().is_some()),"{stream:#?}");
+    }
+    let imported=success(stream); assert_eq!(imported["programs_imported"].as_array().unwrap().len(),7);
     let mut fresh=conn(&target);
     assert_eq!(fresh.query::<(i32,i32,i32),_>("SELECT id,v,g FROM sample ORDER BY id").unwrap(),vec![(1,42,84),(2,43,86)]);
     assert_eq!(fresh.query::<i32,_>("SELECT total FROM totals ORDER BY id").unwrap(),vec![84,86]);
@@ -169,7 +173,9 @@ fn event_warnings_and_replica_disabled_state_are_reported_without_running_a_prob
     let target=s.other(true); let restored=success(events("dump.import",s.payload(&target))); assert_eq!(status(&mut conn(&target),"e"),"DISABLED");
     assert!(restored["program_warnings"].as_array().unwrap().iter().any(|w|w["code"]=="program_event_system_timezone"));
     let p=&mut m["stored_programs"][0]; p["definition"]=json!(p["definition"].as_str().unwrap().replace("ON COMPLETION PRESERVE","ON COMPLETION NOT PRESERVE")); p["status"]=json!("DISABLED"); s.save(&m);
-    let other=s.other(true); let warned=success(events("dump.import",s.payload(&other)));
+    let other=s.other(true); let warned=outcome(events("dump.import",s.payload(&other)));
+    assert_eq!(warned["status"],"partial");
+    assert_eq!(warned["programs_failed"][0]["code"],"program_event_dropped");
     assert!(warned["program_warnings"].as_array().unwrap().iter().any(|w|w["code"]==1588),"{warned}");
 }
 
@@ -223,4 +229,161 @@ fn same_named_procedure_function_pair_with_in_out_and_reads_sql_data_roundtrips_
     p["definition"]=json!(format!("{}; DROP TABLE sample",p["definition"].as_str().unwrap())); s.save(&m); fresh.query_drop("UPDATE sample SET v=99").unwrap();
     let output=events("dump.import",s.payload(&target)); assert!(output.iter().any(|e|e["event"]=="error" && e["message"].as_str().unwrap().contains("program_probe_failed")),"{output:#?}");
     assert_eq!(fresh.query_first::<i32,_>("SELECT v FROM sample LIMIT 1").unwrap(),Some(99));
+}
+
+// Cross-review reproductions, adapted into permanent regression tests.
+fn definer(db:&mut mysql::PooledConn,name:&str) -> Option<String> { db.exec_first("SELECT DEFINER FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME=?",(name,)).unwrap() }
+fn bogus_event_dump(s:&Sandbox) {
+    let mut m=s.manifest(); let p=&mut m["stored_programs"][0];
+    p["definition"]=json!(p["definition"].as_str().unwrap().replace("SET @original=1","BOGUS SQL")); s.save(&m);
+}
+
+#[test]
+fn regression_replica_disabled_event_exports_and_restores_disabled() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT r ON SCHEDULE EVERY 1 DAY DISABLE ON SLAVE DO SET @a=1").unwrap();
+    let st=status(&mut db,"r"); eprintln!("source status={st}");
+    let out=events("dump.run",json!({"source":s.endpoint,"output_dir":s.output,"data_format":"jsonl","compression":"none","mysql_snapshot_mode":"single_connection"}));
+    let refusal=out.iter().find(|e|e["error_code"]=="unsupported_objects").cloned();
+    assert!(refusal.is_none(),"replica-disabled event refused: {refusal:#?}");
+    let target=s.other(true); let v=success(events("dump.import",s.payload(&target)));
+    eprintln!("{v:#}"); assert_eq!(status(&mut conn(&target),"r"),"DISABLED");
+}
+
+#[test]
+fn regression_target_replica_disabled_same_named_event_is_replaced() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT r ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1").unwrap(); s.dump();
+    let target=s.other(true); let mut fresh=conn(&target);
+    fresh.query_drop("CREATE EVENT r ON SCHEDULE EVERY 2 DAY DISABLE ON SLAVE DO SET @a=2").unwrap();
+    let v=outcome(events("dump.import",s.payload(&target))); eprintln!("{:#}",v["programs_failed"]);
+    assert_eq!(v["status"],"completed","{v:#}");
+}
+
+#[test]
+fn regression_failed_event_replacement_restores_foreign_definer_event_without_set_user_id() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY ENABLE DO SET @original=1").unwrap(); s.dump(); bogus_event_dump(&s);
+    let target=s.other(true); let pid=std::process::id();
+    let owner=format!("rv_owner_{pid}"); let importer=format!("rv_imp_{pid}");
+    let _o=User{endpoint:s.endpoint.clone(),name:owner.clone()}; let _i=User{endpoint:s.endpoint.clone(),name:importer.clone()};
+    db.query_drop(format!("CREATE USER '{owner}'@'%' IDENTIFIED BY 'tf_local_test'; CREATE USER '{importer}'@'%' IDENTIFIED BY 'tf_local_test'; GRANT ALL ON `{}`.* TO '{importer}'@'%'",target.database)).unwrap();
+    let mut fresh=conn(&target); fresh.query_drop(format!("CREATE DEFINER='{owner}'@'%' EVENT e ON SCHEDULE EVERY 2 DAY DISABLE DO SET @previous=9")).unwrap();
+    let account=Endpoint{user:importer,password:"tf_local_test".into(),..target.clone()};
+    let preview=success(events("dump.import_preview",s.payload(&account)));
+    assert!(preview["warnings"].as_array().unwrap().iter().any(|w|w["code"]=="program_restore_definer_may_change"));
+    let v=outcome(events("dump.import",s.payload(&account))); eprintln!("{:#}",v["programs_failed"]);
+    assert_eq!(v["programs_failed"][0]["previous_restored"],true,"{:#}",v["programs_failed"]);
+    assert!(definer(&mut fresh,"e").is_some(),"target event e is gone");
+    assert_eq!(v["programs_failed"][0]["previous_definer_preserved"],false);
+    assert!(v["program_warnings"].as_array().unwrap().iter().any(|w|w["code"]=="program_restore_definer_changed"));
+
+}
+
+#[test]
+fn regression_restored_enabled_event_keeps_its_original_definer() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY ENABLE DO SET @original=1").unwrap(); s.dump(); bogus_event_dump(&s);
+    let target=s.other(true); let owner=format!("rv_owner2_{}",std::process::id()); let _o=User{endpoint:s.endpoint.clone(),name:owner.clone()};
+    db.query_drop(format!("CREATE USER '{owner}'@'%' IDENTIFIED BY 'tf_local_test'")).unwrap();
+    let mut fresh=conn(&target); fresh.query_drop(format!("CREATE DEFINER='{owner}'@'%' EVENT e ON SCHEDULE EVERY 2 DAY ENABLE DO SET @previous=9")).unwrap();
+    let v=outcome(events("dump.import",s.payload(&target))); assert_eq!(v["programs_failed"][0]["previous_restored"],true,"{v:#}");
+    assert_eq!(status(&mut fresh,"e"),"ENABLED");
+    assert_eq!(definer(&mut fresh,"e"),Some(format!("{owner}@%")),"restore changed the definer");
+}
+
+#[test]
+fn regression_replacing_routine_keeps_or_reports_routine_level_grants() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE PROCEDURE p() SELECT 1").unwrap(); s.dump();
+    let target=s.other(true); let app=format!("rv_app_{}",std::process::id()); let _a=User{endpoint:s.endpoint.clone(),name:app.clone()};
+    let mut fresh=conn(&target);
+    fresh.query_drop(format!("CREATE PROCEDURE p() SELECT 2; CREATE USER '{app}'@'%' IDENTIFIED BY 'x'; GRANT EXECUTE ON PROCEDURE `{}`.p TO '{app}'@'%'",target.database)).unwrap();
+    let preview=success(events("dump.import_preview",s.payload(&target))); eprintln!("preview warnings {:#}",preview["warnings"]);
+    let v=success(events("dump.import",s.payload(&target))); eprintln!("warnings {:#}",v["program_warnings"]);
+    let grants:Option<u64>=db.exec_first("SELECT COUNT(*) FROM mysql.procs_priv WHERE Db=? AND User=?",(&target.database,&app)).unwrap();
+    assert_eq!(grants,Some(0));
+    assert!(preview["warnings"].as_array().unwrap().iter().any(|w|w["code"]=="routine_grants_reset"));
+    assert!(v["program_warnings"].as_array().unwrap().iter().any(|w|w["code"]=="routine_grants_reset"));
+}
+
+#[test]
+fn regression_past_one_shot_event_replacing_target_event_keeps_previous_definition() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY ON COMPLETION NOT PRESERVE DISABLE DO SET @a=1").unwrap(); s.dump();
+    let mut m=s.manifest(); let p=&mut m["stored_programs"][0]; let mut sql=p["definition"].as_str().unwrap().to_string();
+    let start=sql.find(" AT '").unwrap()+5; let end=start+sql[start..].find('\'').unwrap(); sql.replace_range(start..end,"2000-01-01 00:00:00"); p["definition"]=json!(sql); s.save(&m);
+    let target=s.other(true); let mut fresh=conn(&target); fresh.query_drop("CREATE EVENT e ON SCHEDULE EVERY 2 DAY DISABLE DO SET @previous=9").unwrap();
+    let v=outcome(events("dump.import",s.payload(&target))); eprintln!("status {} imported {:#} warnings {:#}",v["status"],v["programs_imported"],v["program_warnings"]);
+    assert_eq!(v["status"],"partial");
+    assert!(v["programs_imported"].as_array().unwrap().is_empty());
+    assert_eq!(v["programs_failed"][0]["previous_restored"],true);
+    assert!(v["programs_failed"][0]["previous_definition"].as_str().unwrap().contains("@previous=9"));
+    assert!(definer(&mut fresh,"e").is_some());
+}
+
+#[test]
+fn regression_nondeterministic_function_with_super_preview_warns() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE FUNCTION f() RETURNS INT RETURN 1").unwrap(); s.dump();
+    let log:bool=db.query_first("SELECT @@log_bin").unwrap().unwrap(); if !log { return }
+    db.query_drop("SET GLOBAL log_bin_trust_function_creators=0").unwrap();
+    let target=s.other(true);
+    let preview=success(events("dump.import_preview",s.payload(&target))); eprintln!("preview warnings {:#}",preview["warnings"]);
+    let v=outcome(events("dump.import",s.payload(&target))); eprintln!("status {} warnings {:#}",v["status"],v["program_warnings"]);
+    assert!(preview["warnings"].as_array().unwrap().iter().any(|w|w["code"]=="routine_binlog_unsafe"),"preview silent but runtime skipped");
+}
+
+#[test]
+fn recovery_keeps_the_targets_replica_state_and_definer_verbatim() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY ENABLE DO SET @original=1").unwrap(); s.dump(); bogus_event_dump(&s);
+    let target=s.other(true); let mut fresh=conn(&target);
+    let owner=format!("tf_replica_owner_{}",std::process::id()); let _owner=User{endpoint:s.endpoint.clone(),name:owner.clone()};
+    db.query_drop(format!("CREATE USER '{owner}'@'%' IDENTIFIED BY 'tf_local_test'")).unwrap();
+    fresh.query_drop(format!("CREATE DEFINER='{owner}'@'%' EVENT e ON SCHEDULE EVERY 2 DAY DISABLE ON SLAVE DO SET @previous=9")).unwrap();
+    let before=status(&mut fresh,"e");
+    let v=outcome(events("dump.import",s.payload(&target))); assert_eq!(v["programs_failed"][0]["previous_restored"],true,"{v}");
+    assert_eq!(status(&mut fresh,"e"),before); assert_eq!(definer(&mut fresh,"e"),Some(format!("{owner}@%")));
+}
+
+#[test]
+fn each_object_resets_charset_before_reading_unicode_target_metadata() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("SET NAMES latin1; CREATE PROCEDURE a() SELECT 1; SET NAMES utf8mb4; CREATE PROCEDURE `한글`() SELECT 2").unwrap(); s.dump();
+    let mut target=s.endpoint.clone(); target.database.push_str("_한글"); s.databases.push(target.database.clone());
+    db.query_drop(format!("CREATE DATABASE `{}` CHARACTER SET utf8mb4",target.database)).unwrap();
+    let mut fresh=conn(&target); fresh.query_drop("SET NAMES latin1; CREATE PROCEDURE a() SELECT 9; SET NAMES utf8mb4; CREATE PROCEDURE `한글`() SELECT 9").unwrap();
+    let v=success(events("dump.import",s.payload(&target))); assert_eq!(v["programs_imported"].as_array().unwrap().len(),2);
+    let row:mysql::Row=fresh.query_first("SHOW CREATE PROCEDURE `한글`").unwrap().unwrap(); assert!(row.get::<String,_>("Create Procedure").unwrap().contains("SELECT 2"));
+    assert_eq!(fresh.query_first::<u64,_>("SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE()").unwrap(),Some(2));
+}
+
+#[test]
+fn bad_event_timezone_warns_in_preview_and_preserves_target_before_drop() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT bad ON SCHEDULE EVERY 1 DAY STARTS '2000-01-01' ENABLE DO SET @a=1; CREATE EVENT good ON SCHEDULE EVERY 1 DAY STARTS '2000-01-01' ENABLE DO SET @a=1").unwrap(); s.dump();
+    let mut m=s.manifest(); m["stored_programs"].as_array_mut().unwrap().iter_mut().find(|p|p["name"]=="bad").unwrap()["time_zone"]=json!("Missing/Zone"); s.save(&m);
+    let target=s.other(true); let mut fresh=conn(&target); fresh.query_drop("CREATE EVENT bad ON SCHEDULE EVERY 2 DAY ENABLE DO SET @previous=9").unwrap();
+    let before:mysql::Row=fresh.query_first("SHOW CREATE EVENT bad").unwrap().unwrap(); let before:String=before.get("Create Event").unwrap();
+    let preview=success(events("dump.import_preview",s.payload(&target))); assert!(preview["warnings"].as_array().unwrap().iter().any(|w|w["code"]=="program_session_unavailable")); assert_eq!(preview["events_enabled"],json!(["good"]));
+    let absent=s.other(false); let preview=success(events("dump.import_preview",s.payload(&absent))); assert!(preview["warnings"].as_array().unwrap().iter().any(|w|w["code"]=="program_session_unavailable"));
+    let v=outcome(events("dump.import",s.payload(&target))); assert_eq!(v["status"],"partial"); assert_eq!(v["programs_failed"][0]["target_unchanged"],true);
+    let after:mysql::Row=fresh.query_first("SHOW CREATE EVENT bad").unwrap().unwrap(); assert_eq!(after.get::<String,_>("Create Event").unwrap(),before); assert_eq!(status(&mut fresh,"good"),"ENABLED");
+}
+
+#[test]
+fn unprovable_function_recovery_leaves_foreign_owned_target_untouched() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 1").unwrap(); s.dump();
+    let target=s.other(true); let mut fresh=conn(&target); fresh.query_drop("CREATE FUNCTION f() RETURNS INT RETURN 9").unwrap();
+    let name=format!("tf_unrestorable_{}",std::process::id()); let _user=User{endpoint:s.endpoint.clone(),name:name.clone()};
+    db.query_drop(format!("CREATE USER '{name}'@'%' IDENTIFIED BY 'tf_local_test'; GRANT ALL ON `{}`.* TO '{name}'@'%'",target.database)).unwrap();
+    let account=Endpoint{user:name,password:"tf_local_test".into(),..target.clone()}; let mut output=Vec::new(); let mut injected=false;
+    handle_request_streaming(Request{command:"dump.import".into(),request_id:None,payload:s.payload(&account)},|e| {
+        if !injected && e["event"]=="row_progress" { db.query_drop("SET GLOBAL log_bin_trust_function_creators=0").unwrap(); injected=true; }
+        output.push(e);
+    });
+    let v=outcome(output); assert!(injected); assert_eq!(v["status"],"partial"); assert_eq!(v["programs_failed"][0]["target_unchanged"],true); assert_eq!(v["programs_failed"][0]["code"],"program_restore_unavailable");
+    assert_eq!(fresh.query_first::<i32,_>("SELECT f()").unwrap(),Some(9));
 }

@@ -261,3 +261,10 @@ def test_routine_and_event_definers_name_original_and_importing_accounts():
     plan = describe_plan({"warnings": [{"code": "program_definer_replaced", "detail": detail}]}, False)
     assert plan["must_see"]
     assert detail in "\n".join(plan["warnings"])
+
+
+@pytest.mark.parametrize("code", ["routine_grants_reset", "program_restore_definer_may_change", "program_session_unavailable"])
+def test_program_replacement_risks_are_named_must_see_warnings(code):
+    plan = describe_plan({"warnings": [{"code": code, "detail": "PROCEDURE named_object"}]}, False)
+    assert plan["must_see"] and not plan["blockers"]
+    assert "named_object" in "\n".join(plan["warnings"])

@@ -614,11 +614,11 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             let table_programs = programs.iter().filter(|p| p.table.as_deref() == Some(table.name.as_str())).collect::<Vec<_>>();
             if !table_programs.is_empty() {
                 journal.phase = "dump_import_triggers".into();
-                let mut conn = import_trigger_connection(&endpoint).map_err(|err| classified_import_error("program_create_failed", &err, Some(&table.name)))?;
+                let mut conn = import_trigger_connection(&endpoint).map_err(|err| classified_import_error("program_create_failed", err.strip_prefix("program_create_failed: ").unwrap_or(&err), Some(&table.name)))?;
                 for p in table_programs {
                     let warnings = create_trigger(&mut conn, p, &p.name, &table.name).map_err(|err| {
                         journal.programs_failed.push(json!({"table":table.name,"name":p.name,"error":err}));
-                        classified_import_error("program_create_failed", &err, Some(&table.name))
+                        classified_import_error("program_create_failed", err.strip_prefix("program_create_failed: ").unwrap_or(&err), Some(&table.name))
                     })?;
                     journal.triggers_created.push(json!({"table":table.name,"name":p.name}));
                     journal.program_warnings.extend(warnings);
@@ -736,7 +736,7 @@ fn probe_import_ddl(
     let prefix = format!("tf_probe_{}_{nonce}", std::process::id());
     let engine = adapter.engine();
     let mut program_conn = if programs.is_empty() { None } else { Some(import_trigger_connection(endpoint)
-        .map_err(|err| classified_import_error("program_probe_failed", &err, None))?) };
+        .map_err(|err| trigger_probe_error(&err, None))?) };
     run_owned_ddl_probe(schema, source_engine, engine, surviving, &prefix,
         |table| { journal.current_table = Some(table.to_string()); journal.checkpoint() },
         |sql| adapter.execute_sql(sql),
@@ -744,17 +744,17 @@ fn probe_import_ddl(
             if let Some(conn) = program_conn.as_mut() {
                 for (index, p) in programs.iter().enumerate().filter(|(_, p)| p.table.as_deref() == Some(table)) {
                     create_trigger(conn, p, &format!("{prefix}_t{index}"), probe)
-                        .map_err(|err| trigger_probe_error(&err, &p.name))?;
+                        .map_err(|err| trigger_probe_error(&err, Some(&p.name)))?;
                 }
             }
             Ok(())
         })
 }
 
-fn trigger_probe_error(err: &str, name: &str) -> String {
+fn trigger_probe_error(err: &str, name: Option<&str>) -> String {
     if err.starts_with("trigger_binlog_privilege:") { return err.to_string() }
     let detail = err.strip_prefix("program_create_failed: ").unwrap_or(err);
-    classified_import_error("program_probe_failed", detail, Some(name))
+    classified_import_error("program_probe_failed", detail, name)
 }
 
 fn import_trigger_connection(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
@@ -1330,12 +1330,13 @@ fn import_table_rows<F: FnMut(Value)>(
 
 /// import 데이터 적재 완료 후의 마무리 단계: post-load DDL(인덱스/FK) 적용,
 /// 적재 행수 검증, View 생성(best-effort), 리포트 기록 후 최종 result JSON을 만든다.
-fn import_schema_programs(endpoint: &Endpoint, manifest: &DumpManifest, journal: &mut ImportJournal, events: bool) -> Result<(),String> {
+fn import_schema_programs<F: FnMut(Value)>(endpoint: &Endpoint, manifest: &DumpManifest, journal: &mut ImportJournal, events: bool, request_id: &Option<String>, emit: &mut F) -> Result<(),String> {
     let programs = manifest.stored_programs.iter().filter(|p| p.kind!="TRIGGER" && (p.kind=="EVENT")==events
         && !journal.routines_skipped.contains(&(p.kind.clone(),p.name.clone()))).collect::<Vec<_>>();
     if programs.is_empty() { return Ok(()) }
     journal.phase = if events { "dump_import_events" } else { "dump_import_routines" }.into();
     journal.checkpoint()?;
+    emit(json!({"event":"phase","request_id":request_id,"phase":journal.phase,"message":if events {"이벤트 복원 중입니다."} else {"루틴 복원 중입니다."}}));
     let mut conn = match import_trigger_connection(endpoint) {
         Ok(conn) => conn,
         Err(err) => {
@@ -1343,7 +1344,9 @@ fn import_schema_programs(endpoint: &Endpoint, manifest: &DumpManifest, journal:
             return journal.checkpoint()
         }
     };
-    for p in programs {
+    let total=programs.len();
+    for (index,p) in programs.into_iter().enumerate() {
+        emit(json!({"event":"phase","request_id":request_id,"phase":journal.phase,"name":p.name,"kind":p.kind,"current":index+1,"total":total,"message":format!("{}: {}",if events {"이벤트 복원 중"} else {"루틴 복원 중"},p.name)}));
         match replace_schema_program(&mut conn,&endpoint.database,p) {
             Ok((warnings,created)) => { journal.program_warnings.extend(warnings); journal.programs_imported.push(created); }
             Err(failure) => {
@@ -1393,7 +1396,7 @@ fn finalize_dump_import<F: FnMut(Value)>(
     // Table data is already committed. View failures produce a partial result,
     // without suggesting that the restored rows were rolled back.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
-    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,false)?; }
+    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,false,&request_id,&mut emit)?; }
     let view_outcome = if selected.is_empty() && !manifest.views.is_empty() {
         import_views(
             adapter,
@@ -1405,7 +1408,7 @@ fn finalize_dump_import<F: FnMut(Value)>(
     } else {
         ViewImportOutcome::default()
     };
-    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,true)?; }
+    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,true,&request_id,&mut emit)?; }
     let import_complete = view_outcome.failed.is_empty() && journal.programs_failed.is_empty() && journal.routines_skipped.is_empty();
     let status = if import_complete { "completed" } else { "partial" };
     let message = if import_complete {
@@ -2533,12 +2536,15 @@ mod tests {
 
     #[test]
     fn trigger_probe_errors_never_claim_data_was_loaded() {
-        let error = trigger_probe_error("program_create_failed: invalid trigger body", "guard");
+        let error = trigger_probe_error("program_create_failed: invalid trigger body", Some("guard"));
         assert!(error.starts_with("program_probe_failed:"));
         assert!(error.contains("guard") && error.contains("invalid trigger body"));
         assert!(!error.contains("program_create_failed"));
+        let connection_error=trigger_probe_error("program_create_failed: connection lost",None);
+        assert_eq!(connection_error.matches("program_probe_failed:").count(),1);
+        assert!(!connection_error.contains("program_create_failed:"));
         let binlog = "trigger_binlog_privilege: log_bin_trust_function_creators=1 or SUPER";
-        assert_eq!(trigger_probe_error(binlog, "guard"), binlog);
+        assert_eq!(trigger_probe_error(binlog, Some("guard")), binlog);
     }
 
     #[test]

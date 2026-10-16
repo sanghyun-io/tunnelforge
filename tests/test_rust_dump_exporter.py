@@ -2035,3 +2035,17 @@ def test_partial_program_import_reports_recovery_and_returns_failure(tmp_path, r
     ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace")
     assert not ok and "루틴 1개" in message and "failed_f" in message
     assert ("이전 정의 복구 성공" if recovered else "이전 정의 복구 실패") in message
+
+
+@pytest.mark.parametrize("code", ["trigger_body_unproven", "program_charset_unsupported", "generated_column_unproven"])
+def test_nameless_code_sentences_drop_placeholder_and_korean_particle(code):
+    from src.exporters.rust_dump_exporter import describe_core_code, describe_core_failure
+    from src.core import i18n
+    text = describe_core_code(code)
+    assert "{}" not in text and " 의 " not in text and "  " not in text
+    assert describe_core_failure(f"failure (error_code={code})") == text
+    i18n.set_language("en")
+    try:
+        assert "{}" not in describe_core_code(code)
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
