@@ -137,7 +137,8 @@ def describe_export_refusal(objects: object, reasons: Optional[Dict[str, str]] =
         kind, _, rest = str(item).partition(":")
         table, _, name = rest.partition(":")
         if kind in _SCHEMA_REFUSAL_REASONS:
-            lines.append(translate_text(_SCHEMA_REFUSAL_REASONS[kind]).format(rest))
+            reason = describe_core_code((reasons or {}).get(str(item)), rest)
+            lines.append(reason or translate_text(_SCHEMA_REFUSAL_REASONS[kind]).format(rest))
         elif name:
             code = (reasons or {}).get(str(item))
             reason = (translate_text(CORE_CODE_SENTENCES[code]).format(name) if code in CORE_CODE_SENTENCES
@@ -629,23 +630,33 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "events_enabled": "가져온 뒤 바로 실행될 수 있는 이벤트가 있습니다. 이름과 일정을 확인하세요.",
+    "routine_body_unreadable": "루틴 {}의 본문을 읽지 못해 담지 않았습니다. SHOW_ROUTINE 권한 또는 원본 소유 계정이 필요합니다.",
+    "program_body_unreadable": "저장 프로그램 {}의 정의를 읽지 못했습니다. 원본 객체와 조회 권한을 확인하세요.",
+    "routine_binlog_unsafe": "함수를 바이너리 로그 설정 때문에 만들지 못하면 건너뛰며, 대상의 같은 이름 함수는 유지합니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요.",
+    "program_probe_cleanup_failed": "확인용 루틴을 지우지 못해 시작하지 않았습니다. 보고서의 남은 객체 이름과 ALTER ROUTINE 권한을 확인하세요.",
+    "program_probe_cleanup_unproven": "확인용 루틴을 지우려면 ALTER ROUTINE 권한이 필요합니다.",
+    "program_privilege_missing": "루틴·이벤트를 만들 권한이 없습니다. CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.",
+    "program_replace_privilege_unproven": "다른 계정이 만든 저장 프로그램은 교체하지 못할 수 있습니다.",
+    "program_event_system_timezone": "이 이벤트의 SYSTEM 시간대는 대상 서버의 시스템 시간대로 해석됩니다.",
+
     "table_definition_unrestorable": "이 테이블의 정의로는 가져오기용 테이블을 만들 수 없어 내보내지 않았습니다. 원본 테이블 정의를 확인하세요.",
-    "program_server_warning": "트리거를 만들 때 서버가 경고를 보냈습니다.",
-    "program_create_failed": "데이터를 넣은 뒤 트리거를 만들다가 멈췄습니다. Import 보고서에서 트리거가 복원되지 않은 테이블을 확인하세요.",
+    "program_server_warning": "저장 프로그램을 만들 때 서버가 경고를 보냈습니다.",
+    "program_create_failed": "데이터를 넣은 뒤 저장 프로그램을 만들지 못했습니다. Import 보고서에서 실패한 객체와 이전 정의 복구 결과를 확인하세요.",
     "trigger_body_unproven": "트리거 {}의 본문이 원본과 같은지 확인하지 못해 담지 않았습니다. 원본 트리거 정의를 확인하세요.",
     "program_definition_invalid": "저장 프로그램 {}의 종류, 실행 시점, 이벤트 또는 세션 설정을 안전하게 확인하지 못했습니다.",
-    "program_charset_unsupported": "트리거 {}의 문자셋으로는 정의를 안전하게 복원할 수 없습니다. 원본 트리거를 utf8mb4 문자셋으로 다시 만든 뒤 내보내세요.",
+    "program_charset_unsupported": "저장 프로그램 {}의 문자셋으로는 정의를 안전하게 복원할 수 없습니다. 원본 객체를 utf8mb4 문자셋으로 다시 만든 뒤 내보내세요.",
     "trigger_name_conflict": "같은 이름의 트리거가 대상의 다른 테이블에 있습니다. 그 트리거를 삭제하거나 다른 이름으로 다시 만든 뒤 가져오세요.",
     "trigger_binlog_privilege": "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다. 트리거를 제외하려면 고급 설정의 '트리거 없이 테이블만 가져오기'를 켜세요.",
     "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
-    "program_probe_failed": "트리거를 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
-    "program_source_schema_reference": "트리거 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
-    "dump_programs_unsupported_in_copy": "트리거가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
-    "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거를 만들지 않습니다.",
-    "programs_skipped_partial": "선택하지 않은 테이블의 트리거는 만들지 않습니다.",
+    "program_probe_failed": "저장 프로그램을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "program_source_schema_reference": "저장 프로그램 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
+    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
+    "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거·루틴·이벤트를 만들지 않습니다.",
+    "programs_skipped_partial": "선택하지 않은 테이블의 트리거와 스키마 전체의 뷰·루틴·이벤트는 만들지 않습니다.",
     "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
-    "program_definer_replaced": "트리거 정의자가 가져오는 계정으로 바뀝니다.",
-    "program_database_collation_changed": "대상 DB의 기본 정렬 규칙이 트리거 원본과 다릅니다.",
+    "program_definer_replaced": "저장 프로그램 정의자가 가져오는 계정으로 바뀝니다.",
+    "program_database_collation_changed": "대상 DB의 기본 정렬 규칙이 저장 프로그램 원본과 다릅니다.",
 
     "generated_column_unproven": "계산 열 {}의 식을 안전하게 해석하고 원본 테이블 정의와 일치하는지 확인하지 못했습니다. 원본의 SHOW CREATE TABLE 정의와 생성식을 확인하세요.",
     **CONNECTION_ERROR_MESSAGES,
@@ -1032,6 +1043,8 @@ class RustDumpImporter(_RustDumpClientBase):
             views_failed = result.get("views_failed") or []
             views_skipped = result.get("views_skipped_cross_engine") or []
             message = f"Rust DB Core import 완료: {len(tables_to_import)}개 테이블, {rows:,} rows"
+            if result.get("status") == "partial":
+                message = translate_text("테이블 데이터는 가져왔지만 일부 객체를 복원하지 못했습니다.") + f" ({len(tables_to_import)}개 테이블, {rows:,} rows)"
             if import_mode == "safe":
                 candidate_name = candidate.get("schema") if self.config.engine == "postgresql" else candidate.get("database")
                 message = f"복사본 {candidate_name}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다."
@@ -1043,8 +1056,17 @@ class RustDumpImporter(_RustDumpClientBase):
                         message += f"\n{blocker}"
             if views_imported:
                 message += f", View {len(views_imported)}개"
-            if result.get("programs_imported"):
-                message += f", 트리거 {len(result['programs_imported'])}개"
+            for kinds, label in [(("TRIGGER",), "트리거"), (("PROCEDURE", "FUNCTION"), "루틴"), (("EVENT",), "이벤트")]:
+                count = sum(item.get("kind", "TRIGGER") in kinds for item in result.get("programs_imported") or [] if isinstance(item, dict))
+                if count:
+                    message += f", {label} {count}개"
+            programs_failed = result.get("programs_failed") or []
+            for failure in programs_failed:
+                name = str(failure.get("name", ""))
+                line = describe_core_code(failure.get("code") or "program_create_failed", name)
+                if "previous_restored" in failure:
+                    line += " " + translate_text("이전 정의 복구 성공" if failure["previous_restored"] else "이전 정의 복구 실패")
+                message += "\n" + line
             for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
                 if result.get(key):
                     message += "\n" + describe_core_code(key) + " " + ", ".join(map(str, result[key]))
@@ -1070,7 +1092,7 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += "\n" + warning_line
                 if progress_callback:
                     progress_callback(warning_line)
-            return not bool(views_failed), message, import_results
+            return not bool(views_failed or programs_failed or result.get("status") == "partial"), message, import_results
         except DbCoreServiceError as exc:
             self._remember_error_code(exc)
             if not _is_operation_scoped_import_error(str(exc)):

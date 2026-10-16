@@ -2009,3 +2009,29 @@ def test_unrestorable_table_export_refusal_uses_its_plain_reason():
     from src.exporters.rust_dump_exporter import describe_export_refusal
     text = describe_export_refusal(["table_definition:sample:DDL"], {"table_definition:sample:DDL":"table_definition_unrestorable"})[0]
     assert "테이블 sample" in text and "내보내지 않았습니다" in text
+
+
+def test_routine_refusal_uses_body_permission_reason_and_translation():
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+    from src.core import i18n
+    line = describe_export_refusal(["routine:rebuild"], {"routine:rebuild": "routine_body_unreadable"})[0]
+    assert "rebuild" in line and "SHOW_ROUTINE" in line and "담지 않았습니다" in line
+    i18n.set_language("en")
+    try:
+        assert "SHOW_ROUTINE" in describe_export_refusal(["routine:rebuild"], {"routine:rebuild": "routine_body_unreadable"})[0]
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("recovered", [True, False])
+def test_partial_program_import_reports_recovery_and_returns_failure(tmp_path, recovered):
+    from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+    folder = tmp_path / "programs"
+    folder.mkdir()
+    (folder / "_tunnelforge_dump.json").write_text(json.dumps({"database": "app", "source_engine": "mysql", "tables": [{"name": "sample"}]}), encoding="utf-8")
+    facade = MagicMock()
+    facade.import_dump.return_value = {"success": False, "status": "partial", "data_imported": True, "rows_imported": 2,
+        "programs_imported": [{"kind": "PROCEDURE", "name": "ok"}], "programs_failed": [{"kind": "FUNCTION", "name": "failed_f", "previous_restored": recovered}]}
+    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace")
+    assert not ok and "루틴 1개" in message and "failed_f" in message
+    assert ("이전 정의 복구 성공" if recovered else "이전 정의 복구 실패") in message

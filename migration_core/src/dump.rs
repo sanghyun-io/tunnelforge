@@ -1250,7 +1250,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
     }
-    let (mut stored_programs, program_reasons) = crate::mysql_programs::collect_mysql_stored_programs(&endpoint, &schema)?;
+    let (mut stored_programs, program_reasons) = crate::mysql_programs::collect_mysql_stored_programs(&endpoint, &schema, full_export)?;
     let held = if endpoint.engine == "mysql" { crate::dump_format::held_object_ids(&schema, &stored_programs) } else { BTreeSet::new() };
     let unheld: Vec<String> = inspection.unsupported_objects.iter().filter(|object| !held.contains(*object)).cloned().collect();
     let mut scope_objects = unheld.clone();
@@ -1264,6 +1264,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             refusal.reasons.extend(refusal.objects.iter().filter(|id| id.starts_with("trigger:"))
                 .map(|id| (id.clone(), program_reasons.get(id).cloned().unwrap_or_else(|| "trigger_body_unproven".into()))));
         }
+        refusal.reasons.extend(refusal.objects.iter().filter_map(|id| program_reasons.get(id).map(|code| (id.clone(),code.clone()))));
         let message = format!(
             "dump.run refused: the selected scope contains objects the dump cannot preserve ({}): {}",
             if refusal.bypassable { "an export without these objects is possible" } else { "table definitions would be lossy" },
@@ -1362,7 +1363,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             export_warnings.push(format!("{WARNING_NON_TRANSACTIONAL_EXCLUDED} {}", non_txn.join(", ")));
             let excluded: BTreeSet<String> = non_txn.iter().cloned().collect();
             schema.tables.retain(|table| !excluded.contains(&table.name));
-            stored_programs.retain(|p| p.table.as_ref().is_some_and(|t| !excluded.contains(t)));
+            stored_programs.retain(|p| p.table.as_ref().is_none_or(|t| !excluded.contains(t)));
             emit(json!({
                 "event": "phase",
                 "request_id": request.request_id,
@@ -1457,8 +1458,8 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
                     .to_string(),
             );
         }
-        let (programs_after, reasons_after) = crate::mysql_programs::collect_mysql_stored_programs(&endpoint, &schema)?;
-        let scoped_reasons = program_reasons.iter().filter(|(id, _)| schema.tables.iter().any(|t| id.starts_with(&format!("trigger:{}:", t.name))))
+        let (programs_after, reasons_after) = crate::mysql_programs::collect_mysql_stored_programs(&endpoint, &schema, full_export)?;
+        let scoped_reasons = program_reasons.iter().filter(|(id, _)| (full_export && (id.starts_with("routine:") || id.starts_with("event:"))) || schema.tables.iter().any(|t| id.starts_with(&format!("trigger:{}:", t.name))))
             .map(|(id, code)| (id.clone(), code.clone())).collect::<BTreeMap<_, _>>();
         if programs_after != stored_programs || reasons_after != scoped_reasons {
             return Err("stored programs changed during export; retry".into());
@@ -1496,7 +1497,9 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         "manifest_warnings": manifest.manifest_warnings,
         "tables": manifest.tables.len(),
         "views": views_count,
-        "triggers": manifest.stored_programs.len(),
+        "triggers": manifest.stored_programs.iter().filter(|p| p.kind=="TRIGGER").count(),
+        "routines": manifest.stored_programs.iter().filter(|p| matches!(p.kind.as_str(),"PROCEDURE" | "FUNCTION")).count(),
+        "events": manifest.stored_programs.iter().filter(|p| p.kind=="EVENT").count(),
         "rows_dumped": total_rows,
         "chunks_dumped": total_chunks,
         "manifest": "_tunnelforge_dump.json"

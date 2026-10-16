@@ -25,8 +25,9 @@ pub(crate) fn held_object_ids(schema: &NormalizedSchema, programs: &[NormalizedS
     let mut held: BTreeSet<String> = schema.tables.iter().flat_map(|table| table.columns.iter()
         .filter(|column| column.generated.is_some())
         .map(|column| format!("generated_column:{}:{}", table.name, column.name))).collect();
-    held.extend(programs.iter().filter(|p| crate::mysql_programs::validate_trigger(p).is_ok()
-        && schema.tables.iter().any(|t| Some(&t.name) == p.table.as_ref())).map(crate::mysql_programs::program_id));
+    held.extend(programs.iter().filter(|p| if p.kind == "TRIGGER" {
+        crate::mysql_programs::validate_trigger(p).is_ok() && schema.tables.iter().any(|t| Some(&t.name) == p.table.as_ref())
+    } else { crate::mysql_schema_programs::schema_program_sql(p,&p.name,None).is_ok() }).map(crate::mysql_programs::program_id));
     held
 }
 

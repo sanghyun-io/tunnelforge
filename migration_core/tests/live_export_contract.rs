@@ -282,10 +282,10 @@ fn unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds() {
         let dir = out("full");
         let events = dump_events(&endpoint, json!({"output_dir": dir, "data_format": "jsonl", "mysql_snapshot_mode": single}));
         let objects = refusal_objects(&events);
-        assert!(objects.contains(&format!("routine:{routine}")), "{objects:?}");
+        assert_eq!(objects.contains(&format!("routine:{routine}")), !mysql, "{objects:?}");
         assert_eq!(objects.contains(&format!("trigger:{table}:{trigger}")), !mysql, "{objects:?}");
         if mysql {
-            assert!(objects.contains(&format!("event:{base}_ev")), "{objects:?}");
+            assert!(!objects.contains(&format!("event:{base}_ev")), "{objects:?}");
             assert!(objects.contains(&format!("non_transactional_table:{base}_mem:MEMORY")), "{objects:?}");
         } else {
             assert!(objects.contains(&format!("materialized_view:{base}_mv")), "{objects:?}");

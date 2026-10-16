@@ -58,6 +58,9 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         blockers += copy_stops + [translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다.")]
 
     data_warnings, notes = [], []
+    enabled = _strings(preview.get("events_enabled"))
+    if enabled:
+        data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(enabled), sanitize_local_diagnostic(", ".join(enabled))))
     views = preview.get("views") if isinstance(preview.get("views"), dict) else {}
     parents = _dicts(preview.get("external_parents"))
 
@@ -82,6 +85,12 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         if code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced"):
             names = _strings(preview.get(code)) or [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
             data_warnings.append(f"- {sentence} " + sanitize_local_diagnostic(", ".join(names)))
+        elif code == "events_enabled":
+            if not enabled:
+                names = [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
+                data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(names), ", ".join(names)))
+        elif code in ("program_replace_privilege_unproven", "program_event_system_timezone", "routine_binlog_unsafe"):
+            data_warnings.append(f"- {sentence}")
         elif code == "unsynchronized_snapshot":
             if preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:
                 data_warnings.append(f"- {sentence}")
@@ -115,7 +124,9 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         details.append("- " + translate_text("교체할 뷰 {}개, 새로 만들 뷰 {}개").format(len(replace_views), len(create_views)))
     programs = preview.get("programs") if isinstance(preview.get("programs"), dict) else {}
     if programs.get("create"):
-        details.append(_line("만들 트리거: {}", _strings(programs.get("create"))))
+        details.append(_line("만들 저장 프로그램: {}", _strings(programs.get("create"))))
+    if programs.get("replace"):
+        details.append(_line("교체할 저장 프로그램: {}", _strings(programs.get("replace"))))
     for key in ("blockers", "copy_blockers", "warnings"):
         items = preview.get(key) if isinstance(preview.get(key), list) else []
         details += [sanitize_local_diagnostic(f"{item.get('code')}: {item.get('detail')}" if isinstance(item, dict) else str(item))

@@ -2,6 +2,7 @@
 //! writes no report or journal, creates no probe tables and never reads chunk data.
 use crate::*;
 use crate::mysql_programs::*;
+use crate::mysql_schema_programs::*;
 use mysql::prelude::Queryable;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -98,10 +99,11 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     for p in &manifest.stored_programs {
         let id = program_id(p);
         if engine != "mysql" { skipped_cross_engine.push(id); }
-        else if p.table.as_ref().is_some_and(|t| !names.contains(t)) { skipped_partial.push(id); }
-        else if skip_triggers { skipped_toggle.push(id); }
+        else if (p.kind!="TRIGGER" && !selected.is_empty()) || p.table.as_ref().is_some_and(|t| !names.contains(t)) { skipped_partial.push(id); }
+        else if skip_triggers && p.kind=="TRIGGER" { skipped_toggle.push(id); }
         else { programs.push(p); }
     }
+    if !selected.is_empty() { skipped_partial.extend(manifest.views.iter().map(|v|format!("view:{}",v.name))); }
     for (code, skipped) in [("programs_skipped_cross_engine", &skipped_cross_engine), ("programs_skipped_partial", &skipped_partial), ("programs_skipped_toggle", &skipped_toggle)] {
         if !skipped.is_empty() { warnings.push(warning(code, skipped.join(", "))); }
     }
@@ -120,11 +122,22 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         if !programs.is_empty() {
             let (log_bin, trusted): (bool, bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators")
                 .map_err(|err| format!("trigger binlog inspection failed: {err}"))?.ok_or("trigger binlog variables unreadable")?;
-            if trigger_binlog_blocked(log_bin, trusted, mysql_grants_allow(conn, "SUPER", None)) {
+            if programs.iter().any(|p|p.kind=="TRIGGER") && trigger_binlog_blocked(log_bin, trusted, mysql_grants_allow(conn, "SUPER", None)) {
                 blockers.push(issue("trigger_binlog_privilege", None, "log_bin_trust_function_creators=1 or SUPER is required"));
             }
-            if mysql_grants_allow(conn, "TRIGGER", Some(&endpoint.database)) == Some(false) {
+            if programs.iter().any(|p|p.kind=="TRIGGER") && mysql_grants_allow(conn, "TRIGGER", Some(&endpoint.database)) == Some(false) {
                 blockers.push(issue("trigger_privilege_missing", None, "TRIGGER privilege is required"));
+            }
+            for (kind,privilege) in [("PROCEDURE","CREATE ROUTINE"),("FUNCTION","CREATE ROUTINE"),("EVENT","EVENT")] {
+                if programs.iter().any(|p|p.kind==kind) && mysql_grants_allow(conn,privilege,Some(&endpoint.database))==Some(false) {
+                    blockers.push(issue("program_privilege_missing",None,format!("{privilege} privilege is required")));
+                }
+            }
+            if programs.iter().any(|p|matches!(p.kind.as_str(),"PROCEDURE" | "FUNCTION")) && mysql_grants_allow(conn,"ALTER ROUTINE",Some(&endpoint.database))==Some(false) {
+                warnings.push(warning("program_probe_cleanup_unproven","ALTER ROUTINE is needed to remove routine probes"));
+            }
+            if programs.iter().any(|p|p.kind=="FUNCTION") && log_bin && !trusted && mysql_grants_allow(conn,"SUPER",None)!=Some(true) {
+                warnings.push(warning("routine_binlog_unsafe","functions that fail binary log creation checks will be skipped"));
             }
             let current: Option<String> = conn.query_first("SELECT CURRENT_USER()")
                 .map_err(|err| format!("current account inspection failed: {err}"))?;
@@ -141,6 +154,10 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             Err(error) => copy_blockers.push(issue("copy_checks_unavailable", None, error)),
         }
     }
+    let mut new_events_enabled = Vec::new();
+    if !exists { if let LiveAdapter::MySql(conn) = &mut admin {
+        for p in programs.iter().filter(|p|p.kind=="EVENT") { if event_due_now(conn,p,None)? { new_events_enabled.push(p.name.clone()); } }
+    } }
     drop(admin);
     if !exists {
         // The replace import creates a missing namespace, so only the privilege matters.
@@ -177,6 +194,24 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         blockers.push(issue("trigger_name_conflict", Some(&conflict), &conflict));
     }
 
+    let mut program_replace = Vec::new(); let mut program_create = Vec::new(); let mut program_may_not_replace = Vec::new(); let mut events_enabled = new_events_enabled;
+    if let Some(LiveAdapter::MySql(conn)) = &mut adapter {
+        let target_programs = target_schema_programs(conn,&schema)?;
+        let current: String = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?.unwrap_or_default();
+        for p in &programs {
+            if p.kind=="TRIGGER" { program_create.push(program_id(p)); continue }
+            let previous = target_programs.iter().find(|(k,n,_,_)| k==&p.kind && n.eq_ignore_ascii_case(&p.name));
+            if let Some((_,_,definer,_)) = previous {
+                program_replace.push(program_id(p));
+                if definer!=&current && mysql_grants_allow(conn,"SYSTEM_USER",None)!=Some(true) {
+                    program_may_not_replace.push(json!({"name":p.name,"kind":p.kind,"definer":definer}));
+                }
+            } else { program_create.push(program_id(p)); }
+            if p.kind=="EVENT" && event_due_now(conn,p,previous.and_then(|(_,_,_,status)|status.as_deref()))? { events_enabled.push(p.name.clone()); }
+        }
+    } else if !exists { program_create = programs.iter().map(|p|program_id(p)).collect(); }
+    if !events_enabled.is_empty() { warnings.push(warning("events_enabled",events_enabled.join(", "))); }
+    if !program_may_not_replace.is_empty() { warnings.push(warning("program_replace_privilege_unproven",program_may_not_replace.iter().map(|p|p["name"].as_str().unwrap()).collect::<Vec<_>>().join(", "))); }
     let mut external_parents = Vec::new();
     for table in &import_schema.tables {
         for fk in table.foreign_keys.iter().filter(|fk| !dumped.contains(&key(&fk.referenced_table))) {
@@ -258,7 +293,8 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         "kept_children": kept_children, "external_parents": external_parents,
         "views": {"replace": views_replace, "create": views_create, "may_not_replace": may_not_replace, "may_break": may_break},
         "triggers_dropped": triggers_dropped, "blockers": blockers, "warnings": warnings,
-        "programs": {"create":programs.iter().map(|p| program_id(p)).collect::<Vec<_>>()},
+        "programs": {"create":program_create,"replace":program_replace,"may_not_replace":program_may_not_replace},
+        "events_enabled":events_enabled,
         "programs_skipped_cross_engine": skipped_cross_engine, "programs_skipped_partial": skipped_partial,
         "programs_skipped_toggle": skipped_toggle,
         "strict_export": manifest.strict_export, "snapshot_policy": manifest.snapshot_policy,

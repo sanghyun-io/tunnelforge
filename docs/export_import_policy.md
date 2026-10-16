@@ -492,7 +492,7 @@ or not at its default. There are no scope or snapshot choices.
   (`dump.run` without `tables`: tables and their triggers plus views, routines and events); unchecking
   any table sends exactly the checked tables, and one line under the list says
   that views, stored procedures, functions and events are then left out
-  (`일부 테이블만 내보낼 때는 선택한 테이블과 트리거를 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.`;
+  (`일부 테이블만 내보낼 때는 테이블과 그 트리거만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다.`;
   PostgreSQL leaves out "·이벤트"). A table the user unchecked that the FK toggle
   checks again as a parent keeps the run a table export, even when every box ends
   up checked. "다시 열기" from the job list with `scope: full` checks everything
@@ -619,7 +619,7 @@ fails closed if the body cannot be proven; refusal includes a per-object reason.
 Timing, event and positive ACTION_ORDER are structured fields, validated before
 SQL construction. Non-UTF-8 client charsets require an ASCII body and ASCII
 header identifiers, since the connection sends UTF-8 bytes. The exporter
-recaptures triggers at its MySQL DDL drift check and refuses a changed set or
+recaptures stored programs at its MySQL DDL drift check and refuses a changed set or
 context. Only exported InnoDB tables' triggers survive scope filtering.
 
 Replace import loads data with no dump triggers installed, completes each table's
@@ -661,11 +661,62 @@ rehearsals) refuses a dump containing stored programs before making a copy with
 `dump_programs_unsupported_in_copy`, including when skip_triggers is set. Existing
 format 5/6 dumps without stored programs follow their previous paths.
 
+### MySQL routines and events (format 7, full replace import)
+
+Full MySQL exports capture PROCEDURE, FUNCTION and EVENT definitions via the named
+SHOW CREATE columns, including sql_mode, client charset, connection/database
+collation, definer, event time_zone and I_S.EVENTS.STATUS. Table-subset exports
+include selected-table triggers and omit schema-wide routines, events and views;
+the Export scope note explains this. Captured routines/events are recaptured at
+the DDL drift check. Missing/NULL routine bodies, unproven headers and non-UTF-8
+non-ASCII definitions are refused with per-object reasons. SHOW_ROUTINE or the
+owning account is needed for unreadable bodies. A same-named procedure/function
+pair is held only if both were captured. Headers require quoted backtick names.
+
+After each table's data/FKs/triggers and row-count verification, full replace
+imports create routines, then views (which may call functions), then events.
+Each CREATE uses a timeout-tuned single-statement connection and the object's
+source session context. Routine SQL SECURITY DEFINER/INVOKER is preserved;
+DEFINER is omitted, so the importing account owns the new object. The plan names
+changed definers as original -> importing account in a must-see line. Changes in
+database collation and events using SYSTEM time_zone are reported. Objects absent
+from the dump are left alone. Cross-engine and table-subset imports report every
+skipped routine/event in a must-see plan line. The trigger-skip toggle does not
+skip routines or events.
+
+Routine probes run before existing tables change. A function rejected by binary
+log checks (1418/1419) is skipped with routine_binlog_unsafe and a partial result;
+its existing target function is kept. Other probe errors stop before replacement.
+Probe cleanup failures name leftover objects and the needed ALTER ROUTINE grant;
+no existing table is replaced after such a failure. Events are never probed.
+Preview checks CREATE ROUTINE/ALTER ROUTINE/EVENT grants, reports possible
+SYSTEM_USER definer replacement restrictions, and warns about binlog function
+checks. Runtime probes remain authoritative.
+
+Event headers always CREATE with DISABLE, including definitions captured as
+DISABLE ON SLAVE. After creation, ALTER EVENT ENABLE runs only if a same-named
+target event was ENABLED, or a new event was ENABLED at the source. A target's
+DISABLED/SLAVESIDE_DISABLED state stays disabled. Enabled events with past AT or
+STARTS schedules are named and counted in a must-see plan line. Source-schema
+body references block a different-schema import before DROP, including routines
+and events; the importer never rewrites those references or enables such an event.
+
+Before replacing a same-named routine/event, the importer saves its SHOW CREATE
+and session context. If replacement CREATE fails, it attempts to recreate the
+saved target definition on the same connection. The report includes
+previous_definition, previous_restored and restore_error, plus the replacement
+failure. Data remains committed and status is partial. SHOW WARNINGS after every
+CREATE is attached to the named object's report and surfaced in Import results.
+This includes past one-shot events MySQL immediately removes (1588). Replace is
+not atomic; previous-definition recovery can itself fail and is reported.
+Verify-in-copy and scheduled rehearsals still refuse all stored programs before
+creating a copy. Legacy format 5/6 and trigger-only format 7 paths stay supported.
+
 ### Object support table (Export)
 
 Only the scope below is officially supported. MySQL triggers are preserved in
-format 7; routines and events remain outside the current reader/writer scope. Live-verified on MySQL 8.0.46 / 8.4.11 and
-PostgreSQL 13.23 / 18.4 (`live_export_contract`,
+format 7, including full-export routines and events in MySQL replace mode. Live-verified on MySQL 8.0.46 / 8.4.11 and
+PostgreSQL 13.23 / 18.4 (`live_mysql_programs`, `live_export_contract`,
 `unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds`): the
 preserved core, triggers, routines, events, materialized views, MEMORY tables,
 default refusal, opt-in and a strict export/import round trip. The lossy-definition
@@ -681,7 +732,8 @@ claimed.
 | Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Non-MySQL targets: refused before DROP on import/migration; PostgreSQL export remains refused |
 | Unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
 | Triggers on an exported table | Preserved after body verification (format 7, replace mode) | Refused before export; waivable |
-| Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not part of a table subset, so a subset export neither refuses nor warns about them | Same (no events; materialized views apply) |
+| Routines (functions/procedures), events | Preserved in full format 7 exports and full MySQL replace imports after header/context validation; failed capture is refused with a reason and is waivable | Refused before full export; waivable (no events) |
+| Materialized views | n/a | Refused before full export; waivable |
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
 
 INVISIBLE columns (MySQL 8.0.23+) retain their visibility through format 6,

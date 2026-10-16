@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn program_id(p: &NormalizedStoredProgram) -> String {
+    if p.kind != "TRIGGER" { return crate::mysql_schema_programs::schema_program_id(p) }
     format!("trigger:{}:{}", p.table.as_deref().unwrap_or_default(), p.name)
 }
 
@@ -39,7 +40,7 @@ fn proven_body(body: &str, original: &str) -> bool {
     !body.trim().is_empty() && original.ends_with(body)
 }
 
-pub(crate) fn collect_mysql_stored_programs(endpoint: &Endpoint, schema: &NormalizedSchema)
+pub(crate) fn collect_mysql_stored_programs(endpoint: &Endpoint, schema: &NormalizedSchema, full_export: bool)
     -> Result<(Vec<NormalizedStoredProgram>, BTreeMap<String, String>), String>
 {
     if endpoint.engine != "mysql" { return Ok(Default::default()) }
@@ -75,6 +76,10 @@ pub(crate) fn collect_mysql_stored_programs(endpoint: &Endpoint, schema: &Normal
         } else { None };
         if let Some(reason) = reason { reasons.insert(program_id(&p), reason.into()); }
         else { programs.push(p); }
+    }
+    if full_export {
+        let (captured, failures) = crate::mysql_schema_programs::collect_schema_programs(&mut conn, &endpoint.database)?;
+        programs.extend(captured); reasons.extend(failures);
     }
     Ok((programs, reasons))
 }
@@ -120,7 +125,7 @@ pub(crate) fn target_trigger_names(conn: &mut mysql::PooledConn, schema: &str) -
 
 pub(crate) fn trigger_name_conflicts(target: &[(String, String)], programs: &[&NormalizedStoredProgram], folds: bool) -> Vec<String> {
     let key = |s: &str| if folds { s.to_lowercase() } else { s.to_string() };
-    target.iter().filter(|(table, name)| programs.iter().any(|p| p.name.to_lowercase() == name.to_lowercase()
+    target.iter().filter(|(table, name)| programs.iter().any(|p| p.kind=="TRIGGER" && p.name.to_lowercase() == name.to_lowercase()
         && p.table.as_deref().is_none_or(|dump_table| key(dump_table) != key(table))))
         .map(|(table, name)| format!("{table}.{name}")).collect()
 }

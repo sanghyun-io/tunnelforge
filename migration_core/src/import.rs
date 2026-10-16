@@ -10,6 +10,7 @@ use std::time::Instant;
 use mysql::{prelude::Queryable, LocalInfileHandler};
 use crate::*;
 use crate::mysql_programs::*;
+use crate::mysql_schema_programs::*;
 
 #[path = "safe_restore.rs"]
 pub(crate) mod safe_restore;
@@ -77,21 +78,23 @@ fn import_table_ddls(
     let mut untranslatable = Vec::new();
     for p in &manifest.stored_programs {
         if manifest.source_engine != "mysql" { return Err(invalid("stored programs require a MySQL source".into())) }
-        validate_trigger(p).map_err(invalid)?;
-        if target_engine == "mysql" && !skip_triggers
-            && (selected.is_empty() || p.table.as_ref().is_some_and(|t| selected.contains(t)))
-            && manifest.source_schema.as_deref().unwrap_or(&manifest.database) != target_schema
-            && references_source_schema(&p.definition, manifest.source_schema.as_deref().unwrap_or(&manifest.database)) {
-            let object = format!("{}.{}", p.table.as_deref().unwrap(), p.name);
-            untranslatable.push((object.clone(), classified_import_error("program_source_schema_reference",
-                "trigger body references the source database; import into the same database name or remove the qualifier from the definition", Some(&object))));
+        let source = manifest.source_schema.as_deref().unwrap_or(&manifest.database);
+        let trigger = p.kind == "TRIGGER";
+        if trigger { validate_trigger(p).map_err(invalid)?; }
+        else { schema_program_sql(p,&p.name,Some(source)).map_err(invalid)?; }
+        let applies = if trigger { !skip_triggers && (selected.is_empty() || p.table.as_ref().is_some_and(|t|selected.contains(t))) } else { selected.is_empty() };
+        let body = if trigger { p.definition.clone() } else { schema_program_body(p,source).map_err(invalid)? };
+        if target_engine == "mysql" && applies && source != target_schema && references_source_schema(&body,source) {
+            let object = if trigger { format!("{}.{}", p.table.as_deref().unwrap(),p.name) } else { format!("{} {}",p.kind,p.name) };
+            untranslatable.push((object.clone(),classified_import_error("program_source_schema_reference",
+                "stored program body references the source database; use the same database name or remove its qualifier",Some(&object))));
         }
-        if !manifest.tables.iter().any(|t| Some(&t.name) == p.table.as_ref())
-            || !program_names.insert(p.name.to_lowercase())
-            || !program_orders.insert((&p.table, &p.timing, &p.event, p.action_order)) {
-            return Err(invalid(format!("invalid or duplicate trigger {}", p.name)));
+        if !program_names.insert((p.kind.clone(),p.name.to_lowercase())) || (trigger &&
+            (!manifest.tables.iter().any(|t|Some(&t.name)==p.table.as_ref()) || !program_orders.insert((&p.table,&p.timing,&p.event,p.action_order)))) {
+            return Err(invalid(format!("invalid or duplicate stored program {}",p.name)));
         }
     }
+
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
     for table in &manifest.tables {
@@ -226,6 +229,8 @@ struct ImportJournal {
     trigger_tables: BTreeSet<String>,
     triggers_completed_tables: BTreeSet<String>,
     program_warnings: Vec<Value>,
+    programs_imported: Vec<Value>,
+    routines_skipped: BTreeSet<(String,String)>,
     programs_failed: Vec<Value>,
     programs_skipped: BTreeMap<String, Vec<String>>,
     /// This attempt's own report file in the dump folder.
@@ -266,7 +271,7 @@ impl ImportJournal {
             "tables_lost_triggers": self.dropped.iter().chain(&self.created).collect::<BTreeSet<_>>().into_iter().filter(|t| self.trigger_tables.contains(*t)
                 && !self.triggers_completed_tables.contains(*t)).collect::<Vec<_>>(),
             "program_warnings": self.program_warnings,
-            "programs_failed": self.programs_failed,
+            "programs_failed": self.programs_failed, "programs_imported": self.programs_imported,
             "failed_tables": failed, "unattempted_tables": unattempted,
             "pending_drop_table": self.pending_drop,
             "drop_outcome_unknown": self.pending_drop.is_some(),
@@ -318,6 +323,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         .and_then(Value::as_str).unwrap_or("replace");
     let mut journal = ImportJournal {
         triggers_created: Vec::new(), trigger_tables: BTreeSet::new(), triggers_completed_tables: BTreeSet::new(), program_warnings: Vec::new(),
+        programs_imported: Vec::new(), routines_skipped: BTreeSet::new(),
         programs_failed: Vec::new(), programs_skipped: BTreeMap::new(),
         report_path: match report_path { Some(path) => path, None => new_dump_import_report_path(Path::new(input_dir))? },
         target: json!({"engine": endpoint.engine, "host": endpoint.host, "port": endpoint.port,
@@ -427,8 +433,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     journal.planned = tables.iter().map(|table| table.name.clone()).collect();
     for p in &manifest.stored_programs {
         let code = if endpoint.engine != "mysql" { Some("programs_skipped_cross_engine") }
-            else if p.table.as_ref().is_some_and(|t| !journal.planned.contains(t)) { Some("programs_skipped_partial") }
-            else if skip_triggers { Some("programs_skipped_toggle") } else { None };
+            else if (p.kind!="TRIGGER" && !selected.is_empty()) || p.table.as_ref().is_some_and(|t| !journal.planned.contains(t)) { Some("programs_skipped_partial") }
+            else if skip_triggers && p.kind=="TRIGGER" { Some("programs_skipped_toggle") } else { None };
         if let Some(code) = code { journal.programs_skipped.entry(code.into()).or_default().push(program_id(p)); }
     }
     journal.checkpoint()?;
@@ -462,6 +468,9 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         .iter()
         .map(|table| table.name.as_str())
         .collect::<BTreeSet<_>>();
+    if !selected.is_empty() {
+        journal.programs_skipped.entry("programs_skipped_partial".into()).or_default().extend(manifest.views.iter().map(|v|format!("view:{}",v.name)));
+    }
     let import_schema = NormalizedSchema {
         tables: manifest
             .schema
@@ -519,6 +528,13 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             }
             if !skip_triggers { journal.trigger_tables.extend(target.into_iter().filter(|(t, _)| planned_tables.contains(t)).map(|(t, _)| t)); }
             journal.trigger_tables.extend(programs.iter().filter_map(|p| p.table.clone()));
+        }
+        if endpoint.engine == "mysql" && selected.is_empty() && manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"PROCEDURE" | "FUNCTION")) {
+            let mut conn = import_trigger_connection(&endpoint)?;
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
+            let probe = probe_routines(&mut conn,&manifest.stored_programs,&format!("tf_probe_{}_{nonce}",std::process::id()),&mut journal.routines_skipped,&mut journal.program_warnings);
+            journal.checkpoint()?;
+            probe?;
         }
         probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, &surviving, &programs, &endpoint)?;
         journal.current_table = None;
@@ -658,12 +674,12 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         rows_imported,
         chunks_imported,
         table_total,
-        |event| {
-            if let Some(phase) = event.get("phase").and_then(Value::as_str) { journal.phase = phase.into(); }
-            emit(event);
-        },
+        &endpoint,
+        journal,
+        |event| emit(event),
     )?;
-    result["programs_imported"] = json!(journal.triggers_created);
+    let mut imported = journal.triggers_created.clone(); imported.extend(journal.programs_imported.clone());
+    result["programs_imported"] = json!(imported);
     result["programs_failed"] = json!(journal.programs_failed);
     for key in ["programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"] {
         result[key] = json!(journal.programs_skipped.get(key).cloned().unwrap_or_default());
@@ -1314,6 +1330,32 @@ fn import_table_rows<F: FnMut(Value)>(
 
 /// import 데이터 적재 완료 후의 마무리 단계: post-load DDL(인덱스/FK) 적용,
 /// 적재 행수 검증, View 생성(best-effort), 리포트 기록 후 최종 result JSON을 만든다.
+fn import_schema_programs(endpoint: &Endpoint, manifest: &DumpManifest, journal: &mut ImportJournal, events: bool) -> Result<(),String> {
+    let programs = manifest.stored_programs.iter().filter(|p| p.kind!="TRIGGER" && (p.kind=="EVENT")==events
+        && !journal.routines_skipped.contains(&(p.kind.clone(),p.name.clone()))).collect::<Vec<_>>();
+    if programs.is_empty() { return Ok(()) }
+    journal.phase = if events { "dump_import_events" } else { "dump_import_routines" }.into();
+    journal.checkpoint()?;
+    let mut conn = match import_trigger_connection(endpoint) {
+        Ok(conn) => conn,
+        Err(err) => {
+            for p in programs { journal.programs_failed.push(json!({"kind":p.kind,"name":p.name,"code":"program_create_failed","error":err,"target_unchanged":true})); }
+            return journal.checkpoint()
+        }
+    };
+    for p in programs {
+        match replace_schema_program(&mut conn,&endpoint.database,p) {
+            Ok((warnings,created)) => { journal.program_warnings.extend(warnings); journal.programs_imported.push(created); }
+            Err(failure) => {
+                for key in ["warnings","restore_warnings"] { if let Some(warnings)=failure[key].as_array() { journal.program_warnings.extend(warnings.clone()); } }
+                journal.programs_failed.push(failure);
+            },
+        }
+        journal.checkpoint()?;
+    }
+    Ok(())
+}
+
 fn finalize_dump_import<F: FnMut(Value)>(
     adapter: &mut LiveAdapter,
     manifest: &DumpManifest,
@@ -1328,6 +1370,8 @@ fn finalize_dump_import<F: FnMut(Value)>(
     rows_imported: u64,
     chunks_imported: u64,
     table_total: usize,
+    endpoint: &Endpoint,
+    journal: &mut ImportJournal,
     mut emit: F,
 ) -> Result<Value, String> {
     let target_engine = adapter.engine().to_string();
@@ -1349,6 +1393,7 @@ fn finalize_dump_import<F: FnMut(Value)>(
     // Table data is already committed. View failures produce a partial result,
     // without suggesting that the restored rows were rolled back.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
+    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,false)?; }
     let view_outcome = if selected.is_empty() && !manifest.views.is_empty() {
         import_views(
             adapter,
@@ -1360,12 +1405,13 @@ fn finalize_dump_import<F: FnMut(Value)>(
     } else {
         ViewImportOutcome::default()
     };
-    let import_complete = view_outcome.failed.is_empty();
+    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,true)?; }
+    let import_complete = view_outcome.failed.is_empty() && journal.programs_failed.is_empty() && journal.routines_skipped.is_empty();
     let status = if import_complete { "completed" } else { "partial" };
     let message = if import_complete {
         "Import completed".to_string()
     } else {
-        format!("Table data imported, but {} view(s) failed to restore; imported rows remain committed", view_outcome.failed.len())
+        format!("Table data imported, but {} view(s) and {} stored program(s) were not restored; imported rows remain committed", view_outcome.failed.len(),journal.programs_failed.len()+journal.routines_skipped.len())
     };
     let import_report = json!({
         "success": import_complete,

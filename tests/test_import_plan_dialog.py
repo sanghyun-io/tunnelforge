@@ -23,7 +23,7 @@ def test_skipped_triggers_and_changed_definers_are_must_see_with_names(code, war
 def test_program_copy_refusal_is_a_plain_blocker():
     plan = describe_plan({"copy_blockers": [{"code": "dump_programs_unsupported_in_copy"}]}, True)
     assert plan["must_see"]
-    assert "트리거가 담긴 덤프" in plan["blockers"][0]
+    assert "트리거·루틴·이벤트가 담긴 덤프" in plan["blockers"][0]
     assert " ".join(plan["blockers"]).count("끄면 진행할 수 있습니다") == 1
 
 
@@ -246,3 +246,18 @@ def test_must_see_is_only_set_by_blockers_and_data_warnings():
     assert describe_plan(quiet, False)["must_see"] is False
     assert describe_plan({**quiet, "external_parents": [{"child": "a", "constraint": "fk", "parent": "p"}]}, False)["must_see"]
     assert describe_plan({**quiet, "blockers": [{"code": "no_tables"}]}, False)["must_see"]
+
+
+def test_enabled_events_are_counted_named_and_must_see_once():
+    plan = describe_plan({"events_enabled": ["nightly", "cleanup"], "warnings": [{"code": "events_enabled", "detail": "nightly, cleanup"}]}, False)
+    assert plan["must_see"] and not plan["blockers"]
+    warnings = "\n".join(plan["warnings"])
+    assert "2개" in warnings and "nightly" in warnings and "cleanup" in warnings
+    assert warnings.count("바로 실행될") == 1
+
+
+def test_routine_and_event_definers_name_original_and_importing_accounts():
+    detail = "PROCEDURE rebuild (owner@host -> importer@host), EVENT nightly (owner@host -> importer@host)"
+    plan = describe_plan({"warnings": [{"code": "program_definer_replaced", "detail": detail}]}, False)
+    assert plan["must_see"]
+    assert detail in "\n".join(plan["warnings"])
