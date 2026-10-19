@@ -1371,8 +1371,9 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     let effective_threads = mysql_snapshot.as_ref().map_or(1, |snapshot| snapshot.workers.len());
 
     let mut postgres_snapshot = if endpoint.engine == "postgresql" {
-        let mut adapter = LiveAdapter::connect_source(&endpoint)?;
+        let mut adapter = LiveAdapter::connect(&endpoint)?;
         adapter.execute_sql("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
+        adapter.execute_sql("SET LOCAL row_security = off")?;
         adapter.execute_sql("SET LOCAL TIME ZONE 'UTC'")?;
         adapter.execute_sql("SET LOCAL DateStyle = 'ISO, YMD'")?;
         adapter.execute_sql("SET LOCAL lock_timeout = '2s'")?;
@@ -1480,8 +1481,8 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             if let Some(adapter) = postgres_snapshot.as_mut() {
                 dump_tables_sequential(adapter, &ctx, &export_tables, |event| emit(event))?
             } else {
-                let mut adapter = LiveAdapter::connect_source(&endpoint)?;
-                dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
+                let mut adapter = LiveAdapter::connect(&endpoint)?;
+                adapter.source_read(|adapter|dump_tables_sequential(adapter, &ctx, &export_tables, |event| emit(event)))?
             }
         }
     };
@@ -2232,9 +2233,9 @@ fn spawn_dump_table_worker(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
-            let mut adapter = LiveAdapter::connect_source(&ctx.endpoint)?;
-            dump_one_table(
-                &mut adapter,
+            let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
+            adapter.source_read(|adapter|dump_one_table(
+                adapter,
                 &ctx,
                 &table,
                 index,
@@ -2242,7 +2243,7 @@ fn spawn_dump_table_worker(
                 |event| {
                     let _ = sender.send(DumpTableEvent::Progress(event));
                 },
-            )
+            ))
         })();
         match result {
             Ok((manifest, rows, chunks)) => {

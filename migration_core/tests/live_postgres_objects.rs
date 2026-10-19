@@ -180,3 +180,6 @@ fn pg_copy_rejects_generated_in_column_list() {
 
 #[path="support/postgres_fidelity_fix.rs"]
 mod fix_round1;
+
+#[path="support/postgres_fidelity_fix2.rs"]
+mod fix_round2;

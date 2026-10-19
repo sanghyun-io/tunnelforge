@@ -1105,7 +1105,7 @@ pub(crate) fn source_value_issues(payload: &Value) -> Vec<MigrationIssue> {
         // ponytail: one full scan per table with temporal columns; sample or index if preflight gets slow.
         let sums = checks.iter().map(|(_, condition)| format!("CAST(SUM(CASE WHEN {condition} THEN 1 ELSE 0 END) AS {text_cast})")).collect::<Vec<_>>();
         let sql = format!("SELECT {} FROM {}", sums.join(", "), quote_ident(&source_engine, &table.name));
-        let counts = match source.query_text_row(&sql) {
+        let counts = match source.query_text_row(&table.name,&sql) {
             Ok(counts) => counts,
             Err(err) => {
                 issues.push(MigrationIssue {
@@ -1359,10 +1359,8 @@ enum TableCopyControl {
 /// PostgreSQL timestamptz text carries that zone's offset into MySQL DATETIME. MySQL sessions are
 /// strict like dump.import, so a value the target column cannot hold (NaN, a key longer than the
 /// mapped VARCHAR) fails instead of being zeroed or truncated.
-fn connect_migration_source(endpoint: &Endpoint) -> Result<LiveAdapter,String> {
-    let mut source=connect_migration_endpoint(endpoint)?;
-    source.source_read_mode()?;
-    Ok(source)
+fn connect_migration_source(endpoint: &Endpoint) -> Result<SourceReadAdapter,String> {
+    Ok(SourceReadAdapter(connect_migration_endpoint(endpoint)?))
 }
 
 fn connect_migration_endpoint(endpoint: &Endpoint) -> Result<LiveAdapter, String> {

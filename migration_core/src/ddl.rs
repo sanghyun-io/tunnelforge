@@ -101,7 +101,7 @@ pub(crate) fn is_safe_pg_expression(expression: &str) -> bool {
             byte if byte.is_ascii_alphabetic() || byte==b'_' => {
                 let start=i; i+=1;
                 while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i],b'_'|b'$') || bytes[i]>=128) { i+=1; }
-                if matches!(expression[start..i].to_ascii_uppercase().as_str(), "SELECT"|"CREATE"|"CONSTRAINT"|"REFERENCES"|"UNION"|"RETURNING"|"INTO") { return false; }
+                if matches!(expression[start..i].to_ascii_uppercase().as_str(), "SELECT"|"CREATE"|"CONSTRAINT"|"REFERENCES"|"UNION"|"INTO") { return false; }
             }
             _ => i+=1,
         }
@@ -877,10 +877,20 @@ pub(crate) fn format_postgres_error(context: &str, err: &postgres::Error) -> Str
     parts.join("; ")
 }
 
-pub(crate) fn postgres_source_read_error(context: &str, table: &str, err: &postgres::Error) -> String {
+pub(crate) fn postgres_table_has_rls(client: &mut postgres::Client, table: &str) -> Result<bool,String> {
+    // Read before the data statement: a permission error may abort its transaction.
+    client.query_opt("SELECT c.relrowsecurity OR c.relforcerowsecurity OR EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid=c.oid) FROM pg_class c WHERE c.oid=to_regclass($1)", &[&quote_ident("postgresql",table)])
+        .map(|row|row.is_some_and(|row|row.get(0)))
+        .map_err(|err|format_postgres_error("postgresql source security inspect error",&err))
+}
+
+fn postgres_read_is_rls(sqlstate: Option<&str>, rls: bool) -> bool {
+    sqlstate==Some("42501") && rls
+}
+
+pub(crate) fn postgres_source_read_error(context: &str, table: &str, rls: bool, err: &postgres::Error) -> String {
     let detail=format_postgres_error(context,err);
-    if err.code()==Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
-        && err.as_db_error().is_some_and(|error|error.message().contains("row-level security")) {
+    if postgres_read_is_rls(err.code().map(|code|code.code()),rls) {
         format!("row_security_blocks_read: {table}: {detail}")
     } else { detail }
 }
@@ -4185,6 +4195,23 @@ mod postgres_fidelity_tests {
 #[cfg(test)]
 mod postgres_keyword_fix_tests {
     use super::*;
+    #[test]
+    fn rls_classification_uses_sqlstate_and_catalog_flags_only() {
+        assert!(postgres_read_is_rls(Some("42501"),true));
+        assert!(!postgres_read_is_rls(Some("42501"),false));
+        assert!(!postgres_read_is_rls(Some("42P01"),true));
+        assert!(!postgres_read_is_rls(None,true));
+    }
+    #[test]
+    fn pg_sql_json_returning_is_part_of_an_expression() {
+        for expression in ["JSON_VALUE(j, '$.name' RETURNING text)",
+            "JSON_QUERY(j, '$.tags' RETURNING jsonb WITHOUT WRAPPER KEEP QUOTES)"] {
+            assert!(is_safe_pg_expression(expression));
+        }
+        for expression in ["JSON_VALUE(j,'$.name'); DELETE FROM t RETURNING id", "JSON_QUERY(j,'$.a') -- x", "j, JSON_VALUE(j,'$.a')"] {
+            assert!(!is_safe_pg_expression(expression));
+        }
+    }
     #[test]
     fn pg_unreserved_identifiers_are_not_statement_tokens() {
         for name in ["comment","update","delete","insert","drop","alter","outfile","dumpfile"] {

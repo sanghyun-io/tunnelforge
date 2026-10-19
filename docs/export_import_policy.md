@@ -906,7 +906,9 @@ RLS flags, forced RLS, or any policy produce `policy:<table>`; a table rule
 produces `rule:<table>:<rule>`. The existing advanced setting
 "담을 수 없는 객체는 빼고 내보내기" explicitly allows their omission. The export
 then records persistent not-exported warnings. PostgreSQL source-copy and comparison
-sessions use `row_security=off`: an account whose rows would be filtered stops with
+reads use `SET LOCAL row_security = off` inside their read transaction (the dump
+uses its snapshot transaction). The setting never changes session defaults or
+leaks into other transactions through a pooler. An account whose rows would be filtered stops with
 `row_security_blocks_read` instead of writing a partial data set. Superusers and
 BYPASSRLS accounts can read all rows; ordinary editor queries keep normal RLS
 behavior. Policies/rules must be
@@ -937,7 +939,7 @@ refusal instead of silently producing an incomplete backup. Import behavior is
 unchanged. Objects this inspection does not detect are not reported: MySQL partitioning;
 PostgreSQL extensions, rules on views, column collation, UNLOGGED persistence,
 replica identity and storage parameters, ownership and ACLs, foreign tables,
-event triggers, view comments, NULLS NOT DISTINCT unique indexes, DEFERRABLE
+event triggers, view/index/constraint/sequence comments, NULLS NOT DISTINCT unique indexes, DEFERRABLE
 constraints, and EXCLUDE constraints. These losses remain outside this fix.
 
 MySQL lists triggers, routines, events, tables and columns only to accounts

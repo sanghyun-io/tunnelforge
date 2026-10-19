@@ -568,27 +568,62 @@ pub enum LiveAdapter {
     PostgreSql(postgres::Client),
 }
 
+/// Source reads pin a pooler backend only for the read, and never change its session defaults.
+pub struct SourceReadAdapter(pub(crate) LiveAdapter);
+
+impl SourceReadAdapter {
+    pub fn into_inner(self) -> LiveAdapter { self.0 }
+
+    pub(crate) fn probe_source_rows(&mut self, schema: &NormalizedSchema) -> Result<(),String> {
+        self.0.source_read(|adapter|adapter.probe_source_rows(schema))
+    }
+
+    pub(crate) fn query_text_row(&mut self, table: &str, sql: &str) -> Result<Vec<Option<String>>,String> {
+        self.0.source_read(|adapter|adapter.query_text_row(table,sql))
+    }
+}
+
+impl MigrationAdapter for SourceReadAdapter {
+    fn row_count(&mut self, table: &str) -> Result<usize,String> {
+        self.0.source_read(|adapter|adapter.row_count(table))
+    }
+    fn read_rows(&mut self, table: &NormalizedTable, offset: usize, limit: usize) -> Result<Vec<Value>,String> {
+        self.0.source_read(|adapter|adapter.read_rows(table,offset,limit))
+    }
+    fn read_rows_after_key(&mut self, table: &NormalizedTable, keys: &[String], last: Option<&str>, limit: usize) -> Result<Vec<Value>,String> {
+        self.0.source_read(|adapter|adapter.read_rows_after_key(table,keys,last,limit))
+    }
+    fn read_rows_by_keys(&mut self, table: &NormalizedTable, keys: &[String], values: &[Vec<String>]) -> Result<Vec<Value>,String> {
+        self.0.source_read(|adapter|adapter.read_rows_by_keys(table,keys,values))
+    }
+    fn create_table(&mut self, table: &NormalizedTable, ddl: &str) -> Result<(),String> { self.0.create_table(table,ddl) }
+    fn insert_rows(&mut self, table: &NormalizedTable, rows: Vec<Value>) -> Result<(),String> { self.0.insert_rows(table,rows) }
+    fn execute_sql(&mut self, sql: &str) -> Result<(),String> { self.0.execute_sql(sql) }
+}
+
 impl LiveAdapter {
     /// Data-copy sources must fail rather than silently read an RLS-filtered subset.
     /// Ordinary editor connections deliberately keep the server's normal RLS behavior.
-    pub fn connect_source(endpoint: &Endpoint) -> Result<Self, String> {
-        let mut adapter=Self::connect(endpoint)?;
-        adapter.source_read_mode()?;
-        Ok(adapter)
+    pub fn connect_source(endpoint: &Endpoint) -> Result<SourceReadAdapter, String> {
+        Self::connect(endpoint).map(SourceReadAdapter)
     }
 
-    pub(crate) fn source_read_mode(&mut self) -> Result<(),String> {
-        if let Self::PostgreSql(client)=self {
-            client.batch_execute("SET row_security=off").map_err(|err|format_postgres_error("postgresql source setup error",&err))?;
+    pub(crate) fn source_read<T>(&mut self, read: impl FnOnce(&mut Self)->Result<T,String>) -> Result<T,String> {
+        if !matches!(self,Self::PostgreSql(_)) { return read(self); }
+        self.execute_sql("BEGIN READ ONLY")?;
+        let result=self.execute_sql("SET LOCAL row_security = off").and_then(|_|read(self));
+        match result {
+            Ok(value) => { self.execute_sql("COMMIT")?; Ok(value) },
+            Err(error) => { let _=self.execute_sql("ROLLBACK"); Err(error) },
         }
-        Ok(())
     }
 
     pub(crate) fn probe_source_rows(&mut self, schema: &NormalizedSchema) -> Result<(),String> {
         if let Self::PostgreSql(client)=self {
             for table in &schema.tables {
+                let rls=postgres_table_has_rls(client,&table.name)?;
                 client.query(&format!("SELECT * FROM {} LIMIT 0",quote_ident("postgresql",&table.name)),&[])
-                    .map_err(|err|postgres_source_read_error("postgresql source probe error",&table.name,&err))?;
+                    .map_err(|err|postgres_source_read_error("postgresql source probe error",&table.name,rls,&err))?;
             }
         }
         Ok(())
@@ -629,7 +664,7 @@ impl LiveAdapter {
     }
 
     /// First row of `sql` as text cells (the SQL casts what it selects to text).
-    pub(crate) fn query_text_row(&mut self, sql: &str) -> Result<Vec<Option<String>>, String> {
+    pub(crate) fn query_text_row(&mut self, table: &str, sql: &str) -> Result<Vec<Option<String>>, String> {
         match self {
             Self::MySql(conn) => {
                 let row: Option<mysql::Row> = conn.query_first(sql).map_err(|err| format!("mysql query error: {err}"))?;
@@ -640,7 +675,8 @@ impl LiveAdapter {
                 }).collect()).unwrap_or_default())
             }
             Self::PostgreSql(client) => {
-                let rows = client.query(sql, &[]).map_err(|err| postgres_source_read_error("postgresql query error", "", &err))?;
+                let rls=postgres_table_has_rls(client,table)?;
+                let rows = client.query(sql, &[]).map_err(|err| postgres_source_read_error("postgresql query error", table, rls, &err))?;
                 Ok(rows.first().map(|row| (0..row.len()).map(|index| row.get::<_, Option<String>>(index)).collect()).unwrap_or_default())
             }
         }
@@ -660,7 +696,9 @@ impl MigrationAdapter for LiveAdapter {
                         Err(format!("mysql count error: {err}"))
                     }
                 }),
-            Self::PostgreSql(client) => client
+            Self::PostgreSql(client) => {
+                let rls=postgres_table_has_rls(client,table)?;
+                client
                 .query_one(&count_sql("postgresql", table), &[])
                 .map(|row| {
                     let count: i64 = row.get(0);
@@ -672,9 +710,10 @@ impl MigrationAdapter for LiveAdapter {
                     {
                         Ok(0)
                     } else {
-                        Err(postgres_source_read_error("postgresql count error", table, &err))
+                        Err(postgres_source_read_error("postgresql count error", table, rls, &err))
                     }
-                }),
+                })
+            },
         }
     }
 
@@ -734,9 +773,10 @@ impl MigrationAdapter for LiveAdapter {
             }
             Self::PostgreSql(client) => {
                 let sql = select_chunk_text_sql("postgresql", table, &key_columns);
+                let rls=postgres_table_has_rls(client,&table.name)?;
                 let rows = client
                     .query(&sql, &[&(limit as i64), &(offset as i64)])
-                    .map_err(|err| postgres_source_read_error("postgresql select chunk error", &table.name, &err))?;
+                    .map_err(|err| postgres_source_read_error("postgresql select chunk error", &table.name, rls, &err))?;
                 Ok(rows
                     .into_iter()
                     .map(|row| postgres_row_to_json(&columns, &row))
@@ -790,8 +830,9 @@ impl MigrationAdapter for LiveAdapter {
                     last_values.as_deref(),
                     limit,
                 );
+                let rls=postgres_table_has_rls(client,&table.name)?;
                 let rows = client.query(&sql, &[]).map_err(|err| {
-                    postgres_source_read_error("postgresql keyset select chunk error", &table.name, &err)
+                    postgres_source_read_error("postgresql keyset select chunk error", &table.name, rls, &err)
                 })?;
                 Ok(rows
                     .into_iter()
@@ -816,7 +857,8 @@ impl MigrationAdapter for LiveAdapter {
                 Ok(rows.into_iter().map(|row| mysql_row_to_json(&columns, row)).collect())
             }
             Self::PostgreSql(client) => {
-                let rows = client.query(&sql, &[]).map_err(|err| postgres_source_read_error("postgresql key lookup error", &table.name, &err))?;
+                let rls=postgres_table_has_rls(client,&table.name)?;
+                let rows = client.query(&sql, &[]).map_err(|err| postgres_source_read_error("postgresql key lookup error", &table.name, rls, &err))?;
                 Ok(rows.into_iter().map(|row| postgres_row_to_json(&columns, &row)).collect())
             }
         }
