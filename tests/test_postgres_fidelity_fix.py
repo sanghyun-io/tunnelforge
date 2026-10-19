@@ -34,11 +34,11 @@ def test_real_comments_preview_keeps_objects_and_not_strict_note(language):
     i18n.set_language(language)
     try:
         plan=describe_plan(preview,True)
-        text="\n".join(plan["notes"]+plan["warnings"])
+        text="\n".join(plan["warnings"])
         assert "comment:orders:TABLE" in text and "comment:orders:id" in text
         assert describe_core_code("not_strict") in text
         assert "source dump:" not in text
-        assert not any(line.rstrip().endswith(":") for line in plan["notes"])
+        assert not any(line.rstrip().endswith(":") for line in plan["warnings"])
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
 
@@ -48,7 +48,7 @@ def test_comments_plan_caps_long_names(language):
     preview={"warnings":[{"code":"comments_not_exported","detail":"source dump: comments_not_exported: "+", ".join(f"comment:t:c{i}" for i in range(25))}]}
     i18n.set_language(language)
     try:
-        text="\n".join(describe_plan(preview,True)["notes"])
+        text="\n".join(describe_plan(preview,True)["warnings"])
         assert "comment:t:c19" in text and "comment:t:c20" not in text
         assert "5" in text
     finally:

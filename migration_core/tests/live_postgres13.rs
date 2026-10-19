@@ -18,7 +18,7 @@ fn pg13_json_identifier_imports_into_pg18_replace_and_safe() {
     let safe=run("dump.import",json!({"target":target.target,"input_dir":source.dir,"mode":"safe"}));
     assert_eq!(safe["ready_for_switch"],true,"{safe:#}");
     assert!(!safe["program_warnings"].to_string().contains("generated_values_recomputed"));
-    let candidate=safe["clone_database"].as_str().unwrap();
+    let candidate=safe["candidate_target"]["schema"].as_str().unwrap();
     let mut admin=db(&target.target);
     let name:String=admin.query_one(&format!("SELECT name FROM \"{candidate}\".doc"),&[]).unwrap().get(0);
     admin.batch_execute(&format!("DROP SCHEMA \"{candidate}\" CASCADE")).unwrap();

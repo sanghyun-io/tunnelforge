@@ -1,6 +1,6 @@
 use super::support::*;
 use migration_core::{Endpoint, LiveAdapter, MigrationAdapter};
-use serde_json::{json,Value};
+use serde_json::json;
 use mysql::prelude::Queryable;
 
 struct Roles { endpoint:Endpoint, names:Vec<String> }
@@ -73,7 +73,8 @@ fn pg_fix_text_search_and_unreserved_column_names_round_trip() {
     let safe=run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"safe"}));
     assert_eq!(safe["ready_for_switch"],true,"{safe:#}");
     assert!(!safe["program_warnings"].to_string().contains("generated_values_recomputed"));
-    if let Some(candidate)=safe["clone_database"].as_str() {db(&s.source).batch_execute(&format!("DROP SCHEMA \"{candidate}\" CASCADE")).unwrap();}
+    let candidate=safe["candidate_target"]["schema"].as_str().unwrap();
+    db(&s.source).batch_execute(&format!("DROP SCHEMA \"{candidate}\" CASCADE")).unwrap();
 }
 
 #[test]
