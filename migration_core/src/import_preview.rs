@@ -124,6 +124,9 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
     let exists = super::safe_restore::target_namespace_exists(&mut admin, endpoint)?;
     let can_create = if exists { None } else { can_create_namespace(&mut admin, endpoint)? };
     if let LiveAdapter::MySql(conn) = &mut admin {
+        if exists {
+            copy_blockers.extend(super::safe_restore::copy_program_refusals(conn,&manifest,skip_triggers,true)?.into_iter().map(|(code,table,detail)|issue(code,table.as_deref(),detail)));
+        }
         copy_blockers.extend(super::safe_restore::program_copy_refusals(conn, endpoint, &manifest, skip_triggers)?
             .into_iter().map(|(code, table, detail)| issue(code, table.as_deref(), detail)));
         if !programs.is_empty() {
@@ -203,6 +206,7 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
     let target_views = target.views.iter().map(|(name, _)| key(name)).collect::<BTreeSet<_>>();
     let (views_replace, views_create): (Vec<String>, Vec<String>) = dump_views.into_iter().partition(|name| target_views.contains(&key(name)));
     let replaced_views = views_replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
+    let direct_conflicts = trigger_name_conflicts(&target.triggers,&programs,fold);
     let conflict_triggers = target.triggers.iter().filter(|(table,_)|!safe_mode || !dumped.contains(&key(table))).cloned().collect::<Vec<_>>();
     for conflict in trigger_name_conflicts(&conflict_triggers, &programs, fold) {
         blockers.push(issue("trigger_name_conflict", Some(&conflict), &conflict));
@@ -215,8 +219,9 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
         programs_kept = target_programs.iter().filter(|(kind,name,_,_)| !programs.iter().any(|p| p.kind==*kind && p.name.eq_ignore_ascii_case(name)))
             .map(|(kind,name,_,_)| format!("{}:{name}", if kind=="EVENT" {"event"} else {"routine"})).collect();
         let current: String = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?.unwrap_or_default();
-        if !preserves_foreign_definer(conn) {
-            let definitions = super::safe_restore::saved_target_programs(conn,endpoint,&manifest).unwrap_or_default();
+        if safe_mode && !preserves_foreign_definer(conn) {
+            let affected = target.tables.iter().filter(|(name,_)|dumped.contains(&key(name))).map(|(name,_)|name.clone()).collect();
+            let definitions = crate::safe_promote_mysql::capture_affected_programs(conn,&schema,&affected,&[]).unwrap_or_default();
             for p in definitions.iter().filter(|p|p.kind=="TRIGGER" && p.definer.as_deref()!=Some(&current)) {
                 warnings.push(warning_names("program_restore_definer_may_change",vec![format!("TRIGGER {} ({} -> {current})",p.name,p.definer.as_deref().unwrap_or_default())]));
             }
@@ -312,6 +317,8 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
         }
     }
 
+    let mut direct_blockers = blockers.iter().filter(|item|item["code"]!="trigger_name_conflict").cloned().collect::<Vec<_>>();
+    direct_blockers.extend(direct_conflicts.iter().map(|name|issue("trigger_name_conflict",Some(name),name)));
     Ok(json!({
         "event": "result", "request_id": request.request_id, "command": "dump.import_preview",
         "success": true, "dry_run": true,
@@ -319,7 +326,7 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
         "replace": replace, "create": create, "untouched": untouched,
         "kept_children": kept_children, "external_parents": external_parents,
         "views": {"replace": views_replace, "create": views_create, "may_not_replace": may_not_replace, "may_break": may_break},
-        "triggers_dropped": triggers_dropped, "blockers": blockers, "warnings": warnings,
+        "triggers_dropped": triggers_dropped, "direct_blockers":direct_blockers, "blockers": blockers, "warnings": warnings,
         "programs": {"create":program_create,"replace":program_replace,"may_not_replace":program_may_not_replace},
         "events_enabled":events_enabled, "programs_kept":programs_kept,
         "programs_skipped_cross_engine": skipped_cross_engine, "programs_skipped_partial": skipped_partial,

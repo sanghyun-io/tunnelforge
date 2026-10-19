@@ -948,32 +948,12 @@ fn recovery_keeps_a_previous_function_it_cannot_recreate() {
     admin.execute_sql("SET GLOBAL log_bin_trust_function_creators=0").unwrap();
     made.unwrap();
     let restored = safe_import(&original, &output);
-    let planned = promote_plan(&original, &restored);
-    let done = run("dump.promote", json!({"endpoint":original,"action":"confirm","report_path":restored["report_path"],"restore_id":restored["restore_id"],"plan_digest":planned["plan_digest"],"overwrite_confirmed":true}));
-    let done = done.iter().find(|e| e["event"] == "result" || e["event"] == "error").cloned().unwrap();
-    let count_f = "SELECT CAST(COUNT(*) AS CHAR) AS n FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE() AND ROUTINE_NAME='f'";
-    let f_after_promote = first_value(&original, count_f);
-    let backups = |action: &str, extra: Value| {
-        let mut payload = json!({"endpoint":original,"input_dirs":[output],"restore_id":restored["restore_id"],"action":action});
-        payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-        run("restore.backups", payload).into_iter().find(|e| e["event"] == "result" || e["event"] == "error").unwrap()
-    };
-    let recovery = backups("rollback_plan", json!({}));
-    let recovered = if recovery["can_rollback"] == true { backups("rollback_apply", json!({"confirmed":true,"plan_digest":recovery["plan_digest"]})) } else { Value::Null };
-    let f_after_recovery = first_value(&original, count_f);
-    eprintln!("restored.status={} planned.can_promote={} done.status={} programs_failed={}", restored["status"], planned["can_promote"], done["status"], done["programs_failed"]);
-    eprintln!("f_after_promote={f_after_promote} can_rollback={} recovered.status={} recovered.error={} f_after_recovery={f_after_recovery}", recovery["can_rollback"], recovered["status"], recovered["error"]);
-    // Clean up before asserting.
-    for ns in [restored["candidate_target"]["database"].as_str(), done["backup_namespace"].as_str(), done["clone_database"].as_str(), recovered["displaced_backup"].as_str(), Some(name.as_str())].into_iter().flatten() {
-        drop_namespace(&mut admin, "mysql", ns);
-    }
-    admin.execute_sql(&format!("SET GLOBAL log_bin_trust_function_creators={}", trust.as_str().unwrap())).unwrap();
+    assert_stopped_before_copy(&restored,"unsafe previous function");
+    assert!(restored["copy_blockers"].to_string().contains("target_routine_binlog_unsafe"));
+    assert_eq!(first_value(&original,"SELECT CAST(f() AS CHAR) AS n"),"1");
+    admin.execute_sql(&format!("SET GLOBAL log_bin_trust_function_creators={}",trust.as_str().unwrap())).unwrap();
+    drop_namespace(&mut admin,"mysql",&name);
     std::fs::remove_dir_all(root).unwrap();
-    assert_eq!(done["status"], "promoted_incomplete", "{done:#}");
-    assert_eq!(done["programs_failed"][0]["code"], "program_restore_unavailable", "{done:#}");
-    assert_eq!(f_after_promote, "1", "promotion left the previous f in place");
-    assert_eq!(recovery["can_rollback"], true, "{recovery:#}");
-    assert_eq!(f_after_recovery, "1", "recovery dropped the previous f it could not recreate: {recovered:#}");
 }
 
 #[test]
@@ -1412,3 +1392,5 @@ fn rv_patched_moved_trigger_promotes() {
     assert_eq!(done["status"],"promoted","{done:#}");
     assert_eq!(on,"children");
 }
+
+mod round2 { include!("support/safe_restore_round2.rs"); }

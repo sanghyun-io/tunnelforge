@@ -264,6 +264,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             let mut refusals = if exists && swap_intended { target_copy_refusals(&mut admin, &original, &manifest, skip_triggers)? } else { Vec::new() };
             if let LiveAdapter::MySql(conn) = &mut admin {
                 refusals.extend(program_copy_refusals(conn, &original, &manifest, skip_triggers)?);
+                if exists { refusals.extend(copy_program_refusals(conn,&manifest,skip_triggers,true)?); }
             }
             if !refusals.is_empty() {
                 state["namespace_existed"] = json!(true);
@@ -585,6 +586,39 @@ pub(crate) fn program_copy_refusals(conn: &mut mysql::PooledConn, original: &End
     Ok(refusals)
 }
 
+pub(crate) fn target_function_refusals(conn: &mut mysql::PooledConn, programs: &[NormalizedStoredProgram]) -> Result<Vec<Refusal>,String> {
+    if !programs.iter().any(|p|p.kind=="FUNCTION") { return Ok(Vec::new()) }
+    let (log_bin,trusted): (bool,bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators").map_err(|e|e.to_string())?.ok_or("binlog variables unreadable")?;
+    let super_grant = super::import_preview::mysql_grants_allow(conn,"SUPER",None);
+    Ok(programs.iter().filter(|p|p.kind=="FUNCTION" && crate::mysql_schema_programs::function_binlog_preview_blocked(p,log_bin,trusted,super_grant))
+        .map(|p|("target_routine_binlog_unsafe",Some(p.name.clone()),"the previous target function cannot be recreated with the current binary log settings and privileges".into())).collect())
+}
+
+pub(crate) fn copy_program_refusals(conn: &mut mysql::PooledConn, manifest: &DumpManifest, skip_triggers: bool, candidate_grants: bool) -> Result<Vec<Refusal>,String> {
+    let mut refusals = Vec::new();
+    if candidate_grants {
+        for (needed,privilege) in [
+            (!skip_triggers && manifest.stored_programs.iter().any(|p|p.kind=="TRIGGER"),"TRIGGER"),
+            (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"CREATE ROUTINE"),
+            (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"ALTER ROUTINE"),
+        ] {
+            if needed && super::import_preview::mysql_grants_allow(conn,privilege,Some("tf_restore_0"))!=Some(true) {
+                refusals.push(("program_privilege_missing",Some("tf_restore_*".into()),format!("{privilege} is required on the verification copy")));
+            }
+        }
+    }
+    for view in &manifest.views {
+        for function in manifest.stored_programs.iter().filter(|p|p.kind=="FUNCTION") {
+            match crate::mysql_schema_programs::view_calls_function(&view.definition,&function.name,view.sql_mode.as_deref()) {
+                Ok(true) => refusals.push(("view_calls_dump_routine",Some(view.name.clone()),format!("view {} calls dump function {}",view.name,function.name))),
+                Ok(false) => {},
+                Err(error) => { refusals.push(("copy_checks_unavailable",Some(view.name.clone()),error)); break; }
+            }
+        }
+    }
+    Ok(refusals)
+}
+
 pub(crate) fn target_trigger_refusals(conn: &mut mysql::PooledConn, database: &str) -> Result<Vec<Refusal>,String> {
     let mut refusals = Vec::new();
     if super::import_preview::mysql_grants_allow(conn,"TRIGGER",Some(database)) == Some(false) {
@@ -633,27 +667,12 @@ pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
             for conflict in crate::mysql_programs::trigger_name_conflicts(&retained_triggers, &programs, fold) {
                 refusals.push(("trigger_name_conflict", Some(conflict), "덤프의 트리거 이름이 그대로 둘 테이블의 트리거 이름과 같습니다. 이름을 바꾼 뒤 다시 시도하세요.".into()));
             }
-            if super::import_preview::mysql_grants_allow(conn,"TRIGGER",Some(&schema))==Some(false) || triggers.iter().any(|(table,_)|dumped.iter().any(|name|if fold { name.eq_ignore_ascii_case(table) } else { name==table })) {
+            if triggers.iter().any(|(table,_)|dumped.iter().any(|name|if fold { name.eq_ignore_ascii_case(table) } else { name==table })) {
                 refusals.extend(target_trigger_refusals(conn,&schema)?);
             }
-            for (needed,privilege) in [
-                (!programs.is_empty(),"TRIGGER"),
-                (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"CREATE ROUTINE"),
-                (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"ALTER ROUTINE"),
-            ] {
-                if needed && super::import_preview::mysql_grants_allow(conn,privilege,Some("tf_restore_0")) != Some(true) {
-                    refusals.push(("program_privilege_missing",Some("tf_restore_*".into()),format!("{privilege} is required on the verification copy")));
-                }
-            }
-            for view in &manifest.views {
-                for function in manifest.stored_programs.iter().filter(|p|p.kind=="FUNCTION") {
-                    if crate::mysql_schema_programs::view_calls_function(&view.definition,&function.name)? {
-                        refusals.push(("view_calls_dump_routine",Some(view.name.clone()),format!("view {} calls dump function {}",view.name,function.name)));
-                    }
-                }
-            }
-            if let Err(error) = saved_target_programs(conn,original,manifest) {
-                refusals.push(("target_program_unsavable",None,error));
+            match saved_target_programs(conn,original,manifest) {
+                Ok(programs) => refusals.extend(target_function_refusals(conn,&programs)?),
+                Err(error) => refusals.push(("target_program_unsavable",None,error)),
             }
             let present: Vec<String> = conn.exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (&schema,)).map_err(inspect)?;
             let foreign_keys: Vec<ForeignKeyLink> = conn.exec(

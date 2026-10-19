@@ -181,12 +181,13 @@ fn inspect_backup(entry: &Entry, credentials: &Endpoint, deep: bool) -> Result<O
     let fingerprint = entry.fingerprint();
     match &stored.engine_plan {
         EnginePlan::MySql(plan) => {
-            let completed = entry.journal_status()=="promoted" && entry.attempt.as_ref().is_some_and(|a|a["result"]["phase"]=="completed");
+            let completed = (entry.journal_status()=="promoted" && entry.attempt.as_ref().is_some_and(|a|a["result"]["phase"]=="completed"))
+                || entry.journal_status()=="failed_original_unchanged" || entry.rolled_back().is_some();
             let mut backup = crate::safe_promote_mysql::inspect_backup_recorded(&endpoint,plan,deep,fingerprint.as_ref(),completed)?;
             if let Some(record) = entry.rollbacks().last().filter(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete"))) {
                 match crate::safe_promote_mysql::inspect_rollback(&endpoint,plan,record) {
                     Ok(Some(missing)) => {
-                        backup["verdict"] = json!(if missing.is_empty() {"rolled_back"} else {"rollback_incomplete"});
+                        backup["verdict"] = json!(if record["status"]=="rolled_back" && missing.is_empty() {"rolled_back"} else {"rollback_incomplete"});
                         backup["missing_programs"] = json!(missing);
                     }
                     Err(err) => {
@@ -326,7 +327,12 @@ fn list(request: &Request, credentials: &Endpoint) -> Result<Value, String> {
     let mut skipped = 0_u64;
     for entry in &entries {
         match original_target(entry) {
-            Some(target) if same_server(credentials, &target) => items.push(entry_json(entry, credentials)?),
+            Some(target) if same_server(credentials, &target) => {
+                match entry_json(entry,credentials) {
+                    Ok(item) => items.push(item),
+                    Err(err) => items.push(json!({"restore_id":entry.restore_id,"original_target":target,"journal_status":entry.journal_status(),"inspection_error":redact_endpoint_secret(&err,credentials),"backup":{"verdict":"undeterminable","blockers":[redact_endpoint_secret(&err,credentials)]}})),
+                }
+            },
             _ => skipped += 1,
         }
     }
@@ -644,7 +650,11 @@ fn rollback_apply(request: &Request, credentials: &Endpoint) -> Result<Value, St
     });
     if result["status"] == "rollback_incomplete" {
         let names = result["missing_programs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
-        result["message"] = json!(format!("The original tables are active again, but these programs need to be recreated or dropped: {names}. Their saved definitions remain in the promotion journal."));
+        result["message"] = if names.is_empty() {
+            json!(format!("The original tables are active again, but stored program state could not be verified. Their saved definitions remain in the promotion journal. ({})",result["program_verification_error"].as_str().unwrap_or("verification unavailable")))
+        } else {
+            json!(format!("The original tables are active again, but these programs need to be recreated or dropped: {names}. Their saved definitions remain in the promotion journal."))
+        };
     }
     Ok(result)
 }

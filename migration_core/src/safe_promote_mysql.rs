@@ -1033,6 +1033,8 @@ pub(crate) fn plan(
     }
     let original_program_inventory = program_inventory(&mut conn, &original.database)?;
     let original_programs = capture_affected_programs(&mut conn, &original.database, &old.keys().cloned().collect(), programs)?;
+    let unsafe_functions = crate::import::safe_restore::target_function_refusals(&mut conn,&original_programs)?;
+    if !unsafe_functions.is_empty() { return Err(format!("target_routine_binlog_unsafe: {unsafe_functions:?}")) }
     if !program_inventory(&mut conn, &candidate.database)?.is_empty() {
         return Err("candidate must not contain stored programs".into());
     }
@@ -1770,6 +1772,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         rename_attempted = true;
         if let Err(err) = conn.query_drop(rename_sql(plan)) {
             rename_rejected = matches!(err,mysql::Error::MySqlError(_));
+            if matches!(&err,mysql::Error::MySqlError(e) if e.code==1435) { return Err(error("atomic rename: an account with TRIGGER privilege is required to move tables with hidden triggers",err)) }
             return Err(error("atomic rename", err));
         }
         rename_committed = true;
@@ -1797,6 +1800,9 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
                 match crate::mysql_schema_programs::replace_schema_program(&mut conn, &plan.original_database, p, || {}) {
                     Ok((notes, created)) => { warnings.extend(notes); imported.push(created); }
                     Err(failure) => {
+                        warnings.extend(failure["warnings"].as_array().into_iter().flatten().cloned());
+                        warnings.extend(failure["restore_warnings"].as_array().into_iter().flatten().cloned());
+                        state["program_warnings"] = json!(warnings);
                         state["programs_failed"] = json!([failure]);
                         return Err("Some stored programs could not be restored. Check the saved report for the missing objects.".into());
                     }
@@ -2029,14 +2035,9 @@ pub(crate) fn inspect_backup_recorded(endpoint: &Endpoint, plan: &PromotionPlan,
         let db = if in_backup { &plan.backup_database } else { &plan.original_database };
         optional_table_id(&mut conn, db, name)
     });
-    let differences = if completed && verdict=="promoted" {
-        Some(missing_recorded_programs(&mut conn,&plan.original_database,&final_programs(plan),true)?)
-    } else { None };
-    let verdict = if let Some(missing) = &differences {
-        if missing.is_empty() { "promoted".into() } else { "promoted_incomplete".into() }
-    } else { classify_programs(&mut conn, plan, verdict) };
+    let verdict = if completed { verdict } else { classify_programs(&mut conn,plan,verdict) };
     if matches!(verdict.as_str(), "promoted_incomplete" | "failed_original_triggers_missing") {
-        match differences.map(Ok).unwrap_or_else(||program_differences(&mut conn, plan, verdict == "promoted_incomplete")) {
+        match program_differences(&mut conn,plan,verdict=="promoted_incomplete") {
             Ok(missing) => result["missing_programs"] = json!(missing),
             Err(err) => result["program_verification_error"] = json!(err),
         }
@@ -2260,6 +2261,13 @@ fn rollback_blockers(
             blockers.push(format!("{privilege} is required to restore saved programs"));
         }
     }
+    let mut recreate = Vec::new();
+    for previous in plan.original_programs.iter().filter(|p|p.kind=="FUNCTION") {
+        let actual = crate::mysql_schema_programs::read_schema_program(conn,original,"FUNCTION",&previous.name);
+        if !actual.as_ref().is_ok_and(|actual|crate::mysql_schema_programs::schema_program_matches(actual,previous)) { recreate.push(previous.clone()); }
+    }
+    blockers.extend(crate::import::safe_restore::target_function_refusals(conn,&recreate)?.into_iter().map(|(code,name,message)|format!("{code}: {}: {message}",name.unwrap_or_default())));
+    reset_session(conn)?;
     let expected = final_programs(plan);
     let scopes = expected.iter().chain(&plan.original_programs).cloned().collect::<Vec<_>>();
     let affected = active_names(plan);
@@ -2523,6 +2531,7 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
 pub(crate) fn inspect_rollback(endpoint: &Endpoint, plan: &PromotionPlan, record: &Value) -> Result<Option<Vec<String>>,String> {
     let mut conn = lifecycle_connect(endpoint,plan)?;
     if !plan.original_tables.iter().all(|(name,t)|optional_table_id(&mut conn,&plan.original_database,name).ok().flatten()==Some(t.table_id)) { return Ok(None) }
+    if record["status"]=="rolled_back" { return Ok(Some(Vec::new())) }
     let Some(displaced) = record["displaced_backup"].as_str() else { return Ok(None) };
     let Some(ids) = record["displaced_tables"].as_object() else { return Ok(None) };
     if !ids.iter().all(|(name,id)|optional_table_id(&mut conn,displaced,name).ok().flatten()==id.as_u64()) { return Ok(None) }
@@ -3175,7 +3184,7 @@ fn safe_promote_completed_lifecycle_ignores_unrelated_program_changes() {
     assert_eq!(get("not_preserve_before_fire"),"promoted");
     assert_eq!(get("no_program_plan_new_procedure"),"promoted");
     // Finding: these flip to promoted_incomplete.
-    assert_eq!(get("alter_event_disable"),"promoted_incomplete");
+    assert_eq!(get("alter_event_disable"),"promoted");
     for k in ["new_procedure","new_trigger_unrelated_table","not_preserve_after_fire"] {
         assert_eq!(get(k),"promoted","{k}: {seen:?}");
     }

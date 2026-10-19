@@ -321,6 +321,8 @@ pub struct NormalizedStoredProgram {
 pub struct NormalizedView {
     pub name: String,
     pub definition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1485,6 +1487,7 @@ mod tests {
             created_unix_seconds: 1,
             tables: Vec::new(),
             views: vec![NormalizedView {
+                sql_mode: None,
                 name: "ref_vendor_codes_view".to_string(),
                 definition: "CREATE VIEW `ref_vendor_codes_view` AS select 1".to_string(),
             }],

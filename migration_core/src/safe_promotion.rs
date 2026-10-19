@@ -243,6 +243,7 @@ fn target_refusals(verified: &VerifiedSafeRestorePlan) -> Result<Vec<Refusal>, S
     let mut refusals = target_copy_refusals(&mut admin, &verified.original, &manifest, skip_triggers)?;
     if let LiveAdapter::MySql(conn) = &mut admin {
         refusals.extend(crate::import::safe_restore::program_copy_refusals(conn, &verified.original, &manifest, skip_triggers)?);
+        refusals.extend(crate::import::safe_restore::copy_program_refusals(conn,&manifest,skip_triggers,false)?);
     }
     Ok(refusals.into_iter()
         .filter(|(_, object, _)| !object.as_deref().is_some_and(|object| object.starts_with(&own)))

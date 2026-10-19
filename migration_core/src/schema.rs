@@ -872,7 +872,7 @@ fn collect_mysql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, Strin
             .as_ref()
             .and_then(|row| row.get::<String, _>(1))
             .ok_or_else(|| format!("mysql SHOW CREATE VIEW returned no definition for {name}"))?;
-        views.push(NormalizedView { name, definition });
+        views.push(NormalizedView { name, definition, sql_mode: None });
     }
     Ok(views)
 }
@@ -900,7 +900,7 @@ fn collect_postgresql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, 
             quote_ident("postgresql", &name),
             body
         );
-        views.push(NormalizedView { name, definition });
+        views.push(NormalizedView { name, definition, sql_mode: None });
     }
     Ok(views)
 }

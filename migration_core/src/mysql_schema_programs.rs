@@ -45,9 +45,21 @@ fn tokens(sql: &str, no_escape: bool) -> Result<Vec<Token>, String> {
     Ok(out)
 }
 
-pub(crate) fn view_calls_function(sql: &str, name: &str) -> Result<bool,String> {
-    for no_escape in [false,true] {
-        if tokens(sql,no_escape)?.windows(2).any(|w|matches!(w[0].quote,0 | b'`') && w[0].text.eq_ignore_ascii_case(name) && w[1].text=="(" && w[1].quote==0) { return Ok(true) }
+pub(crate) fn view_calls_function(sql: &str, name: &str, sql_mode: Option<&str>) -> Result<bool,String> {
+    let no_escape = sql_mode.is_some_and(|mode|mode.split(',').any(|mode|mode.trim().eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES")));
+    let ts = tokens(sql,no_escape)?;
+    for i in 0..ts.len().saturating_sub(1) {
+        if !matches!(ts[i].quote,0 | b'`') || !ts[i].text.eq_ignore_ascii_case(name) || !keyword(&ts[i+1],"(") { continue }
+        let start = if i>=2 && keyword(&ts[i-1],".") {i-2} else {i};
+        if start>0 && (keyword(&ts[start-1],"VIEW") || keyword(&ts[start-1],"AS") || keyword(&ts[start-1],")")) { continue }
+        let mut depth=0; let mut closing=None;
+        for (j,t) in ts.iter().enumerate().skip(i+1) {
+            if keyword(t,"(") {depth+=1;}
+            if keyword(t,")") {depth-=1; if depth==0 {closing=Some(j);break}}
+        }
+        let j=closing.ok_or("view definition has an unclosed argument or column list")?;
+        if ts.get(j+1).is_some_and(|t|keyword(t,"AS")) && ts.get(j+2).is_some_and(|t|keyword(t,"(")) {continue}
+        return Ok(true)
     }
     Ok(false)
 }
@@ -309,6 +321,7 @@ pub(crate) fn schema_program_matches(actual: &NormalizedStoredProgram, expected:
 
 /// A missing one-shot event is complete only when its recorded absolute schedule has passed.
 pub(crate) fn recorded_event_completed(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram) -> Result<bool,String> {
+    let result = (|| -> Result<bool,String> {
     if p.kind != "EVENT" { return Ok(false) }
     let (ts,_) = suffix_start(p,None)?;
     let header = &ts[..ts.iter().position(|t|keyword(t,"DO")).ok_or("event body missing")?];
@@ -317,6 +330,10 @@ pub(crate) fn recorded_event_completed(conn: &mut mysql::PooledConn, p: &Normali
     let Some(at) = at.filter(|_|expires) else { return Ok(false) };
     set_program_context(conn,p)?;
     conn.exec_first::<bool,_,_>("SELECT CAST(? AS DATETIME) <= CURRENT_TIMESTAMP",(&at[2].text,)).map_err(|e|e.to_string()).map(|v|v.unwrap_or(false))
+    })();
+    let reset = reset_program_context(conn);
+    match (result,reset) { (Err(err),_) => Err(err), (Ok(_),Err(err)) => Err(err), (Ok(completed),Ok(())) => Ok(completed) }
+
 }
 
 /// Replay the target definition, then verify state and definer after any corrective ALTER.
@@ -441,12 +458,21 @@ pub(crate) fn replace_schema_program(conn: &mut mysql::PooledConn, schema: &str,
 #[cfg(test)]
 mod tests {
     #[test]
+    fn view_calls_respect_escaping_and_definition_context() {
+        for sql in ["SELECT 'it\\'s' AS label", "SELECT 'it\\'s', 'call f(1)', 'don\\'t'", "CREATE VIEW `f` (`a`) AS SELECT 1", "WITH f(m) AS (SELECT 1) SELECT m FROM f", "SELECT * FROM (SELECT 1) AS f(m)"] {
+            assert_eq!(view_calls_function(sql,"f",None),Ok(false),"{sql}");
+        }
+        for sql in ["SELECT f(x) AS y", "SELECT `db`.`f`()"] {assert_eq!(view_calls_function(sql,"f",None),Ok(true),"{sql}");}
+        assert_eq!(view_calls_function("SELECT 'a\\' AS x, f(1)","f",Some("NO_BACKSLASH_ESCAPES")),Ok(true));
+    }
+
+    #[test]
     fn view_function_calls_ignore_literals_comments_and_other_names() {
         for sql in ["SELECT f()", "SELECT `f` ()", "SELECT `db`.`f` /* call */ ()", "SELECT db.F()"] {
-            assert!(super::view_calls_function(sql,"f").unwrap(),"{sql}");
+            assert!(super::view_calls_function(sql,"f",None).unwrap(),"{sql}");
         }
         for sql in ["SELECT 'f()'", "SELECT 1 /* f() */", "SELECT ff()", "SELECT 1 -- f()\n"] {
-            assert!(!super::view_calls_function(sql,"f").unwrap(),"{sql}");
+            assert!(!super::view_calls_function(sql,"f",None).unwrap(),"{sql}");
         }
     }
 
