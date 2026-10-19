@@ -1,11 +1,14 @@
 """
 pytest 공용 fixtures
 """
+import atexit
 import os
+import shutil
 import tempfile
 
 # Isolate every platform-specific app-data fallback before importing src modules.
 _TEST_APP_DATA_DIR = tempfile.mkdtemp(prefix="tunnelforge-tests-")
+atexit.register(shutil.rmtree, _TEST_APP_DATA_DIR, ignore_errors=True)
 os.environ["TF_TEST_APP_DATA_DIR"] = _TEST_APP_DATA_DIR
 for _app_data_var in ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "HOME"):
     os.environ[_app_data_var] = _TEST_APP_DATA_DIR
