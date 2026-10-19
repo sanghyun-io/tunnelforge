@@ -313,10 +313,10 @@ fn safe_promote_rvf_d12_edited_original_trigger_after_failed_attempt_allows_cand
     let Some((original, candidate, mut conn, dir, programs)) = program_fixture() else { return };
     let p = plan(&original, &candidate, "rvfd12", &programs).unwrap();
     let result = promote_with_hook(&original, &candidate, &p, &p.digest, &dir, |at, _| if at == "before_rename" { Err("injected".into()) } else { Ok(()) }).unwrap();
-    let verdict_before = inspect_backup_recorded(&original, &p, false, None,true).unwrap()["verdict"].clone();
+    let verdict_before = inspect_backup_recorded(&original, &p, false, None,true,false).unwrap()["verdict"].clone();
     conn.query_drop(format!("DROP TRIGGER {}", qualified(&original.database, "guard"))).unwrap();
     conn.query_drop(format!("CREATE TRIGGER {} BEFORE UPDATE ON {} FOR EACH ROW SET NEW.note='edited'", qualified(&original.database, "guard"), qualified(&original.database, "parent"))).unwrap();
-    let verdict_after = inspect_backup_recorded(&original, &p, false, None,true).unwrap()["verdict"].clone();
+    let verdict_after = inspect_backup_recorded(&original, &p, false, None,true,false).unwrap()["verdict"].clone();
     let input = rvf_journal(&dir, "rvfd12", &original, &candidate, &p, &result);
     let rc = rvf_backups(&input, "rvfd12", &original, "reconcile", json!({}));
     let cp = rvf_backups(&input, "rvfd12", &original, "cleanup_plan", json!({"target":"candidate"}));
@@ -347,14 +347,14 @@ fn safe_promote_rvf_d13_completed_promotion_ignores_expired_recurring_event() {
     let r = promote(&original, &candidate, &p, &p.digest, &dir).unwrap();
     assert_eq!(r["status"], "promoted");
     let input = rvf_journal(&dir, "rvfd13", &original, &candidate, &p, &r);
-    let before = inspect_backup_recorded(&original, &p, false, r.get("backup_fingerprint"), true).unwrap();
+    let before = inspect_backup_recorded(&original, &p, false, r.get("backup_fingerprint"), true,false).unwrap();
     let mut gone = false;
     for _ in 0..80 {
         let n: Option<u64> = conn.exec_first("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME='new_e'", (&original.database,)).unwrap();
         if n == Some(0) { gone = true; break }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    let after = inspect_backup_recorded(&original, &p, false, r.get("backup_fingerprint"), true).unwrap();
+    let after = inspect_backup_recorded(&original, &p, false, r.get("backup_fingerprint"), true,false).unwrap();
     let cp = rvf_backups(&input, "rvfd13", &original, "cleanup_plan", json!({"target":"backup"}));
     let rc = rvf_backups(&input, "rvfd13", &original, "reconcile", json!({}));
     cleanup(&mut conn, &p, &dir);
@@ -387,14 +387,14 @@ fn safe_promote_rvf_d14_completed_event_timezone_does_not_change_backup_digest()
     let r = promote(&original, &candidate, &p, &p.digest, &dir).unwrap();
     assert_eq!(r["status"], "promoted");
     let input = rvf_journal(&dir, "rvfd14", &original, &candidate, &p, &r);
-    let before = inspect_backup_recorded(&original, &p, true, r.get("backup_fingerprint"), true).unwrap();
+    let before = inspect_backup_recorded(&original, &p, true, r.get("backup_fingerprint"), true,false).unwrap();
     let mut gone = false;
     for _ in 0..80 {
         let n: Option<u64> = conn.exec_first("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME='new_e'", (&original.database,)).unwrap();
         if n == Some(0) { gone = true; break }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    let after = inspect_backup_recorded(&original, &p, true, r.get("backup_fingerprint"), true).unwrap();
+    let after = inspect_backup_recorded(&original, &p, true, r.get("backup_fingerprint"), true,false).unwrap();
     let cp = rvf_backups(&input, "rvfd14", &original, "cleanup_plan", json!({"target":"backup"}));
     cleanup(&mut conn, &p, &dir);
     assert_eq!(before["verdict"], "promoted");
@@ -418,7 +418,7 @@ fn safe_promote_rvf_d17_completed_promotion_does_not_reread_unsavable_trigger() 
     conn.query_drop("SET SESSION character_set_client=latin1, collation_connection=latin1_swedish_ci").unwrap();
     conn.query_drop("CREATE TRIGGER app_note BEFORE INSERT ON parent FOR EACH ROW SET NEW.note=CONCAT(NEW.note,'é')").unwrap();
     reset_session(&mut conn).unwrap();
-    let recorded = inspect_backup_recorded(&original, &p, false, r.get("backup_fingerprint"), true);
+    let recorded = inspect_backup_recorded(&original, &p, false, r.get("backup_fingerprint"), true,false);
     let classic = inspect_backup(&original, &p, false, r.get("backup_fingerprint"));
     let listed = rvf_backups(&input, "rvfd17", &original, "list", json!({}));
     let rc = rvf_backups(&input, "rvfd17", &original, "reconcile", json!({}));

@@ -208,4 +208,3 @@ fn safe_promote_rvg5_repaired_programs_complete_rollback_and_allow_cleanup() {
     assert!(!rc1["message"].as_str().unwrap().contains("some programs still need"));
     assert_eq!(rc1["evidence"]["missing_programs"], json!([]));
 }
-
