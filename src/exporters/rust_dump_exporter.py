@@ -635,6 +635,7 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "target_routine_binlog_unsafe": "대상에 같은 이름의 함수가 있는데, 지금 서버 설정으로는 교체가 실패했을 때 그 함수를 원래대로 다시 만들 수 없어 복사 전에 멈췄습니다. 그 함수에 DETERMINISTIC 같은 선언을 추가하거나 log_bin_trust_function_creators=1로 바꾼 뒤 다시 시도하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수는 바꾸지 않고 가져옵니다.",
     "copy_routine_binlog_unsafe": "지금 서버 설정과 계정 권한으로는 이 함수를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수만 건너뛰고 가져옵니다.",
     "target_trigger_binlog_privilege": "교체할 테이블에 이미 트리거가 있어, 교체하는 동안 그 트리거를 지웠다가 다시 만들어야 합니다. 지금 서버 설정과 계정 권한으로는 트리거를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 가져오세요.",
     "target_program_unsavable": "교체 중에 저장했다가 되돌려야 하는 대상 프로그램을 저장할 수 없어 복사 전에 멈췄습니다.",
@@ -891,7 +892,7 @@ _UNKNOWN_COPY_BLOCKER = "복사본에서 검증할 수 없는 다른 이유가 �
 _UNVERIFIED_COPY_MESSAGE = "복사본 검증 결과를 확인할 수 없습니다. 원본과 복사본의 상태를 Import 보고서에서 확인하세요."
 
 
-def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKER) -> List[str]:
+def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKER, omit_verify_hint: bool = False) -> List[str]:
     """One line per copy_blockers code (why verify-in-copy stopped), naming the tables or views it concerns.
 
     Preview ``blockers`` share the shape; ``unknown`` words a code without a sentence."""
@@ -899,11 +900,17 @@ def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKE
     for item in blockers if isinstance(blockers, list) else []:
         if isinstance(item, dict):
             names = grouped.setdefault(str(item.get("code") or "").lower(), [])
-            if item.get("table") and str(item["table"]) not in names:
-                names.append(str(item["table"]))
+            if item.get("table"):
+                name = {"original triggers": translate_text("원래 트리거"), "tf_restore_*": translate_text("검증용 복사본")}.get(str(item["table"]), str(item["table"]))
+                if name not in names:
+                    names.append(name)
+
     lines = []
     for code, names in grouped.items():
-        sentence = translate_text(CORE_CODE_SENTENCES.get(code) or unknown)
+        source = CORE_CODE_SENTENCES.get(code) or unknown
+        if omit_verify_hint and code in ("copy_routine_binlog_unsafe", "target_routine_binlog_unsafe", "view_calls_dump_routine"):
+            source = source.split(" '먼저 복사본에서 검증하고 교체'")[0]
+        sentence = translate_text(source)
         shown = ", ".join(names[:10]) + (f" … (+{len(names) - 10})" if len(names) > 10 else "")
         lines.append(f"- {sentence}" + (f" ({shown})" if names else ""))
     return lines
@@ -1147,7 +1154,7 @@ class RustDumpImporter(_RustDumpClientBase):
                     if ids:
                         message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in ids))
                 if result.get("status") == "ready_for_review":
-                    message += " 교체 전에 따로 확인할 것이 있습니다."
+                    message += "\n" + translate_text("교체 전에 따로 확인할 것이 있습니다.")
                     for blocker in result.get("blockers") or []:
                         message += f"\n{blocker}"
             if views_imported:

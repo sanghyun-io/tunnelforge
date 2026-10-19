@@ -24,6 +24,7 @@ JOURNAL_LABELS = {
     "rollback_incomplete": "테이블 복구됨 · 저장 프로그램 복원 필요",
     "cutover_unknown": "전환 결과 불명",
     "failed_no_change": "실패 (변경 없음)",
+    "failed_triggers_recreated": "실패 (변경 없음, 트리거 다시 만듦)",
     "failed_original_unchanged": "실패 (원본 그대로)",
     "rolled_back": "백업으로 복구됨",
     "rollback_unknown": "복구 결과 불명",
@@ -36,6 +37,8 @@ OWNERSHIP_LABELS = {
     "destination_not_a_candidate": "복원 대상 (정리 안 함)",
 }
 VERDICT_LABELS = {
+    "rolled_back": "백업으로 복구됨",
+    "rollback_incomplete": "테이블 복구됨 · 저장 프로그램 복원 필요",
     "promoted": "전환됨",
     "not_promoted": "전환 안 됨",
     "promoted_incomplete": "테이블 교체됨 · 저장 프로그램 복원 필요",
@@ -267,6 +270,11 @@ class BackupLifecycleDialog(QDialog):
 
     def _on_rolled_back(self, success: bool, message: str, result: dict) -> None:
         if not success or result.get("status") != "rolled_back":
+            from src.core.error_report_sanitizer import sanitize_local_diagnostic
+            status = status_label(JOURNAL_LABELS, result.get("status"))
+            lines = [status, str(result.get("message") or message or "")]
+            error = str(result.get("error") or "")
+            verification_error = str(result.get("program_verification_error") or "")
             from src.exporters.rust_dump_exporter import describe_program_warnings, display_program_name
             names = [display_program_name(str(item).removeprefix("unexpected:")) for item in result.get("missing_programs") or []]
             pending = result.get("pending_program") or {}
@@ -276,13 +284,20 @@ class BackupLifecycleDialog(QDialog):
                 if name and name not in names:
                     names.append(name)
             if result.get("status") == "rollback_incomplete":
-                message = translate_text("원래 테이블로 되돌렸지만 저장 프로그램 일부가 원래대로 돌아오지 않았습니다: {names}. 원래 정의는 승격 기록에 남아 있습니다.").format(names=", ".join(names))
+                if names:
+                    lines.append(translate_text("원래 테이블로 되돌렸지만 저장 프로그램 일부가 원래대로 돌아오지 않았습니다: {names}. 원래 정의는 승격 기록에 남아 있습니다.").format(names=", ".join(names)))
+                else:
+                    lines.append(translate_text("원래 테이블로 되돌렸지만 저장 프로그램 상태를 확인하지 못했습니다. 원래 정의는 승격 기록에 남아 있습니다. ({error})").format(error=verification_error or error or "—"))
             elif names:
-                message += "\n" + ", ".join(names)
+                lines.append(", ".join(names))
             warnings = result.get("program_warnings") or []
             if warnings:
-                message += "\n" + "\n".join(describe_program_warnings(warnings))
-            QMessageBox.warning(self, "복구 실패", message)
+                lines.extend(describe_program_warnings(warnings))
+            if error:
+                lines.append(error)
+            if verification_error and names:
+                lines.append(verification_error)
+            QMessageBox.warning(self, translate_text("복구 실패"), sanitize_local_diagnostic("\n".join(line for line in lines if line)))
         else:
             QMessageBox.information(self, "복구 결과", f"{status_label(JOURNAL_LABELS, result.get('status'))}\n{result.get('message', '')}")
         self.refresh()

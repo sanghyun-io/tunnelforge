@@ -377,6 +377,7 @@ def test_direct_and_copy_blockers_are_shown_once(code):
     assert not any("끄면 진행할 수 있습니다" in line for line in shown)
 
 
-def test_candidate_grant_blocker_is_retained_with_direct_grant_blocker():
+def test_candidate_grant_blocker_is_deduplicated_with_direct_grant_blocker():
     preview={"blockers":[{"code":"program_privilege_missing"}],"copy_blockers":[{"code":"program_privilege_missing","table":"tf_restore_*"}]}
-    assert any("tf_restore_*" in line for line in describe_plan(preview,True)["blockers"])
+    assert len(describe_plan(preview,True)["blockers"])==1
+    assert not any("tf_restore_*" in line for line in describe_plan(preview,True)["blockers"])

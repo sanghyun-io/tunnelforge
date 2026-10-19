@@ -367,3 +367,24 @@ def test_stored_program_recovery_strings_have_exact_english():
     i18n.set_language("en")
     leaks = {source: translate_text(source) for source in strings if re.search(r"[가-힣]", translate_text(source))}
     assert not leaks
+
+
+def test_core_lifecycle_outcomes_all_have_status_and_verdict_labels():
+    import re
+    from src.ui.dialogs.backup_lifecycle_dialog import JOURNAL_LABELS, VERDICT_LABELS
+    root=Path(__file__).resolve().parents[1]/"migration_core"/"src"
+    outcomes=set()
+    for name in ["safe_promote_mysql.rs","safe_promote_postgres.rs"]:
+        source=(root/name).read_text(encoding="utf-8").split("#[cfg(test)]")[0]
+        outcomes.update(re.findall(r'"((?:failed_|rollback_|cutover_)[a-z_]+|preparing|promoted(?:_incomplete)?|rolled_back)"\s*(?:\.into\(\)|\.to_string\(\))',source))
+        outcomes.update(re.findall(r'\["status"\]\s*=\s*json!\("([a-z_]+)"\)',source))
+    assert {"rolled_back","failed_triggers_recreated","rollback_incomplete","cutover_unknown"} <= outcomes
+    assert outcomes <= JOURNAL_LABELS.keys()
+    source=(root/"safe_backups.rs").read_text(encoding="utf-8")
+    reconcile=source[source.index("fn reconcile("):source.index("fn cleanup_plan(")]
+    conclusions=set(re.findall(r'=>\s*\("([a-z_]+)"',reconcile))
+    assert {"rolled_back","rollback_incomplete","not_promoted"}<=conclusions
+    assert conclusions<=VERDICT_LABELS.keys()
+    i18n.set_language("en")
+    for sentence in ("실패 (변경 없음, 트리거 다시 만듦)","원래 트리거","검증용 복사본","원래 테이블로 되돌렸지만 저장 프로그램 상태를 확인하지 못했습니다. 원래 정의는 승격 기록에 남아 있습니다. ({error})"):
+        assert not re.search(r"[가-힣]",i18n.translate_text(sentence))

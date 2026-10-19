@@ -12,6 +12,7 @@ from typing import Optional
 
 # Stable codes emitted by migration_core (classified_import_error and friends).
 RUST_CORE_CODES = frozenset({
+    "target_routine_binlog_unsafe",
     "copy_routine_binlog_unsafe",
     "target_trigger_binlog_privilege",
     "target_program_unsavable",
