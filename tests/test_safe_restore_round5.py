@@ -59,7 +59,10 @@ def test_pg_unknown_outcome_keeps_driver_text_in_details_and_job_metadata(
     box = _stop_window(promotion_dialog)
     assert "Retain all recorded namespaces" in box.text()
     assert raw_error not in box.text()
-    assert raw_error in box.detailedText()
+    information = MagicMock()
+    monkeypatch.setattr(dialog_module.QMessageBox, "information", information)
+    next(button for button in box.buttons() if button.text() == i18n.translate_text("자세히")).click()
+    assert raw_error in information.call_args.args[2]
     recorded = {}
     monkeypatch.setattr(job_recording, "job_finish", lambda job_id, state, **kw: recorded.update(kw))
     job_recording.finish_promotion_job(SimpleNamespace(_promotion_job_id="j1", _cancel_requested=False),
