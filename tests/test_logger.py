@@ -1,6 +1,17 @@
 import logging
+import os
+from pathlib import Path
 
+from src.core import logger, platform_paths
 from src.core.logger import WindowsSafeRotatingFileHandler
+
+
+def test_logger_uses_isolated_test_app_data_directory():
+    log_dir = Path(logger.get_log_dir()).resolve()
+    test_app_data_dir = Path(os.environ["TF_TEST_APP_DATA_DIR"]).resolve()
+    assert log_dir == platform_paths.log_dir().resolve()
+    assert log_dir != platform_paths.log_dir(environ={}, home=Path.home()).resolve()
+    assert log_dir.is_relative_to(test_app_data_dir)
 
 
 def test_windows_safe_rotating_handler_keeps_logging_when_rollover_is_locked(tmp_path):

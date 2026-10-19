@@ -2,6 +2,15 @@
 pytest 공용 fixtures
 """
 import os
+import tempfile
+
+# Isolate every platform-specific app-data fallback before importing src modules.
+_TEST_APP_DATA_DIR = tempfile.mkdtemp(prefix="tunnelforge-tests-")
+os.environ["TF_TEST_APP_DATA_DIR"] = _TEST_APP_DATA_DIR
+for _app_data_var in ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "HOME"):
+    os.environ[_app_data_var] = _TEST_APP_DATA_DIR
+for _xdg_var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
+    os.environ[_xdg_var] = _TEST_APP_DATA_DIR
 
 # 어떤 PyQt import 보다 먼저: 일부 테스트 파일만 설정하면 전체 실행 시 첫 QApplication 이 만들어지는
 # 순서에 따라 실제 화면에 대화상자가 뜬다. CI 가 다른 값을 주면 그것을 존중한다(setdefault).
