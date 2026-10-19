@@ -880,9 +880,16 @@ fn verify_candidate(
             let sql=format!("SELECT COUNT(*) FROM {} c LEFT JOIN {} p ON {join} WHERE {present} AND p.{} IS NULL",q(&table.name),q(&fk.referenced_table),q(&fk.referenced_columns[0]));
             let orphans = count(&mut adapter, &sql)?;
             if orphans > 0 {
-                return Err(format!(
-                    "candidate verification found {orphans} orphan rows for FK {} on {}",
-                    fk.name, table.name
+                let fields = json!({
+                    "foreign_key": fk.name,
+                    "child_table": table.name,
+                    "row_count": orphans,
+                    "snapshot_policy": manifest.snapshot_policy,
+                });
+                return Err(classified_import_error(
+                    "candidate_fk_orphans",
+                    &format!("fields={fields}"),
+                    None,
                 ));
             }
             foreign_keys_checked += 1;

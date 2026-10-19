@@ -62,6 +62,10 @@ _SNAPSHOT_POLICY_MODES = {
     "mysql_single_connection_consistent_snapshot": "single_connection",
     "mysql_parallel_unsynchronized_snapshots": "parallel_unsynchronized",
 }
+_UNSYNCHRONIZED_SNAPSHOT_POLICIES = frozenset({
+    "mysql_parallel_unsynchronized_snapshots",
+    "mysql_parallel_no_backup_lock_consistent_snapshot",
+})
 # Why the automatic choice skipped a method (snapshot_fallbacks[].reason).
 _SNAPSHOT_FALLBACK_REASONS = {
     "privilege": "잠금 권한이 없어",
@@ -684,6 +688,7 @@ CORE_CODE_SENTENCES = {
     "safe_restore_content_invalid": "복사본을 검증하다가 덤프에서 읽을 수 없는 값을 만났습니다.",
     "safe_restore_content_mismatch": "복사본의 데이터가 덤프와 달라 교체하지 않았습니다.",
     "safe_restore_content_read_failed": "복사본의 데이터를 읽지 못해 검증하지 못했습니다.",
+    "candidate_fk_orphans": "복사본에 부모 행이 없는 자식 행이 있어 교체하지 않았습니다.",
     "legacy_bit_unverifiable": "예전 형식 덤프라 BIT 열을 복사본에서 검증할 수 없습니다. 이 버전으로 다시 내보내세요.",
     "cross_engine": "다른 DB 종류에서 만든 덤프는 복사본에서 검증할 수 없습니다.",
     "partial_table_filter": "일부 테이블만 넣을 때는 복사본에서 검증할 수 없습니다.",
@@ -746,6 +751,7 @@ _CORE_CODE_TOKEN = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_CORE_CODE = re.compile(r"\(error_code=([a-z_]+)\)")
+_CANDIDATE_FK_ORPHANS_FIELDS = re.compile(r"\bcandidate_fk_orphans:\s*fields=(\{[^\n]*\})")
 
 
 def describe_core_code(code: object, name: object = "") -> Optional[str]:
@@ -812,6 +818,33 @@ def describe_manifest_warning(warning: str) -> str:
 def describe_core_failure(message: object) -> Optional[str]:
     """The sentences for the core codes in a failure text; None when it carries none."""
     text = str(message or "")
+    if fields_match := _CANDIDATE_FK_ORPHANS_FIELDS.search(text):
+        try:
+            fields = json.loads(fields_match.group(1))
+            foreign_key = str(fields["foreign_key"])
+            child_table = str(fields["child_table"])
+            row_count = int(fields["row_count"])
+            snapshot_policy = str(fields.get("snapshot_policy") or "")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        else:
+            snapshot_reason = (
+                translate_text("이 덤프는 테이블마다 다른 시점에 읽었다고 기록되어 있어, 내보내는 동안 원본이 바뀌어 생긴 차이일 수 있습니다. 원본에 원래 있던 행일 수도 있습니다.")
+                if snapshot_policy in _UNSYNCHRONIZED_SNAPSHOT_POLICIES
+                else translate_text("원본에 원래 있던 행일 수 있습니다.")
+            )
+            template = (
+                "{child_table} 테이블의 행 {row_count}개가 가리키는 부모 행이 덤프에 없어 교체하지 않았습니다"
+                "(외래 키 {foreign_key}). {snapshot_reason} 이런 행까지 그대로 가져오려면 "
+                "'먼저 복사본에서 검증하고 교체'를 끄세요(mysqldump와 같은 동작). 아니면 모든 테이블을 같은 시점에 "
+                "읽도록 다시 내보내거나, 원본에서 '고아 레코드 분석'으로 이 행을 찾아 정리하세요."
+            )
+            return translate_text(template).format(
+                child_table=child_table,
+                row_count=row_count,
+                foreign_key=foreign_key,
+                snapshot_reason=snapshot_reason,
+            )
     found = [describe_core_code(match.group(1), match.group(2) or "") for match in _CORE_CODE_TOKEN.finditer(text)]
     if not found and (trailing := _TRAILING_CORE_CODE.search(text)):
         found = [describe_core_code(trailing.group(1))]

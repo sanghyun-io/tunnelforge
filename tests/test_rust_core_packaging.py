@@ -333,8 +333,8 @@ def test_macos_package_script_creates_dmg_and_supports_signing_notarization():
     assert "hdiutil info || true" in script
     assert 'ditto "$APP_PATH" "$DMG_STAGING/TunnelForge.app"' in script
     assert 'cp -R "$APP_PATH" "$DMG_STAGING/"' not in script
-    assert 'shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"' in script
-    assert 'shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"' in script
+    assert '(cd dist && shasum -a 256 "${ZIP_PATH##*/}" > "${ZIP_PATH##*/}.sha256")' in script
+    assert '(cd dist && shasum -a 256 "${DMG_PATH##*/}" > "${DMG_PATH##*/}.sha256")' in script
 
 
 def test_macos_release_validation_script_smokes_app_dmg_and_zip():
@@ -347,8 +347,8 @@ def test_macos_release_validation_script_smokes_app_dmg_and_zip():
     assert "bash scripts/package-macos.sh" in script
     assert 'test -f "$DMG_PATH.sha256"' in script
     assert 'test -f "$ZIP_PATH.sha256"' in script
-    assert 'shasum -a 256 -c "$DMG_PATH.sha256"' in script
-    assert 'shasum -a 256 -c "$ZIP_PATH.sha256"' in script
+    assert '(cd dist && shasum -a 256 -c "${DMG_PATH##*/}.sha256")' in script
+    assert '(cd dist && shasum -a 256 -c "${ZIP_PATH##*/}.sha256")' in script
     assert "dist/TunnelForge.app/Contents/MacOS/TunnelForge" in script
     assert "build/dmg-smoke-mount" in script
     assert "build/install-smoke-mount" in script
@@ -739,7 +739,8 @@ exit 1
     assert (stale_artifact_dir / "TunnelForge-macOS-2.0.5-arm64.dmg").exists()
 
 
-def test_macos_validation_artifact_download_script_verifies_flat_downloaded_checksums(tmp_path):
+@pytest.mark.parametrize("recorded_path", ["{name}", "dist/{name}"])
+def test_macos_validation_artifact_download_script_verifies_flat_downloaded_checksums(tmp_path, recorded_path):
     if shutil.which("bash") is None:
         pytest.skip("bash is required for shell script validation")
 
@@ -749,7 +750,7 @@ def test_macos_validation_artifact_download_script_verifies_flat_downloaded_chec
     dmg.write_bytes(b"fake-dmg")
     checksum = hashlib.sha256(dmg.read_bytes()).hexdigest()
     (artifact_dir / "TunnelForge-macOS-2.0.5-arm64.dmg.sha256").write_text(
-        f"{checksum}  dist/{dmg.name}\n",
+        f"{checksum}  {recorded_path.format(name=dmg.name)}\n",
         encoding="utf-8",
     )
 

@@ -212,6 +212,16 @@ fn safe_restore_stages_verified_candidate_and_never_changes_original_on_failure(
                 assert_eq!(result["success"], false, "{engine}/{defect}: {result:?}");
                 assert_eq!(result["status"], "failed_original_untouched");
                 assert_eq!(result["candidate_retained"], true);
+                if defect == "orphan" && engine == "mysql" {
+                    let error = result["error"].as_str().unwrap();
+                    assert!(error.starts_with("candidate_fk_orphans:"), "{error}");
+                    let fields = error.split_once("fields=").unwrap().1;
+                    let fields: Value = serde_json::from_str(fields).unwrap();
+                    assert_eq!(fields["foreign_key"], "fk_parent");
+                    assert_eq!(fields["child_table"], "children");
+                    assert_eq!(fields["row_count"], 1);
+                    assert_eq!(fields["snapshot_policy"], manifest["snapshot_policy"]);
+                }
             }
             let report: Value = serde_json::from_slice(
                 &std::fs::read(result["report_path"].as_str().unwrap()).unwrap(),

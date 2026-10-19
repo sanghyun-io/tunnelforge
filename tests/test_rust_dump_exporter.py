@@ -1893,6 +1893,51 @@ def test_every_code_the_core_can_emit_has_a_korean_sentence():
     assert {"copy_refused", "copy_checks_unavailable", "target_events", "linked_target_only", "previous_copy_leftover"} <= emitted
     assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []
 
+
+def test_candidate_fk_orphan_failure_explains_snapshot_and_recovery_options():
+    import json
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import describe_core_failure
+
+    def describe(policy):
+        fields = json.dumps({
+            "foreign_key": "is_read_comment_ibfk_1",
+            "child_table": "comments",
+            "row_count": 11,
+            "snapshot_policy": policy,
+        }, separators=(",", ":"))
+        return describe_core_failure(f"candidate_fk_orphans: fields={fields}")
+
+    synchronized = describe("mysql_single_connection_consistent_snapshot")
+    assert synchronized == (
+        "comments 테이블의 행 11개가 가리키는 부모 행이 덤프에 없어 교체하지 않았습니다"
+        "(외래 키 is_read_comment_ibfk_1). 원본에 원래 있던 행일 수 있습니다. 이런 행까지 그대로 가져오려면 "
+        "'먼저 복사본에서 검증하고 교체'를 끄세요(mysqldump와 같은 동작). 아니면 모든 테이블을 같은 시점에 "
+        "읽도록 다시 내보내거나, 원본에서 '고아 레코드 분석'으로 이 행을 찾아 정리하세요."
+    )
+    unsynchronized = describe("mysql_parallel_unsynchronized_snapshots")
+    assert unsynchronized == (
+        "comments 테이블의 행 11개가 가리키는 부모 행이 덤프에 없어 교체하지 않았습니다"
+        "(외래 키 is_read_comment_ibfk_1). 이 덤프는 테이블마다 다른 시점에 읽었다고 기록되어 있어, "
+        "내보내는 동안 원본이 바뀌어 생긴 차이일 수 있습니다. 원본에 원래 있던 행일 수도 있습니다. "
+        "이런 행까지 그대로 가져오려면 '먼저 복사본에서 검증하고 교체'를 끄세요(mysqldump와 같은 동작). "
+        "아니면 모든 테이블을 같은 시점에 읽도록 다시 내보내거나, 원본에서 '고아 레코드 분석'으로 이 행을 찾아 정리하세요."
+    )
+    i18n.set_language("en")
+    assert describe("mysql_single_connection_consistent_snapshot") == (
+        "11 rows of table comments point to parent rows that are not in the dump, so nothing was switched "
+        "(foreign key is_read_comment_ibfk_1). The rows may have been in the source already. To import such rows as they are, "
+        "turn off 'Verify in a copy first, then swap' (the same as mysqldump). Otherwise export again with all tables read "
+        "at the same moment, or find and clean these rows at the source with 'Analyze Orphan Records'."
+    )
+    assert describe("mysql_parallel_unsynchronized_snapshots") == (
+        "11 rows of table comments point to parent rows that are not in the dump, so nothing was switched "
+        "(foreign key is_read_comment_ibfk_1). The dump records that its tables were read at different moments, so the source "
+        "may have changed during the export. The rows may also have been in the source already. To import such rows as they are, "
+        "turn off 'Verify in a copy first, then swap' (the same as mysqldump). Otherwise export again with all tables read "
+        "at the same moment, or find and clean these rows at the source with 'Analyze Orphan Records'."
+    )
+
 @pytest.mark.parametrize("code, expected", [
     ("trigger:orders:trg_audit", "테이블 orders: 트리거(trg_audit)는 덤프에 담을 수 없습니다"),
     ("non_transactional_table:logs:MEMORY",

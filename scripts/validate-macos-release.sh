@@ -66,8 +66,8 @@ test -f "$DMG_PATH"
 test -f "$ZIP_PATH"
 test -f "$DMG_PATH.sha256"
 test -f "$ZIP_PATH.sha256"
-shasum -a 256 -c "$DMG_PATH.sha256"
-shasum -a 256 -c "$ZIP_PATH.sha256"
+(cd dist && shasum -a 256 -c "${DMG_PATH##*/}.sha256")
+(cd dist && shasum -a 256 -c "${ZIP_PATH##*/}.sha256")
 
 echo "[6/8] Smoke testing DMG package"
 rm -rf "$DMG_SMOKE_MOUNT"

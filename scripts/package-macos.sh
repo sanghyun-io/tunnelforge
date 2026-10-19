@@ -116,7 +116,7 @@ ditto "$APP_PATH" "$DMG_STAGING/TunnelForge.app"
 ln -s /Applications "$DMG_STAGING/Applications"
 create_dmg_with_retry
 
-shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"
+(cd dist && shasum -a 256 "${ZIP_PATH##*/}" > "${ZIP_PATH##*/}.sha256")
 
 if [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
   echo "Signing $DMG_PATH"
@@ -131,7 +131,7 @@ else
   echo "Apple notarization credentials are not set; skipping DMG notarization."
 fi
 
-shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"
+(cd dist && shasum -a 256 "${DMG_PATH##*/}" > "${DMG_PATH##*/}.sha256")
 
 echo "Created $ZIP_PATH"
 echo "Created $ZIP_PATH.sha256"

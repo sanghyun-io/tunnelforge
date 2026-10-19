@@ -34,6 +34,7 @@ RUST_CORE_CODES = frozenset({
     "unsupported_generated_column",
     "unsupported_invisible_column",
     "copy_refused",
+    "candidate_fk_orphans",
     "dump_programs_unsupported_in_copy",
     "table_definition_unrestorable",
     "routine_binlog_unsafe",
