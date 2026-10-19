@@ -659,7 +659,7 @@ CORE_CODE_SENTENCES = {
     "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
     "program_probe_failed": "저장 프로그램을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "program_source_schema_reference": "저장 프로그램 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
-    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 일반 Import로 가져오세요.",
+    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
     "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거·루틴·이벤트를 만들지 않습니다.",
     "programs_skipped_partial": "선택한 테이블에 딸린 객체만 가져오므로 나머지 객체는 만들지 않습니다.",
     "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
@@ -1085,6 +1085,8 @@ class RustDumpImporter(_RustDumpClientBase):
                 if count:
                     message += ", " + translate_text({"트리거":"트리거 {}개","루틴":"루틴 {}개","이벤트":"이벤트 {}개"}[label]).format(count)
             programs_failed = result.get("programs_failed") or []
+            if programs_failed:
+                self.last_error_code = classify_error_code(programs_failed[0].get("code") or "program_create_failed", "")
             for failure in programs_failed:
                 name = str(failure.get("name", ""))
                 line = describe_core_code(failure.get("code") or "program_create_failed", name)

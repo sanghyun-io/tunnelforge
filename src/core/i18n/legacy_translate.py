@@ -19,7 +19,7 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 _EN_TEXT_TRANSLATIONS = {
     "원본 세션 설정을 적용할 수 없어 이 객체는 바꾸지 않고 남겨 둡니다(결과는 일부 완료). 대상 서버의 시간대 설정을 확인하세요.": "The source session settings cannot be applied, so this object will be left unchanged and the result will be partial. Check the target server time zone configuration.",
     "루틴·이벤트 {}의 정의나 생성 설정을 안전하게 읽을 수 없습니다. 원본 객체의 정의와 문자셋·시간대를 확인한 뒤 다시 내보내세요.": "Could not safely read routine or event {} or its creation settings. Check the source definition, character set and time zone, then export again.",
-    "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 일반 Import로 가져오세요.": "Dumps containing triggers, routines or events cannot yet be verified in a copy. Use normal Import.",
+    "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.": "Dumps containing triggers, routines or events cannot yet be verified in a copy.",
     "선택한 테이블에 딸린 객체만 가져오므로 나머지 객체는 만들지 않습니다.": "Only objects belonging to the selected tables are imported; other objects are left out.",
     "계산 열 {}의 식이 원본과 같은지 확인하지 못했습니다. 이모지처럼 원본 DB가 다시 표시하지 못하는 문자가 있을 수 있습니다. 그 문자를 쓰지 않도록 식을 고치거나 이 테이블의 체크를 풀어 나머지만 내보내세요.": "Could not verify generated column {} against the source. Characters such as emoji may not be printable by the source database. Rewrite the expression without them, or uncheck this table to export the rest.",
     "객체를 만들었지만 활성화나 마무리 확인을 끝내지 못했습니다. 보고서에서 남아 있는 객체와 실행 상태를 확인하세요.": "The object was created, but activation or final checks did not finish. Check the remaining object and its state in the report.",

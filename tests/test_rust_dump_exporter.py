@@ -2032,7 +2032,9 @@ def test_partial_program_import_reports_recovery_and_returns_failure(tmp_path, r
     facade = MagicMock()
     facade.import_dump.return_value = {"success": False, "status": "partial", "data_imported": True, "rows_imported": 2,
         "programs_imported": [{"kind": "PROCEDURE", "name": "ok"}], "programs_failed": [{"kind": "FUNCTION", "name": "failed_f", "previous_restored": recovered}]}
-    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace")
+    importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade)
+    ok, message, _ = importer.import_dump(str(folder), import_mode="replace")
+    assert importer.last_error_code == "PROGRAM_CREATE_FAILED"
     assert not ok and "루틴 1개" in message and "failed_f" in message
     assert ("이전 정의 복구 성공" if recovered else "이전 정의 복구 실패") in message
 

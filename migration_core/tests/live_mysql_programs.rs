@@ -396,6 +396,8 @@ fn tampered_event_headers_cannot_escape_the_target_or_hide_enabled_creation() {
     let victim=s.other(true); let target=s.other(true); let mut fresh=conn(&target); table(&mut fresh); fresh.query_drop("UPDATE sample SET v=99").unwrap();
     let original=s.manifest();
     for definition in [
+        format!("CREATE EVENT `{}` #\rON SCHEDULE AT '2000-01-01 00:00:00' DISABLE DO SELECT 1 #\n.`ev` ON SCHEDULE EVERY 1 DAY ENABLE DO SET @a=1",victim.database),
+        format!("CREATE EVENT `{}` -- \rON SCHEDULE AT '2000-01-01 00:00:00' DISABLE DO SELECT 1 #\n.`ev` ON SCHEDULE EVERY 1 DAY ENABLE DO SET @a=1",victim.database),
         format!("CREATE EVENT `{}` /*!.`leaked`*/ ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1",victim.database),
         format!("CREATE EVENT `{}` /*M!.`leaked`*/ ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1",victim.database),
         format!("CREATE EVENT `{}` ON SCHEDULE EVERY 1 DAY /*! ENABLE COMMENT '*/ DISABLE /*' */ DO SET @a=1",victim.database),
@@ -460,7 +462,7 @@ fn post_create_disconnect_reports_the_new_disabled_event_left_in_target() {
         output.push(e);
     });
     let v=outcome(output); assert!(killed); assert_eq!(v["status"],"partial");
-    assert_eq!(v["programs_failed"][0]["code"],"program_finalize_failed"); assert_eq!(v["programs_failed"][0]["object_left"],true); assert_eq!(v["programs_failed"][0]["enabled"],false);
+    assert_eq!(v["programs_failed"][0]["code"],"program_finalize_failed"); assert_eq!(v["programs_failed"][0]["object_left"],true); assert_eq!(v["programs_failed"][0]["enabled"],Value::Null);
     assert_eq!(status(&mut conn(&target),"e"),"DISABLED");
 }
 
@@ -477,4 +479,69 @@ fn post_create_disconnect_keeps_the_created_trigger_in_the_journal() {
     assert_eq!(report["triggers_created"],json!([{"name":"guard","table":"sample"}])); assert_eq!(report["tables_lost_triggers"],json!([]));
     assert_eq!(report["programs_failed"][0]["object_left"],true);
     assert!(matches!(conn(&target).query_drop("DELETE FROM sample"),Err(mysql::Error::MySqlError(e)) if e.code==1644));
+}
+
+
+#[test]
+fn cr_line_comments_cannot_hide_disabled_state_for_new_or_replaced_events() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1").unwrap(); s.dump();
+    let original=s.manifest();
+    for existing in [false,true] {
+        let target=s.other(true); let mut fresh=conn(&target); table(&mut fresh);
+        fresh.query_drop("UPDATE sample SET v=99").unwrap();
+        if existing { fresh.query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY DISABLE DO SET @previous=1").unwrap(); }
+        for comment in ["-- x","#x"] {
+            let mut m=original.clone();
+            m["stored_programs"][0]["definition"]=json!(format!("CREATE EVENT `e` ON SCHEDULE EVERY 1 DAY {comment}\rDISABLE\nDO SET @a=1")); s.save(&m);
+            let preview=success(events("dump.import_preview",s.payload(&target)));
+            assert!(!preview["blockers"].as_array().unwrap().is_empty(),"{preview}");
+            let output=events("dump.import",s.payload(&target));
+            assert!(output.iter().any(|e|e["event"]=="error" && e.to_string().contains("program_definition_invalid")),"{output:#?}");
+            assert_eq!(fresh.query_first::<i32,_>("SELECT v FROM sample LIMIT 1").unwrap(),Some(99));
+            if existing { assert_eq!(status(&mut fresh,"e"),"DISABLED"); }
+            else { assert_eq!(fresh.query_first::<u64,_>("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE()").unwrap(),Some(0)); }
+        }
+    }
+}
+
+#[test]
+fn event_state_is_read_back_and_corrected_if_changed_at_create_boundary() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1").unwrap(); s.dump();
+    for intended_enabled in [false,true] {
+        let target=s.other(true);
+        if intended_enabled { conn(&target).query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY ENABLE DO SET @old=1").unwrap(); }
+        let mut changed=false; let mut output=Vec::new();
+        handle_request_streaming(Request{command:"dump.import".into(),request_id:None,payload:s.payload(&target)},|e| {
+            if e["event"]=="program_created" && e["kind"]=="EVENT" {
+                let mut other=conn(&target); assert_eq!(status(&mut other,"e"),"DISABLED");
+                other.query_drop("ALTER EVENT e ENABLE").unwrap(); changed=true;
+            }
+            output.push(e);
+        });
+        let v=success(output); assert!(changed);
+        let expected=if intended_enabled {"ENABLED"} else {"DISABLED"};
+        assert_eq!(status(&mut conn(&target),"e"),expected);
+        let imported=v["programs_imported"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT").unwrap();
+        assert_eq!(imported["status"],expected); assert_eq!(imported["enabled"],intended_enabled);
+    }
+}
+
+#[test]
+fn long_enum_and_set_definitions_export_and_import_with_values_intact() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint);
+    let labels=(0..40).map(|i|format!("선택항목_{i:03}_long_value")).collect::<Vec<_>>();
+    let list=labels.iter().map(|v|format!("'{v}'")).collect::<Vec<_>>().join(",");
+    assert!(list.len()>512);
+    db.query_drop(format!("CREATE TABLE sample(id INT PRIMARY KEY,e ENUM({list}),s SET({list}))")).unwrap();
+    let set_value=format!("{},{}",labels[0],labels[39]);
+    db.exec_drop("INSERT INTO sample VALUES(1,?,?)",(&labels[39],&set_value)).unwrap();
+    s.dump(); let target=s.other(false); success(events("dump.import",s.payload(&target)));
+    let mut fresh=conn(&target);
+    let row:Option<(String,String)>=fresh.query_first("SELECT e,s FROM sample").unwrap();
+    assert_eq!(row,Some((labels[39].clone(),set_value)));
+    let types=|db:&mut mysql::PooledConn| db.query::<String,_>("SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sample' AND COLUMN_NAME IN ('e','s') ORDER BY COLUMN_NAME").unwrap();
+    assert_eq!(types(&mut db),types(&mut fresh));
+    assert!(types(&mut fresh).iter().all(|t|t.len()>512));
 }

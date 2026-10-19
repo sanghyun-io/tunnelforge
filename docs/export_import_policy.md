@@ -864,7 +864,8 @@ and results. Keep a recoverable target backup before destructive replacement.
 ### Final validation and result reporting
 
 Executable comments (`/*!`, `/*M!`) and ambiguous control-character line comments
-are refused in stored-program definitions on both Export and Import. Timestamp
+are refused in routine and event definitions on both Export and Import.
+Line comments end only at LF, matching MySQL; a bare CR stays in the comment. Timestamp
 schedule expressions are conservatively reported as possibly due. The parser
 never treats server-executable header text as an ordinary ignored comment.
 
@@ -876,12 +877,26 @@ Created triggers remain in `triggers_created` even if later confirmation fails.
 the affected trigger; routine/event `program_finalize_failed` is a partial result.
 
 Core `status=partial` with `data_imported=true` is shown as partial completion,
-recorded as STATUS_PARTIAL, and does not generate an anonymous failure report.
+recorded as STATUS_PARTIAL. Only omissions already warned about in the accepted
+preview suppress anonymous failure reporting. Unexpected view or stored-program
+failures remain reportable.
 Warnings appear once in the result; skipped names also reach the visible progress
 log. The trigger toggle is locked during preview/run and disabled for a selected
 dump without triggers. Stable stored-program failure codes are privacy-allowlisted.
 
-Compatibility note: partial-view reporting is intentional under the no-silent-loss
-policy, including old and PostgreSQL dumps. It uses engine-neutral wording. The
-strict same-engine DDL export guard stays non-bypassable; see the TF-STATUS-203
-release notes for the impact on previously successful backups.
+Compatibility: full MySQL dumps preserve proven generated/invisible columns and
+stored programs in formats 6/7. This release reads formats 1-7; older applications
+refuse unsupported formats before changing the target. Table-subset imports name
+omitted views and programs, which can require confirmation for old and PostgreSQL
+dumps as well, without changing their table data or DDL behavior.
+
+The non-bypassable same-engine DDL export guard applies to MySQL. A definition
+that cannot be safely recreated produces `table_definition_unrestorable` and can
+make previously successful exports or scheduled backups fail. ENUM/SET definitions
+may contain up to 64 KiB of type text, with structural validation retained; other
+column type text retains the 512-byte limit. Unsupported definitions must be
+reviewed; explicitly exporting other tables produces a subset, not a full backup.
+
+Events are read back from information_schema.EVENTS after creation or alteration,
+including recovery. A mismatched status is corrected and verified, or reported as
+an object failure. Reports use the observed status, or unknown if it cannot be read.

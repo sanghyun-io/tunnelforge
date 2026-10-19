@@ -18,7 +18,7 @@ fn tokens(sql: &str, no_escape: bool) -> Result<Vec<Token>, String> {
             return Err("program_definition_invalid: executable comments are not supported".into())
         }
         if b[i]==b'#' || (b[i..].starts_with(b"--") && b.get(i+2).is_some_and(u8::is_ascii_whitespace)) {
-            i += sql[i..].find(|c|c=='\n' || c=='\r').unwrap_or(b.len()-i); continue;
+            i += sql[i..].find('\n').unwrap_or(b.len()-i); continue;
         }
         if b[i..].starts_with(b"/*") {
             i += 2; i += sql[i..].find("*/").ok_or("program_definition_invalid: unterminated comment")?+2; continue;
@@ -196,6 +196,22 @@ pub(crate) fn set_program_context(conn: &mut mysql::PooledConn, p: &NormalizedSt
     Ok(())
 }
 
+fn event_status(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Result<String,String> {
+    conn.exec_first("SELECT STATUS FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME=?",(schema,name))
+        .map_err(|e|e.to_string())?.ok_or_else(||"program_event_dropped: event is missing".into())
+}
+
+fn reconcile_event_status(conn: &mut mysql::PooledConn, schema: &str, name: &str, expected: &str) -> Result<String,String> {
+    let matches = |status: &str| status==expected || (matches!(status,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED") && matches!(expected,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED"));
+    let actual=event_status(conn,schema,name)?;
+    if matches(&actual) { return Ok(actual) }
+    let clause=match expected { "ENABLED"=>"ENABLE", "DISABLED"=>"DISABLE", "SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED"=>"DISABLE ON SLAVE", _=>return Err(format!("invalid expected event status: {expected}")) };
+    conn.query_drop(format!("ALTER EVENT {}.{} {clause}",quote_ident("mysql",schema),quote_ident("mysql",name))).map_err(|e|e.to_string())?;
+    let actual=event_status(conn,schema,name)?;
+    if !matches(&actual) { return Err(format!("event state mismatch: expected {expected}, actual {actual}")) }
+    Ok(actual)
+}
+
 fn create_schema_program(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, name: &str) -> Result<Vec<Value>,String> {
     set_program_context(conn,p)?;
     create_schema_program_in_context(conn,p,name,&mut false,||{})
@@ -209,6 +225,10 @@ fn create_schema_program_in_context(conn: &mut mysql::PooledConn, p: &Normalized
     *created=true; on_created();
     let warnings: Vec<(String,u32,String)> = conn.query("SHOW WARNINGS").map_err(|e|e.to_string())?;
     let mut out = warnings.into_iter().map(|(level,code,message)| json!({"name":p.name,"kind":p.kind,"level":level,"code":code,"message":message})).collect::<Vec<_>>();
+    if p.kind=="EVENT" && !out.iter().any(|w|w["code"]==1588) {
+        let schema:String=conn.query_first("SELECT DATABASE()").map_err(|e|e.to_string())?.ok_or("event schema is missing")?;
+        reconcile_event_status(conn,&schema,name,"DISABLED")?;
+    }
     let current: Option<String> = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?;
     if p.definer != current { out.push(json!({"name":p.name,"kind":p.kind,"code":"program_definer_replaced","source":p.definer,"target":current})); }
     let collation: Option<String> = conn.query_first("SELECT @@collation_database").map_err(|e|e.to_string())?;
@@ -279,6 +299,10 @@ fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: 
     warnings.extend(restored_warnings.iter().map(|(level,code,message)|json!({"name":previous.name,"kind":previous.kind,"level":level,"code":code,"message":message})));
     failure["restore_warnings"]=json!(warnings);
     if restored_warnings.iter().any(|(_,code,_)|*code==1588) { return Err("program_event_dropped: previous event disappeared during recovery".into()) }
+    if previous.kind=="EVENT" {
+        let actual=reconcile_event_status(conn,schema,&previous.name,previous.status.as_deref().ok_or("previous event status is missing")?)?;
+        failure["status"]=json!(actual); failure["enabled"]=json!(actual=="ENABLED");
+    }
     Ok(())
 }
 
@@ -316,19 +340,22 @@ pub(crate) fn replace_schema_program(conn: &mut mysql::PooledConn, schema: &str,
     conn.query_drop(format!("DROP {} IF EXISTS {}",p.kind,quote_ident("mysql",&p.name))).map_err(|e|unchanged(e.to_string()))?;
     let mut warnings = Vec::new();
     if previous.is_some() && p.kind!="EVENT" { warnings.push(json!({"name":p.name,"kind":p.kind,"code":"routine_grants_reset"})); }
-    let mut created=false; let mut activation_attempted=false;
+    let mut created=false; let mut actual_status=None;
     let result = create_schema_program_in_context(conn,p,&p.name,&mut created,on_created).and_then(|created_warnings| {
         warnings.extend(created_warnings);
         if warnings.iter().any(|w|w["code"]==1588) { created=false; return Err("program_event_dropped: event was immediately removed by the server".into()) }
-        if enable { activation_attempted=true; conn.query_drop(format!("ALTER EVENT {} ENABLE",quote_ident("mysql",&p.name))).map_err(|e|e.to_string())?; }
+        if p.kind=="EVENT" { actual_status=Some(reconcile_event_status(conn,schema,&p.name,if enable {"ENABLED"} else {"DISABLED"})?); }
         Ok(())
     });
     match result {
-        Ok(()) => Ok((warnings,json!({"kind":p.kind,"name":p.name,"enabled":enable}))),
+        Ok(()) => Ok((warnings,json!({"kind":p.kind,"name":p.name,"enabled":actual_status.as_ref().map(|s|s=="ENABLED").unwrap_or(false),"status":actual_status}))),
         Err(err) => {
             let code=if err.starts_with("routine_binlog_unsafe:") {"routine_binlog_unsafe"} else if err.starts_with("program_event_dropped:") {"program_event_dropped"} else if created {"program_finalize_failed"} else {"program_create_failed"};
             let mut failure = json!({"kind":p.kind,"name":p.name,"code":code,"error":err,"created":created,"object_left":created && previous.is_none(),"warnings":warnings,"previous_definition":previous.as_ref().map(|p|&p.definition)});
-            if p.kind=="EVENT" { failure["enabled"]=if activation_attempted {Value::Null} else {json!(false)}; }
+            if p.kind=="EVENT" {
+                let actual=event_status(conn,schema,&p.name).ok();
+                failure["enabled"]=json!(actual.as_ref().map(|s|s=="ENABLED")); failure["status"]=json!(actual);
+            }
             if let Some(previous) = previous {
                 let restore=restore_schema_program(conn,schema,&previous,&mut failure);
                 if created && restore.is_err() { failure["object_left"]=Value::Null; }
@@ -377,6 +404,10 @@ mod tests {
     #[test]
     fn executable_and_ambiguous_comments_cannot_hide_qualifiers_or_enabled_states() {
         for sql in [
+            "CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY -- x\rDISABLE\nDO SET @a=1",
+            "CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY #x\rDISABLE\nDO SET @a=1",
+            "CREATE EVENT `p` #\rON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1 #\n.`ev` ON SCHEDULE EVERY 1 DAY ENABLE DO SET @a=1",
+            "CREATE EVENT `p` -- \rON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1 #\n.`ev` ON SCHEDULE EVERY 1 DAY ENABLE DO SET @a=1",
             "CREATE EVENT `p` /*!.`outside`*/ ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1",
             "CREATE EVENT `p` /*M!.`outside`*/ ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1",
             "CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY /*! ENABLE COMMENT '*/ DISABLE /*' */ DO SET @a=1",
@@ -386,6 +417,10 @@ mod tests {
             let p=program("EVENT",sql);
             assert!(schema_program_sql(&p,"p",Some("source")).unwrap_err().starts_with("program_definition_invalid:"));
             assert!(schema_program_sql(&p,"p",None).is_err());
+        }
+        for comment in ["#x", "-- x"] {
+            let p=program("EVENT",&format!("CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY {comment}\r\nDISABLE DO SET @a=1"));
+            assert!(schema_program_sql(&p,"p",None).is_ok());
         }
         for kind in ["PROCEDURE","FUNCTION"] {
             assert!(schema_program_sql(&program(kind,&format!("CREATE {kind} `p` /*!.`outside`*/() SELECT 1")),"p",None).is_err());

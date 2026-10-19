@@ -229,8 +229,14 @@ class ImportPlanDialog(SchemaConfirmDialog):
                 outer.addWidget(widget)
         outer.addLayout(self._build_button_row(colors[0]))
         screen = self.screen().availableGeometry()
-        self.resize(620, min(740, screen.height() - 60))
-        self.setMaximumHeight(screen.height())
+        content.setMinimumWidth(580)
+        content.layout().activate()
+        fixed_height = outer.sizeHint().height() - self.content_area.sizeHint().height()
+        body_height = max(0, screen.height() - 60 - fixed_height)
+        self.content_area.setMinimumHeight(min(content.sizeHint().height() + 4, body_height))
+        self.adjustSize()
+        self.resize(max(620, self.sizeHint().width()), min(self.sizeHint().height(), screen.height() - 60))
+        self.setMaximumHeight(screen.height() - 60)
         if environment != Environment.PRODUCTION:
             self.btn_execute.setEnabled(not self.blockers)
         if environment in (Environment.STAGING, Environment.UNKNOWN):

@@ -288,7 +288,7 @@ def test_large_must_see_lists_are_summarized_and_dialog_buttons_stay_visible():
         assert dialog.btn_execute.mapTo(dialog, dialog.btn_execute.rect().bottomRight()).y() < dialog.height()
         assert dialog.btn_cancel.mapTo(dialog, dialog.btn_cancel.rect().bottomRight()).y() < dialog.height()
         assert dialog.input_schema.mapTo(dialog, dialog.input_schema.rect().bottomRight()).y() < dialog.height()
-        assert dialog.height() <= dialog.screen().availableGeometry().height()
+        assert dialog.height() <= dialog.screen().availableGeometry().height() - 60
     finally:
         dialog.close()
 
@@ -320,3 +320,14 @@ def test_full_structured_warning_names_remain_available_beyond_log_line_limit():
     plan = describe_plan({"warnings":[{"code":"program_definer_replaced","names":names,"detail":", ".join(names)}]},False)
     assert "object_399_" in "\n".join(plan["details"])
     assert "object_399_" not in "\n".join(plan["warnings"])
+
+
+def test_short_replace_plan_sizes_to_its_content():
+    preview={"target":{"engine":"mysql"},"replace":["users"],"create":[]}
+    dialog=ImportPlanDialog(None,preview,describe_plan(preview,False),Environment.STAGING,"app","app")
+    try:
+        dialog.show()
+        _app.processEvents()
+        assert dialog.height()<500
+        assert dialog.btn_execute.mapTo(dialog,dialog.btn_execute.rect().bottomRight()).y()<dialog.height()
+    finally: dialog.close()

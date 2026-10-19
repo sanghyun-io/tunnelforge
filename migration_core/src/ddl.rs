@@ -8,9 +8,9 @@ use crate::*;
 /// 그보다 긴 collation 문자열은 변조된 값으로 보고 fail-closed로 거부한다.
 const MYSQL_IDENTIFIER_MAX_LEN: usize = 64;
 
-/// 검증 대상 컬럼 타입 문자열의 최대 길이. 정상 타입 선언은 이보다 훨씬 짧으므로,
-/// 초과하는 값은 주입 시도로 보고 파싱 전에 fail-closed로 거부한다.
+/// Bound type text before parsing; ENUM/SET value lists need a larger limit.
 const MAX_COLUMN_TYPE_LEN: usize = 512;
+const MAX_ENUM_SET_TYPE_LEN: usize = 64 * 1024;
 
 fn schema_string_literal(engine: &str, value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('\'', "''");
@@ -1685,7 +1685,7 @@ fn parse_modifier_word(s: &str, bytes: &[u8], i: usize) -> Option<usize> {
 fn is_safe_column_type(type_name: &str) -> bool {
     let mut s = type_name.trim();
     while let Some(base) = s.strip_suffix("[]") { s = base.trim_end(); }
-    if s.is_empty() || s.len() > MAX_COLUMN_TYPE_LEN {
+    if s.is_empty() || s.len() > MAX_ENUM_SET_TYPE_LEN {
         return false;
     }
     let bytes = s.as_bytes();
@@ -1694,6 +1694,9 @@ fn is_safe_column_type(type_name: &str) -> bool {
     let Some(mut i) = parse_base_ident(bytes, 0) else {
         return false;
     };
+
+    let enum_set=matches!(s[..i].to_ascii_lowercase().as_str(),"enum" | "set");
+    if !enum_set && s.len()>MAX_COLUMN_TYPE_LEN { return false; }
 
     // 2) 선택적 인자 그룹 '(' ... ')'
     if i < bytes.len() && bytes[i] == b'(' {
@@ -3407,6 +3410,19 @@ mod tests {
         assert!(!is_valid_mysql_collation_ident("paren)"));
         assert!(!is_valid_mysql_collation_ident("eq=sign"));
         assert!(!is_valid_mysql_collation_ident(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn long_enum_set_types_keep_structural_validation() {
+        let labels=(0..40).map(|i|format!("'선택항목_{i:03}_long_value'")).collect::<Vec<_>>().join(",");
+        for kind in ["enum","SET"] {
+            let valid=format!("{kind}({labels})");
+            assert!(valid.len()>512 && is_safe_column_type(&valid));
+            assert!(!is_safe_column_type(&format!("{valid} ENGINE=MyISAM")));
+            assert!(!is_safe_column_type(&format!("{kind}({labels},'unterminated)")));
+            assert!(!is_safe_column_type(&format!("{kind}('{}')","x".repeat(MAX_ENUM_SET_TYPE_LEN))));
+        }
+        assert!(!is_safe_column_type(&format!("varchar(10){}"," ".repeat(512)+"unsigned")));
     }
 
     #[test]

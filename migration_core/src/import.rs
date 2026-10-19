@@ -375,7 +375,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
     }
     let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
     for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed",
-        "namespace_creation_outcome_unknown", "namespace_created", "created_tables", "data_imported", "probe_left_behind", "target", "triggers_created", "tables_lost_triggers", "program_warnings", "programs_failed", "programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"] {
+        "namespace_creation_outcome_unknown", "namespace_created", "created_tables", "data_imported", "probe_left_behind", "target", "triggers_created", "tables_lost_triggers", "program_warnings", "programs_failed", "views_failed", "programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"] {
         summary[key] = report[key].clone();
     }
     emit(summary);

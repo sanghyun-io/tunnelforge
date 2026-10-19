@@ -72,7 +72,7 @@ def _capture_import_audit(audit: dict, event: dict):
                 audit[key] = event[key]
         for key in ("dropped_tables", "dropped_not_restored_tables", "unattempted_tables", "dropped_foreign_keys",
                     "restored_foreign_keys", "triggers_created", "tables_lost_triggers", "programs_skipped_toggle",
-                    "programs_skipped_partial", "programs_skipped_cross_engine", "program_warnings"):
+                    "programs_skipped_partial", "programs_skipped_cross_engine", "program_warnings", "views_failed"):
             if isinstance(event.get(key), list):
                 audit[key] = event[key]
         if isinstance(event.get("data_imported"), bool):
@@ -1381,6 +1381,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if not self._confirm_plan(self._pending_request, preview):
             self.set_ui_enabled(True)
             return
+        self._accepted_program_preview = preview
         self._start_import(self._pending_request)
 
     def _plan_notes(self, request: dict, preview: dict) -> List[str]:
@@ -1805,6 +1806,25 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.label_rerun_hint.setVisible(True)
             self.txt_log.addItem(f"⚠️ {len(failed_tables)}개 테이블 Import 실패")
 
+    def _only_accepted_program_omissions(self):
+        audit = self.import_audit
+        if audit.get("views_failed") or audit.get("programs_failed"):
+            return False
+        preview = getattr(self, "_accepted_program_preview", {})
+        expected_functions = {name for warning in preview.get("warnings", [])
+                              if warning.get("code") == "routine_binlog_unsafe" for name in warning.get("names", [])}
+        omitted_functions = {warning.get("name") for warning in audit.get("program_warnings", [])
+                             if warning.get("code") == "routine_binlog_unsafe"}
+        if not omitted_functions.issubset(expected_functions):
+            return False
+        any_omitted = bool(omitted_functions)
+        for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
+            omitted = set(audit.get(key) or [])
+            if not omitted.issubset(set(preview.get(key) or [])):
+                return False
+            any_omitted |= bool(omitted)
+        return any_omitted
+
     def _report_error_anonymously(self):
         """Submit a privacy-allowlisted report in the background."""
         report_operation_error(self, "import", "dump.import")
@@ -1898,6 +1918,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 if line not in visible:
                     self._log_visible(line)
             self._show_failure("Import 일부 완료", message)
+            if not self._only_accepted_program_omissions():
+                self._report_error_anonymously()
         elif success:
             sentence = self._success_sentence(new_target, total_count)
             self.label_status.setText(f"✅ {sentence}")

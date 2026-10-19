@@ -2520,6 +2520,7 @@ def test_program_partial_has_warning_outcome_once_and_no_anonymous_report(monkey
     monkeypatch.setattr(job_recording,"job_finish",finish)
     dialog=RustDumpImportDialog()
     try:
+        dialog._accepted_program_preview={"warnings":[{"code":"routine_binlog_unsafe","names":["f"]}]}
         dialog._job_id="job-partial"
         dialog.last_import_mode="replace"
         dialog.import_results={"users":{"status":"done"}}
@@ -2534,3 +2535,34 @@ def test_program_partial_has_warning_outcome_once_and_no_anonymous_report(monkey
         assert finish.call_args.args[1]==STATUS_PARTIAL
         assert any("binlog warning" in dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count()))
     finally: dialog.close()
+
+
+@pytest.mark.parametrize("evidence", [
+    {"views_failed":[{"name":"v_orders","error":"missing function"}]},
+    {"programs_failed":[{"code":"program_create_failed","name":"p"}]},
+    {"programs_failed":[{"code":"program_finalize_failed","name":"e"}]},
+    {"program_warnings":[{"code":"routine_binlog_unsafe","name":"not_previewed"}]},
+    {},
+])
+def test_unexpected_partial_failures_still_send_anonymous_report(monkeypatch, evidence):
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda:(True,"ok"))
+    dialog=RustDumpImportDialog()
+    try:
+        dialog.last_import_mode="replace"
+        dialog.import_results={"users":{"status":"done"}}
+        dialog.import_audit={"status":"partial","data_imported":True,**evidence}
+        dialog._show_failure=MagicMock()
+        dialog._report_error_anonymously=MagicMock()
+        dialog.on_finished(False,"일부 객체 복원 실패")
+        assert "일부 완료" in dialog.label_status.text()
+        dialog._report_error_anonymously.assert_called_once()
+    finally: dialog.close()
+
+
+def test_view_failures_survive_import_audit_capture():
+    from src.ui.dialogs.db_import_dialog import _capture_import_audit
+    audit={}
+    failed=[{"name":"v_orders","error":"missing function"}]
+    _capture_import_audit(audit,{"event":"import_report","views_failed":failed})
+    assert audit["views_failed"]==failed
