@@ -5,6 +5,7 @@
         let (original,candidate,_,dir)=fixture(&base);
         let schemas=vec![original.schema.clone().unwrap()];
         let mut client=connect(&original).unwrap();
+        client.batch_execute(&format!("SET search_path TO {}",q(original.schema.as_deref().unwrap()))).unwrap();
         let legacy=client.query(include_str!("../fixtures/postgres_legacy_objects.sql"),&[&schemas]).unwrap().into_iter()
             .map(|row|serde_json::from_str::<Value>(row.get::<_,&str>(0)).unwrap()).collect::<Vec<_>>();
         assert_eq!(serde_json::to_vec(&objects(&mut client,&schemas).unwrap()).unwrap(),serde_json::to_vec(&legacy).unwrap());
@@ -26,6 +27,7 @@
             assert!(err.contains("cannot insert multiple commands"),"{err}");
         }
         let mut client=connect(&original).unwrap();
+        client.batch_execute(&format!("SET search_path TO {}",q(original.schema.as_deref().unwrap()))).unwrap();
         assert!(client.query_one("SELECT count(*) FROM items",&[]).unwrap().get::<_,i64>(0)>0);
         assert!(client.query_one("SELECT to_regclass('extra')::text",&[]).unwrap().get::<_,Option<String>>(0).is_none());
         cleanup(&base,&original,&candidate,None,&dir);
