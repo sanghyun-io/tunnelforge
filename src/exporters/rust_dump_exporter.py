@@ -888,6 +888,31 @@ def describe_core_failure(message: object) -> Optional[str]:
     return " ".join(sentences) or None
 
 
+def describe_specific_promotion_failure(result: dict, message: object = "") -> Optional[str]:
+    """Keep generic promotion wrappers behind the recorded outcome's guidance."""
+    code = str(result.get("error_code") or "").lower()
+    if code != "safe_promotion" and (sentence := describe_core_code(code)):
+        return sentence
+    for value in (message, result.get("error")):
+        text = re.sub(r"^\s*safe_promotion:\s*", "", str(value or ""))
+        if any(match.group(1).lower()=="safe_promotion" for match in _CORE_CODE_TOKEN.finditer(text)):
+            continue
+        if sentence := describe_core_failure(text):
+            return sentence
+    return None
+
+
+_IMPORT_TOGGLE_NAMES = ("먼저 복사본에서 검증하고 교체", "트리거 없이 테이블만 가져오기")
+
+
+def without_import_toggle_hints(sentence: str) -> str:
+    # A toggle-dependent prefix can qualify an otherwise useful base sentence.
+    for name in _IMPORT_TOGGLE_NAMES:
+        sentence = sentence.replace(f"'{name}'를 켜서 ", "")
+    return " ".join(part for part in re.split(r"(?<=[.!?])\s+", sentence)
+                    if not any(name in part for name in _IMPORT_TOGGLE_NAMES))
+
+
 IMPORT_PREVIEW_CAPABILITY = "dump.import_preview"
 _UNKNOWN_TARGET_MESSAGE = "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요."
 _MISSING_MANIFEST_MESSAGE = "TunnelForge Rust dump manifest를 찾을 수 없습니다."
@@ -912,8 +937,8 @@ def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKE
     lines = []
     for code, names in grouped.items():
         source = CORE_CODE_SENTENCES.get(code) or unknown
-        if omit_verify_hint and code in ("copy_routine_binlog_unsafe", "target_routine_binlog_unsafe", "view_calls_dump_routine"):
-            source = source.split(" '먼저 복사본에서 검증하고 교체'")[0]
+        if omit_verify_hint:
+            source = without_import_toggle_hints(source)
         sentence = translate_text(source)
         shown = ", ".join(names[:10]) + (f" … (+{len(names) - 10})" if len(names) > 10 else "")
         lines.append(f"- {sentence}" + (f" ({shown})" if names else ""))

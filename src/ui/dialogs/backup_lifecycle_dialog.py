@@ -48,6 +48,16 @@ VERDICT_LABELS = {
 }
 
 
+BACKUP_NOTE_LABELS = {
+    "The original table identities changed after the recorded failed attempt. The candidate still has its recorded table identities; a new promotion plan can be made.": "실패가 기록된 뒤 원본 테이블이 다시 만들어졌습니다. 복사본은 그대로라 새 교체 계획을 만들 수 있습니다.",
+    "This account cannot see all stored programs, so the recovery result was not re-checked. The recorded state is kept.": "이 계정으로는 저장 프로그램을 모두 볼 수 없어 복구 결과를 다시 확인하지 못했습니다. 기록된 상태를 유지합니다."
+}
+
+
+def describe_backup_note(note) -> str:
+    return translate_text(BACKUP_NOTE_LABELS.get(str(note or ""), str(note or "")))
+
+
 def status_label(labels: dict, code) -> str:
     code = str(code or "-")
     return translate_text(labels.get(code, code))
@@ -201,7 +211,11 @@ class BackupLifecycleDialog(QDialog):
         for entry in self.entries:
             if entry.get("inspection_error"):
                 lines.append(f"[{entry.get('restore_id')}] {entry['inspection_error']}")
-            note = (entry.get("backup") or {}).get("saved_view_alias_note")
+            backup = entry.get("backup") or {}
+            for key in ("note", "program_verification_error"):
+                if backup.get(key):
+                    lines.append(f"[{entry.get('restore_id')}] {describe_backup_note(backup[key])}")
+            note = backup.get("saved_view_alias_note")
             if note:
                 lines.append(f"[{entry.get('restore_id')}] {note}")
         for item in result.get("unproven_namespaces") or []:
@@ -228,7 +242,8 @@ class BackupLifecycleDialog(QDialog):
             return
         QMessageBox.information(
             self, "전환 결과 대조",
-            f"판정: {status_label(VERDICT_LABELS, result.get('conclusion'))}\n{result.get('message', '')}\n\n"
+            f"판정: {status_label(VERDICT_LABELS, result.get('conclusion'))}\n{result.get('message', '')}\n"
+            + (describe_backup_note((result.get("evidence") or {}).get("note")) + "\n" if (result.get("evidence") or {}).get("note") else "") + "\n" +
             "이 대조는 조회 전용이며 저널이나 DB 객체를 바꾸지 않습니다.")
 
     # -- 복구 -----------------------------------------------------------
@@ -264,7 +279,7 @@ class BackupLifecycleDialog(QDialog):
             for blocker in plan.get("blockers") or []:
                 code, _, rest = str(blocker).partition(":")
                 sentence = describe_core_code(code)
-                name = rest.partition(":")[0].strip()
+                name = rest.strip().rpartition(": ")[0]
                 if name == "original triggers":
                     name = translate_text("원래 트리거")
                 blockers.append((sentence + (f" ({name})" if name else "")) if sentence else str(blocker))

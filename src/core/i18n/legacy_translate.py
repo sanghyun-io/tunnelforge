@@ -17,6 +17,10 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "실패가 기록된 뒤 원본 테이블이 다시 만들어졌습니다. 복사본은 그대로라 새 교체 계획을 만들 수 있습니다.": "The original table identities changed after the recorded failed attempt. The candidate still has its recorded table identities; a new promotion plan can be made.",
+    "이 계정으로는 저장 프로그램을 모두 볼 수 없어 복구 결과를 다시 확인하지 못했습니다. 기록된 상태를 유지합니다.": "This account cannot see all stored programs, so the recovery result was not re-checked. The recorded state is kept.",
+    "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다.": "Creating triggers requires log_bin_trust_function_creators=1 or SUPER.",
+    "덤프의 트리거를 만들지 않습니다.": "Triggers from the dump will not be created.",
     "교체할 테이블에 지금 계정으로는 보이지 않는 트리거가 있어 교체하지 않았습니다. 원본은 그대로입니다. TRIGGER 권한이 있는 계정으로 다시 교체하세요.": "The tables to swap have triggers this account cannot see, so nothing was swapped. The originals are unchanged. Swap again with an account that has the TRIGGER privilege.",
     "원래 함수를 지금 서버 설정으로는 다시 만들 수 없어 복구를 시작하지 않았습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 복구하세요.": "The original function cannot be recreated with the current server settings, so the recovery did not start. Set log_bin_trust_function_creators=1 or recover with an account that has SUPER.",
     "원래 트리거를 다시 만들 TRIGGER 권한이 없어 복구를 시작하지 않았습니다. TRIGGER 권한이 있는 계정으로 복구하세요.": "This account lacks the TRIGGER privilege needed to recreate the original triggers, so the recovery did not start. Recover with an account that has TRIGGER.",

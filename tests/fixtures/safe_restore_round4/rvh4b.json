@@ -1,0 +1,10 @@
+{
+  "status": "failed_original_triggers_missing",
+  "success": false,
+  "original_unchanged": false,
+  "message": "Tables were not promoted, but original triggers could not be restored. Recover them from the definitions saved in the report.",
+  "error": "safe_promotion: atomic rename: IoError { server disconnected }",
+  "missing_programs": [
+    "trigger:parent:guard"
+  ]
+}

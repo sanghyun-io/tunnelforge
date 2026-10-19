@@ -250,7 +250,13 @@ def test_program_dump_is_accepted_by_scheduled_rehearsal(env):
     assert "cleanup_apply" in env.facade.calls
 
 
-@pytest.mark.parametrize("code", ["view_calls_dump_routine", "copy_routine_binlog_unsafe", "target_routine_binlog_unsafe"])
+from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES
+
+_REHEARSAL_TOGGLES = ("먼저 복사본에서 검증하고 교체", "트리거 없이 테이블만 가져오기")
+
+
+@pytest.mark.parametrize("code", [code for code,sentence in CORE_CODE_SENTENCES.items()
+                                 if any(toggle in sentence for toggle in _REHEARSAL_TOGGLES)])
 @pytest.mark.parametrize("language", ["ko", "en"])
 def test_rehearsal_copy_refusal_never_recommends_a_verify_toggle(env, code, language):
     from src.core import i18n
@@ -267,8 +273,13 @@ def test_rehearsal_copy_refusal_never_recommends_a_verify_toggle(env, code, lang
         for message in (outcome.message, report["error"]):
             assert "먼저 복사본에서 검증하고 교체" not in message
             assert "Verify in a copy first, then swap" not in message
-            prefix = CORE_CODE_SENTENCES[code].split(" '먼저 복사본에서 검증하고 교체'")[0]
-            assert i18n.translate_text(prefix) in message
+            assert "트리거 없이 테이블만 가져오기" not in message
+            assert "Import tables without triggers" not in message
+            base = CORE_CODE_SENTENCES[code].split(" '먼저 복사본에서 검증하고 교체'")[0].split(" 트리거를 제외하려면")[0]
+            if any(toggle in base for toggle in _REHEARSAL_TOGGLES):
+                base = base.split("켜서 ",1)[-1]
+            assert base and not any(toggle in base for toggle in _REHEARSAL_TOGGLES)
+            assert i18n.translate_text(base) in message
         assert facade.import_dump.call_args.args[0]["verify_only"] is True
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)

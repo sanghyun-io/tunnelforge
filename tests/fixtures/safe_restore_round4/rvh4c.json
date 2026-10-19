@@ -1,0 +1,7 @@
+{
+  "status": "failed_original_unchanged",
+  "success": false,
+  "original_unchanged": true,
+  "message": "Promotion did not change original tables or their foreign keys. The verified candidate remains available.",
+  "error": "safe_promotion: bounded WRITE lock acquisition (2 seconds): MySqlError { ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction }"
+}
