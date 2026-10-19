@@ -81,7 +81,7 @@ def test_rollback_warning_omits_absent_status_and_preserves_real_line_breaks(mon
 def test_hidden_trigger_failure_reaches_stop_dialog_and_job_record(monkeypatch, language, fixed_status_message):
     from src.ui.dialogs import db_import_dialog as mod, job_recording
 
-    error = "target_trigger_hidden: an account with TRIGGER privilege is required (ERROR 1435)"
+    error = "safe_promotion: target_trigger_hidden: an account with TRIGGER privilege is required (ERROR 1435)"
     message = "Promotion did not change original tables." if fixed_status_message else error
     done = {"status": "failed_original_unchanged", "success": False, "original_unchanged": True,
             "message": message, "error": error, "error_code": "target_trigger_hidden"}

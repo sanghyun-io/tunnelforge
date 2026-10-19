@@ -27,7 +27,7 @@ from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component
 from src.core.production_guard import ProductionGuard
 from src.exporters.rust_dump_exporter import (
-    DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure,
+    DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_code, describe_core_failure,
     dump_original_namespace, restore_target_connection_info, describe_program_results, describe_program_warnings, describe_core_code, display_program_name,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
@@ -2166,7 +2166,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_audit["original_unchanged"] = True if known_unchanged else None
             self.import_audit["cutover_pending"] = True if known_unchanged else None
             self._log_visible(message or "Promotion result could not be verified")
-            cause = describe_core_failure(message) or describe_core_failure(result.get("error"))
+            cause = describe_core_failure(message) or describe_core_code(result.get("error_code")) or describe_core_failure(result.get("error"))
             if self._cancel_requested:
                 self.label_status.setText(translate_text(
                     "⏹ 교체 중지됨 · 원본은 그대로입니다" if known_unchanged

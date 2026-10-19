@@ -196,8 +196,8 @@ def finish_promotion_job(dialog, success: bool, message: str, result: Dict[str, 
         outcome = str((result or {}).get("status") or "")
         error = ""
         if status != STATUS_COMPLETED:
-            from src.exporters.rust_dump_exporter import describe_core_failure
-            error = describe_core_failure((result or {}).get("error")) or message or str((result or {}).get("message") or "")
+            from src.exporters.rust_dump_exporter import describe_core_code, describe_core_failure
+            error = describe_core_code((result or {}).get("error_code")) or describe_core_failure((result or {}).get("error")) or describe_core_failure(message) or message or str((result or {}).get("message") or "")
             if outcome in ("cutover_unknown", "pending", "preparing", ""):
                 error = ("전환 결과를 알 수 없습니다. 원본/백업/복원 대상의 상태를 확인하세요. " + error).strip()
         job_finish(job_id, status, error=error, report_path=str((result or {}).get("report_path") or ""),
