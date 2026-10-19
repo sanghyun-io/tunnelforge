@@ -44,8 +44,11 @@ def test_every_postgres_refusal_reason_has_a_sentence_and_translation():
     ("cross_schema_fk:orders:parent","cross_schema_fk_unsupported","parent"),
     ("materialized_view:recent","materialized_view_unsupported","recent"),
     ("policy:orders","row_security_unsupported","orders"),
+    ("policy:orders:archive","row_security_unsupported","orders:archive"),
     ("rule:orders:keep_rows","rule_unsupported","orders"),
+    ("rule:orders:archive:keep_rows","rule_unsupported","orders:archive"),
     ("table_inheritance:orders","table_inheritance_unsupported","orders"),
+    ("table_inheritance:orders:archive","table_inheritance_unsupported","orders:archive"),
     ("generated_column:orders:g","generated_dependency_unsupported","g"),
 ])
 def test_export_refusal_uses_the_recorded_postgres_reason(language,object_id,code,name):

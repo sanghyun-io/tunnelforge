@@ -140,7 +140,12 @@ def describe_export_refusal(objects: object, reasons: Optional[Dict[str, str]] =
     lines = []
     for item in objects if isinstance(objects, list) else []:
         kind, _, rest = str(item).partition(":")
-        table, _, name = rest.partition(":")
+        if kind in ("policy", "table_inheritance"):
+            table, name = rest, ""
+        elif kind == "rule":
+            table, _, name = rest.rpartition(":")
+        else:
+            table, _, name = rest.partition(":")
         code = (reasons or {}).get(str(item)) or {
             "policy": "row_security_unsupported", "rule": "rule_unsupported",
             "table_inheritance": "table_inheritance_unsupported",
