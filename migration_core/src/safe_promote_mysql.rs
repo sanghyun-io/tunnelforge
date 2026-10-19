@@ -1772,7 +1772,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         rename_attempted = true;
         if let Err(err) = conn.query_drop(rename_sql(plan)) {
             rename_rejected = matches!(err,mysql::Error::MySqlError(_));
-            if matches!(&err,mysql::Error::MySqlError(e) if e.code==1435) { return Err(error("target_trigger_hidden: an account with TRIGGER privilege is required to move tables with hidden triggers",err)) }
+            if matches!(&err,mysql::Error::MySqlError(e) if e.code==1435) { state["error_code"]=json!("target_trigger_hidden"); return Err(error("target_trigger_hidden: an account with TRIGGER privilege is required to move tables with hidden triggers",err)) }
             return Err(error("atomic rename", err));
         }
         rename_committed = true;
@@ -1922,7 +1922,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         state["phase"] = json!("completed");
     }
     state["message"]=json!(match state["status"].as_str() { Some("promoted")=>"Verified candidate promoted at the original database name. Original tables are retained in the recorded backup namespace.",Some("failed_original_unchanged")=>"Promotion did not change original tables or their foreign keys. The verified candidate remains available.",Some("promoted_incomplete")=>"Tables were promoted, but stored programs are missing. Check the report before recovery.",Some("failed_original_triggers_missing")=>"Tables were not promoted, but original triggers could not be restored. Recover them from the definitions saved in the report.",_=>"Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery." });
-    if state["error"].as_str().is_some_and(|error|error.starts_with("target_trigger_hidden:")) {
+    if state["error_code"]=="target_trigger_hidden" {
         state["error_code"] = json!("target_trigger_hidden");
         state["message"] = state["error"].clone();
     }
