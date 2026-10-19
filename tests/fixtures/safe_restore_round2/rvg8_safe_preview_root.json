@@ -1,0 +1,23 @@
+{
+  "blockers": [],
+  "copy_blockers": [],
+  "direct_blockers": [
+    {
+      "code": "trigger_name_conflict",
+      "detail": "parents.trg",
+      "table": "parents.trg"
+    }
+  ],
+  "replace": [
+    "children",
+    "parents"
+  ],
+  "create": [],
+  "views": {
+    "create": [],
+    "may_break": [],
+    "may_not_replace": [],
+    "replace": []
+  },
+  "untouched": []
+}

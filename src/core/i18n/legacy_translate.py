@@ -17,6 +17,13 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "교체할 테이블에 지금 계정으로는 보이지 않는 트리거가 있어 교체하지 않았습니다. 원본은 그대로입니다. TRIGGER 권한이 있는 계정으로 다시 교체하세요.": "The tables to swap have triggers this account cannot see, so nothing was swapped. The originals are unchanged. Swap again with an account that has the TRIGGER privilege.",
+    "원래 함수를 지금 서버 설정으로는 다시 만들 수 없어 복구를 시작하지 않았습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 복구하세요.": "The original function cannot be recreated with the current server settings, so the recovery did not start. Set log_bin_trust_function_creators=1 or recover with an account that has SUPER.",
+    "원래 트리거를 다시 만들 TRIGGER 권한이 없어 복구를 시작하지 않았습니다. TRIGGER 권한이 있는 계정으로 복구하세요.": "This account lacks the TRIGGER privilege needed to recreate the original triggers, so the recovery did not start. Recover with an account that has TRIGGER.",
+    "원래 트리거를 다시 만들려면 log_bin_trust_function_creators=1 설정이나 SUPER 권한이 필요해 복구를 시작하지 않았습니다.": "Recreating the original triggers needs log_bin_trust_function_creators=1 or SUPER, so the recovery did not start.",
+    "교체 전에 따로 확인할 것이 있습니다.": "Check the following before the swap.",
+    "복사본 {}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다.": "Imported into copy {} and verified it. The originals are unchanged and waiting for the swap.",
+    "새 대상 {}을 만들어 넣고 검증했습니다.": "Created new target {}, imported and verified it.",
     "대상에 같은 이름의 함수가 있는데, 지금 서버 설정으로는 교체가 실패했을 때 그 함수를 원래대로 다시 만들 수 없어 복사 전에 멈췄습니다. 그 함수에 DETERMINISTIC 같은 선언을 추가하거나 log_bin_trust_function_creators=1로 바꾼 뒤 다시 시도하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수는 바꾸지 않고 가져옵니다.": "The target has a function with the same name that cannot be recreated after a failed replacement with the current server settings, so the copy was not started. Add a declaration such as DETERMINISTIC or set log_bin_trust_function_creators=1 and retry. Turning off 'Verify in a copy first, then swap' imports the dump without changing this function.",
     "원래 테이블로 되돌렸지만 저장 프로그램 상태를 확인하지 못했습니다. 원래 정의는 승격 기록에 남아 있습니다. ({error})": "The original tables are active again, but stored program state could not be verified. Their original definitions remain in the promotion journal. ({error})",
     "실패 (변경 없음, 트리거 다시 만듦)": "Failed (no change, triggers recreated)",

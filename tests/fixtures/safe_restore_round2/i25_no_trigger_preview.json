@@ -1,0 +1,28 @@
+{
+  "blockers": [
+    {
+      "code": "trigger_privilege_missing",
+      "detail": "TRIGGER privilege is required",
+      "table": null
+    }
+  ],
+  "copy_blockers": [
+    {
+      "code": "program_privilege_missing",
+      "detail": "TRIGGER is required on the verification copy",
+      "table": "tf_restore_*"
+    },
+    {
+      "code": "trigger_privilege_missing",
+      "detail": "트리거를 만들 권한이 없습니다. 트리거를 제외하려면 '트리거 없이 테이블만 가져오기'를 켜세요.",
+      "table": null
+    }
+  ],
+  "direct_blockers": [
+    {
+      "code": "trigger_privilege_missing",
+      "detail": "TRIGGER privilege is required",
+      "table": null
+    }
+  ]
+}

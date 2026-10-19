@@ -100,7 +100,7 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         "copy_routine_binlog_unsafe", "target_routine_binlog_unsafe", "view_calls_dump_routine", "trigger_privilege_missing", "trigger_binlog_privilege", "trigger_name_conflict"
     ) for item in copy_only):
         blockers.append(translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."))
-    if any(item.get("code") in ("trigger_privilege_missing", "trigger_name_conflict") for item in raw_blockers + copy_only + direct_blockers if isinstance(item, dict)):
+    if any(item.get("code") in ("trigger_privilege_missing", "trigger_name_conflict") for item in raw_blockers + copy_only if isinstance(item, dict)):
         blockers.append(translate_text("트리거를 제외하려면 '트리거 없이 테이블만 가져오기'를 켜세요."))
 
     data_warnings, notes = [], []

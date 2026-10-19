@@ -2,6 +2,7 @@
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -247,3 +248,27 @@ def test_program_dump_is_accepted_by_scheduled_rehearsal(env):
     assert outcome.ok, outcome.message
     assert env.holder.importer.seen["verify_only"] is True
     assert "cleanup_apply" in env.facade.calls
+
+
+@pytest.mark.parametrize("code", ["view_calls_dump_routine", "copy_routine_binlog_unsafe", "target_routine_binlog_unsafe"])
+@pytest.mark.parametrize("language", ["ko", "en"])
+def test_rehearsal_copy_refusal_never_recommends_a_verify_toggle(env, code, language):
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES
+    facade = MagicMock()
+    facade.import_dump.return_value = {"status": "failed_original_untouched", "copy_blockers": [{"code": code, "table": "f"}]}
+    run = RestoreRehearsal(lambda s: (conn(), ""), env.tunnels.get,
+                          lambda *a, **k: env.connector, lambda: facade)
+    i18n.set_language(language)
+    try:
+        outcome = run.run(schedule(), env.backup, conn(port=3307))
+        assert not outcome.ok
+        report = json.loads(Path(env.backup, REPORT_NAME).read_text(encoding="utf-8"))
+        for message in (outcome.message, report["error"]):
+            assert "먼저 복사본에서 검증하고 교체" not in message
+            assert "Verify in a copy first, then swap" not in message
+            prefix = CORE_CODE_SENTENCES[code].split(" '먼저 복사본에서 검증하고 교체'")[0]
+            assert i18n.translate_text(prefix) in message
+        assert facade.import_dump.call_args.args[0]["verify_only"] is True
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)

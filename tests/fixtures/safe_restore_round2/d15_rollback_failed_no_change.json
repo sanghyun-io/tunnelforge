@@ -1,0 +1,5 @@
+{
+  "status": "failed_no_change",
+  "message": "The recovery did not change anything.",
+  "error": "safe_promotion: bounded WRITE lock acquisition (2 seconds): MySqlError { ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction }"
+}

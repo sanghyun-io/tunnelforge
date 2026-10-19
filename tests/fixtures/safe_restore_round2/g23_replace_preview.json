@@ -1,0 +1,23 @@
+{
+  "blockers": [
+    {
+      "code": "trigger_name_conflict",
+      "detail": "parents.trg",
+      "table": "parents.trg"
+    }
+  ],
+  "copy_blockers": [
+    {
+      "code": "metadata_visibility_unproven",
+      "detail": "verify-in-copy needs direct global SELECT, SHOW VIEW and PROCESS grants (no roles or partial revokes) to see every object that depends on the target",
+      "table": null
+    }
+  ],
+  "direct_blockers": [
+    {
+      "code": "trigger_name_conflict",
+      "detail": "parents.trg",
+      "table": "parents.trg"
+    }
+  ]
+}

@@ -259,9 +259,18 @@ class BackupLifecycleDialog(QDialog):
             QMessageBox.warning(self, "복구 미리보기 실패", message)
             return
         if not plan.get("can_rollback"):
+            from src.exporters.rust_dump_exporter import describe_core_code
+            blockers = []
+            for blocker in plan.get("blockers") or []:
+                code, _, rest = str(blocker).partition(":")
+                sentence = describe_core_code(code)
+                name = rest.partition(":")[0].strip()
+                if name == "original triggers":
+                    name = translate_text("원래 트리거")
+                blockers.append((sentence + (f" ({name})" if name else "")) if sentence else str(blocker))
             QMessageBox.warning(
                 self, "복구 차단",
-                "복구할 수 없습니다:\n" + "\n".join(f"- {b}" for b in plan.get("blockers") or []))
+                "복구할 수 없습니다:\n" + "\n".join(f"- {b}" for b in blockers))
             return
         if not self._confirm_rollback(plan):
             return
@@ -274,7 +283,8 @@ class BackupLifecycleDialog(QDialog):
         if not success or result.get("status") != "rolled_back":
             from src.core.error_report_sanitizer import sanitize_local_diagnostic
             status = status_label(JOURNAL_LABELS, result.get("status"))
-            lines = [status, str(result.get("message") or message or "")]
+            lines = [status] if result.get("status") else []
+            lines.append(str(result.get("message") or message or ""))
             error = str(result.get("error") or "")
             verification_error = str(result.get("program_verification_error") or "")
             from src.exporters.rust_dump_exporter import describe_program_warnings, display_program_name
@@ -299,7 +309,7 @@ class BackupLifecycleDialog(QDialog):
                 lines.append(error)
             if verification_error and names:
                 lines.append(verification_error)
-            QMessageBox.warning(self, translate_text("복구 실패"), sanitize_local_diagnostic("\n".join(line for line in lines if line)))
+            QMessageBox.warning(self, translate_text("복구 실패"), "\n".join(sanitize_local_diagnostic(line) for text in lines for line in text.splitlines() if line))
         else:
             QMessageBox.information(self, "복구 결과", f"{status_label(JOURNAL_LABELS, result.get('status'))}\n{result.get('message', '')}")
         self.refresh()

@@ -635,6 +635,10 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "target_trigger_hidden": "교체할 테이블에 지금 계정으로는 보이지 않는 트리거가 있어 교체하지 않았습니다. 원본은 그대로입니다. TRIGGER 권한이 있는 계정으로 다시 교체하세요.",
+    "rollback_routine_binlog_unsafe": "원래 함수를 지금 서버 설정으로는 다시 만들 수 없어 복구를 시작하지 않았습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 복구하세요.",
+    "rollback_trigger_privilege_missing": "원래 트리거를 다시 만들 TRIGGER 권한이 없어 복구를 시작하지 않았습니다. TRIGGER 권한이 있는 계정으로 복구하세요.",
+    "rollback_trigger_binlog_privilege": "원래 트리거를 다시 만들려면 log_bin_trust_function_creators=1 설정이나 SUPER 권한이 필요해 복구를 시작하지 않았습니다.",
     "target_routine_binlog_unsafe": "대상에 같은 이름의 함수가 있는데, 지금 서버 설정으로는 교체가 실패했을 때 그 함수를 원래대로 다시 만들 수 없어 복사 전에 멈췄습니다. 그 함수에 DETERMINISTIC 같은 선언을 추가하거나 log_bin_trust_function_creators=1로 바꾼 뒤 다시 시도하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수는 바꾸지 않고 가져옵니다.",
     "copy_routine_binlog_unsafe": "지금 서버 설정과 계정 권한으로는 이 함수를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수만 건너뛰고 가져옵니다.",
     "target_trigger_binlog_privilege": "교체할 테이블에 이미 트리거가 있어, 교체하는 동안 그 트리거를 지웠다가 다시 만들어야 합니다. 지금 서버 설정과 계정 권한으로는 트리거를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 가져오세요.",
@@ -1116,7 +1120,7 @@ class RustDumpImporter(_RustDumpClientBase):
                     reason = str((result.get("message") if result.get("report_write_failed") else result.get("error"))
                                  or result.get("message") or "")
                     self.last_error_code = classify_error_code(result.get("error_code"), reason)
-                    stops = describe_copy_blockers(result.get("copy_blockers"))
+                    stops = describe_copy_blockers(result.get("copy_blockers"), omit_verify_hint=verify_only)
                     if stops:
                         return False, "\n".join([describe_core_code("copy_refused"), *stops]), import_results
                     return False, "\n".join([reason, *(str(item) for item in result.get("blockers") or [])]), import_results
@@ -1138,9 +1142,9 @@ class RustDumpImporter(_RustDumpClientBase):
                 message = translate_text("테이블 데이터는 가져왔지만 일부 객체를 복원하지 못했습니다.") + f" ({len(tables_to_import)}개 테이블, {rows:,} rows)"
             if import_mode == "safe":
                 candidate_name = candidate.get("schema") if self.config.engine == "postgresql" else candidate.get("database")
-                message = f"복사본 {candidate_name}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다."
+                message = translate_text("복사본 {}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다.").format(candidate_name)
                 if new_target:
-                    message = f"새 대상 {candidate_name}을 만들어 넣고 검증했습니다."
+                    message = translate_text("새 대상 {}을 만들어 넣고 검증했습니다.").format(candidate_name)
                 for key, sentence in (("programs_kept", "그대로 둘 루틴·이벤트: {}"),):
                     if result.get(key):
                         message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in result[key]))
