@@ -21,7 +21,7 @@ fn pg_generated_dump_into_mysql_refused_before_change() {
     let untouched=call("query.execute",json!({"connection":target,"sql":"SELECT id FROM sample"}));
     admin.execute_sql(&format!("DROP DATABASE {name}")).unwrap();
     assert!(refused.to_string().contains("unsupported_generated_column:"),"{refused:#}");
-    assert_eq!(untouched["rows"],json!([{"id":91}]));
+    assert_eq!(untouched["rows"],json!([{"id":"91"}]));
 }
 
 fn call(command: &str, payload: Value) -> Value {
