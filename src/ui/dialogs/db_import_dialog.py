@@ -2166,7 +2166,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_audit["original_unchanged"] = True if known_unchanged else None
             self.import_audit["cutover_pending"] = True if known_unchanged else None
             self._log_visible(message or "Promotion result could not be verified")
-            cause = describe_core_failure(message) or describe_core_code(result.get("error_code")) or describe_core_failure(result.get("error"))
+            cause = describe_core_code(result.get("error_code")) or describe_core_failure(message) or describe_core_failure(result.get("error"))
             if self._cancel_requested:
                 self.label_status.setText(translate_text(
                     "⏹ 교체 중지됨 · 원본은 그대로입니다" if known_unchanged
