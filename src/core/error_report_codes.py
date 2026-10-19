@@ -12,6 +12,7 @@ from typing import Optional
 
 # Stable codes emitted by migration_core (classified_import_error and friends).
 RUST_CORE_CODES = frozenset({
+    "row_security_blocks_read",
     "identity_always_unsupported",
     "sequence_options_unsupported",
     "default_expression_unsupported",

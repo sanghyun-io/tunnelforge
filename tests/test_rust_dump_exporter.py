@@ -1966,7 +1966,7 @@ def test_every_refusal_kind_the_core_reports_has_a_sentence():
 
     source = (Path(__file__).resolve().parents[1] / "migration_core" / "src" / "dump.rs").read_text(encoding="utf-8")
     lossy = re.search(r"LOSSY_SCHEMA_KINDS: \[&str; \d+\] = \[([^\]]*)\]", source).group(1)
-    omitted = re.search(r"fn scoped_omitted_objects\b.*?\n\}", source, re.DOTALL).group(0)
+    omitted = re.search(r"fn scoped_omitted_objects_with_tables\b.*?\n\}", source, re.DOTALL).group(0)
     assert set(re.findall(r'"([a-z_]+)"', lossy)) == LOSSY_REFUSAL_KINDS, "the dialog splits a refusal by the core's own list"
     kinds = set(re.findall(r'"([a-z_]+)"', lossy)) | set(re.findall(r'"([a-z_]+)"', omitted))
     assert {"generated_column", "cross_schema_fk", "trigger", "non_transactional_table", "routine", "event"} <= kinds

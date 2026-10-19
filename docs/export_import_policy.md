@@ -802,8 +802,10 @@ PostgreSQL 13.23 / 18.4 (`live_mysql_programs`, `live_export_contract`,
 preserved core, triggers, routines, events, materialized views, MEMORY tables,
 default refusal, opt-in and a strict export/import round trip. The lossy-definition
 rows (unproven generated columns, CHECK, defaults, advanced indexes, cross-schema FKs)
-come from the existing inspection and its earlier fixtures. Other versions are not
-claimed.
+come from the existing inspection and its earlier fixtures. The new PostgreSQL
+RLS, rules, inheritance/partitioning, and comment-warning rows were live-tested
+only on 18.4. The dedicated PG13 binary tests STORED capture, VIRTUAL refusal and
+PG13-to-PG18 generated-column imports. Other versions are not claimed.
 
 | Object | MySQL | PostgreSQL |
 | --- | --- | --- |
@@ -903,11 +905,17 @@ GENERATED ALWAYS identity are still refused, not newly supported.
 RLS flags, forced RLS, or any policy produce `policy:<table>`; a table rule
 produces `rule:<table>:<rule>`. The existing advanced setting
 "담을 수 없는 객체는 빼고 내보내기" explicitly allows their omission. The export
-then records persistent not-exported warnings, and policies/rules must be
+then records persistent not-exported warnings. PostgreSQL source-copy and comparison
+sessions use `row_security=off`: an account whose rows would be filtered stops with
+`row_security_blocks_read` instead of writing a partial data set. Superusers and
+BYPASSRLS accounts can read all rows; ordinary editor queries keep normal RLS
+behavior. Policies/rules must be
 recreated after import. Inheritance and partitioning cannot be waived because
 omission would change the tables themselves. Table/column comments do not block
 export: one persistent `comments_not_exported` line names at most 20 objects,
-plus the count left out. This warning is also carried through import reports.
+plus the count left out. Even a comments-only PostgreSQL dump has
+`strict_export=false`; Import shows the `not_strict` note as well as the named
+comment warning. This warning is also carried through import reports.
 
 Default behavior: when the selected scope contains any refused object, `dump.run`
 fails before the target directory or any dump file is created, with
@@ -926,8 +934,11 @@ triggers of unselected tables and, for a table subset, routines, events and
 materialized views do not mark the dump incomplete. Lossy table definitions
 (`bypassable: false`) cannot be waived. Scheduled backups have no such prompt and therefore fail with the
 refusal instead of silently producing an incomplete backup. Import behavior is
-unchanged. Objects this inspection does not detect (for example MySQL
-partitioning, PostgreSQL extensions, rules or privileges) are not reported.
+unchanged. Objects this inspection does not detect are not reported: MySQL partitioning;
+PostgreSQL extensions, rules on views, column collation, UNLOGGED persistence,
+replica identity and storage parameters, ownership and ACLs, foreign tables,
+event triggers, view comments, NULLS NOT DISTINCT unique indexes, DEFERRABLE
+constraints, and EXCLUDE constraints. These losses remain outside this fix.
 
 MySQL lists triggers, routines, events, tables and columns only to accounts
 allowed to see them, so a narrow account would get a dump that looks complete

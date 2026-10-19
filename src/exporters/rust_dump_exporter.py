@@ -133,14 +133,18 @@ _SCHEMA_REFUSAL_REASONS = {
 _UNKNOWN_TABLE_REFUSAL = "이 객체는 담을 수 없습니다"
 
 
-def describe_export_refusal(objects: object, reasons: Optional[Dict[str, str]] = None) -> List[str]:
+def describe_export_refusal(objects: object, reasons: Optional[Dict[str, str]] = None,
+                            object_tables: Optional[Dict[str, str]] = None) -> List[str]:
     """One plain sentence per refused object, e.g. "테이블 orders: 트리거(trg)는 덤프에 담을 수 없습니다".
 
     An unknown code still names its table; the codes themselves go behind "자세히"."""
     lines = []
     for item in objects if isinstance(objects, list) else []:
         kind, _, rest = str(item).partition(":")
-        if kind in ("policy", "table_inheritance"):
+        if str(item) in (object_tables or {}):
+            table = str(object_tables[str(item)])
+            name = rest[len(table) + 1:] if rest.startswith(table + ":") else ""
+        elif kind in ("policy", "table_inheritance"):
             table, name = rest, ""
         elif kind == "rule":
             table, _, name = rest.rpartition(":")
@@ -438,6 +442,7 @@ class RustDumpExporter(_RustDumpClientBase):
                     "objects": [str(item) for item in event.get("objects") or []],
                     "bypassable": bool(event.get("bypassable")),
                     **({"reasons": dict(event["reasons"])} if event.get("reasons") else {}),
+                    **({"object_tables": dict(event["object_tables"])} if event.get("object_tables") else {}),
                 }
             self._emit_core_event(
                 event,
@@ -647,8 +652,9 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "row_security_blocks_read": "테이블 {}에 행 수준 보안(RLS)이 걸려 있어 이 계정으로는 모든 행을 읽을 수 없습니다. 슈퍼유저나 BYPASSRLS 권한이 있는 계정으로 다시 시도하세요.",
     "identity_always_unsupported": "열 {}은 GENERATED ALWAYS identity라서 아직 덤프에 담을 수 없습니다.",
-    "sequence_options_unsupported": "열 {}의 시퀀스가 시작값 1·증가 1이 아니거나 이 테이블 소유가 아니어서 덤프에 담을 수 없습니다.",
+    "sequence_options_unsupported": "열 {}의 시퀀스 설정(시작값·증가값·최솟값·최댓값·순환·형식)이 기본값과 다르거나 시퀀스가 이 테이블 소유가 아니어서 덤프에 담을 수 없습니다.",
     "default_expression_unsupported": "열 {}의 기본값이 상수·now()·gen_random_uuid() 같은 옮길 수 있는 형태가 아니어서 덤프에 담을 수 없습니다.",
     "check_constraint_unsupported": "PostgreSQL CHECK 제약 {}은 아직 덤프에 담을 수 없습니다.",
     "custom_type_unsupported": "열 {}이 enum·domain·확장 형식 같은 사용자 정의 형식을 써서 아직 덤프에 담을 수 없습니다.",
@@ -661,7 +667,7 @@ CORE_CODE_SENTENCES = {
     "rule_unsupported": "테이블 {}에 걸린 규칙(RULE)은 아직 덤프에 담을 수 없습니다. 규칙 없이 내보내려면 고급 설정의 '담을 수 없는 객체는 빼고 내보내기'를 켜세요.",
     "table_inheritance_unsupported": "테이블 {}은 상속이나 파티션으로 다른 테이블과 이어져 있어 아직 덤프에 담을 수 없습니다.",
     "comments_not_exported": "테이블·열 주석(COMMENT)은 덤프에 담지 않았습니다: {}",
-    "generated_expression_unsafe": "계산 열 {}의 식에 덤프로 옮길 수 없는 부분(;, 주석, 괄호 밖 쉼표 등)이 있어 담지 않았습니다.",
+    "generated_expression_unsafe": "계산 열 {}의 식에 덤프로 옮길 수 없는 부분(;, 주석, 괄호 밖 쉼표, SELECT 같은 문장 키워드 등)이 있어 덤프에 담을 수 없습니다.",
     "generated_dependency_unsupported": "계산 열 {}의 식이 PostgreSQL 기본 함수가 아닌 함수나 형식을 써서 아직 덤프에 담을 수 없습니다.",
     "generated_expression_changed": "대상 DB가 계산 열의 식을 원본과 다르게 저장해 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "program_name_resolution_changed": "대상 스키마에 이름이 같은 함수나 연산자가 있어, 계산 열이나 트리거가 원본과 다른 객체를 부르게 됩니다. 대상 스키마의 그 객체 이름을 바꾸거나 지운 뒤 다시 가져오세요. 대상 테이블은 바뀌지 않았습니다.",

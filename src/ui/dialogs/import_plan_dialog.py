@@ -144,6 +144,19 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         elif code == "unsynchronized_snapshot":
             if preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:
                 data_warnings.append(f"- {sentence}")
+        elif code == "comments_not_exported":
+            names = []
+            for item in _dicts(preview.get("warnings")):
+                if item.get("code") == code:
+                    detail = str(item.get("detail") or "")
+                    if detail.startswith("source dump: "):
+                        detail = detail[len("source dump: "):]
+                    if detail.startswith("comments_not_exported: "):
+                        detail = detail[len("comments_not_exported: "):]
+                    names.extend(detail.split(", ") if detail else [])
+            # The core already caps at 20 plus a remaining-count suffix.
+            shown = ", ".join(names) if len(names) == 21 and names[-1].startswith("… (+") else names_preview(names, 20)
+            notes.append("- " + describe_core_code(code, sanitize_local_diagnostic(shown)))
         elif code == "legacy_timezone":
             # Worded here: the core's sentence cannot know whether a timezone was chosen.
             if timezone_label:

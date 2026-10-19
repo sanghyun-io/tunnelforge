@@ -1262,7 +1262,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         limit = _INCOMPLETE_EXPORT_LIST_LIMIT
         refusal = getattr(self.worker, "export_refusal", None)
         reasons = refusal.get("reasons") if isinstance(refusal, dict) else None
-        listed = [f"• {line}" for line in describe_export_refusal(objects[:limit], reasons)]
+        tables = refusal.get("object_tables") if isinstance(refusal, dict) else None
+        listed = [f"• {line}" for line in describe_export_refusal(objects[:limit], reasons, tables)]
         if len(objects) > limit:
             listed.append(translate_text("외 {}개").format(len(objects) - limit))
         return listed
@@ -1400,7 +1401,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             logger.info("Export refused by the core: %s", message)
             objects = list(refusal["objects"])
             message = " ".join([translate_text("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다."),
-                                "; ".join(describe_export_refusal(objects[:_INCOMPLETE_EXPORT_LIST_LIMIT], refusal.get("reasons")))])
+                                "; ".join(describe_export_refusal(objects[:_INCOMPLETE_EXPORT_LIST_LIMIT], refusal.get("reasons"), refusal.get("object_tables")))])
             if len(objects) > _INCOMPLETE_EXPORT_LIST_LIMIT:
                 message += " " + translate_text("외 {}개").format(len(objects) - _INCOMPLETE_EXPORT_LIST_LIMIT)
         run = getattr(self.worker, "export_run", None)
