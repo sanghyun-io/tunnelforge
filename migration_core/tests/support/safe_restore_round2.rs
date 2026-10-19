@@ -40,7 +40,7 @@ fn rvf_i_a1_rebuild_after_plan_is_cutover_unknown_and_blocks_retry() {
     assert_eq!(done["status"], "failed_original_unchanged");
     assert_eq!(done["original_unchanged"],true);
     assert_eq!(again["can_promote"],true,"{again:#}");
-    
+
     assert!(!active);
     // Old plan identities need not match an externally rebuilt table.
     assert_ne!(rc["conclusion"],"failed_original_triggers_missing");

@@ -304,7 +304,7 @@ fn safe_promote_rvf_c9_rollback_function_binlog_rule_not_prechecked() {
     assert!(reviewed["blockers"].to_string().contains("target_routine_binlog_unsafe"));
     assert!(!tables_back);
     assert!(refused.contains("recovery is blocked"));
-    
+
     assert_eq!(f_now, Some(2));
 }
 #[test]
