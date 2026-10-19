@@ -995,7 +995,7 @@ fn rv204_function_binlog_rule_without_triggers_stops_before_copy() {
     assert_stopped_before_copy(&rehearsal, "rehearsal, FUNCTION only, SUPER revoked");
 }
 #[test]
-fn rv204_target_trigger_without_super_passes_copy_checks_and_is_lost_on_recovery() {
+fn round3_legacy_target_trigger_without_super_is_refused_before_copy() {
     // Dump has no stored programs; the target's parents table gains a trigger afterwards.
     let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
     LiveAdapter::connect(&original).unwrap()
@@ -1041,7 +1041,7 @@ fn rv204_target_trigger_without_super_passes_copy_checks_and_is_lost_on_recovery
     assert_eq!(guard,"1");
 }
 #[test]
-fn rv204_program_privilege_on_original_only_does_not_fail_after_copy() {
+fn round3_legacy_candidate_program_grants_are_checked_before_copy() {
     let cases = [
         ("EVENT", "CREATE EVENT e ON SCHEDULE AT '2099-01-01' ON COMPLETION PRESERVE DISABLE DO SET @tf_e=1"),
         ("CREATE ROUTINE", "CREATE PROCEDURE p() SELECT 1"),
@@ -1079,7 +1079,7 @@ fn rv204_program_privilege_on_original_only_does_not_fail_after_copy() {
     }
 }
 #[test]
-fn rv18_unsavable_target_program_is_refused_only_after_the_copy() {
+fn round3_legacy_unsavable_target_program_is_refused_before_copy() {
     let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
     let mut db = LiveAdapter::connect(&original).unwrap();
     db.execute_sql("CREATE PROCEDURE p() SELECT 'dump'").unwrap();
@@ -1163,7 +1163,7 @@ fn rv21_binlog_unsafe_function_safe_vs_replace() {
     assert_eq!(replace_f, "7", "replace keeps the target's same-named function");
 }
 #[test]
-fn rv22_rollback_incomplete_reports_unknown_and_no_missing_programs() {
+fn round3_legacy_rollback_without_create_routine_is_refused_before_changes() {
     let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
     let mut db = LiveAdapter::connect(&original).unwrap();
     for sql in ["CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 2",
