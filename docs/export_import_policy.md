@@ -900,3 +900,16 @@ reviewed; explicitly exporting other tables produces a subset, not a full backup
 Events are read back from information_schema.EVENTS after creation or alteration,
 including recovery. A mismatched status is corrected and verified, or reported as
 an object failure. Reports use the observed status, or unknown if it cannot be read.
+
+An enabled PRESERVE event may already have completed when its status is read back.
+DISABLED with LAST_EXECUTED and an expired one-time AT or recurring ENDS is normal
+completion, not a reason to enable it again or restore the previous definition.
+The result retains its observed DISABLED state. Recovery verifies the actual
+DEFINER after any corrective ALTER and names a changed execution account instead
+of claiming that the previous definer was preserved.
+
+Routine/event manifests must retain the canonical uppercase SQL_MODE text returned
+by MySQL metadata. Noncanonical case or whitespace is refused before target
+changes: accepting it could let server normalization change quote/comment rules
+relative to header validation. This does not reject sources configured with
+lowercase mode names; MySQL metadata normalizes those names before export.

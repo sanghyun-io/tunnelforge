@@ -57,6 +57,11 @@ fn suffix_start(p: &NormalizedStoredProgram, schema: Option<&str>) -> Result<(Ve
     if !matches!(p.character_set_client.as_deref(), Some("utf8" | "utf8mb3" | "utf8mb4")) && !p.definition.is_ascii() {
         return Err(format!("program_charset_unsupported: {}",p.name))
     }
+    // SHOW CREATE/I_S return canonical uppercase modes. A manifest must not
+    // change the server's quote rules through case or whitespace normalization.
+    if !p.sql_mode.as_deref().unwrap().bytes().all(|c|c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c,b'_' | b',')) {
+        return Err(format!("program_definition_invalid: noncanonical sql_mode: {}",p.name))
+    }
     let ts = tokens(&p.definition, p.sql_mode.as_deref().unwrap().split(',').any(|s| s == "NO_BACKSLASH_ESCAPES"))?;
     let mut i = 0;
     let take = |i: &mut usize, word: &str| -> Result<(),String> {
@@ -201,14 +206,24 @@ fn event_status(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Resul
         .map_err(|e|e.to_string())?.ok_or_else(||"program_event_dropped: event is missing".into())
 }
 
+fn event_state(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Result<(String,bool),String> {
+    conn.exec_first("SELECT STATUS, COALESCE(ON_COMPLETION='PRESERVE' AND LAST_EXECUTED IS NOT NULL AND ((EVENT_TYPE='ONE TIME' AND EXECUTE_AT<=CURRENT_TIMESTAMP) OR (EVENT_TYPE='RECURRING' AND ENDS<=CURRENT_TIMESTAMP)),FALSE) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME=?",(schema,name))
+        .map_err(|e|e.to_string())?.ok_or_else(||"program_event_dropped: event is missing".into())
+}
+
+fn event_state_matches(actual: &str, completed: bool, expected: &str) -> bool {
+    actual==expected || (expected=="ENABLED" && actual=="DISABLED" && completed)
+        || (matches!(actual,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED") && matches!(expected,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED"))
+}
+
 fn reconcile_event_status(conn: &mut mysql::PooledConn, schema: &str, name: &str, expected: &str) -> Result<String,String> {
-    let matches = |status: &str| status==expected || (matches!(status,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED") && matches!(expected,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED"));
-    let actual=event_status(conn,schema,name)?;
-    if matches(&actual) { return Ok(actual) }
+    let (actual,completed)=event_state(conn,schema,name)?;
+    // PRESERVE completion may disable a due event between ENABLE and this read.
+    if event_state_matches(&actual,completed,expected) { return Ok(actual) }
     let clause=match expected { "ENABLED"=>"ENABLE", "DISABLED"=>"DISABLE", "SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED"=>"DISABLE ON SLAVE", _=>return Err(format!("invalid expected event status: {expected}")) };
     conn.query_drop(format!("ALTER EVENT {}.{} {clause}",quote_ident("mysql",schema),quote_ident("mysql",name))).map_err(|e|e.to_string())?;
-    let actual=event_status(conn,schema,name)?;
-    if !matches(&actual) { return Err(format!("event state mismatch: expected {expected}, actual {actual}")) }
+    let (actual,completed)=event_state(conn,schema,name)?;
+    if !event_state_matches(&actual,completed,expected) { return Err(format!("event state mismatch: expected {expected}, actual {actual}")) }
     Ok(actual)
 }
 
@@ -276,7 +291,7 @@ pub(crate) fn probe_routines(conn: &mut mysql::PooledConn, programs: &[Normalize
     Ok(())
 }
 
-/// A rollback replays the target status verbatim; ALTER EVENT would change its definer.
+/// Replay the target definition, then verify state and definer after any corrective ALTER.
 fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: &NormalizedStoredProgram, failure: &mut Value) -> Result<(),String> {
     set_program_context(conn,previous)?;
     conn.query_drop(format!("DROP {} IF EXISTS {}",previous.kind,quote_ident("mysql",&previous.name))).map_err(|e|e.to_string())?;
@@ -300,8 +315,20 @@ fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: 
     failure["restore_warnings"]=json!(warnings);
     if restored_warnings.iter().any(|(_,code,_)|*code==1588) { return Err("program_event_dropped: previous event disappeared during recovery".into()) }
     if previous.kind=="EVENT" {
-        let actual=reconcile_event_status(conn,schema,&previous.name,previous.status.as_deref().ok_or("previous event status is missing")?)?;
-        failure["status"]=json!(actual); failure["enabled"]=json!(actual=="ENABLED");
+        let restored=reconcile_event_status(conn,schema,&previous.name,previous.status.as_deref().ok_or("previous event status is missing")?);
+        failure["previous_definer_preserved"]=Value::Null;
+        let actual_definer:Option<String>=conn.exec_first("SELECT DEFINER FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME=?",(schema,&previous.name)).map_err(|e|e.to_string())?;
+        failure["previous_definer_preserved"]=json!(actual_definer.as_ref().zip(previous.definer.as_ref()).map(|(actual,source)|actual==source));
+        if actual_definer.is_some() && actual_definer!=previous.definer {
+            let mut warnings=failure["restore_warnings"].as_array().cloned().unwrap_or_default();
+            if !warnings.iter().any(|w|w["code"]=="program_restore_definer_changed") {
+                warnings.push(json!({"name":previous.name,"kind":previous.kind,"code":"program_restore_definer_changed","source":previous.definer,"target":actual_definer}));
+            }
+            failure["restore_warnings"]=json!(warnings);
+        }
+        let actual=event_status(conn,schema,&previous.name).ok();
+        failure["status"]=json!(actual); failure["enabled"]=json!(actual.as_ref().map(|s|s=="ENABLED"));
+        restored?;
     }
     Ok(())
 }
@@ -373,6 +400,26 @@ mod tests {
     fn program(kind: &str, definition: &str) -> NormalizedStoredProgram {
         serde_json::from_value(json!({"kind":kind,"name":"p","definition":definition,"sql_mode":"","character_set_client":"utf8mb4","collation_connection":"utf8mb4_bin","time_zone":"+00:00","status":"ENABLED"})).unwrap()
     }
+    #[test]
+    fn noncanonical_sql_modes_cannot_hide_event_enable_inside_a_string() {
+        let sql="CREATE EVENT `p` ON SCHEDULE EVERY '1\\' DAY STARTS '2099-01-01' ENABLE #fake' DISABLE\nDO SET @a=1";
+        for mode in ["no_backslash_escapes","Ansi_Quotes,no_Backslash_Escapes"," NO_BACKSLASH_ESCAPES "] {
+            let mut p=program("EVENT",sql); p.sql_mode=Some(mode.into());
+            assert!(schema_program_sql(&p,"p",None).is_err(),"noncanonical mode accepted: {mode}");
+        }
+        let mut p=program("EVENT",sql); p.sql_mode=Some("NO_BACKSLASH_ESCAPES".into());
+        assert!(schema_program_sql(&p,"p",None).unwrap().contains("'2099-01-01' DISABLE #fake' DISABLE"));
+    }
+
+    #[test]
+    fn preserved_completion_is_success_only_for_a_completed_enable_request() {
+        assert!(event_state_matches("DISABLED",true,"ENABLED"));
+        assert!(!event_state_matches("DISABLED",false,"ENABLED"));
+        assert!(!event_state_matches("ENABLED",true,"DISABLED"));
+        assert!(!event_state_matches("SLAVESIDE_DISABLED",true,"ENABLED"));
+        assert!(event_state_matches("SLAVESIDE_DISABLED",false,"REPLICA_SIDE_DISABLED"));
+    }
+
     #[test]
     fn binlog_preview_accounts_for_1418_even_with_super_and_1419_without_it() {
         for (declaration,super_grant,blocked) in [

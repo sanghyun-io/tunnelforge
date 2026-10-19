@@ -545,3 +545,170 @@ fn long_enum_and_set_definitions_export_and_import_with_values_intact() {
     assert_eq!(types(&mut db),types(&mut fresh));
     assert!(types(&mut fresh).iter().all(|t|t.len()>512));
 }
+
+fn wait_for_preserved_completion(db:&mut mysql::PooledConn) {
+    for _ in 0..100 {
+        let done:Option<bool>=db.query_first("SELECT STATUS='DISABLED' AND LAST_EXECUTED IS NOT NULL FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
+        let rows:Option<u64>=db.query_first("SELECT COUNT(*) FROM audit").unwrap();
+        if done==Some(true) && rows==Some(1) { return }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("preserved event did not complete exactly once");
+}
+
+#[test]
+fn due_preserved_events_complete_once_without_failed_import_or_replacement_rollback() {
+    for schedule in ["AT '2000-01-01 00:00:00'", "EVERY 1 DAY STARTS '2000-01-01 00:00:00' ENDS '2000-01-02 00:00:00'"] {
+        let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint);
+        db.query_drop("CREATE TABLE audit(id INT)").unwrap();
+        db.query_drop(format!("CREATE EVENT e ON SCHEDULE {schedule} ON COMPLETION PRESERVE DISABLE DO INSERT INTO audit VALUES(1)")).unwrap();
+        db.query_drop("ALTER EVENT e ENABLE").unwrap(); assert_eq!(status(&mut db,"e"),"ENABLED"); s.dump();
+        for existing in [false,true] { for complete_before_read in [false,true] {
+            db.query_drop("SET GLOBAL event_scheduler=OFF").unwrap();
+            let target=s.other(true);
+            if existing { conn(&target).query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY STARTS '2099-01-01' ENABLE DO SET @old=1").unwrap(); }
+            let preview=success(events("dump.import_preview",s.payload(&target)));
+            assert!(preview["events_enabled"].as_array().unwrap().contains(&json!("e")),"{preview}");
+            db.query_drop("SET GLOBAL event_scheduler=ON").unwrap();
+            let mut output=Vec::new(); let mut injected=false;
+            handle_request_streaming(Request{command:"dump.import".into(),request_id:None,payload:s.payload(&target)},|e| {
+                if complete_before_read && e["event"]=="program_created" && e["kind"]=="EVENT" {
+                    let mut fresh=conn(&target); fresh.query_drop("ALTER EVENT e ENABLE").unwrap();
+                    wait_for_preserved_completion(&mut fresh); injected=true;
+                }
+                output.push(e);
+            });
+            let v=success(output); assert_eq!(injected,complete_before_read);
+            assert!(v["programs_failed"].as_array().unwrap().is_empty(),"{v}");
+            let mut fresh=conn(&target); wait_for_preserved_completion(&mut fresh);
+            let body:Option<String>=fresh.query_first("SELECT EVENT_DEFINITION FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
+            assert!(body.unwrap().contains("INSERT INTO audit"),"old definition was restored");
+            let imported=v["programs_imported"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT").unwrap();
+            if complete_before_read { assert_eq!(imported["status"],"DISABLED"); assert_eq!(imported["enabled"],false); }
+        }}
+    }
+}
+
+#[test]
+fn recovery_reports_the_actual_definer_after_reenabling_a_past_preserved_event() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+    db.query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY DISABLE DO SET @original=1").unwrap(); s.dump();
+    let mut m=s.manifest(); m["stored_programs"][0]["definition"]=json!("CREATE EVENT `e` ON SCHEDULE AT '2000-01-01' ON COMPLETION NOT PRESERVE ENABLE DO SET @a=1"); m["stored_programs"][0]["status"]=json!("ENABLED"); s.save(&m);
+    let target=s.other(true); let owner=format!("lr_owner_{}",std::process::id()); let _owner=User{endpoint:s.endpoint.clone(),name:owner.clone()};
+    db.query_drop(format!("CREATE USER '{owner}'@'%' IDENTIFIED BY 'tf_local_test'")).unwrap();
+    let mut fresh=conn(&target);
+    fresh.query_drop(format!("CREATE DEFINER='{owner}'@'%' EVENT e ON SCHEDULE AT '2000-01-01' ON COMPLETION PRESERVE ENABLE DO SET @previous=1")).unwrap();
+    fresh.query_drop(format!("ALTER DEFINER='{owner}'@'%' EVENT e ENABLE")).unwrap();
+    assert_eq!(status(&mut fresh,"e"),"ENABLED"); assert_eq!(definer(&mut fresh,"e"),Some(format!("{owner}@%")));
+    let v=outcome(events("dump.import",s.payload(&target)));
+    let failed=&v["programs_failed"][0]; assert_eq!(failed["previous_restored"],true,"{v}"); assert_eq!(failed["previous_definer_preserved"],false,"{v}");
+    let actual=definer(&mut fresh,"e").unwrap(); assert_ne!(actual,format!("{owner}@%"));
+    let warning=v["program_warnings"].as_array().unwrap().iter().find(|w|w["code"]=="program_restore_definer_changed").unwrap();
+    assert_eq!(warning["source"],format!("{owner}@%")); assert_eq!(warning["target"],actual);
+    assert_eq!(failed["status"],status(&mut fresh,"e"));
+}
+
+// This is a finite grammar mutation set, not random fuzzing. The production preview,
+// probe and single-statement CREATE paths are used; the checkpoint observes objects
+// before post-CREATE reconciliation can conceal a lexer/rewrite mismatch.
+#[test]
+fn deterministic_header_variants_match_mysql_creation_or_fail_closed() {
+    let Some(mut s)=Sandbox::new() else {return}; let mut admin=conn(&s.endpoint); table(&mut admin); s.dump();
+    let original=s.manifest(); let target=s.other(true); let victim=s.other(true);
+    let mut observer=conn(&target);
+    admin.query_drop(format!("CREATE TABLE `{}`.sentinel(id INT)",victim.database)).unwrap();
+    let current:String=observer.query_first("SELECT CURRENT_USER()").unwrap().unwrap();
+    let qi=|name:&str|format!("`{}`",name.replace('`',"``"));
+    let source=qi(&s.endpoint.database);
+    let fragments=["/* note */ ","# note\n","# note\r\n","# note\r","# note","#\tnote\n","#\rnote\n","#\nnote\n",
+        "-- note\n","--\tnote\n","--\rnote\n","-- \rnote\n","-- note\r\n","-- note\r","-- note",
+        "--\nnote\n","--note\n","--\u{b}note\n","--\u{c}note\n","--\u{1}note\n",
+        "/*! ENABLE */ ","/*!80000 ENABLE */ ","/*!00000 ENABLE */ ","/*M! ENABLE */ ","/*+ hint */ ","/* unterminated"];
+    let spaces=[" ","\t","\n","\r\n","\u{c}","\u{b}","\u{a0}","\u{3000}"];
+    let mut total=0; let mut refused=0; let mut created=0; let mut server_rejected=0;
+    for mode in ["","NO_BACKSLASH_ESCAPES","ANSI_QUOTES","ANSI_QUOTES,NO_BACKSLASH_ESCAPES"] {
+        for kind in ["PROCEDURE","FUNCTION","EVENT"] {
+            let tail=match kind {
+                "PROCEDURE"=>"() SQL SECURITY INVOKER COMMENT 'literal' SELECT 1",
+                "FUNCTION"=>"() RETURNS INT DETERMINISTIC SQL SECURITY INVOKER COMMENT 'literal' RETURN 1",
+                _=>"ON SCHEDULE EVERY 1 DAY STARTS '2099-01-01' ON COMPLETION PRESERVE ENABLE COMMENT 'literal' DO SET @header_test=1",
+            };
+            let base=format!("CREATE DEFINER=`not_importer`@`%` {kind} {source} . `p` {tail}");
+            let mut positions=vec!["CREATE ".to_string(),"DEFINER=".into(),"`not_importer`".into(),"@".into(),"`%` ".into(),format!("{kind} "),format!("{source} "),". ".into(),"`p` ".into()];
+            if kind=="EVENT" { positions.extend(["ON ","SCHEDULE ","STARTS ","'2099-01-01' ","ON COMPLETION ","COMPLETION ","PRESERVE ","ENABLE ","DO "].map(str::to_string)); }
+            let mut cases=vec![("baseline".to_string(),base.clone(),"p".to_string())];
+            for (i,fragment) in fragments.iter().enumerate() {
+                for index in [i%positions.len(),(i+positions.len()/2)%positions.len()] {
+                    let needle=&positions[index];
+                    cases.push((format!("comment-{i}-position-{index}"),base.replacen(needle,&format!("{needle}{fragment}"),1),"p".into()));
+                }
+            }
+            for (index,needle) in positions.iter().enumerate() {
+                for (i,space) in spaces.iter().enumerate() {
+                    cases.push((format!("space-{i}-position-{index}"),base.replacen(needle,&format!("{}{space}",needle.trim_end()),1),"p".into()));
+                }
+            }
+            for (i,literal) in ["'a\\'b'","'a''b'","\"a\\\"b\"","\"a\"\"b\"","'a\\\\b'","'/* ! */ # -- . ` data'","'line\r\nbreak'"].iter().enumerate() {
+                cases.push((format!("literal-{i}"),base.replace("'literal'",literal),"p".into()));
+                cases.push((format!("definer-quote-{i}"),base.replace("`not_importer`",literal),"p".into()));
+            }
+            for (i,name) in ["p`tick","p.dot","p'quote","p\"quote","p# -- /*data*/","한글_p"].iter().enumerate() {
+                cases.push((format!("identifier-{i}"),base.replace("`p`",&qi(name)),name.to_string()));
+            }
+            for quoted in ["'p'","\"p\"","`p` . `outside`"] {
+                cases.push((format!("name-{quoted}"),base.replace("`p`",quoted),"p".into()));
+            }
+            cases.push(("single-statement".into(),format!("{base}; INSERT INTO `{}`.sentinel VALUES(1)",victim.database),"p".into()));
+            cases.push(("second-object".into(),format!("{base}; CREATE TABLE `{}`.second_object(id INT)",victim.database),"p".into()));
+            if kind=="EVENT" {
+                cases.push(("disabled-header".into(),base.replace(" ENABLE "," DISABLE "),"p".into()));
+                for comment in ["#","-- "] {
+                    cases.push((format!("hidden-cr-{comment}"),format!("CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY {comment}x\rDISABLE\nDO SET @header_test=1"),"p".into()));
+                    cases.push((format!("hidden-qualifier-{comment}"),format!("CREATE EVENT {} {comment}\rON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1 #\n.`p` ON SCHEDULE EVERY 1 DAY ENABLE DO SET @header_test=1",qi(&victim.database)),victim.database.clone()));
+                }
+            }
+            if kind=="EVENT" && mode.is_empty() {
+                let sql="CREATE EVENT `p` ON SCHEDULE EVERY '1\\' DAY STARTS '2099-01-01' ENABLE #fake' DISABLE\nDO SET @header_test=1";
+                for label in ["mode-case-lower","mode-case-mixed","mode-case-spaced","mode-case-canonical"] {
+                    cases.push((label.into(),sql.into(),"p".into()));
+                }
+            }
+            for (label,definition,name) in cases {
+                total+=1; assert!(total<=2300,"mutation set exceeded its CI budget");
+                let mode=match label.as_str() { "mode-case-lower"=>"no_backslash_escapes", "mode-case-mixed"=>"Ansi_Quotes,no_Backslash_Escapes", "mode-case-spaced"=>" NO_BACKSLASH_ESCAPES ", "mode-case-canonical"=>"NO_BACKSLASH_ESCAPES", _=>mode };
+                let mut program=json!({"kind":kind,"name":name,"definition":definition,"sql_mode":mode,"character_set_client":"utf8mb4","collation_connection":"utf8mb4_bin","definer":"not_importer@%"});
+                if kind=="EVENT" { program["time_zone"]=json!("+00:00"); program["status"]=json!("DISABLED"); }
+                let mut m=original.clone(); m["format_version"]=json!(7); m["stored_programs"]=json!([program]); s.save(&m);
+                let preview=success(events("dump.import_preview",s.payload(&target)));
+                let accepted=preview["blockers"].as_array().unwrap().is_empty();
+                let mut at_create=false; let mut output=Vec::new();
+                handle_request_streaming(Request{command:"dump.import".into(),request_id:None,payload:s.payload(&target)},|e| {
+                    if e["event"]=="program_created" {
+                        assert!(accepted,"rejected header executed: {kind}/{mode}/{label}: {definition:?}");
+                        assert_eq!(e["name"],name); at_create=true;
+                        if kind=="EVENT" { assert_eq!(status(&mut observer,&name),"DISABLED","{mode}/{label}: {definition:?}"); }
+                    }
+                    output.push(e);
+                });
+                let objects:Vec<(String,String,String,String)>=observer.exec("SELECT ROUTINE_SCHEMA,ROUTINE_NAME,ROUTINE_TYPE,DEFINER FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA IN (?,?,?) UNION ALL SELECT EVENT_SCHEMA,EVENT_NAME,'EVENT',DEFINER FROM information_schema.EVENTS WHERE EVENT_SCHEMA IN (?,?,?) UNION ALL SELECT TRIGGER_SCHEMA,TRIGGER_NAME,'TRIGGER',DEFINER FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA IN (?,?,?)",(&s.endpoint.database,&target.database,&victim.database,&s.endpoint.database,&target.database,&victim.database,&s.endpoint.database,&target.database,&victim.database)).unwrap();
+                if !objects.is_empty() {
+                    assert!(accepted && at_create,"unreported object: {kind}/{mode}/{label}: {definition:?} {objects:?} {output:#?}");
+                    assert_eq!(objects,vec![(target.database.clone(),name.clone(),kind.into(),current.clone())],"{mode}/{label}: {definition:?}");
+                    created+=1;
+                    assert_eq!(output.iter().find(|e|e["event"]=="result").unwrap()["success"],true,"{output:#?}");
+                    observer.query_drop(format!("DROP {kind} {}",qi(&name))).unwrap();
+                } else {
+                    assert!(!at_create,"successful CREATE left no object: {mode}/{label}");
+                    assert!(output.iter().any(|e|e["event"]=="error" || (e["event"]=="result" && e["success"]==false)),"silent loss: {output:#?}");
+                    if accepted { server_rejected+=1; } else { refused+=1; }
+                }
+                let sentinel:Option<u64>=observer.query_first(format!("SELECT COUNT(*) FROM `{}`.sentinel",victim.database)).unwrap(); assert_eq!(sentinel,Some(0),"second statement ran: {definition:?}");
+                let tables:Vec<(String,String)>=observer.exec("SELECT TABLE_SCHEMA,TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA IN (?,?,?) ORDER BY TABLE_SCHEMA,TABLE_NAME",(&s.endpoint.database,&target.database,&victim.database)).unwrap();
+                let mut expected=vec![(s.endpoint.database.clone(),"sample".into()),(target.database.clone(),"sample".into()),(victim.database.clone(),"sentinel".into())]; expected.sort();
+                assert_eq!(tables,expected,"unexpected table or view: {definition:?}");
+            }
+        }
+    }
+    assert!(created>200 && refused>100 && server_rejected>0,"vacuous differential test");
+    println!("header differential: total={total}, created={created}, refused={refused}, server_rejected={server_rejected}");
+}
