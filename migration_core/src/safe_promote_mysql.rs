@@ -1921,7 +1921,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
     } else {
         state["phase"] = json!("completed");
     }
-    state["message"]=json!(match state["status"].as_str() { Some("promoted")=>"Verified candidate promoted at the original database name. Original tables are retained in the recorded backup namespace.",Some("failed_original_unchanged")=>"Promotion did not change original tables or their foreign keys. The verified candidate remains available.",Some("promoted_incomplete")=>"Tables were promoted, but stored programs are missing. Check the report before recovery.",Some("failed_original_triggers_missing")=>"Tables were not promoted, but original triggers could not be restored. Recover them from the definitions saved in the report.",_=>"Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery." });
+    state["message"]=json!(match state["status"].as_str() { Some("promoted")=>"Verified candidate promoted at the original database name. Original tables are retained in the recorded backup namespace.",Some("failed_original_unchanged")=>"Promotion did not change original tables or their foreign keys. The verified candidate remains available.",Some("promoted_incomplete")=>"Tables were promoted, but stored programs are missing. Check the report before recovery.",Some("failed_original_triggers_missing")=>"Tables were not promoted, but original triggers could not be restored. Recover them from the definitions saved in the report.",_=>crate::safe_promotion::CUTOVER_UNKNOWN_MESSAGE });
     if state["error_code"]=="target_trigger_hidden" {
         state["error_code"] = json!("target_trigger_hidden");
         state["message"] = state["error"].clone();
@@ -2466,7 +2466,8 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
     })();
     if locked && outcome.is_err() && triggers_detaching && !renamed && (!rename_attempted || rename_rejected)
         && conn.query_first::<u8,_>("SELECT 1").ok().flatten()==Some(1) {
-        let recovery = recover_triggers(&mut conn, plan, &start_triggers, &mut state);
+        let recovery = hook("before_original_trigger_recovery", &mut conn)
+            .and_then(|_|recover_triggers(&mut conn, plan, &start_triggers, &mut state));
         recovered_locked = recovery.is_ok() || conn.query_first::<u8,_>("SELECT 1").ok().flatten()==Some(1);
         match recovery {
             Ok(count) => triggers_recreated = count > 0,
@@ -2502,7 +2503,9 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
             } else if intact && !renamed {
                 if triggers_detaching && !recovered_locked && !start_triggers.is_empty() {
                     let locks = active.iter().map(|n|format!("{} WRITE",qualified(original,n))).collect::<Vec<_>>();
-                    let result = db.query_drop(format!("LOCK TABLES {}",locks.join(", "))).map_err(|e|e.to_string()).and_then(|_|recover_triggers(db,plan,&start_triggers,&mut state));
+                    let result = hook("before_original_trigger_recovery", db)
+                        .and_then(|_|db.query_drop(format!("LOCK TABLES {}",locks.join(", "))).map_err(|e|e.to_string()))
+                        .and_then(|_|recover_triggers(db,plan,&start_triggers,&mut state));
                     let _ = db.query_drop("UNLOCK TABLES");
                     match result {
                         Ok(count) => triggers_recreated = count > 0,
@@ -2539,6 +2542,8 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
     }
     Ok(state)
 }
+
+pub(crate) const ROLLBACK_IDS_CHANGED_NOTE: &str = "The original tables were rebuilt after the recorded recovery, so its result cannot be re-checked. The recorded state is kept. Check the stored programs yourself and drop the recovery backup in the database if it is no longer needed.";
 
 pub(crate) const ROLLBACK_VISIBILITY_NOTE: &str = "This account cannot see all stored programs, so the recovery result was not re-checked. The recorded state is kept.";
 
@@ -2757,6 +2762,7 @@ mod tests {
     include!("../tests/support/safe_promote_round2.rs");
     include!("../tests/support/safe_promote_round3.rs");
     include!("../tests/support/safe_promote_round4.rs");
+    include!("../tests/support/safe_promote_round5.rs");
 
     #[test]
     fn safe_promote_rollback_lock_failure_leaves_active_triggers_untouched() {

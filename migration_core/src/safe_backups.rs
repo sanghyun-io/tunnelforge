@@ -197,7 +197,7 @@ fn inspect_backup(entry: &Entry, credentials: &Endpoint, deep: bool) -> Result<O
                             backup["missing_programs"] = json!(missing);
                         }
                         Ok(RollbackInspection::ProgramsNotVisible) => backup["note"] = json!(crate::safe_promote_mysql::ROLLBACK_VISIBILITY_NOTE),
-                        Ok(RollbackInspection::OriginalIdsChanged) => {},
+                        Ok(RollbackInspection::OriginalIdsChanged) => backup["note"] = json!(crate::safe_promote_mysql::ROLLBACK_IDS_CHANGED_NOTE),
                         Err(err) => backup["program_verification_error"] = json!(err),
                     }
                 }

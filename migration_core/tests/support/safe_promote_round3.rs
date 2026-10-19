@@ -159,7 +159,7 @@ fn safe_promote_rvg4_rollback_binlog_blocker_text() {
     assert!(reviewed["blockers"].as_array().unwrap().iter().any(|b| b.as_str().unwrap().starts_with("rollback_routine_binlog_unsafe: f: ")), "{reviewed:#}");
 }
 
-/// [5] a rollback_incomplete record stays rollback_incomplete after the program is recreated from the journal.
+/// [5] Restoring the saved program resolves an incomplete rollback and permits cleanup.
 #[test]
 fn safe_promote_rvg5_repaired_programs_complete_rollback_and_allow_cleanup() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

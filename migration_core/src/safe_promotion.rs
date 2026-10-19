@@ -11,6 +11,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub(crate) const CUTOVER_UNKNOWN_MESSAGE: &str = "Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery.";
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "engine", content = "plan")]
 pub(crate) enum EnginePlan {
