@@ -109,6 +109,20 @@ fn pg_generated_columns_round_trip_replace() {
 }
 
 #[test]
+fn pg_security_on_quoted_table_names_is_not_silently_omitted() {
+    let Some(s)=Sandbox::new() else { return };
+    db(&s.source).batch_execute("CREATE TABLE \"orders:archive\"(id int); ALTER TABLE \"orders:archive\" ENABLE ROW LEVEL SECURITY; CREATE RULE no_delete AS ON DELETE TO \"orders:archive\" DO INSTEAD NOTHING; CREATE TABLE plain(id int)").unwrap();
+    let refused=response("dump.run",json!({"source":s.source,"output_dir":s.dir,"tables":["orders:archive"]}));
+    assert_eq!(refused["event"],"error","{refused:#}");
+    assert_eq!(refused["reasons"],json!({"policy:orders:archive":"row_security_unsupported","rule:orders:archive:no_delete":"rule_unsupported"}));
+    let bypassed=run("dump.run",json!({"source":s.source,"output_dir":s.dir,"tables":["orders:archive"],"allow_incomplete":true}));
+    assert_eq!(bypassed["manifest_warnings"].as_array().unwrap().len(),2);
+    std::fs::remove_dir_all(&s.dir).unwrap();
+    let unrelated=run("dump.run",json!({"source":s.source,"output_dir":s.dir,"tables":["plain"]}));
+    assert_eq!(unrelated["strict_export"],true);
+}
+
+#[test]
 fn pg_generated_column_using_user_function_refused_with_reason() {
     let Some(s)=Sandbox::new() else { return };
     db(&s.source).batch_execute("CREATE FUNCTION twice(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1*2'; CREATE TABLE sample(a int,g int GENERATED ALWAYS AS(twice(a)) STORED)").unwrap();

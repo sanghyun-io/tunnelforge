@@ -1066,7 +1066,9 @@ fn scoped_omitted_objects(objects: &[String], schema: &NormalizedSchema, full_ex
     objects.iter().filter(|object| {
         let mut parts = object.splitn(3, ':');
         match (parts.next(), parts.next()) {
-            (Some("trigger" | "deprecated_engine" | "non_transactional_table" | "policy" | "rule"), Some(table)) => selected(table),
+            (Some("policy"), _) => schema.tables.iter().any(|table|**object==format!("policy:{}",table.name)),
+            (Some("rule"), _) => schema.tables.iter().any(|table|object.starts_with(&format!("rule:{}:",table.name))),
+            (Some("trigger" | "deprecated_engine" | "non_transactional_table"), Some(table)) => selected(table),
             (Some("routine" | "event" | "materialized_view"), _) => full_export,
             _ => false,
         }
@@ -3469,6 +3471,16 @@ mod tests {
 #[cfg(test)]
 mod postgres_refusal_tests {
     use super::*;
+    #[test]
+    fn postgres_security_objects_follow_quoted_table_names() {
+        let mut schema=crate::adapters::test_support::schema();
+        schema.tables[0].name="orders:archive".into();
+        let objects=vec!["policy:orders:archive".into(),"rule:orders:archive:no_delete".into()];
+        let refused=dump_scope_refusal(&objects,&schema,false,false).unwrap();
+        assert_eq!(refused.objects,objects);
+        assert!(refused.bypassable);
+        assert!(dump_scope_refusal(&objects,&schema,false,true).is_none());
+    }
     #[test]
     fn postgres_refusal_carries_inspection_reasons() {
         let inspection=InspectionResult {
