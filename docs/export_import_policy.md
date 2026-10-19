@@ -686,7 +686,7 @@ events. Before making a copy it checks the required TRIGGER, CREATE ROUTINE,
 ALTER ROUTINE and EVENT grants, the trigger binary-log rule (1419), trigger-name
 collisions with tables outside the dump, and explicit references to a differently
 named source database. The trigger-skip toggle removes the dump triggers from
-these checks and lists each omitted trigger. PostgreSQL refusals are unchanged.
+these checks and lists each omitted trigger. PostgreSQL stored-program refusals remain in place.
 
 The candidate imports tables, data and views. Trigger and routine creation is
 probed using owned temporary names, then the probes are dropped. Events are not
@@ -807,15 +807,18 @@ claimed.
 
 | Object | MySQL | PostgreSQL |
 | --- | --- | --- |
-| Tables, rows, PK/UNIQUE/secondary indexes, supported FKs, comments, supported defaults | Preserved | Preserved |
+| Tables, rows, PK/UNIQUE/secondary indexes, supported FKs, supported defaults | Preserved | Preserved |
+| Table/column comments | Preserved | Export proceeds with one `comments_not_exported` warning listing up to 20 objects and a count of the rest |
 | Views (full export only) | Preserved as separately captured definitions; persistent warning, `strict_export=false` | Same |
 | INVISIBLE columns | Preserved with explicit read/load/INSERT column lists (format 6) | Non-MySQL targets: refused before DROP on import/migration |
-| Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Non-MySQL targets: refused before DROP on import/migration; PostgreSQL export remains refused |
+| Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Proven built-in-only expressions preserved (format 6); STORED on PostgreSQL 13+, VIRTUAL on 18+; cross-engine imports refused before DROP |
 | Unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
 | Triggers on an exported table | Preserved after body verification (format 7, replace and verify-in-copy modes) | Refused before export; waivable |
 | Routines (functions/procedures), events | Preserved in full format 7 exports and full MySQL replace or verify-in-copy imports after header/context validation; failed capture is refused with a reason and is waivable | Refused before full export; waivable (no events) |
 | Materialized views | n/a | Refused before full export; waivable |
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
+| Row-level security flags/policies and table rules | n/a | Refused with `row_security_unsupported` / `rule_unsupported`; explicitly waivable, then listed as not exported |
+| Inheritance/partitioning, including either side of a relationship | n/a | Refused with `table_inheritance_unsupported`; never waivable, including partial exports |
 
 INVISIBLE columns (MySQL 8.0.23+) retain their visibility through format 6,
 including invisible generated columns. Reads and loads name these columns
@@ -830,15 +833,15 @@ SHOW CREATE TABLE line. The manifest stores the decoded expression without the
 outer AS parentheses; parentheses belonging to the expression remain. Unproven
 columns remain refused (`generated_column_unproven`, not waivable). This includes
 literal emoji when SHOW CREATE prints them as `????` (observed on 8.0/8.4).
-PostgreSQL export and imports/migrations across engines refuse generated columns
-before DROP.
+Imports/migrations across engines refuse generated columns before DROP
+(`unsupported_generated_column`); INVISIBLE columns still require MySQL.
 
 Data chunks retain generated values. Import skips those fields in LOAD DATA and
 INSERT, so MySQL recalculates them. Format 6 readers preserve the expression,
 VIRTUAL/STORED kind, indexes and supported FKs. Dumps without generated/invisible
 columns or stored programs retain the previous format versions. Formats 1-7 are readable: format 6 marks generated/invisible columns and format 7 stored programs. Older applications refuse unsupported 6/7 dumps before changing the target.
 
-Before creating a MySQL dump directory, Export also checks that every table it
+Before creating a MySQL or PostgreSQL dump directory, Export also checks that every table it
 will export can generate same-engine import DDL. Failure refuses even an
 incomplete opt-in with `table_definition_unrestorable` and a per-table reason.
 ON UPDATE metadata captures only the timestamp function token (including its
@@ -852,11 +855,65 @@ the dump, so expression output differences between server versions stop the swit
 with a content mismatch. Replace mode reports recalculation errors but does not
 compare recalculated generated values with the values in the dump; safe mode does.
 
+### PostgreSQL generated columns and export reasons
+
+PostgreSQL 13 and newer are supported. STORED generated columns retain their
+expression and kind, NOT NULL, and supported indexes; PostgreSQL 18 VIRTUAL
+columns retain their kind as well. A dump containing them uses existing format 6.
+A PostgreSQL dump without generated columns remains format 3 with the same
+manifest serialization; MySQL formats and serialization are unchanged. No new
+format number is introduced.
+
+Export captures an expression only when the PostgreSQL expression scanner accepts
+it and catalog dependencies point exclusively to the same table's columns or
+`pg_catalog` objects. User functions/types remain refused with
+`generated_dependency_unsupported` until program capture is supported; unsafe
+expression boundaries use `generated_expression_unsafe`. Neither can be waived.
+The deparse query uses a short transaction with a local source search path, so
+other type/default metadata keeps its existing representation.
+
+Import excludes generated columns from both the COPY column list and CSV row
+fields; chunks still contain their original values for verification. Before any
+target replacement, owned probe tables re-check the stored expression and kind
+(`generated_expression_changed`) and catalog dependencies
+(`program_name_resolution_changed`). A target function/operator that would
+capture an unqualified built-in reference therefore stops the import. PostgreSQL
+CREATE TABLE and probe DDL use the extended protocol, which permits one statement
+per call, in addition to the PostgreSQL-aware expression scanner. The account
+needs CREATE on the target schema and the existing ownership/replacement rights;
+probe tables and their supported indexes/FKs are created and removed before DROP.
+A VIRTUAL dump targeting PostgreSQL below 18 stops before DDL with
+`generated_virtual_unsupported_on_target` (also shown in preview).
+
+Replace import reports `generated_values_recomputed` for each table with STORED
+generated columns; it does not compare the recomputed values with the dump.
+Verify-in-copy does compare them and supports generated-column-only PostgreSQL
+dumps through promotion. The promotion inventory records generated kind only for
+columns that have it, retaining the legacy inventory/digest shape otherwise.
+Stored programs remain refused/skipped according to the existing engine rules.
+
+Every remaining detected PostgreSQL export refusal has a per-object reason in
+`InspectionResult.object_reasons` and the export's `reasons` map, with Korean and
+English sentences. Unsupported defaults select one reason in this order:
+`identity_always_unsupported`, `sequence_options_unsupported`, then
+`default_expression_unsupported`. CHECK constraints, custom types, advanced
+indexes, cross-schema FKs, and materialized views have their own codes; CHECK and
+GENERATED ALWAYS identity are still refused, not newly supported.
+
+RLS flags, forced RLS, or any policy produce `policy:<table>`; a table rule
+produces `rule:<table>:<rule>`. The existing advanced setting
+"담을 수 없는 객체는 빼고 내보내기" explicitly allows their omission. The export
+then records persistent not-exported warnings, and policies/rules must be
+recreated after import. Inheritance and partitioning cannot be waived because
+omission would change the tables themselves. Table/column comments do not block
+export: one persistent `comments_not_exported` line names at most 20 objects,
+plus the count left out. This warning is also carried through import reports.
+
 Default behavior: when the selected scope contains any refused object, `dump.run`
 fails before the target directory or any dump file is created, with
 `error_code: "unsupported_objects"`, `objects` (one `kind:table:name` entry per
 object), `bypassable`, and a `reasons` map for unproven generated columns, triggers, routine/event
-definitions and unrestorable table definitions. Only the
+definitions, PostgreSQL refusal reasons, and unrestorable table definitions. Only the
 waivable objects can be omitted, and only by
 the explicit choice "Export without these objects (incomplete)" (`allow_incomplete:
 true` in the `dump.run` payload; the dialog words the objects, up to 10 inline plus
@@ -929,7 +986,7 @@ refuse unsupported formats before changing the target. Table-subset imports name
 omitted views and programs, which can require confirmation for old and PostgreSQL
 dumps as well, without changing their table data or DDL behavior.
 
-The non-bypassable same-engine DDL export guard applies to MySQL. A definition
+The non-bypassable same-engine DDL export guard applies to MySQL and PostgreSQL. A definition
 that cannot be safely recreated produces `table_definition_unrestorable` and can
 make previously successful exports or scheduled backups fail. ENUM/SET definitions
 may contain up to 64 KiB of type text, with structural validation retained; other

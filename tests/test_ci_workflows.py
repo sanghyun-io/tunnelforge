@@ -510,12 +510,13 @@ def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
     job = load_version_gate()['jobs']['dump-roundtrip-regression']
     assert job['runs-on'] == 'ubuntu-24.04'
     assert job['timeout-minutes'] == 35
-    for service, image, port in [('mysql', 'mysql:8.4', 3306), ('postgres', 'postgres:18.4', 5432)]:
+    for service, image, port in [('mysql', 'mysql:8.4', 3306), ('postgres', 'postgres:18.4', 5432), ('postgres13', 'postgres:13', 5433)]:
         container = job['services'][service]
         assert container['image'] == image
-        assert container['ports'] == [f'{port}:{port}']
+        internal_port = 5432 if service == 'postgres13' else port
+        assert container['ports'] == [f'{port}:{internal_port}']
         assert '--health-cmd' in container['options']
-        prefix = 'TF_MYSQL' if service == 'mysql' else 'TF_POSTGRES'
+        prefix = 'TF_MYSQL' if service == 'mysql' else ('TF_POSTGRES13' if service == 'postgres13' else 'TF_POSTGRES')
         assert job['env'][f'{prefix}_HOST'] == '127.0.0.1'
         assert job['env'][f'{prefix}_DATABASE'] == 'tf_test'
         assert job['env'][f'{prefix}_PASSWORD'] == 'tf_local_test'
@@ -524,13 +525,16 @@ def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
     assert job['services']['mysql']['env']['MYSQL_DATABASE'] == 'tf_test'
     assert job['env']['TF_PROMOTE_MYSQL_HOST'] == job['env']['TF_MYSQL_HOST']
     assert job['services']['postgres']['env']['POSTGRES_DB'] == 'tf_test'
+    assert job['services']['postgres13']['env']['POSTGRES_DB'] == 'tf_test'
+    assert job['env']['TF_POSTGRES13_PORT'] == '5433'
     commands = '\n'.join(step.get('run', '') for step in job['steps'])
-    fixtures = ['live_roundtrip', 'live_binary_keyset', 'live_keyset_pk_matrix', 'live_mysql_bit', 'live_mysql_spatial', 'live_mysql_objects', 'live_generated_columns', 'live_mysql_triggers', 'live_mysql_programs', 'live_cross_engine_types', 'live_dump_cross_engine', 'live_schema_fidelity', 'live_schema_compare', 'live_upgrade_analyze', 'live_upgrade_fix', 'live_catalog',
+    fixtures = ['live_roundtrip', 'live_binary_keyset', 'live_keyset_pk_matrix', 'live_mysql_bit', 'live_mysql_spatial', 'live_mysql_objects', 'live_generated_columns', 'live_postgres_objects', 'live_mysql_triggers', 'live_mysql_programs', 'live_cross_engine_types', 'live_dump_cross_engine', 'live_schema_fidelity', 'live_schema_compare', 'live_upgrade_analyze', 'live_upgrade_fix', 'live_catalog',
                 'live_import_policy', 'live_foreign_key_actions', 'live_export_contract',
                 'live_fault_injection', 'live_safe_restore', 'live_backup_lifecycle', 'live_real_schema',
+                'live_postgres13',
                 # The same import suites again against a MySQL 8.0 server on port 3307.
                 'live_import_policy', 'live_real_schema', 'live_mysql_objects', 'live_generated_columns', 'live_mysql_triggers', 'live_mysql_programs']
-    assert re.findall(r'--test ([a-z_]+)', commands) == fixtures
+    assert re.findall(r'--test ([a-z_0-9]+)', commands) == fixtures
     assert 'mysql:8.0' in commands and 'TF_MYSQL_PORT' in str(job['steps'])
     assert 'cargo test --manifest-path migration_core/Cargo.toml' in commands
     assert '--include-ignored --test-threads=1' in commands
