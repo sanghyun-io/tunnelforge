@@ -138,8 +138,12 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
                 data_warnings.append("- " + describe_core_code(code) + " " + sanitize_local_diagnostic(names_preview(names)))
 
     programs = preview.get("programs") if isinstance(preview.get("programs"), dict) else {}
-    for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 저장 프로그램: {}")):
-        names = [display_program_name(item) for item in _strings(programs.get(key))]
+    for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 루틴·이벤트: {}")):
+        ids = _strings(programs.get(key))
+        triggers = [item for item in ids if item.startswith("trigger:")]
+        if triggers:
+            notes.append(_line("만들 트리거: {}", [display_program_name(item) for item in triggers]))
+        names = [display_program_name(item) for item in ids if item not in triggers]
         if names:
             notes.append(_line(sentence, names))
     kept = [display_program_name(item) for item in _strings(preview.get("programs_kept"))]

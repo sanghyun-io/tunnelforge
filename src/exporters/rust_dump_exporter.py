@@ -1106,9 +1106,14 @@ class RustDumpImporter(_RustDumpClientBase):
                     if result.get(key):
                         message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in result[key]))
                 programs = result.get("programs") or {}
-                for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 저장 프로그램: {}")):
-                    if programs.get(key):
-                        message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in programs[key]))
+                for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 루틴·이벤트: {}")):
+                    ids = programs.get(key) or []
+                    triggers = [item for item in ids if str(item).startswith("trigger:")]
+                    if triggers:
+                        message += "\n" + translate_text("만들 트리거: {}").format(", ".join(display_program_name(item) for item in triggers))
+                    ids = [item for item in ids if item not in triggers]
+                    if ids:
+                        message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in ids))
                 if result.get("status") == "ready_for_review":
                     message += " 교체 전에 따로 확인할 것이 있습니다."
                     for blocker in result.get("blockers") or []:
