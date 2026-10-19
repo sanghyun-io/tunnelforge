@@ -19,6 +19,7 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 _EN_TEXT_TRANSLATIONS = {
     "원본 세션 설정을 적용할 수 없어 이 객체는 바꾸지 않고 남겨 둡니다(결과는 일부 완료). 대상 서버의 시간대 설정을 확인하세요.": "The source session settings cannot be applied, so this object will be left unchanged and the result will be partial. Check the target server time zone configuration.",
     "루틴·이벤트 {}의 정의나 생성 설정을 안전하게 읽을 수 없습니다. 원본 객체의 정의와 문자셋·시간대를 확인한 뒤 다시 내보내세요.": "Could not safely read routine or event {} or its creation settings. Check the source definition, character set and time zone, then export again.",
+    "복사본에 부모 행이 없는 자식 행이 있어 교체하지 않았습니다.": "The copy contains child rows without parent rows, so it was not switched in.",
     "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.": "Dumps containing triggers, routines or events cannot yet be verified in a copy.",
     "선택한 테이블에 딸린 객체만 가져오므로 나머지 객체는 만들지 않습니다.": "Only objects belonging to the selected tables are imported; other objects are left out.",
     "계산 열 {}의 식이 원본과 같은지 확인하지 못했습니다. 이모지처럼 원본 DB가 다시 표시하지 못하는 문자가 있을 수 있습니다. 그 문자를 쓰지 않도록 식을 고치거나 이 테이블의 체크를 풀어 나머지만 내보내세요.": "Could not verify generated column {} against the source. Characters such as emoji may not be printable by the source database. Rewrite the expression without them, or uncheck this table to export the rest.",
@@ -257,6 +258,10 @@ _EN_TEXT_TRANSLATIONS = {
     "대상에서 뷰 같은 다른 객체가 이 이름을 쓰고 있어 테이블로 바꿀 수 없습니다.": "Another object such as a view already uses this name in the target, so it cannot become a table.",
     "이 테이블이 참조하는 부모 테이블이 덤프에도 대상에도 없습니다.": "The parent table this table references is neither in the dump nor in the target.",
     "덤프의 테이블들이 같은 시점에 내보내지지 않아 서로 맞지 않을 수 있습니다.": "The dump's tables were not exported at one point in time and may not match each other.",
+    "덤프에는 원본 테이블을 서로 다른 시점에 읽었다고 기록되어 있어 이런 차이가 생겼을 수 있습니다. 원본에 이미 이런 행이 있었을 수도 있습니다.": "The dump records that source tables were read at different times, which may have caused this mismatch. These rows may also have existed in the source already.",
+    "원본에 이미 이런 행이 있었을 수도 있습니다.": "These rows may already have existed in the source.",
+    "덤프의 {child_table} 테이블에 부모 행이 덤프에 없는 자식 행이 {row_count}개 있습니다 (외래 키: {foreign_key}). {snapshot_reason} '먼저 복사본에서 검증하고 교체'를 끄고 mysqldump처럼 바로 가져오거나, 모든 테이블을 같은 시점에 읽도록 다시 내보내거나, 원본의 고아 레코드 검사에서 찾아 정리하세요.": "The dump's {child_table} table has {row_count} child rows whose parent rows are absent from the dump (foreign key: {foreign_key}). {snapshot_reason} Turn off 'Verify in a copy first, then swap' to import directly, like mysqldump, export again with all tables read at the same time, or find and clean these rows at the source with the orphan record check.",
+    "복사본 검증은 테이블마다 다른 시점에 읽은 덤프에서 자식 행의 부모 행이 빠진 것을 발견하면 멈출 수 있습니다. '먼저 복사본에서 검증하고 교체'를 끄고 mysqldump처럼 바로 가져오거나, 모든 테이블을 같은 시점에 읽도록 다시 내보내거나, 원본의 고아 레코드 검사에서 찾아 정리하세요.": "Verify in a copy may stop if it finds child rows whose parent rows are missing in a dump whose tables were read at different times. Turn off 'Verify in a copy first, then swap' to import directly, like mysqldump, export again with all tables read at the same time, or find and clean these rows at the source with the orphan record check.",
     "뷰 정의는 테이블 데이터와 같은 시점에 담기지 않았습니다.": "View definitions were not captured at the same point in time as the table data.",
     "내보낸 계정의 권한으로는 트리거, 저장 프로시저·함수, 예약 이벤트, 테이블과 열이 모두 보였는지 알 수 없어 덤프에 빠진 것이 있을 수 있습니다.": "The exporting account's privileges do not show that every trigger, stored procedure or function, scheduled event, table and column was visible, so the dump may be missing some.",
     "이 Rust DB Core는 내보내는 방법 자동 선택을 지원하지 않습니다. 앱과 함께 배포된 코어를 사용하세요.": "This Rust DB Core cannot choose the export method automatically. Use the core shipped with the app.",

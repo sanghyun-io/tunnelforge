@@ -1893,6 +1893,34 @@ def test_every_code_the_core_can_emit_has_a_korean_sentence():
     assert {"copy_refused", "copy_checks_unavailable", "target_events", "linked_target_only", "previous_copy_leftover"} <= emitted
     assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []
 
+
+def test_candidate_fk_orphan_failure_explains_snapshot_and_recovery_options():
+    import json
+    from src.exporters.rust_dump_exporter import describe_core_failure
+
+    def describe(policy):
+        fields = json.dumps({
+            "foreign_key": "is_read_comment_ibfk_1",
+            "child_table": "comments",
+            "row_count": 11,
+            "snapshot_policy": policy,
+        }, separators=(",", ":"))
+        return describe_core_failure(f"candidate_fk_orphans: fields={fields}")
+
+    synchronized = describe("mysql_single_connection_consistent_snapshot")
+    assert synchronized == (
+        "덤프의 comments 테이블에 부모 행이 덤프에 없는 자식 행이 11개 있습니다 "
+        "(외래 키: is_read_comment_ibfk_1). 원본에 이미 이런 행이 있었을 수도 있습니다. "
+        "'먼저 복사본에서 검증하고 교체'를 끄고 mysqldump처럼 바로 가져오거나, 모든 테이블을 같은 시점에 읽도록 "
+        "다시 내보내거나, 원본의 고아 레코드 검사에서 찾아 정리하세요."
+    )
+    unsynchronized = describe("mysql_parallel_unsynchronized_snapshots")
+    assert "서로 다른 시점에 읽었다고 기록되어" in unsynchronized
+    assert "11개" in unsynchronized and "is_read_comment_ibfk_1" in unsynchronized and "comments" in unsynchronized
+    assert "'먼저 복사본에서 검증하고 교체'를 끄고 mysqldump처럼 바로 가져오거나" in unsynchronized
+    assert "모든 테이블을 같은 시점에 읽도록 다시 내보내거나" in unsynchronized
+    assert "원본의 고아 레코드 검사에서 찾아 정리하세요" in unsynchronized
+
 @pytest.mark.parametrize("code, expected", [
     ("trigger:orders:trg_audit", "테이블 orders: 트리거(trg_audit)는 덤프에 담을 수 없습니다"),
     ("non_transactional_table:logs:MEMORY",

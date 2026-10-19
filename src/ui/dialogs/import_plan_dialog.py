@@ -79,6 +79,12 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         blockers += copy_stops + [translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다.")]
 
     data_warnings, notes = [], []
+    if verify and preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:
+        data_warnings.append("- " + translate_text(
+            "복사본 검증은 테이블마다 다른 시점에 읽은 덤프에서 자식 행의 부모 행이 빠진 것을 발견하면 멈출 수 있습니다. "
+            "'먼저 복사본에서 검증하고 교체'를 끄고 mysqldump처럼 바로 가져오거나, 모든 테이블을 같은 시점에 읽도록 다시 내보내거나, "
+            "원본의 고아 레코드 검사에서 찾아 정리하세요."
+        ))
     enabled = _strings(preview.get("events_enabled"))
     if enabled:
         data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(enabled), sanitize_local_diagnostic(names_preview(enabled))))
