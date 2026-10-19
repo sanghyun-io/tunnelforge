@@ -1,6 +1,8 @@
 //! `dump.import_preview`: what a replace import of this dump would do to the target. Read-only: it
 //! writes no report or journal, creates no probe tables and never reads chunk data.
 use crate::*;
+use crate::mysql_programs::*;
+use crate::mysql_schema_programs::*;
 use mysql::prelude::Queryable;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -45,7 +47,7 @@ struct DumpFindings {
     copy_blockers: Vec<Value>,
 }
 
-fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &str, strict: bool) -> Result<DumpFindings, String> {
+fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &str, strict: bool, target_schema: &str, skip_triggers: bool) -> Result<DumpFindings, String> {
     let (data_format, compression) = super::supported_dump_format(manifest)?;
     let mut blockers = Vec::new();
     let mut warnings = super::coded_source_dump_warnings(manifest).into_iter()
@@ -53,10 +55,10 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     if let Err(err) = super::check_mysql_spatial_import(manifest, selected, engine) {
         blockers.push(issue("spatial_unsupported", None, err));
     }
-    match super::import_table_ddls(manifest, selected, engine) {
+    match super::import_table_ddls(manifest, selected, engine, target_schema, skip_triggers) {
         Ok((_, untranslatable)) => blockers.extend(untranslatable.into_iter()
-            .map(|(table, reason)| issue("untranslatable_table", Some(table.as_str()), reason))),
-        Err(err) => blockers.push(issue("dump_invalid", None, err)),
+            .map(|(table, reason)| issue(if reason.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else if reason.starts_with("unsupported_generated_column:") {"unsupported_generated_column"} else if reason.starts_with("unsupported_invisible_column:") {"unsupported_invisible_column"} else { "untranslatable_table" }, Some(table.as_str()), reason))),
+        Err(err) => blockers.push(issue(if err.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else { "dump_invalid" }, None, err)),
     }
     let tables = manifest.tables.iter()
         .filter(|table| selected.is_empty() || selected.contains(&table.name)).cloned().collect::<Vec<_>>();
@@ -75,6 +77,10 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     Ok(DumpFindings { tables: dependency_ordered_dump_tables(&manifest.schema, tables), blockers, warnings, copy_blockers })
 }
 
+fn warning_names(code: &str, names: Vec<String>) -> Value {
+    let mut item=warning(code,names.join(", ")); item["names"]=json!(names); item
+}
+
 fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let input_dir = request.payload.get("input_dir").and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty()).ok_or("dump.import_preview requires input_dir")?;
@@ -82,13 +88,29 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let engine = endpoint.engine.as_str();
     let selected: BTreeSet<String> = string_list(request.payload.get("tables")).into_iter().collect();
     let strict = request.payload.get("strict_manifest").and_then(Value::as_bool).unwrap_or(true);
-    let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict)?;
+    let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
+    let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict, &endpoint_schema(endpoint), skip_triggers)?;
     // A timezone the import would refuse is a bad request, not a property of the target.
     super::import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), engine)?;
     let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
     let import_schema = NormalizedSchema {
         tables: manifest.schema.tables.iter().filter(|table| names.contains(&table.name)).cloned().collect(),
     };
+    let mut programs = Vec::new();
+    let mut skipped_cross_engine = Vec::new();
+    let mut skipped_partial = Vec::new();
+    let mut skipped_toggle = Vec::new();
+    for p in &manifest.stored_programs {
+        let id = program_id(p);
+        if engine != "mysql" { skipped_cross_engine.push(id); }
+        else if (p.kind!="TRIGGER" && !selected.is_empty()) || p.table.as_ref().is_some_and(|t| !names.contains(t)) { skipped_partial.push(id); }
+        else if skip_triggers && p.kind=="TRIGGER" { skipped_toggle.push(id); }
+        else { programs.push(p); }
+    }
+    if !selected.is_empty() { skipped_partial.extend(manifest.views.iter().map(|v|format!("view:{}",v.name))); }
+    for (code, skipped) in [("programs_skipped_cross_engine", &skipped_cross_engine), ("programs_skipped_partial", &skipped_partial), ("programs_skipped_toggle", &skipped_toggle)] {
+        if !skipped.is_empty() { warnings.push(warning(code, skipped.join(", "))); }
+    }
     // Only a whole same-engine import replaces views (finalize_dump_import).
     let dump_views = if selected.is_empty() && manifest.source_engine == engine {
         manifest.views.iter().map(|view| view.name.clone()).collect::<Vec<_>>()
@@ -100,6 +122,40 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let mut admin = super::safe_restore::maintenance_connection(endpoint)?;
     let exists = super::safe_restore::target_namespace_exists(&mut admin, endpoint)?;
     let can_create = if exists { None } else { can_create_namespace(&mut admin, endpoint)? };
+    if let LiveAdapter::MySql(conn) = &mut admin {
+        if !programs.is_empty() {
+            let (log_bin, trusted): (bool, bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators")
+                .map_err(|err| format!("trigger binlog inspection failed: {err}"))?.ok_or("trigger binlog variables unreadable")?;
+            if programs.iter().any(|p|p.kind=="TRIGGER") && trigger_binlog_blocked(log_bin, trusted, mysql_grants_allow(conn, "SUPER", None)) {
+                blockers.push(issue("trigger_binlog_privilege", None, "log_bin_trust_function_creators=1 or SUPER is required"));
+            }
+            if programs.iter().any(|p|p.kind=="TRIGGER") && mysql_grants_allow(conn, "TRIGGER", Some(&endpoint.database)) == Some(false) {
+                blockers.push(issue("trigger_privilege_missing", None, "TRIGGER privilege is required"));
+            }
+            for (kind,privilege) in [("PROCEDURE","CREATE ROUTINE"),("FUNCTION","CREATE ROUTINE"),("EVENT","EVENT")] {
+                if programs.iter().any(|p|p.kind==kind) && mysql_grants_allow(conn,privilege,Some(&endpoint.database))==Some(false) {
+                    blockers.push(issue("program_privilege_missing",None,format!("{privilege} privilege is required")));
+                }
+            }
+            if programs.iter().any(|p|matches!(p.kind.as_str(),"PROCEDURE" | "FUNCTION")) && mysql_grants_allow(conn,"ALTER ROUTINE",Some(&endpoint.database))==Some(false) {
+                warnings.push(warning("program_probe_cleanup_unproven","ALTER ROUTINE is needed to remove routine probes"));
+            }
+            let super_grant=mysql_grants_allow(conn,"SUPER",None);
+            let blocked=programs.iter().filter(|p|p.kind=="FUNCTION" && function_binlog_preview_blocked(p,log_bin,trusted,super_grant)).map(|p|p.name.clone()).collect::<Vec<_>>();
+            if !blocked.is_empty() { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
+            let events=programs.iter().filter(|p|p.kind=="EVENT").map(|p|p.name.clone()).collect::<Vec<_>>();
+            if !events.is_empty() && mysql_grants_allow(conn,"EVENT",Some(&endpoint.database)).is_none() {
+                warnings.push(warning_names("event_privilege_unproven",events));
+            }
+            let current: Option<String> = conn.query_first("SELECT CURRENT_USER()")
+                .map_err(|err| format!("current account inspection failed: {err}"))?;
+            let changed = programs.iter().filter(|p| p.definer != current).map(|p| format!("{} ({} -> {})", p.name,
+                p.definer.as_deref().unwrap_or("?"), current.as_deref().unwrap_or("?"))).collect::<Vec<_>>();
+            if !changed.is_empty() { warnings.push(warning_names("program_definer_replaced", changed)); }
+            let privileged=programs.iter().filter(|p|program_runs_as_importer(p)).map(|p|format!("{} {}",p.kind,p.name)).collect::<Vec<_>>();
+            if !privileged.is_empty() { warnings.push(warning_names("program_execution_account",privileged)); }
+        }
+    }
     // A cross-engine dump is already refused as a whole.
     if exists && manifest.source_engine == engine {
         // Only verify-in-copy needs these checks, so a failed one does not fail the preview.
@@ -108,6 +164,10 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             Err(error) => copy_blockers.push(issue("copy_checks_unavailable", None, error)),
         }
     }
+    let mut new_events_enabled = Vec::new();
+    if !exists { if let LiveAdapter::MySql(conn) = &mut admin {
+        for p in programs.iter().filter(|p|p.kind=="EVENT") { if preview_event_due(conn,p,None,&mut warnings) { new_events_enabled.push(p.name.clone()); } }
+    } }
     drop(admin);
     if !exists {
         // The replace import creates a missing namespace, so only the privilege matters.
@@ -134,12 +194,38 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let replaced = replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
     let untouched = target.tables.iter().filter(|(name, partition)| !partition && !dumped.contains(&key(name)))
         .map(|(name, _)| name.clone()).collect::<Vec<_>>();
-    let triggers_dropped = target.triggers.iter().filter(|(table, _)| replaced.contains(&key(table)))
+    let triggers_dropped = target.triggers.iter().filter(|(table, name)| replaced.contains(&key(table))
+        && !programs.iter().any(|p| p.name.eq_ignore_ascii_case(name) && p.table.as_ref().is_some_and(|t| key(t)==key(table))))
         .map(|(table, name)| json!({"table": table, "name": name})).collect::<Vec<_>>();
     let target_views = target.views.iter().map(|(name, _)| key(name)).collect::<BTreeSet<_>>();
     let (views_replace, views_create): (Vec<String>, Vec<String>) = dump_views.into_iter().partition(|name| target_views.contains(&key(name)));
     let replaced_views = views_replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
+    for conflict in trigger_name_conflicts(&target.triggers, &programs, fold) {
+        blockers.push(issue("trigger_name_conflict", Some(&conflict), &conflict));
+    }
 
+    let mut program_replace = Vec::new(); let mut program_create = Vec::new(); let mut program_may_not_replace = Vec::new(); let mut events_enabled = new_events_enabled;
+    if let Some(LiveAdapter::MySql(conn)) = &mut adapter {
+        let target_programs = target_schema_programs(conn,&schema)?;
+        let current: String = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?.unwrap_or_default();
+        for p in &programs {
+            if p.kind=="TRIGGER" { program_create.push(program_id(p)); continue }
+            let previous = target_programs.iter().find(|(k,n,_,_)| k==&p.kind && n.eq_ignore_ascii_case(&p.name));
+            if let Some((_,_,definer,_)) = previous {
+                program_replace.push(program_id(p));
+                if p.kind!="EVENT" { warnings.push(warning_names("routine_grants_reset",vec![format!("{} {}",p.kind,p.name)])); }
+                if definer!=&current && !preserves_foreign_definer(conn) {
+                    warnings.push(warning_names("program_restore_definer_may_change",vec![format!("{} {} ({definer} -> {current})",p.kind,p.name)]));
+                }
+                if definer!=&current && mysql_grants_allow(conn,"SYSTEM_USER",None)!=Some(true) {
+                    program_may_not_replace.push(json!({"name":p.name,"kind":p.kind,"definer":definer}));
+                }
+            } else { program_create.push(program_id(p)); }
+            if p.kind=="EVENT" && preview_event_due(conn,p,previous.and_then(|(_,_,_,status)|status.as_deref()),&mut warnings) { events_enabled.push(p.name.clone()); }
+        }
+    } else if !exists { program_create = programs.iter().map(|p|program_id(p)).collect(); }
+    if !events_enabled.is_empty() { warnings.push(warning_names("events_enabled",events_enabled.clone())); }
+    if !program_may_not_replace.is_empty() { warnings.push(warning_names("program_replace_privilege_unproven",program_may_not_replace.iter().map(|p|format!("{} {}",p["kind"].as_str().unwrap(),p["name"].as_str().unwrap())).collect())); }
     let mut external_parents = Vec::new();
     for table in &import_schema.tables {
         for fk in table.foreign_keys.iter().filter(|fk| !dumped.contains(&key(&fk.referenced_table))) {
@@ -221,9 +307,21 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         "kept_children": kept_children, "external_parents": external_parents,
         "views": {"replace": views_replace, "create": views_create, "may_not_replace": may_not_replace, "may_break": may_break},
         "triggers_dropped": triggers_dropped, "blockers": blockers, "warnings": warnings,
+        "programs": {"create":program_create,"replace":program_replace,"may_not_replace":program_may_not_replace},
+        "events_enabled":events_enabled,
+        "programs_skipped_cross_engine": skipped_cross_engine, "programs_skipped_partial": skipped_partial,
+        "programs_skipped_toggle": skipped_toggle,
         "strict_export": manifest.strict_export, "snapshot_policy": manifest.snapshot_policy,
         "source_timezone": manifest.source_timezone, "copy_blockers": copy_blockers,
     }))
+}
+
+fn preview_event_due(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, target: Option<&str>, warnings: &mut Vec<Value>) -> bool {
+    let due=reset_program_context(conn).and_then(|()|event_due_now(conn,p,target));
+    match due {
+        Ok(due) => due,
+        Err(err) => { let mut item=warning_names("program_session_unavailable",vec![p.name.clone()]); item["raw_error"]=json!(err); warnings.push(item); false }
+    }
 }
 
 fn inspect_target(adapter: &mut LiveAdapter, schema: &str) -> Result<Target, String> {
@@ -479,6 +577,7 @@ mod tests {
                 name: table.name.clone(), path: table.name.clone(), rows: 0, chunks: 0, chunk_sha256: BTreeMap::new(),
             }).collect(),
             schema: NormalizedSchema { tables },
+            stored_programs: Vec::new(),
         }
     }
 
@@ -488,7 +587,7 @@ mod tests {
 
     fn findings(manifest: &DumpManifest, selected: &[&str], engine: &str, strict: bool) -> DumpFindings {
         let selected = selected.iter().map(|name| name.to_string()).collect();
-        dump_findings(manifest, &selected, engine, strict).unwrap()
+        dump_findings(manifest, &selected, engine, strict, "app", false).unwrap()
     }
 
     #[test]
@@ -497,6 +596,19 @@ mod tests {
         assert_eq!(found.blockers, Vec::<Value>::new());
         assert_eq!(found.warnings, Vec::<Value>::new());
         assert_eq!(found.copy_blockers, Vec::<Value>::new());
+    }
+
+    #[test]
+    fn preview_names_every_qualified_trigger_and_keeps_other_ddl_blockers() {
+        let mut m = manifest("mysql",7,vec![users()]);
+        for (name,event) in [("guard1","INSERT"),("guard2","UPDATE")] {
+            m.stored_programs.push(serde_json::from_value(json!({"kind":"TRIGGER","name":name,"table":"users","timing":"BEFORE","event":event,
+                "action_order":1,"definition":"INSERT INTO app.audit VALUES(NEW.id)","sql_mode":"","character_set_client":"utf8mb4","collation_connection":"utf8mb4_bin"})).unwrap());
+        }
+        m.schema.tables[0].columns[0].type_name = "bad); DROP TABLE users".into();
+        let found = dump_findings(&m,&BTreeSet::new(),"mysql",true,"copy",false).unwrap();
+        assert_eq!(codes(&found.blockers),["program_source_schema_reference","program_source_schema_reference","untranslatable_table"]);
+        assert_eq!(found.blockers[0]["table"],"users.guard1"); assert_eq!(found.blockers[1]["table"],"users.guard2");
     }
 
     #[test]

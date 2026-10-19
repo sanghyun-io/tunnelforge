@@ -155,8 +155,15 @@ fn lossy_selected_schema_is_rejected_before_success_manifest() {
         let dir = std::env::temp_dir().join(format!("{name}_{}", endpoint.engine));
         let events = handle_request(Request { command: "dump.run".into(), request_id: None,
             payload: json!({"endpoint": endpoint, "tables": [name], "output_dir": dir}) });
-        assert!(events.iter().any(|event| event["event"] == "error" && event["message"].as_str().unwrap_or_default().contains("generated_column")), "{events:#?}");
-        assert!(!dir.join("_tunnelforge_dump.json").exists());
+        if endpoint.engine == "mysql" {
+            assert!(!events.iter().any(|event| event["event"] == "error"), "{events:#?}");
+            let restored = handle_request(Request { command: "dump.import".into(), request_id: None,
+                payload: json!({"target":endpoint,"input_dir":dir,"mode":"replace"}) });
+            assert!(!restored.iter().any(|event| event["event"] == "error"), "{restored:#?}");
+        } else {
+            assert!(events.iter().any(|event| event["event"] == "error" && event["message"].as_str().unwrap_or_default().contains("generated_column")), "{events:#?}");
+            assert!(!dir.join("_tunnelforge_dump.json").exists());
+        }
         admin.execute_sql(&format!("DROP TABLE {name}")).unwrap();
         if dir.exists() { fs::remove_dir_all(dir).unwrap(); }
     }
@@ -250,12 +257,20 @@ fn unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds() {
         let out = |name: &str| std::env::temp_dir().join(format!("{base}_{}_{name}", endpoint.engine));
         let single = if mysql { json!("single_connection") } else { json!("parallel_strict") };
 
-        // Trigger on a selected table: refused before anything is written.
+        // MySQL captures selected-table triggers; PostgreSQL still refuses them.
         let dir = out("refused");
         let events = dump_events(&endpoint, json!({"tables": [table], "output_dir": dir, "data_format": "jsonl", "mysql_snapshot_mode": single}));
-        let objects = refusal_objects(&events);
-        assert!(objects.contains(&format!("trigger:{table}:{trigger}")), "{objects:?}");
-        assert!(!dir.exists(), "output must not be created before refusal");
+        if mysql {
+            assert!(!events.iter().any(|e| e["event"] == "error"), "{events:#?}");
+            let manifest: Value = serde_json::from_slice(&fs::read(dir.join("_tunnelforge_dump.json")).unwrap()).unwrap();
+            assert_eq!(manifest["format_version"], 7);
+            assert_eq!(manifest["stored_programs"][0]["name"], trigger);
+            fs::remove_dir_all(&dir).unwrap();
+        } else {
+            let objects = refusal_objects(&events);
+            assert!(objects.contains(&format!("trigger:{table}:{trigger}")), "{objects:?}");
+            assert!(!dir.exists(), "output must not be created before refusal");
+        }
 
         // Objects of unselected tables do not block a partial export.
         let dir = out("plain");
@@ -267,10 +282,10 @@ fn unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds() {
         let dir = out("full");
         let events = dump_events(&endpoint, json!({"output_dir": dir, "data_format": "jsonl", "mysql_snapshot_mode": single}));
         let objects = refusal_objects(&events);
-        assert!(objects.contains(&format!("routine:{routine}")), "{objects:?}");
-        assert!(objects.contains(&format!("trigger:{table}:{trigger}")), "{objects:?}");
+        assert_eq!(objects.contains(&format!("routine:{routine}")), !mysql, "{objects:?}");
+        assert_eq!(objects.contains(&format!("trigger:{table}:{trigger}")), !mysql, "{objects:?}");
         if mysql {
-            assert!(objects.contains(&format!("event:{base}_ev")), "{objects:?}");
+            assert!(!objects.contains(&format!("event:{base}_ev")), "{objects:?}");
             assert!(objects.contains(&format!("non_transactional_table:{base}_mem:MEMORY")), "{objects:?}");
         } else {
             assert!(objects.contains(&format!("materialized_view:{base}_mv")), "{objects:?}");
@@ -282,8 +297,8 @@ fn unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds() {
         let events = dump_events(&endpoint, json!({"tables": [table], "output_dir": dir, "data_format": "jsonl", "allow_incomplete": true, "mysql_snapshot_mode": single}));
         assert!(!events.iter().any(|e| e["event"] == "error"), "{events:#?}");
         let manifest: Value = serde_json::from_slice(&fs::read(dir.join("_tunnelforge_dump.json")).unwrap()).unwrap();
-        assert_eq!(manifest["strict_export"], false);
-        assert!(manifest["manifest_warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains(&trigger)), "{manifest}");
+        assert_eq!(manifest["strict_export"], mysql);
+        assert_eq!(manifest["manifest_warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains(&trigger)), !mysql, "{manifest}");
         admin.execute_sql(&format!("DROP TRIGGER {trigger}{}", if mysql { String::new() } else { format!(" ON {table}") })).unwrap();
         run(&endpoint, "dump.import", json!({"tables": [table], "input_dir": dir, "mode": "replace", "threads": 1, "strict_manifest": true}));
         assert_eq!(admin.row_count(&table).unwrap(), 2);
@@ -741,7 +756,9 @@ fn export_without_trigger_privilege_is_not_strict() {
 
     // The account that sees everything is refused for the trigger and strict without it.
     let events = dump_events(&user_in(&root, seer, db), auto_payload(db, "seer_parent", single(json!(["parent"]))));
-    assert!(refusal_objects(&events).contains(&"trigger:parent:parent_trg".to_string()), "{events:#?}");
+    assert!(!events.iter().any(|e| e["event"] == "error"), "{events:#?}");
+    assert_eq!(manifest_of(db, "seer_parent")["strict_export"], true);
+    assert_eq!(manifest_of(db, "seer_parent")["stored_programs"][0]["name"], "parent_trg");
     let (_, result) = auto_export(&user_in(&root, seer, db), db, "seer_child", single(json!(["child"])));
     assert_eq!(result["strict_export"], true, "{result}");
     assert_eq!(visibility(&result), None);
@@ -795,10 +812,10 @@ fn export_warnings_exclude_out_of_scope_objects() {
     assert_eq!(warnings(&result), Vec::<String>::new());
     assert_eq!(result["strict_export"], true, "{result}");
 
-    // Opting out of the parent's trigger warns about that trigger only.
-    let (_, result) = auto_export(&in_db, db, "parent", json!({"tables": ["parent"], "allow_incomplete": true}));
+    // Selected-table triggers are held without an incomplete opt-in.
+    let (_, result) = auto_export(&in_db, db, "parent", json!({"tables": ["parent"]}));
     let warnings = warnings(&result);
-    assert_eq!(result["strict_export"], false, "{result}");
-    assert!(warnings.iter().any(|w| w.contains("trigger:parent:parent_trg")), "{warnings:?}");
+    assert_eq!(result["strict_export"], true, "{result}");
+    assert!(!warnings.iter().any(|w| w.contains("trigger:parent:parent_trg")), "{warnings:?}");
     assert!(!warnings.iter().any(|w| w.contains("scoped_fn") || w.contains("scoped_ev")), "{warnings:?}");
 }

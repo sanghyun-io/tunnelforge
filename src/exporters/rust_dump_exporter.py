@@ -128,7 +128,7 @@ _SCHEMA_REFUSAL_REASONS = {
 _UNKNOWN_TABLE_REFUSAL = "이 객체는 담을 수 없습니다"
 
 
-def describe_export_refusal(objects: object) -> List[str]:
+def describe_export_refusal(objects: object, reasons: Optional[Dict[str, str]] = None) -> List[str]:
     """One plain sentence per refused object, e.g. "테이블 orders: 트리거(trg)는 덤프에 담을 수 없습니다".
 
     An unknown code still names its table; the codes themselves go behind "자세히"."""
@@ -137,9 +137,12 @@ def describe_export_refusal(objects: object) -> List[str]:
         kind, _, rest = str(item).partition(":")
         table, _, name = rest.partition(":")
         if kind in _SCHEMA_REFUSAL_REASONS:
-            lines.append(translate_text(_SCHEMA_REFUSAL_REASONS[kind]).format(rest))
+            reason = describe_core_code((reasons or {}).get(str(item)), rest)
+            lines.append(reason or translate_text(_SCHEMA_REFUSAL_REASONS[kind]).format(rest))
         elif name:
-            reason = translate_text(_TABLE_REFUSAL_REASONS.get(kind, _UNKNOWN_TABLE_REFUSAL)).format(name)
+            code = (reasons or {}).get(str(item))
+            reason = (translate_text(CORE_CODE_SENTENCES[code]).format(name) if code in CORE_CODE_SENTENCES
+                      else translate_text(_TABLE_REFUSAL_REASONS.get(kind, _UNKNOWN_TABLE_REFUSAL)).format(name))
             lines.append(translate_text("테이블 {}: {}").format(table, reason))
         else:
             lines.append(f"{item}: {translate_text(_UNKNOWN_TABLE_REFUSAL)}")
@@ -418,6 +421,7 @@ class RustDumpExporter(_RustDumpClientBase):
                 self.last_refusal = {
                     "objects": [str(item) for item in event.get("objects") or []],
                     "bypassable": bool(event.get("bypassable")),
+                    **({"reasons": dict(event["reasons"])} if event.get("reasons") else {}),
                 }
             self._emit_core_event(
                 event,
@@ -438,6 +442,9 @@ class RustDumpExporter(_RustDumpClientBase):
         message = f"Export 완료: 테이블 {table_count}개, 행 {rows:,}개"
         if view_count:
             message += f", 뷰 {view_count}개"
+        for key,template in [("triggers","트리거 {}개"),("routines","루틴 {}개"),("events","이벤트 {}개")]:
+            if result.get(key):
+                message += ", " + translate_text(template).format(int(result[key]))
         method = describe_snapshot_method(result, effective_threads)
         if method:
             message += f" · {method}"
@@ -624,6 +631,42 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "program_restore_definer_changed": "이전 정의를 복구하면서 정의자가 가져오는 계정으로 바뀌었습니다. 권한과 소유 계정을 확인하세요.",
+    "program_restore_definer_may_change": "다른 계정의 정의자를 지정할 권한이 없어 교체 실패 후 복구하면 정의자가 가져오는 계정으로 바뀔 수 있습니다.",
+    "program_restore_unavailable": "대상의 이전 정의를 안전하게 복구할 수 있는지 확인하지 못해 이 객체는 교체하지 않았습니다. 보고서에서 세션 설정과 권한을 확인하세요.",
+    "program_event_dropped": "과거의 일회성 이벤트를 서버가 생성 직후 삭제했습니다. 교체 실패로 처리하고 이전 정의 복구 결과를 보고합니다.",
+    "routine_grants_reset": "동명 루틴을 교체하면 그 루틴에 직접 부여한 EXECUTE·ALTER ROUTINE 권한이 사라질 수 있습니다. 필요한 권한을 다시 부여하세요.",
+    "program_session_unavailable": "원본 세션 설정을 적용할 수 없어 이 객체는 바꾸지 않고 남겨 둡니다(결과는 일부 완료). 대상 서버의 시간대 설정을 확인하세요.",
+
+    "events_enabled": "가져온 뒤 바로 실행될 수 있는 이벤트가 있습니다. 이름과 일정을 확인하세요.",
+    "routine_body_unreadable": "루틴 {}의 본문을 읽지 못해 담지 않았습니다. SHOW_ROUTINE 권한 또는 원본 소유 계정이 필요합니다.",
+    "program_body_unreadable": "저장 프로그램 {}의 정의를 읽지 못했습니다. 원본 객체와 조회 권한을 확인하세요.",
+    "routine_binlog_unsafe": "함수를 바이너리 로그 설정 때문에 만들지 못하면 건너뛰며, 대상의 같은 이름 함수는 유지합니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요.",
+    "program_probe_cleanup_failed": "확인용 루틴을 지우지 못해 시작하지 않았습니다. 보고서의 남은 객체 이름과 ALTER ROUTINE 권한을 확인하세요.",
+    "program_probe_cleanup_unproven": "확인용 루틴을 지우려면 ALTER ROUTINE 권한이 필요합니다.",
+    "program_privilege_missing": "루틴·이벤트를 만들 권한이 없습니다. CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.",
+    "program_replace_privilege_unproven": "다른 계정이 만든 저장 프로그램은 교체하지 못할 수 있습니다.",
+    "program_event_system_timezone": "이 이벤트의 SYSTEM 시간대는 대상 서버의 시스템 시간대로 해석됩니다.",
+
+    "table_definition_unrestorable": "이 테이블의 정의로는 가져오기용 테이블을 만들 수 없어 내보내지 않았습니다. 원본 테이블 정의를 확인하세요.",
+    "program_server_warning": "저장 프로그램을 만들 때 서버가 경고를 보냈습니다.",
+    "program_create_failed": "데이터를 넣은 뒤 저장 프로그램을 만들지 못했습니다. Import 보고서에서 실패한 객체와 이전 정의 복구 결과를 확인하세요.",
+    "trigger_body_unproven": "트리거 {}의 본문이 원본과 같은지 확인하지 못해 담지 않았습니다. 원본 트리거 정의를 확인하세요.",
+    "program_definition_invalid": "루틴·이벤트 {}의 정의나 생성 설정을 안전하게 읽을 수 없습니다. 원본 객체의 정의와 문자셋·시간대를 확인한 뒤 다시 내보내세요.",
+    "program_charset_unsupported": "저장 프로그램 {}의 문자셋으로는 정의를 안전하게 복원할 수 없습니다. 원본 객체를 utf8mb4 문자셋으로 다시 만든 뒤 내보내세요.",
+    "trigger_name_conflict": "같은 이름의 트리거가 대상의 다른 테이블에 있습니다. 그 트리거를 삭제하거나 다른 이름으로 다시 만든 뒤 가져오세요.",
+    "trigger_binlog_privilege": "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다. 트리거를 제외하려면 고급 설정의 '트리거 없이 테이블만 가져오기'를 켜세요.",
+    "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
+    "program_probe_failed": "저장 프로그램을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "program_source_schema_reference": "저장 프로그램 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
+    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
+    "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거·루틴·이벤트를 만들지 않습니다.",
+    "programs_skipped_partial": "선택한 테이블에 딸린 객체만 가져오므로 나머지 객체는 만들지 않습니다.",
+    "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
+    "program_definer_replaced": "저장 프로그램 정의자가 가져오는 계정으로 바뀝니다.",
+    "program_database_collation_changed": "대상 DB의 기본 정렬 규칙이 저장 프로그램 원본과 다릅니다.",
+
+    "generated_column_unproven": "계산 열 {}의 식이 원본과 같은지 확인하지 못했습니다. 이모지처럼 원본 DB가 다시 표시하지 못하는 문자가 있을 수 있습니다. 그 문자를 쓰지 않도록 식을 고치거나 이 테이블의 체크를 풀어 나머지만 내보내세요.",
     **CONNECTION_ERROR_MESSAGES,
     # Import errors
     "load_failed": "이 테이블을 지우고 다시 만들거나 데이터를 넣는 중에 멈췄습니다.",
@@ -681,6 +724,14 @@ CORE_CODE_SENTENCES = {
     "create_privilege_unproven": "대상 DB(스키마)가 없는데 이 계정이 만들 수 있는지 권한 목록으로는 알 수 없습니다.",
     "drop_privilege_unproven": "이 계정이 대상 테이블을 지울 수 있는지 권한 목록으로는 알 수 없습니다.",
     "view_dependencies_unknown": "교체할 테이블을 쓰는 뷰를 확인하지 못했습니다(MySQL 8.0.13 이상 필요).",
+    "program_finalize_failed": "객체를 만들었지만 활성화나 마무리 확인을 끝내지 못했습니다. 보고서에서 남아 있는 객체와 실행 상태를 확인하세요.",
+    "event_privilege_unproven": "이벤트 생성 권한을 확인하지 못했습니다. 권한이 없으면 이 객체는 만들지 못하고 결과가 일부 완료로 남을 수 있습니다.",
+    "program_execution_account": "이 객체들은 가져오는 계정의 권한으로 실행됩니다. 신뢰하는 덤프인지 확인하세요.",
+    "unsupported_generated_column": "이 테이블의 계산 열은 MySQL 대상에서만 복원할 수 있습니다. MySQL 대상으로 가져오세요.",
+    "unsupported_invisible_column": "이 테이블의 숨김 열은 MySQL 대상에서만 복원할 수 있습니다. MySQL 대상으로 가져오세요.",
+    "trigger_definition_invalid": "트리거 {}의 정의나 생성 설정을 안전하게 읽을 수 없습니다. 원본 트리거 정의를 확인한 뒤 다시 내보내세요.",
+    "trigger_create_failed": "데이터를 넣은 뒤 트리거를 만들다가 Import가 멈췄습니다. 앞서 완료한 테이블은 유지됩니다. 보고서에서 트리거가 없는 테이블을 확인하세요.",
+    "trigger_finalize_failed": "트리거는 만들었지만 마무리 확인 중 Import가 멈췄습니다. 보고서에서 만들어진 트리거와 남은 테이블을 확인하세요.",
 }
 _REPORT_NOT_SAVED = "Import 보고서를 저장하지 못했습니다. 보고서 내용은 최신이 아닙니다."
 
@@ -703,7 +754,32 @@ def describe_core_code(code: object, name: object = "") -> Optional[str]:
     if sentence is None:
         return None
     sentence = translate_text(sentence)
+    if "{}" in sentence:
+        return sentence.format(name) if name else re.sub(r"\{\}(?:의|은|는|이|가|을|를)?\s*", "", sentence).strip()
     return f"{name}: {sentence}" if name else sentence
+
+
+def display_program_name(value: object) -> str:
+    kind, _, rest = str(value).partition(":")
+    if kind == "trigger":
+        return rest.replace(":", ".", 1)
+    templates = {"routine": "루틴 {}", "event": "이벤트 {}", "view": "뷰 {}"}
+    return translate_text(templates[kind]).format(rest) if kind in templates else str(value)
+
+
+def describe_program_warnings(items: object) -> List[str]:
+    lines = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        code, name = item.get("code"), item.get("name", "")
+        sentence = describe_core_code(code, name)
+        if sentence is None:
+            sentence = describe_core_code("program_server_warning", name) + f" ({code}): {item.get('message', '')}"
+        elif item.get("source") is not None and item.get("target") is not None:
+            sentence += f" ({item['source']} → {item['target']})"
+        lines.append(sentence)
+    return lines
 
 
 # How the core's manifest warnings begin (adapters.rs WARNING_*) and the code Import gives
@@ -804,6 +880,7 @@ class RustDumpImporter(_RustDumpClientBase):
         threads: int = DEFAULT_DUMP_THREADS,
         timezone_sql: Optional[str] = None,
         use_source_timezone: bool = True,
+        skip_triggers: bool = False,
     ) -> Tuple[bool, str, dict]:
         """What a replace import would do, read from the target without changing it.
 
@@ -823,6 +900,8 @@ class RustDumpImporter(_RustDumpClientBase):
             )
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, {}
+            if skip_triggers:
+                payload["skip_triggers"] = True
             if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):
                 return False, "Import 엔진이 이 버전보다 오래되어 실행 전 확인을 할 수 없습니다. TunnelForge를 다시 설치하세요.", {}
             return True, "", self.facade.preview_import(payload)
@@ -896,6 +975,7 @@ class RustDumpImporter(_RustDumpClientBase):
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
         use_source_timezone: bool = True,
         verify_only: bool = False,
+        skip_triggers: bool = False,
     ) -> Tuple[bool, str, dict]:
         """``import_mode`` is ``replace`` (the dialog's default) or ``safe`` (verify in a copy first); it has
         no default, so no caller falls into either one by accident. ``verify_only`` (safe mode): the copy is
@@ -929,6 +1009,8 @@ class RustDumpImporter(_RustDumpClientBase):
             payload = self._import_payload(
                 input_dir, target_schema or source_schema, threads, timezone_sql, use_source_timezone,
             )
+            if payload is not None and skip_triggers:
+                payload["skip_triggers"] = True
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, import_results
             payload["mode"] = import_mode
@@ -966,7 +1048,9 @@ class RustDumpImporter(_RustDumpClientBase):
                     self.last_error_code = classify_error_code(result.get("error_code"), reason)
                     stops = describe_copy_blockers(result.get("copy_blockers"))
                     if stops:
-                        # Stopped before making a copy: one sentence per reason; the core's text is in the report.
+                        # Rehearsals have no interactive verify toggle.
+                        if not verify_only and any(item.get("code") == "dump_programs_unsupported_in_copy" for item in result.get("copy_blockers") or [] if isinstance(item, dict)):
+                            stops.append(translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."))
                         return False, "\n".join([describe_core_code("copy_refused"), *stops]), import_results
                     return False, "\n".join([reason, *(str(item) for item in result.get("blockers") or [])]), import_results
                 new_target = result.get("status") == "completed_new_target" and result.get("namespace_existed") is False and result.get("namespace_created") is True
@@ -983,6 +1067,8 @@ class RustDumpImporter(_RustDumpClientBase):
             views_failed = result.get("views_failed") or []
             views_skipped = result.get("views_skipped_cross_engine") or []
             message = f"Rust DB Core import 완료: {len(tables_to_import)}개 테이블, {rows:,} rows"
+            if result.get("status") == "partial":
+                message = translate_text("테이블 데이터는 가져왔지만 일부 객체를 복원하지 못했습니다.") + f" ({len(tables_to_import)}개 테이블, {rows:,} rows)"
             if import_mode == "safe":
                 candidate_name = candidate.get("schema") if self.config.engine == "postgresql" else candidate.get("database")
                 message = f"복사본 {candidate_name}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다."
@@ -994,6 +1080,29 @@ class RustDumpImporter(_RustDumpClientBase):
                         message += f"\n{blocker}"
             if views_imported:
                 message += f", View {len(views_imported)}개"
+            for kinds, label in [(("TRIGGER",), "트리거"), (("PROCEDURE", "FUNCTION"), "루틴"), (("EVENT",), "이벤트")]:
+                count = sum(item.get("kind", "TRIGGER") in kinds for item in result.get("programs_imported") or [] if isinstance(item, dict))
+                if count:
+                    message += ", " + translate_text({"트리거":"트리거 {}개","루틴":"루틴 {}개","이벤트":"이벤트 {}개"}[label]).format(count)
+            programs_failed = result.get("programs_failed") or []
+            if programs_failed:
+                self.last_error_code = classify_error_code(programs_failed[0].get("code") or "program_create_failed", "")
+            for failure in programs_failed:
+                name = str(failure.get("name", ""))
+                line = describe_core_code(failure.get("code") or "program_create_failed", name)
+                if "previous_restored" in failure:
+                    line += " " + translate_text("이전 정의 복구 성공" if failure["previous_restored"] else "이전 정의 복구 실패")
+                message += "\n" + line
+            for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
+                if result.get(key):
+                    skipped_line = describe_core_code(key) + " " + ", ".join(display_program_name(item) for item in result[key])
+                    message += "\n" + skipped_line
+                    if progress_callback:
+                        progress_callback(skipped_line)
+            for warning_line in describe_program_warnings(result.get("program_warnings")):
+                message += "\n" + warning_line
+                if progress_callback:
+                    progress_callback(warning_line)
             if views_failed:
                 failed_names = ", ".join(
                     str(item.get("name", "")) for item in views_failed if isinstance(item, dict)
@@ -1012,7 +1121,7 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += "\n" + warning_line
                 if progress_callback:
                     progress_callback(warning_line)
-            return not bool(views_failed), message, import_results
+            return not bool(views_failed or programs_failed or result.get("status") == "partial"), message, import_results
         except DbCoreServiceError as exc:
             self._remember_error_code(exc)
             if not _is_operation_scoped_import_error(str(exc)):

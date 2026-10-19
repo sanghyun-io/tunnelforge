@@ -17,6 +17,8 @@ mod oneclick;
 mod migrate;
 mod compare;
 mod dump_format;
+mod mysql_programs;
+mod mysql_schema_programs;
 mod ddl;
 mod safe_promote_mysql;
 mod safe_promote_postgres;

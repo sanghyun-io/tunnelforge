@@ -7,6 +7,31 @@ from src.ui.dialogs.import_plan_dialog import ImportPlanDialog, describe_plan
 
 _app = QApplication.instance() or QApplication([])
 
+
+@pytest.mark.parametrize("code", ["programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced"])
+@pytest.mark.parametrize("warning_only", [False, True])
+def test_skipped_triggers_and_changed_definers_are_must_see_with_names(code, warning_only):
+    preview = {"warnings": [{"code": code, "detail": "sample.guard (old@host -> new@host)"}]}
+    if not warning_only and code != "program_definer_replaced":
+        preview[code] = ["trigger:sample:guard"]
+    plan = describe_plan(preview, False)
+    assert plan["must_see"] is True
+    assert "sample.guard" in "\n".join(plan["warnings"])
+    assert not plan["blockers"]
+
+
+def test_program_copy_refusal_is_a_plain_blocker():
+    plan = describe_plan({"copy_blockers": [{"code": "dump_programs_unsupported_in_copy"}]}, True)
+    assert plan["must_see"]
+    assert "트리거·루틴·이벤트가 담긴 덤프" in plan["blockers"][0]
+    assert " ".join(plan["blockers"]).count("끄면 진행할 수 있습니다") == 1
+
+
+@pytest.mark.parametrize("code", ["trigger_name_conflict", "program_source_schema_reference"])
+def test_trigger_blockers_name_the_affected_object(code):
+    plan = describe_plan({"blockers":[{"code":code, "table":"sample.guard"}]}, False)
+    assert "sample.guard" in plan["blockers"][0]
+
 PREVIEW = {
     "dry_run": True, "target": {"engine": "mysql", "database": "app", "schema": "app", "exists": True},
     "replace": ["users", "orders"], "create": ["audit"], "untouched": ["notes"],
@@ -48,7 +73,7 @@ def test_import_plan_dialog_lists_replace_create_untouched_and_warnings():
             button.click()
             assert label.isVisibleTo(dialog)
         warnings = dialog.label_warnings.text()
-        assert "- 덮어쓰면 사라지는 트리거: users.trg_users" in warnings
+        assert "- 덤프에서 다시 만들지 않아 사라지는 트리거: users.trg_users" in warnings
         assert "- 이 계정으로 지우지 못할 수 있는 뷰(다른 계정이 만듦): v_users (admin@%)" in warnings
         assert "- 교체 뒤 동작하지 않을 수 있는 뷰: v_notes → users" in warnings
         assert ("- 덤프에 없는 부모 테이블을 가리키는 외래 키입니다. 부모 테이블에 맞는 행이 있는지는 확인하지 않습니다: "
@@ -210,7 +235,7 @@ def test_copy_blockers_stop_only_verify_in_copy_and_say_how_to_go_on():
         assert not dialog.btn_execute.isEnabled()
         # Verified in a copy, the old tables go to a backup: "교체", never "덮어쓰기".
         assert dialog.lists["replace"][0].text() == "교체할 테이블 2개 ▸"
-        assert "- 교체하면 사라지는 트리거: users.trg_users" in dialog.label_warnings.text()
+        assert "- 덤프에서 다시 만들지 않아 사라지는 트리거: users.trg_users" in dialog.label_warnings.text()
     finally:
         dialog.close()
 
@@ -221,3 +246,88 @@ def test_must_see_is_only_set_by_blockers_and_data_warnings():
     assert describe_plan(quiet, False)["must_see"] is False
     assert describe_plan({**quiet, "external_parents": [{"child": "a", "constraint": "fk", "parent": "p"}]}, False)["must_see"]
     assert describe_plan({**quiet, "blockers": [{"code": "no_tables"}]}, False)["must_see"]
+
+
+def test_enabled_events_are_counted_named_and_must_see_once():
+    plan = describe_plan({"events_enabled": ["nightly", "cleanup"], "warnings": [{"code": "events_enabled", "detail": "nightly, cleanup"}]}, False)
+    assert plan["must_see"] and not plan["blockers"]
+    warnings = "\n".join(plan["warnings"])
+    assert "2개" in warnings and "nightly" in warnings and "cleanup" in warnings
+    assert warnings.count("바로 실행될") == 1
+
+
+def test_routine_and_event_definers_name_original_and_importing_accounts():
+    detail = "PROCEDURE rebuild (owner@host -> importer@host), EVENT nightly (owner@host -> importer@host)"
+    plan = describe_plan({"warnings": [{"code": "program_definer_replaced", "detail": detail}]}, False)
+    assert plan["must_see"]
+    assert detail in "\n".join(plan["warnings"])
+
+
+@pytest.mark.parametrize("code", ["routine_grants_reset", "program_restore_definer_may_change", "program_session_unavailable"])
+def test_program_replacement_risks_are_named_must_see_warnings(code):
+    plan = describe_plan({"warnings": [{"code": code, "detail": "PROCEDURE named_object"}]}, False)
+    assert plan["must_see"] and not plan["blockers"]
+    assert "named_object" in "\n".join(plan["warnings"])
+
+
+
+def test_large_must_see_lists_are_summarized_and_dialog_buttons_stay_visible():
+    names = [f"object_{i:03d} (owner@host -> importer@host)" for i in range(300)]
+    preview = {"target":{"engine":"mysql"}, "replace":[], "create":[], "warnings":[
+        {"code":code, "names":names, "detail":", ".join(names)} for code in
+        ("program_definer_replaced", "program_execution_account", "routine_grants_reset", "program_restore_definer_may_change")],
+        "events_enabled":[f"event_{i}" for i in range(300)]}
+    plan = describe_plan(preview, False)
+    assert plan["must_see"] and "외 290개" in "\n".join(plan["warnings"])
+    assert max(map(len, plan["warnings"])) < 1200
+    assert "object_299" in "\n".join(plan["details"])
+    dialog = ImportPlanDialog(None, preview, plan, Environment.PRODUCTION, "app", "app")
+    try:
+        dialog.show()
+        _app.processEvents()
+        assert dialog.btn_execute.mapTo(dialog, dialog.btn_execute.rect().bottomRight()).y() < dialog.height()
+        assert dialog.btn_cancel.mapTo(dialog, dialog.btn_cancel.rect().bottomRight()).y() < dialog.height()
+        assert dialog.input_schema.mapTo(dialog, dialog.input_schema.rect().bottomRight()).y() < dialog.height()
+        assert dialog.height() <= dialog.screen().availableGeometry().height() - 60
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("code,names", [("program_replace_privilege_unproven",["PROCEDURE p1","EVENT e1"]),("routine_binlog_unsafe",["f1","f2"])])
+def test_program_risk_lines_show_object_names(code, names):
+    plan = describe_plan({"warnings":[{"code":code,"names":names,"detail":", ".join(names)}]},False)
+    assert plan["must_see"] and all(name in "\n".join(plan["warnings"]) for name in names)
+
+
+def test_program_ids_are_presented_as_names_and_driver_errors_stay_in_details():
+    plan = describe_plan({"programs_skipped_partial":["trigger:users:guard","routine:p","event:e","view:v"],
+        "warnings":[{"code":"program_session_unavailable","detail":"bad","names":["bad"],"raw_error":"MySqlError { ERROR 1298 private driver details }"}]},False)
+    text="\n".join(plan["warnings"])
+    assert "users.guard" in text and "루틴 p" in text and "이벤트 e" in text and "뷰 v" in text
+    assert "trigger:" not in text and "MySqlError" not in text
+    assert "MySqlError" in "\n".join(plan["details"])
+
+
+@pytest.mark.parametrize("code,noun", [("unsupported_generated_column","계산 열"),("unsupported_invisible_column","숨김 열")])
+def test_cross_engine_column_blocker_names_the_specific_reason(code, noun):
+    plan=describe_plan({"blockers":[{"code":code,"table":"orders"}]},False)
+    assert plan["must_see"] and noun in plan["blockers"][0] and "orders" in plan["blockers"][0]
+
+
+
+def test_full_structured_warning_names_remain_available_beyond_log_line_limit():
+    names = [f"object_{i:03d}_" + "x"*90 for i in range(400)]
+    plan = describe_plan({"warnings":[{"code":"program_definer_replaced","names":names,"detail":", ".join(names)}]},False)
+    assert "object_399_" in "\n".join(plan["details"])
+    assert "object_399_" not in "\n".join(plan["warnings"])
+
+
+def test_short_replace_plan_sizes_to_its_content():
+    preview={"target":{"engine":"mysql"},"replace":["users"],"create":[]}
+    dialog=ImportPlanDialog(None,preview,describe_plan(preview,False),Environment.STAGING,"app","app")
+    try:
+        dialog.show()
+        _app.processEvents()
+        assert dialog.height()<500
+        assert dialog.btn_execute.mapTo(dialog,dialog.btn_execute.rect().bottomRight()).y()<dialog.height()
+    finally: dialog.close()

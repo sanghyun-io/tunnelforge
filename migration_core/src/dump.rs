@@ -547,6 +547,7 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
             });
             if let Some(refusal) = refusal {
                 event["error_code"] = json!("unsupported_objects");
+                event["reasons"] = json!(refusal.reasons);
                 event["objects"] = json!(refusal.objects);
                 event["bypassable"] = json!(refusal.bypassable);
             }
@@ -559,6 +560,7 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DumpRefusal {
     pub(crate) objects: Vec<String>,
+    pub(crate) reasons: BTreeMap<String, String>,
     /// True when only omittable objects (triggers, routines, events, ...) are
     /// involved, so "table data only (incomplete)" may proceed. Lossy table
     /// definitions are never bypassable.
@@ -950,6 +952,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     endpoint: &Endpoint,
     schema: NormalizedSchema,
     table_manifests: Vec<DumpTableManifest>,
+    stored_programs: Vec<NormalizedStoredProgram>,
     options: &DumpRunOptions,
     // The method that actually ran (never "auto"); PostgreSQL ignores it.
     mysql_snapshot_policy: &str,
@@ -1010,7 +1013,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         format: "tunnelforge-dump".to_string(),
         // Older readers ignore namespace, timezone and ON UPDATE metadata. Fail
         // their version gate instead of silently restoring different semantics.
-        format_version: if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
+        format_version: if !stored_programs.is_empty() { 7 } else if schema.tables.iter().any(|table| table.columns.iter().any(|column| column.generated.is_some() || column.invisible)) { 6 } else if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
         data_format: options.data_format.clone(),
         compression: options.compression.clone(),
         source_engine: endpoint.engine.clone(),
@@ -1025,12 +1028,21 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         created_unix_seconds: current_unix_seconds(),
         tables: table_manifests,
         views,
+        stored_programs,
     };
     write_dump_manifest(output_path, &manifest)?;
     Ok((manifest, views_count))
 }
 
 const LOSSY_SCHEMA_KINDS: [&str; 6] = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk"];
+
+fn mysql_dump_ddl_refusal(schema: &NormalizedSchema) -> Option<DumpRefusal> {
+    let objects = schema.tables.iter().filter(|table| generate_table_ddl(table, "mysql", "mysql").is_none())
+        .map(|table| format!("table_definition:{}:DDL", table.name)).collect::<Vec<_>>();
+    if objects.is_empty() { return None }
+    let reasons = objects.iter().map(|id| (id.clone(), "table_definition_unrestorable".into())).collect();
+    Some(DumpRefusal { objects, reasons, bypassable: false })
+}
 
 fn scoped_unrepresentable(objects: &[String], schema: &NormalizedSchema) -> Vec<String> {
     objects.iter().filter(|object| {
@@ -1070,7 +1082,7 @@ fn dump_scope_refusal(
     if listed.is_empty() {
         None
     } else {
-        Some(DumpRefusal { objects: listed, bypassable })
+        Some(DumpRefusal { objects: listed, reasons: BTreeMap::new(), bypassable })
     }
 }
 
@@ -1238,11 +1250,21 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
     }
-    let mut scope_objects = inspection.unsupported_objects.clone();
+    let (mut stored_programs, program_reasons) = crate::mysql_programs::collect_mysql_stored_programs(&endpoint, &schema, full_export)?;
+    let held = if endpoint.engine == "mysql" { crate::dump_format::held_object_ids(&schema, &stored_programs) } else { BTreeSet::new() };
+    let unheld: Vec<String> = inspection.unsupported_objects.iter().filter(|object| !held.contains(*object)).cloned().collect();
+    let mut scope_objects = unheld.clone();
     if endpoint.engine == "mysql" {
         scope_objects.extend(mysql_non_transactional_objects(&endpoint, &schema)?);
     }
-    if let Some(refusal) = dump_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete) {
+    if let Some(mut refusal) = dump_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete) {
+        if endpoint.engine == "mysql" {
+            refusal.reasons = refusal.objects.iter().filter(|id| id.starts_with("generated_column:"))
+                .map(|id| (id.clone(), "generated_column_unproven".to_string())).collect();
+            refusal.reasons.extend(refusal.objects.iter().filter(|id| id.starts_with("trigger:"))
+                .map(|id| (id.clone(), program_reasons.get(id).cloned().unwrap_or_else(|| "trigger_body_unproven".into()))));
+        }
+        refusal.reasons.extend(refusal.objects.iter().filter_map(|id| program_reasons.get(id).map(|code| (id.clone(),code.clone()))));
         let message = format!(
             "dump.run refused: the selected scope contains objects the dump cannot preserve ({}): {}",
             if refusal.bypassable { "an export without these objects is possible" } else { "table definitions would be lossy" },
@@ -1251,8 +1273,18 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         *refusal_slot = Some(refusal);
         return Err(message);
     }
+    if endpoint.engine == "mysql" {
+        let mut exported = schema.clone();
+        exported.tables.retain(|table| !scope_objects.iter().any(|id|
+            id.starts_with(&format!("non_transactional_table:{}:", table.name)) || id.starts_with(&format!("deprecated_engine:{}:", table.name))));
+        if let Some(refusal) = mysql_dump_ddl_refusal(&exported) {
+            let message = format!("table_definition_unrestorable: {}", refusal.objects.join(", "));
+            *refusal_slot = Some(refusal);
+            return Err(message);
+        }
+    }
     // Only objects inside the export scope make this dump incomplete (C5).
-    let mut export_warnings: Vec<String> = scoped_omitted_objects(&inspection.unsupported_objects, &schema, full_export)
+    let mut export_warnings: Vec<String> = scoped_omitted_objects(&unheld, &schema, full_export)
         .into_iter()
         .map(|object| format!("{WARNING_OBJECT_NOT_EXPORTED} {object}"))
         .collect();
@@ -1331,6 +1363,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             export_warnings.push(format!("{WARNING_NON_TRANSACTIONAL_EXCLUDED} {}", non_txn.join(", ")));
             let excluded: BTreeSet<String> = non_txn.iter().cloned().collect();
             schema.tables.retain(|table| !excluded.contains(&table.name));
+            stored_programs.retain(|p| p.table.as_ref().is_none_or(|t| !excluded.contains(t)));
             emit(json!({
                 "event": "phase",
                 "request_id": request.request_id,
@@ -1425,12 +1458,19 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
                     .to_string(),
             );
         }
+        let (programs_after, reasons_after) = crate::mysql_programs::collect_mysql_stored_programs(&endpoint, &schema, full_export)?;
+        let scoped_reasons = program_reasons.iter().filter(|(id, _)| (full_export && (id.starts_with("routine:") || id.starts_with("event:"))) || schema.tables.iter().any(|t| id.starts_with(&format!("trigger:{}:", t.name))))
+            .map(|(id, code)| (id.clone(), code.clone())).collect::<BTreeMap<_, _>>();
+        if programs_after != stored_programs || reasons_after != scoped_reasons {
+            return Err("stored programs changed during export; retry".into());
+        }
     }
 
     let (manifest, views_count) = finalize_dump_manifest(
         &endpoint,
         schema,
         table_manifests,
+        stored_programs,
         &options,
         resolved_mode.map_or("", MysqlSnapshotMode::policy_label),
         output_path,
@@ -1457,6 +1497,9 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         "manifest_warnings": manifest.manifest_warnings,
         "tables": manifest.tables.len(),
         "views": views_count,
+        "triggers": manifest.stored_programs.iter().filter(|p| p.kind=="TRIGGER").count(),
+        "routines": manifest.stored_programs.iter().filter(|p| matches!(p.kind.as_str(),"PROCEDURE" | "FUNCTION")).count(),
+        "events": manifest.stored_programs.iter().filter(|p| p.kind=="EVENT").count(),
         "rows_dumped": total_rows,
         "chunks_dumped": total_chunks,
         "manifest": "_tunnelforge_dump.json"
@@ -2522,6 +2565,17 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_export_refuses_definitions_its_import_cannot_recreate() {
+        let mut schema = crate::adapters::test_support::schema();
+        assert!(mysql_dump_ddl_refusal(&schema).is_none());
+        schema.tables[0].columns[0].on_update = Some("CURRENT_TIMESTAMP INVISIBLE".into());
+        let refusal = mysql_dump_ddl_refusal(&schema).unwrap();
+        assert!(!refusal.bypassable);
+        assert_eq!(refusal.objects,["table_definition:users:DDL"]);
+        assert_eq!(refusal.reasons["table_definition:users:DDL"],"table_definition_unrestorable");
+    }
     
     
     
@@ -2761,6 +2815,7 @@ mod tests {
             created_unix_seconds: 1,
             views: Vec::new(),
             tables: Vec::new(),
+            stored_programs: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
         fs::write(dir.join("old_chunk.tsv"), b"old").unwrap();

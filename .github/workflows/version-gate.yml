@@ -101,6 +101,7 @@ jobs:
           --health-cmd="pg_isready -U postgres -d tf_test"
           --health-interval=10s --health-timeout=5s --health-retries=12
     env:
+      TF_LIVE_REQUIRED: "1"
       TF_MYSQL_HOST: 127.0.0.1
       TF_PROMOTE_MYSQL_HOST: 127.0.0.1
       TF_MYSQL_PORT: "3306"
@@ -134,6 +135,10 @@ jobs:
             --test live_keyset_pk_matrix \
             --test live_mysql_bit \
             --test live_mysql_spatial \
+            --test live_mysql_objects \
+            --test live_generated_columns \
+            --test live_mysql_triggers \
+            --test live_mysql_programs \
             --test live_cross_engine_types \
             --test live_dump_cross_engine \
             --test live_schema_fidelity \
@@ -171,6 +176,10 @@ jobs:
           cargo test --manifest-path migration_core/Cargo.toml \
             --test live_import_policy \
             --test live_real_schema \
+            --test live_mysql_objects \
+            --test live_generated_columns \
+            --test live_mysql_triggers \
+            --test live_mysql_programs \
             -- --include-ignored --test-threads=1
 
       - name: Remove MySQL 8.0 server

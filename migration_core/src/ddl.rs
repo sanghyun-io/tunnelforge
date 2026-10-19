@@ -8,9 +8,9 @@ use crate::*;
 /// 그보다 긴 collation 문자열은 변조된 값으로 보고 fail-closed로 거부한다.
 const MYSQL_IDENTIFIER_MAX_LEN: usize = 64;
 
-/// 검증 대상 컬럼 타입 문자열의 최대 길이. 정상 타입 선언은 이보다 훨씬 짧으므로,
-/// 초과하는 값은 주입 시도로 보고 파싱 전에 fail-closed로 거부한다.
+/// Bound type text before parsing; ENUM/SET value lists need a larger limit.
 const MAX_COLUMN_TYPE_LEN: usize = 512;
+const MAX_ENUM_SET_TYPE_LEN: usize = 64 * 1024;
 
 fn schema_string_literal(engine: &str, value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('\'', "''");
@@ -122,6 +122,21 @@ pub(crate) fn validate_target_foreign_key_actions(table: &NormalizedTable, targe
     Ok(())
 }
 
+pub(crate) fn mysql_column_direction_refusals<'a>(table: &'a NormalizedTable, source: &str, target: &str) -> Vec<(&'a NormalizedColumn, &'static str, String)> {
+    table.columns.iter().filter_map(|column| {
+        if column.generated.is_some() && (source != "mysql" || target != "mysql") {
+            Some((column, "unsupported_generated_column", format!("cannot translate {source} generated column {}.{} to {target}; generated columns require MySQL -> MySQL", table.name, column.name)))
+        } else if column.invisible && (source != "mysql" || target != "mysql") {
+            Some((column, "unsupported_invisible_column", format!("cannot preserve INVISIBLE column {}.{} from {source} on {target}; invisible columns require MySQL -> MySQL", table.name, column.name)))
+        } else { None }
+    }).collect()
+}
+
+pub(crate) fn validate_mysql_column_direction(table: &NormalizedTable, source: &str, target: &str) -> Result<(), String> {
+    let reasons = mysql_column_direction_refusals(table, source, target).into_iter().map(|(_, _, reason)| reason).collect::<Vec<_>>();
+    if reasons.is_empty() { Ok(()) } else { Err(reasons.join("; ")) }
+}
+
 pub fn generate_schema_ddl(
     schema: &NormalizedSchema,
     source: &str,
@@ -134,6 +149,7 @@ pub fn generate_schema_ddl(
         .tables
         .iter()
         .map(|table| {
+            validate_mysql_column_direction(table, source, target)?;
             validate_target_foreign_key_actions(table, target)?;
             generate_table_ddl(table, source, target).ok_or_else(|| {
                 format!(
@@ -752,7 +768,7 @@ pub fn insert_rows_literal_sql_for_table(
     table: &NormalizedTable,
     rows: &[Value],
 ) -> String {
-    let column_names: Vec<&str> = table.columns.iter().map(|column| column.name.as_str()).collect();
+    let column_names: Vec<&str> = table.columns.iter().filter(|column| column.generated.is_none()).map(|column| column.name.as_str()).collect();
     let column_types: BTreeMap<&str, &str> = table
         .columns
         .iter()
@@ -1176,7 +1192,7 @@ pub fn inspect_columns_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
         "SELECT c.column_name, c.data_type, c.is_nullable, c.character_maximum_length, c.numeric_precision, c.numeric_scale, c.column_default, c.is_identity, pg_catalog.format_type(a.atttypid, a.atttypmod) FROM information_schema.columns c JOIN pg_catalog.pg_namespace n ON n.nspname=c.table_schema JOIN pg_catalog.pg_class t ON t.relnamespace=n.oid AND t.relname=c.table_name JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attname=c.column_name WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position"
     } else {
-        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra, COLUMN_COMMENT AS column_comment FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
+        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra, COLUMN_COMMENT AS column_comment, GENERATION_EXPRESSION FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
     }
 }
 
@@ -1290,6 +1306,7 @@ pub(crate) fn group_foreign_keys(rows: Vec<(String, String, String, String, Stri
 }
 
 pub(crate) fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Option<String> {
+    validate_mysql_column_direction(table,source,target).ok()?;
     validate_target_foreign_key_actions(table,target).ok()?;
     let (mut lines, primary_keys) = column_ddl_lines(table, source, target)?;
     if !primary_keys.is_empty() {
@@ -1344,7 +1361,17 @@ fn column_ddl_lines(
         if !is_safe_column_type(&mapped_type) {
             return None;
         }
-        let default_sql = if auto_increment {
+        let generated = column.generated.as_ref();
+        if let Some(generated) = generated {
+            if !is_safe_check_expression(&generated.expression) { return None; }
+        }
+        // MySQL places SRID after GENERATED ... STORED [NOT NULL], not in its type.
+        let (mapped_type, srid_sql) = if generated.is_some() && is_mysql_spatial_type(&mapped_type) {
+            if let Some(index) = mapped_type.to_ascii_lowercase().rfind(" srid ") {
+                (&mapped_type[..index], mapped_type[index..].to_ascii_uppercase())
+            } else { (mapped_type.as_str(), String::new()) }
+        } else { (mapped_type.as_str(), String::new()) };
+        let default_sql = if auto_increment || generated.is_some() {
             String::new()
         } else if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| value.trim().trim_matches(['(',')']).eq_ignore_ascii_case("uuid")) {
             if target != "mysql" { return None; }
@@ -1355,13 +1382,15 @@ fn column_ddl_lines(
                 .unwrap_or(false) { return None; }
             default_clause(target, column.default_value.as_deref(), &column.type_name)
         };
-        let on_update_sql = if let Some(value) = &column.on_update {
+        let on_update_sql = if generated.is_some() { String::new() } else if let Some(value) = &column.on_update {
             let value = value.to_ascii_uppercase();
             if target != "mysql" || !is_safe_temporal_default_expression(&value) { return None; }
             format!(" ON UPDATE {value}")
         } else { String::new() };
         let null_sql = if column.nullable { "" } else { " NOT NULL" };
-        let generation_sql = if auto_increment && target == "postgresql" {
+        let generation_sql = if let Some(generated) = generated {
+            format!(" GENERATED ALWAYS AS ({}) {}", generated.expression, if generated.stored { "STORED" } else { "VIRTUAL" })
+        } else if auto_increment && target == "postgresql" {
             table.auto_increment.map(|counter| format!(" GENERATED BY DEFAULT AS IDENTITY (START WITH {counter})")).unwrap_or_else(|| " GENERATED BY DEFAULT AS IDENTITY".to_string())
         } else if auto_increment && target == "mysql" {
             " AUTO_INCREMENT".to_string()
@@ -1370,14 +1399,16 @@ fn column_ddl_lines(
         };
         let comment_sql = if target == "mysql" { column.comment.as_ref().map(|comment| format!(" COMMENT {}",schema_string_literal(target,comment))).unwrap_or_default() } else { String::new() };
         lines.push(format!(
-            "  {} {}{}{}{}{}{}",
+            "  {} {}{}{}{}{}{}{}{}",
             quote_ident(target, &column.name),
             mapped_type,
             generation_sql,
             default_sql,
             on_update_sql,
             null_sql,
-            comment_sql
+            srid_sql,
+            comment_sql,
+            if column.invisible { " INVISIBLE" } else { "" }
         ));
         if column.primary_key {
             primary_keys.push(quote_ident(target, &column.name));
@@ -1654,7 +1685,7 @@ fn parse_modifier_word(s: &str, bytes: &[u8], i: usize) -> Option<usize> {
 fn is_safe_column_type(type_name: &str) -> bool {
     let mut s = type_name.trim();
     while let Some(base) = s.strip_suffix("[]") { s = base.trim_end(); }
-    if s.is_empty() || s.len() > MAX_COLUMN_TYPE_LEN {
+    if s.is_empty() || s.len() > MAX_ENUM_SET_TYPE_LEN {
         return false;
     }
     let bytes = s.as_bytes();
@@ -1663,6 +1694,9 @@ fn is_safe_column_type(type_name: &str) -> bool {
     let Some(mut i) = parse_base_ident(bytes, 0) else {
         return false;
     };
+
+    let enum_set=matches!(s[..i].to_ascii_lowercase().as_str(),"enum" | "set");
+    if !enum_set && s.len()>MAX_COLUMN_TYPE_LEN { return false; }
 
     // 2) 선택적 인자 그룹 '(' ... ')'
     if i < bytes.len() && bytes[i] == b'(' {
@@ -2176,6 +2210,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generated_spatial_srid_and_invisible_column_ddl() {
+        let table: NormalizedTable = serde_json::from_value(json!({"name":"t","columns":[
+            {"name":"g","type":"point srid 4326","nullable":false,"invisible":true,
+             "generated":{"expression":"st_srid(point(`lon`,`lat`),4326)","stored":true}}
+        ]})).unwrap();
+        let ddl=generate_table_ddl(&table,"mysql","mysql").unwrap();
+        assert!(ddl.contains("`g` point GENERATED ALWAYS AS (st_srid(point(`lon`,`lat`),4326)) STORED NOT NULL SRID 4326 INVISIBLE"),"{ddl}");
+        let mut plain=table.clone(); plain.columns[0].generated=None; plain.columns[0].type_name="int".into();
+        assert!(generate_table_ddl(&plain,"mysql","mysql").unwrap().contains("`g` int NOT NULL INVISIBLE"));
+        assert!(generate_table_ddl(&plain,"mysql","postgresql").is_none());
+        assert!(validate_mysql_column_direction(&plain,"mysql","postgresql").unwrap_err().contains("INVISIBLE column t.g"));
+        let serialized=serde_json::to_value(&plain).unwrap();
+        assert_eq!(serialized["columns"][0]["invisible"],true);
+        plain.columns[0].invisible=false;
+        assert!(serde_json::to_value(&plain).unwrap()["columns"][0].get("invisible").is_none());
+    }
+
+    #[test]
+    fn generated_column_ddl_and_insert_preserve_only_mysql_semantics() {
+        let mut table: NormalizedTable = serde_json::from_value(json!({"name":"t","columns":[
+            {"name":"a","type":"int"},
+            {"name":"g","type":"int auto_increment","nullable":false,"default":"3","on_update":"CURRENT_TIMESTAMP","generated":{"expression":"`a` + 1","stored":false},"comment":"generated"}
+        ]})).unwrap();
+        for stored in [false, true] {
+            table.columns[1].generated.as_mut().unwrap().stored = stored;
+            let ddl = generate_table_ddl(&table,"mysql","mysql").unwrap();
+            assert!(ddl.contains(&format!("`g` int GENERATED ALWAYS AS (`a` + 1) {} NOT NULL COMMENT", if stored { "STORED" } else { "VIRTUAL" })), "{ddl}");
+            assert!(!ddl.contains("DEFAULT") && !ddl.contains("ON UPDATE") && !ddl.contains("AUTO_INCREMENT"), "{ddl}");
+        }
+        let sql = insert_rows_literal_sql_for_table("mysql", &table, &[json!({"a":2,"g":999})]);
+        assert!(sql.contains("(`a`) VALUES (2)"), "{sql}");
+        assert!(generate_table_ddl(&table,"mysql","postgresql").is_none());
+        assert!(generate_table_ddl(&table,"postgresql","mysql").is_none());
+        assert!(validate_mysql_column_direction(&table,"postgresql","mysql").unwrap_err().contains("generated column t.g"));
+        assert!(validate_mysql_column_direction(&table,"mysql","postgresql").unwrap_err().contains("generated column t.g"));
+        table.columns[1].generated.as_mut().unwrap().expression = "1); DROP TABLE t; --".into();
+        assert!(generate_table_ddl(&table,"mysql","mysql").is_none());
+    }
+
+    #[test]
     fn check_expression_validation_preserves_one_expression_boundary() {
         for expression in ["`quantity` > 0", "((quantity > 0) and (quantity < 10))", "label <> 'semi;colon'", "length(label) <= 80", "label in ('a','b')", "`select` <> 0"] {
             assert!(is_safe_check_expression(expression), "{expression}");
@@ -2236,6 +2310,8 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
+                invisible: false,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2317,6 +2393,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -2358,6 +2436,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -2379,6 +2459,8 @@ mod tests {
                             comment: None,
                             default_is_expression: false,
                             on_update: None,
+                            generated: None,
+                            invisible: false,
                         },
                         NormalizedColumn {
                             name: "user_id".to_string(),
@@ -2390,6 +2472,8 @@ mod tests {
                             comment: None,
                             default_is_expression: false,
                             on_update: None,
+                            generated: None,
+                            invisible: false,
                         },
                     ],
                     indexes: vec![NormalizedIndex {
@@ -2443,6 +2527,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -2470,6 +2556,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     }],
                     indexes: vec![NormalizedIndex {
                         name: "ux_cr_industry_briefs_slug".to_string(),
@@ -2535,6 +2623,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
@@ -2583,6 +2673,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -2603,6 +2695,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -2659,6 +2753,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
@@ -2709,6 +2805,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
@@ -2751,6 +2849,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
@@ -2772,6 +2872,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     }],
                     indexes: vec![NormalizedIndex {
                         name: "idx_df_evaluation_results_audit_category_code".to_string(),
@@ -2818,6 +2920,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_login_attempts_user_id".to_string(),
@@ -2874,6 +2978,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -2896,6 +3002,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -2936,6 +3044,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "enabled".to_string(),
@@ -2947,6 +3057,8 @@ mod tests {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),
@@ -2970,6 +3082,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -3044,6 +3158,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 },
                 NormalizedColumn {
                     name: "payload".to_string(),
@@ -3055,6 +3171,8 @@ mod tests {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 },
             ],
             indexes: Vec::new(),
@@ -3152,6 +3270,8 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
+                invisible: false,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3172,6 +3292,8 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
+                invisible: false,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3291,6 +3413,19 @@ mod tests {
     }
 
     #[test]
+    fn long_enum_set_types_keep_structural_validation() {
+        let labels=(0..40).map(|i|format!("'선택항목_{i:03}_long_value'")).collect::<Vec<_>>().join(",");
+        for kind in ["enum","SET"] {
+            let valid=format!("{kind}({labels})");
+            assert!(valid.len()>512 && is_safe_column_type(&valid));
+            assert!(!is_safe_column_type(&format!("{valid} ENGINE=MyISAM")));
+            assert!(!is_safe_column_type(&format!("{kind}({labels},'unterminated)")));
+            assert!(!is_safe_column_type(&format!("{kind}('{}')","x".repeat(MAX_ENUM_SET_TYPE_LEN))));
+        }
+        assert!(!is_safe_column_type(&format!("varchar(10){}"," ".repeat(512)+"unsigned")));
+    }
+
+    #[test]
     fn is_safe_column_type_accepts_normal_types() {
         for ok in [
             "int",
@@ -3356,6 +3491,8 @@ mod tests {
             comment: None,
             default_is_expression: false,
             on_update: None,
+            generated: None,
+            invisible: false,
         });
         assert!(
             generate_table_ddl(&table, "mysql", "mysql").is_none(),
@@ -3378,6 +3515,8 @@ mod tests {
             comment: None,
             default_is_expression: false,
             on_update: None,
+            generated: None,
+            invisible: false,
         });
         assert!(
             generate_table_ddl(&table, "postgresql", "mysql").is_none(),
@@ -3433,6 +3572,8 @@ mod tests {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
+                invisible: false,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3713,6 +3854,8 @@ mod binary_keyset_tests {
             comment: None,
             default_is_expression: false,
             on_update: None,
+            generated: None,
+            invisible: false,
         }
     }
 

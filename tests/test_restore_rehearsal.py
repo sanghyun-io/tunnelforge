@@ -97,6 +97,25 @@ def records():
     return jh.make_history().list()
 
 
+def test_trigger_dump_refusal_reaches_scheduled_rehearsal_report(env, monkeypatch):
+    from src.exporters.rust_dump_exporter import RustDumpImporter, CORE_CODE_SENTENCES
+    run = env.build()
+    monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpImporter", RustDumpImporter)
+    env.facade.import_dump = MagicMock(return_value={
+        "success": False, "status": "failed_original_untouched", "error_code": "copy_refused",
+        "original_unchanged": True, "candidate_created": False,
+        "copy_blockers": [{"code": "dump_programs_unsupported_in_copy"}],
+    })
+    outcome = run.run(schedule(), env.backup, conn(port=3307))
+    assert outcome.ok is False
+    assert CORE_CODE_SENTENCES["dump_programs_unsupported_in_copy"] in outcome.message
+    assert "끄면" not in outcome.message and "끄세요" not in outcome.message
+    assert "Import로 가져오" not in outcome.message
+    report = json.loads(open(os.path.join(env.backup, REPORT_NAME), encoding="utf-8").read())
+    assert CORE_CODE_SENTENCES["dump_programs_unsupported_in_copy"] in json.dumps(report, ensure_ascii=False)
+    assert "Import로 가져오" not in json.dumps(report, ensure_ascii=False)
+
+
 # ------------------------------------------------------------------ target rules
 
 def test_production_unset_and_missing_targets_are_rejected_and_dev_staging_allowed():

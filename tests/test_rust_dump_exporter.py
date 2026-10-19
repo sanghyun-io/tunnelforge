@@ -9,6 +9,13 @@ from unittest.mock import patch, MagicMock
 class TestRustDumpChecker:
     """RustDumpChecker 클래스 테스트"""
 
+    def test_export_completion_reports_held_trigger_count(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+        facade = MagicMock()
+        facade.run_dump.return_value = {"success": True, "tables": 1, "rows_dumped": 2, "triggers": 3, "routines": 4, "events": 5}
+        ok, message = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).export_full_schema("app", str(tmp_path))
+        assert ok and "트리거 3개" in message and "루틴 4개" in message and "이벤트 5개" in message
+
     def test_export_surfaces_manifest_warnings(self, tmp_path):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
 
@@ -1044,15 +1051,16 @@ class TestRustDumpImporter:
         )
         return str(dump_dir)
 
+    @pytest.mark.parametrize("skip_triggers", [False, True])
     @pytest.mark.parametrize("import_mode", ["replace", "safe"])
-    def test_preview_payload_is_import_payload_without_mode(self, tmp_path, import_mode):
+    def test_preview_payload_is_import_payload_without_mode(self, tmp_path, import_mode, skip_triggers):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
 
         dump_dir = self._write_dump(tmp_path)
         facade = self._preview_facade(["dump.import", "dump.import_preview"])
         importer = RustDumpImporter(RustDumpConfig('localhost', 3306, 'root', 'password'), facade=facade)
         options = dict(target_schema="other", threads=4, timezone_sql="SET SESSION time_zone = '+09:00'",
-                       use_source_timezone=False)
+                       use_source_timezone=False, skip_triggers=skip_triggers)
 
         ok, message, preview = importer.preview_import(dump_dir, **options)
         importer.import_dump(dump_dir, import_mode=import_mode, **options)
@@ -1062,6 +1070,7 @@ class TestRustDumpImporter:
         assert "mode" not in facade.preview_payload
         assert facade.preview_payload == {key: value for key, value in facade.import_payload.items() if key != "mode"}
         assert facade.preview_payload["target"]["database"] == "other"
+        assert facade.import_payload.get("skip_triggers", False) is skip_triggers
 
     def test_preview_refused_without_core_capability(self, tmp_path):
         """A core built before the preview would not know the command; nothing is sent to it."""
@@ -1927,3 +1936,126 @@ def test_every_refusal_kind_the_core_reports_has_a_sentence():
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
     assert [line for line in lines if any(ord(char) in _HANGUL for char in line)] == []
+
+
+def test_generated_refusal_reason_has_plain_korean_and_english():
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+    from src.core import i18n
+    object_id = "generated_column:orders:total"
+    line = describe_export_refusal([object_id], {object_id: "generated_column_unproven"})[0]
+    assert line.startswith("테이블 orders:")
+    assert "계산 열 total의 식이" in line
+    assert "이모지" in line and "체크를 풀어" in line
+    assert "generated_column_unproven" not in line
+    i18n.set_language("en")
+    try:
+        english = describe_export_refusal([object_id], {object_id: "generated_column_unproven"})[0]
+        assert "Could not verify generated column total" in english
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("skipped", ["programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"])
+def test_import_reports_each_skipped_trigger_and_created_count(tmp_path, skipped):
+    from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter, CORE_CODE_SENTENCES
+    folder = tmp_path / "programs"
+    folder.mkdir()
+    (folder / "_tunnelforge_dump.json").write_text(json.dumps({"database": "app", "source_engine": "mysql", "tables": [{"name": "sample"}]}), encoding="utf-8")
+    facade = MagicMock()
+    facade.import_dump.return_value = {"success": True, "rows_imported": 1, "programs_imported": [{"name": "created"}],
+                                       skipped: ["trigger:sample:guard", "trigger:other:audit"]}
+    facade.import_dump.return_value["program_warnings"] = [
+        {"name":"guard", "code":"program_database_collation_changed", "source":"utf8mb4_bin", "target":"utf8mb4_0900_ai_ci"},
+        {"name":"guard", "code":1287, "message":"old syntax"},
+    ]
+    progress = []
+    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace", progress_callback=progress.append)
+    assert ok and "트리거 1개" in message
+    assert CORE_CODE_SENTENCES[skipped] in message and "sample.guard" in message and "other.audit" in message
+
+    assert "정렬 규칙" in message and "guard" in message and "utf8mb4_bin" in message
+    assert "1287" in message and "old syntax" in message
+    assert any("정렬 규칙" in line for line in progress)
+
+
+def test_trigger_refusal_reason_names_the_object_and_has_english_translation():
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+    object_id = "trigger:orders:guard"
+    line = describe_export_refusal([object_id], {object_id:"trigger_body_unproven"})[0]
+    assert "orders" in line and "guard" in line and "원본과 같은지" in line
+    assert "ACTION_STATEMENT" not in line and "SHOW CREATE" not in line
+    i18n.set_language("en")
+    try:
+        line = describe_export_refusal([object_id], {object_id:"trigger_body_unproven"})[0]
+        assert "guard" in line and "Could not match" in line
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+def test_named_core_code_formats_placeholder_and_actionable_trigger_guidance():
+    from src.exporters.rust_dump_exporter import describe_core_code, describe_core_failure
+    sentence = describe_core_code("generated_column_unproven", "total")
+    assert "total" in sentence and "{}" not in sentence
+    sentence = describe_core_failure("generated_column_unproven: total: cannot prove")
+    assert "total" in sentence and "{}" not in sentence
+    assert "트리거 없이 테이블만 가져오기" in describe_core_code("trigger_binlog_privilege")
+    assert "삭제하거나 다른 이름으로 다시" in describe_core_code("trigger_name_conflict")
+    assert "utf8mb4" in describe_core_code("program_charset_unsupported", "guard")
+    assert "다시 만든 뒤" in describe_core_code("program_charset_unsupported", "guard")
+
+
+def test_unrestorable_table_export_refusal_uses_its_plain_reason():
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+    text = describe_export_refusal(["table_definition:sample:DDL"], {"table_definition:sample:DDL":"table_definition_unrestorable"})[0]
+    assert "테이블 sample" in text and "내보내지 않았습니다" in text
+
+
+def test_routine_refusal_uses_body_permission_reason_and_translation():
+    from src.exporters.rust_dump_exporter import describe_export_refusal
+    from src.core import i18n
+    line = describe_export_refusal(["routine:rebuild"], {"routine:rebuild": "routine_body_unreadable"})[0]
+    assert "rebuild" in line and "SHOW_ROUTINE" in line and "담지 않았습니다" in line
+    i18n.set_language("en")
+    try:
+        assert "SHOW_ROUTINE" in describe_export_refusal(["routine:rebuild"], {"routine:rebuild": "routine_body_unreadable"})[0]
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("recovered", [True, False])
+def test_partial_program_import_reports_recovery_and_returns_failure(tmp_path, recovered):
+    from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+    folder = tmp_path / "programs"
+    folder.mkdir()
+    (folder / "_tunnelforge_dump.json").write_text(json.dumps({"database": "app", "source_engine": "mysql", "tables": [{"name": "sample"}]}), encoding="utf-8")
+    facade = MagicMock()
+    facade.import_dump.return_value = {"success": False, "status": "partial", "data_imported": True, "rows_imported": 2,
+        "programs_imported": [{"kind": "PROCEDURE", "name": "ok"}], "programs_failed": [{"kind": "FUNCTION", "name": "failed_f", "previous_restored": recovered}]}
+    importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade)
+    ok, message, _ = importer.import_dump(str(folder), import_mode="replace")
+    assert importer.last_error_code == "PROGRAM_CREATE_FAILED"
+    assert not ok and "루틴 1개" in message and "failed_f" in message
+    assert ("이전 정의 복구 성공" if recovered else "이전 정의 복구 실패") in message
+
+
+@pytest.mark.parametrize("code", ["trigger_body_unproven", "program_charset_unsupported", "generated_column_unproven"])
+def test_nameless_code_sentences_drop_placeholder_and_korean_particle(code):
+    from src.exporters.rust_dump_exporter import describe_core_code, describe_core_failure
+    from src.core import i18n
+    text = describe_core_code(code)
+    assert "{}" not in text and " 의 " not in text and "  " not in text
+    assert describe_core_failure(f"failure (error_code={code})") == text
+    i18n.set_language("en")
+    try:
+        assert "{}" not in describe_core_code(code)
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("korean,english", [("루틴 복원 중: rebuild","Restoring routine: rebuild"),("이벤트 복원 중: nightly","Restoring event: nightly"),("트리거 {}개","{} triggers"),("루틴 {}개","{} routines"),("이벤트 {}개","{} events")])
+def test_program_progress_and_count_templates_translate_exactly(korean, english):
+    from src.core import i18n
+    i18n.set_language("en")
+    try: assert i18n.translate_text(korean)==english
+    finally: i18n.set_language(i18n.DEFAULT_LANGUAGE)

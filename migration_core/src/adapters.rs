@@ -117,6 +117,20 @@ pub struct NormalizedColumn {
     pub primary_key: bool,
     #[serde(default)]
     pub unique: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<NormalizedGenerated>,
+    /// MySQL 8.0.23+ column visibility. Omitted for legacy/visible columns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invisible: bool,
+}
+
+/// A proven MySQL generated column. `expression` is decoded SQL without the
+/// enclosing AS (...) parentheses (parentheses belonging to the expression stay).
+/// `stored`: true = STORED, false = VIRTUAL; supported only MySQL -> MySQL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedGenerated {
+    pub expression: String,
+    pub stored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,6 +278,43 @@ pub struct DumpManifest {
     pub tables: Vec<DumpTableManifest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<NormalizedView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stored_programs: Vec<NormalizedStoredProgram>,
+}
+
+/// Definition plus its creation context. For TRIGGER, `definition` is the exact
+/// ACTION_STATEMENT suffix cross-checked against SHOW CREATE. `kind` is TRIGGER, PROCEDURE, FUNCTION,
+/// or EVENT. TRIGGER uses `table`, positive `action_order`, `timing` (BEFORE/AFTER)
+/// and `event` (INSERT/UPDATE/DELETE). EVENT uses `time_zone` and `status`
+/// (ENABLED/DISABLED/SLAVESIDE_DISABLED). Other kinds leave those fields absent.
+/// Session fields apply to all kinds; `definer` is report-only, never replayed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedStoredProgram {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_order: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    pub definition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_set_client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation_connection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -787,6 +838,14 @@ pub(crate) fn mysql_conn_raw(endpoint: &Endpoint) -> Result<mysql::PooledConn, m
     mysql::Pool::new(mysql_opts(endpoint))?.get_conn()
 }
 
+/// A connection without CLIENT_MULTI_STATEMENTS: the server refuses `a; b` chains, so a
+/// trigger/routine/event body (which has `;` inside BEGIN..END) runs only as the one CREATE sent.
+pub fn mysql_single_statement_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
+    mysql::Pool::new(mysql_opts(endpoint).multi_statements(false))
+        .and_then(|pool| pool.get_conn())
+        .map_err(|err| mysql_conn_error(endpoint, &err))
+}
+
 pub(crate) fn mysql_conn_error(endpoint: &Endpoint, err: &mysql::Error) -> String {
     let suffix = tls_error_suffix(classify_mysql_error(endpoint, err));
     format!("mysql connection error: {err}{suffix}")
@@ -981,6 +1040,8 @@ pub(crate) mod test_support {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     },
                     NormalizedColumn {
                         name: "name".to_string(),
@@ -992,6 +1053,8 @@ pub(crate) mod test_support {
                         comment: None,
                         default_is_expression: false,
                         on_update: None,
+                        generated: None,
+                        invisible: false,
                     },
                 ],
                 indexes: Vec::new(),
@@ -1160,6 +1223,8 @@ pub(crate) mod test_support {
                 comment: None,
                 default_is_expression: false,
                 on_update: None,
+                generated: None,
+                invisible: false,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
@@ -1423,6 +1488,7 @@ mod tests {
                 name: "ref_vendor_codes_view".to_string(),
                 definition: "CREATE VIEW `ref_vendor_codes_view` AS select 1".to_string(),
             }],
+            stored_programs: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         assert!(json.contains("ref_vendor_codes_view"));
@@ -1449,6 +1515,7 @@ mod tests {
             created_unix_seconds: 1,
             tables: Vec::new(),
             views: Vec::new(),
+            stored_programs: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         // skip_serializing_if 로 빈 views는 직렬화되지 않아 기존 dump와 바이트 호환.

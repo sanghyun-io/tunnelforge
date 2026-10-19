@@ -104,6 +104,71 @@ def _imports(created):
     return [worker for worker in created if worker.task_type == "import"]
 
 
+def test_trigger_skip_toggle_is_shared_with_preview_and_never_persisted(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    preview = {**_NOTHING_OVERWRITTEN, "programs_skipped_toggle": ["trigger:sample:guard"],
+               "warnings": [{"code": "programs_skipped_toggle", "detail": "trigger:sample:guard"}]}
+    created = _fake_workers(monkeypatch, preview=preview)
+    shown = _fake_plan_dialog(monkeypatch, accept=True)
+    values = {}
+    config = MagicMock()
+    config.get_app_setting.side_effect = lambda key, default=None: values.get(key, default)
+    config.set_app_setting.side_effect = lambda key, value: values.__setitem__(key, value)
+    config.set_app_settings.side_effect = values.update
+    dialog = RustDumpImportDialog(config_manager=config, tunnel_config={"environment": "development"})
+    try:
+        assert not dialog.chk_skip_triggers.isChecked()
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump", stored_programs=[{"kind":"TRIGGER","name":"guard","table":"sample"}]))
+        dialog.chk_skip_triggers.setChecked(True)
+        assert "트리거 없이" in dialog._advanced_summary()
+        dialog.do_import()
+        assert shown[0]["plan"]["must_see"] is True
+        assert "sample.guard" in "\n".join(shown[0]["plan"]["warnings"])
+        assert all(worker.kwargs["skip_triggers"] is True for worker in created)
+    finally:
+        dialog.close()
+    fresh = RustDumpImportDialog(config_manager=config)
+    try:
+        assert not fresh.chk_skip_triggers.isChecked()
+    finally:
+        fresh.close()
+
+
+def test_failure_report_names_tables_whose_triggers_were_lost(monkeypatch):
+    from src.ui.dialogs.db_import_dialog import _replace_failure_details
+    assert "트리거를 다시 만들지 못한 테이블: second" in _replace_failure_details({"tables_lost_triggers": ["second"]})
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgresql"])
+def test_trigger_skip_toggle_applies_only_to_mysql_replace(monkeypatch, engine):
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    connector = MagicMock(host="localhost", port=3306, user="root", password="pw", engine=engine, database="app")
+    connector.get_schemas.return_value = []
+    dialog = RustDumpImportDialog(connector=connector)
+    try:
+        assert "기존 트리거도 삭제" in dialog.chk_skip_triggers.toolTip()
+        assert dialog.chk_skip_triggers.isEnabled() is (engine == "mysql")
+        if engine == "mysql":
+            dialog.chk_skip_triggers.setChecked(True)
+        dialog.chk_verify_copy.setChecked(True)
+        assert not dialog.chk_skip_triggers.isEnabled() and not dialog.chk_skip_triggers.isChecked()
+        dialog.chk_verify_copy.setChecked(False)
+        assert dialog.chk_skip_triggers.isEnabled() is (engine == "mysql")
+        assert not dialog.chk_skip_triggers.isChecked()
+    finally:
+        dialog.close()
+
+
+def test_failed_import_report_shows_program_warnings():
+    from src.ui.dialogs.db_import_dialog import _capture_import_audit, _replace_failure_details
+    audit = {}
+    _capture_import_audit(audit, {"event":"import_report", "program_warnings":[{"code":"program_database_collation_changed", "name":"guard", "source":"utf8mb4_bin", "target":"utf8mb4_0900_ai_ci"}]})
+    text = _replace_failure_details(audit)
+    assert "guard" in text and "정렬 규칙" in text and "utf8mb4_bin" in text
+
+
 @pytest.mark.parametrize("tunnel_config", [None, {"environment": "staging"}])
 def test_staging_shows_only_plan_dialog(monkeypatch, tmp_path, tunnel_config):
     """Staging and unclassified profiles get the one plan dialog, and no other prompt, before a run."""
@@ -1480,7 +1545,7 @@ def test_import_toggle_payloads(monkeypatch, tmp_path, setup, expected):
         dialog.do_import()
         preview, imported = created
         default = {"input_dir": str(tmp_path / "dump"), "import_mode": "replace", "target_schema": "app", "threads": 8,
-                   "timezone_sql": None, "use_source_timezone": True}
+                   "timezone_sql": None, "use_source_timezone": True, "skip_triggers": False}
         assert imported.kwargs == {**default, **expected}
         assert preview.kwargs == {key: value for key, value in imported.kwargs.items() if key != "import_mode"}
     finally:
@@ -2423,3 +2488,81 @@ def test_safe_restore_failure_names_the_copy_it_left(monkeypatch, tmp_path, name
         assert "MySqlError" not in text
     finally:
         dialog.close()
+
+
+@pytest.mark.parametrize("programs", [[], [{"kind":"PROCEDURE","name":"p"}], [{"kind":"TRIGGER","table":"users","name":"guard"}]])
+def test_skip_trigger_toggle_follows_dump_and_locks_during_preview(monkeypatch, tmp_path, programs):
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda:(True,"ok"))
+    created=_fake_workers(monkeypatch,hold_preview=True)
+    dialog=RustDumpImportDialog()
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path/"dump", stored_programs=programs))
+        applies=any(p["kind"]=="TRIGGER" for p in programs)
+        assert dialog.chk_skip_triggers.isEnabled() is applies
+        if applies: dialog.chk_skip_triggers.setChecked(True)
+        dialog.do_import()
+        assert created and not dialog.chk_skip_triggers.isEnabled()
+        dialog.set_ui_enabled(True)
+        assert dialog.chk_skip_triggers.isEnabled() is applies
+    finally:
+        for worker in created: worker.running=False
+        dialog.worker=None
+        dialog.close()
+
+
+def test_program_partial_has_warning_outcome_once_and_no_anonymous_report(monkeypatch):
+    from src.core.job_history import STATUS_PARTIAL
+    from src.ui.dialogs import job_recording
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda:(True,"ok"))
+    finish=MagicMock()
+    monkeypatch.setattr(job_recording,"job_finish",finish)
+    dialog=RustDumpImportDialog()
+    try:
+        dialog._accepted_program_preview={"warnings":[{"code":"routine_binlog_unsafe","names":["f"]}]}
+        dialog._job_id="job-partial"
+        dialog.last_import_mode="replace"
+        dialog.import_results={"users":{"status":"done"}}
+        dialog.import_audit={"status":"partial","data_imported":True,"program_warnings":[{"code":"routine_binlog_unsafe","name":"f"}]}
+        dialog._show_failure=MagicMock()
+        dialog._report_error_anonymously=MagicMock()
+        message="테이블 데이터는 가져왔지만 일부 객체를 복원하지 못했습니다.\nf: binlog warning"
+        dialog.on_finished(False,message)
+        assert "일부 완료" in dialog.label_status.text()
+        assert dialog._show_failure.call_args.args[1].count("binlog warning")==1
+        dialog._report_error_anonymously.assert_not_called()
+        assert finish.call_args.args[1]==STATUS_PARTIAL
+        assert any("binlog warning" in dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count()))
+    finally: dialog.close()
+
+
+@pytest.mark.parametrize("evidence", [
+    {"views_failed":[{"name":"v_orders","error":"missing function"}]},
+    {"programs_failed":[{"code":"program_create_failed","name":"p"}]},
+    {"programs_failed":[{"code":"program_finalize_failed","name":"e"}]},
+    {"program_warnings":[{"code":"routine_binlog_unsafe","name":"not_previewed"}]},
+    {},
+])
+def test_unexpected_partial_failures_still_send_anonymous_report(monkeypatch, evidence):
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda:(True,"ok"))
+    dialog=RustDumpImportDialog()
+    try:
+        dialog.last_import_mode="replace"
+        dialog.import_results={"users":{"status":"done"}}
+        dialog.import_audit={"status":"partial","data_imported":True,**evidence}
+        dialog._show_failure=MagicMock()
+        dialog._report_error_anonymously=MagicMock()
+        dialog.on_finished(False,"일부 객체 복원 실패")
+        assert "일부 완료" in dialog.label_status.text()
+        dialog._report_error_anonymously.assert_called_once()
+    finally: dialog.close()
+
+
+def test_view_failures_survive_import_audit_capture():
+    from src.ui.dialogs.db_import_dialog import _capture_import_audit
+    audit={}
+    failed=[{"name":"v_orders","error":"missing function"}]
+    _capture_import_audit(audit,{"event":"import_report","views_failed":failed})
+    assert audit["views_failed"]==failed

@@ -120,3 +120,10 @@ def test_dialog_report_passes_worker_error_code(module, cls, kind, phase):
     dialog_class._report_error_anonymously(dialog)
     base = {"operation_kind": kind, "db_engine": "mysql", "phase": phase}
     assert calls == [{**base, "error_code": "LOAD_FAILED:MYSQL-1822"}, base]
+
+
+@pytest.mark.parametrize("code", ["trigger_create_failed", "program_finalize_failed", "program_probe_failed", "program_source_schema_reference", "trigger_name_conflict", "trigger_binlog_privilege", "program_restore_unavailable"])
+def test_stored_program_failure_codes_are_privacy_allowlisted(code):
+    result = classify_error_code(None, code + ": private_schema.secret_object: private SQL")
+    assert result == code.upper() and is_classified_error_code(result)
+    assert "private" not in result.lower()

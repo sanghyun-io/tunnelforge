@@ -1,6 +1,6 @@
 # Vendored `mysql` 26.0.1
 
-Upstream crate (registry sources, `src/` + `Cargo.toml` + `build.rs`) plus two small
+Upstream crate (registry sources, `src/` + `Cargo.toml` + `build.rs`) plus three small
 TunnelForge patches. Every patched spot carries a `TunnelForge patch` comment
 (`grep -rn "TunnelForge patch" migration_core/vendor/mysql`). `migration_core/Cargo.toml` points
 `[patch.crates-io] mysql` at this directory.
@@ -26,4 +26,16 @@ TunnelForge patches. Every patched spot carries a `TunnelForge patch` comment
 - **Remove when:** upstream exposes the status flags (for example a public `Conn::status_flags()`),
   then call that instead.
 
-If both are gone, drop this directory and the `[patch.crates-io]` entry.
+## 3. Single-statement connections (TF-STATUS-203)
+
+- **What:** `OptsBuilder::multi_statements(bool)` / `Opts::get_multi_statements()` (default `true`,
+  upstream behaviour). With `false`, `get_client_flags` in `src/conn/mod.rs` leaves
+  `CLIENT_MULTI_STATEMENTS` out of the handshake; `CLIENT_MULTI_RESULTS` stays on.
+- **Why:** upstream always asks for `CLIENT_MULTI_STATEMENTS` and `additional_capabilities` cannot
+  remove it. Trigger/routine/event bodies from a dump contain `;` inside `BEGIN ... END`, so a
+  simple semicolon check cannot distinguish a body from a chained `; DROP TABLE ...`. Without the
+  flag the server rejects the whole chained query before executing either statement. The core uses
+  `adapters::mysql_single_statement_conn`; live test `live_mysql_objects` covers this boundary.
+- **Remove when:** upstream lets a connection turn `CLIENT_MULTI_STATEMENTS` off.
+
+If all three are gone, drop this directory and the `[patch.crates-io]` entry.

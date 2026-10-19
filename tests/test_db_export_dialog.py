@@ -1281,7 +1281,7 @@ def test_lossy_refusal_window_names_the_table_and_has_only_close(monkeypatch):
     assert "• 테이블 orders: 계산 열 total의 정의를 덤프에 담을 수 없습니다" in snapshot["text"]
     assert snapshot["text"].rstrip().endswith(
         "목록에서 이 테이블의 체크를 풀면 나머지 테이블은 내보낼 수 있습니다. "
-        "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."), "a full export says what unchecking costs"
+        "일부 테이블만 내보낼 때는 테이블과 그 트리거만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."), "a full export says what unchecking costs"
     assert "그 밖에" not in snapshot["text"]
     assert "generated_column" not in snapshot["text"]
     assert set(snapshot["buttons"]) == {"export_refusal_close", "export_refusal_details"}
@@ -1576,7 +1576,7 @@ def test_export_sends_exact_checked_list(monkeypatch, tmp_path):
     try:
         _uncheck(dialog, "items", "logs")
         assert not dialog.lbl_partial_note.isHidden()
-        assert dialog.lbl_partial_note.text() == "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
+        assert dialog.lbl_partial_note.text() == "일부 테이블만 내보낼 때는 테이블과 그 트리거만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
         dialog.do_export()
         (worker,) = _CapturingWorker.created
         assert worker.task_type == "export_tables"
@@ -1857,4 +1857,48 @@ def test_advanced_toggles_are_locked_while_running(monkeypatch, tmp_path):
         assert not dialog.advanced_panel.isEnabled() and not dialog.table_group.isEnabled()
         assert not dialog.btn_export.isEnabled()
     finally:
+        dialog.close()
+
+
+def test_generated_refusal_reason_reaches_finished_dialog_and_saved_log(monkeypatch):
+    from src.core import i18n
+    for language in ["ko", "en"]:
+        i18n.set_language(language)
+        dialog = _dialog(monkeypatch)
+        dialog.worker = _finished_worker(refusal={
+            "objects": ["generated_column:orders:total"], "bypassable": False,
+            "reasons": {"generated_column:orders:total": "generated_column_unproven"},
+        })
+        try:
+            dialog.on_finished(False, "dump.run refused")
+            boxes = dialog.findChildren(QMessageBox)
+            assert len(boxes) == 1
+            text = boxes[0].text()
+            expected = "계산 열 total의 식이" if language == "ko" else "generated column total"
+            assert expected in text and ("이모지" in text if language == "ko" else "emoji" in text)
+            assert "orders" in text and "generated_column_unproven" not in text
+            saved = next(entry for entry in dialog.log_entries if ("이모지" in entry if language == "ko" else "emoji" in entry))
+            assert expected in saved
+            boxes[0].close()
+        finally:
+            dialog.worker = None
+            dialog.close()
+            i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgresql"])
+def test_incomplete_tooltip_describes_only_the_selected_engine(monkeypatch, tmp_path, engine):
+    from src.core import i18n
+    dialog = _toggles_dialog(monkeypatch, tmp_path, engine=engine)
+    try:
+        text = dialog.chk_allow_incomplete.toolTip()
+        if engine == "mysql":
+            assert "MyISAM, MEMORY" in text and "원본 정의를 확인하지 못한" in text
+        else:
+            assert "구체화 뷰" in text and "InnoDB" not in text and "MyISAM" not in text
+        i18n.set_language("en")
+        english = i18n.translate_text(text)
+        assert not any("가" <= c <= "힣" for c in english)
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
         dialog.close()

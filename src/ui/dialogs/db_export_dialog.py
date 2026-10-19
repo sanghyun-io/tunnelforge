@@ -48,8 +48,10 @@ _INCOMPLETE_EXPORT_WARNING = (
     "일부 객체를 빼고 내보냈습니다(불완전 Export). 나머지 테이블의 구조와 데이터는 모두 담았습니다. "
     "빠진 객체는 실행 로그의 'Export 경고' 줄에서 볼 수 있습니다."
 )
+_INCOMPLETE_EXPORT_TOOLTIP_MYSQL = "원본 정의를 확인하지 못한 트리거·루틴·이벤트와 InnoDB가 아닌 테이블(MyISAM, MEMORY 등)을 묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다."
+_INCOMPLETE_EXPORT_TOOLTIP_POSTGRESQL = "트리거·함수·구체화 뷰처럼 덤프에 담을 수 없는 객체를 묻지 않고 빼고 내보냅니다. 결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 빼고 내보낼 수 없습니다."
 _INCOMPLETE_EXPORT_LIST_LIMIT = 10
-_PARTIAL_EXPORT_NOTE = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
+_PARTIAL_EXPORT_NOTE = "일부 테이블만 내보낼 때는 테이블과 그 트리거만 담습니다. 뷰·저장 프로시저·함수·이벤트는 빠집니다."
 _PARTIAL_EXPORT_NOTE_POSTGRESQL = "일부 테이블만 내보낼 때는 테이블만 담습니다. 뷰·저장 프로시저·함수는 빠집니다."
 _FK_AUTO_TOOLTIP = "체크한 테이블이 이 테이블을 참조해 자동으로 담았습니다. 참조하는 테이블의 체크를 풀면 다시 고를 수 있습니다."
 _FK_NOTICE_EXAMPLES = 3
@@ -562,10 +564,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         panel_layout.addWidget(self.chk_unsynchronized)
 
         self.chk_allow_incomplete = QCheckBox("담을 수 없는 객체는 빼고 내보내기")
-        self.chk_allow_incomplete.setToolTip("트리거·저장 프로시저·예약 이벤트처럼 덤프에 담을 수 없는 것과 InnoDB가 아닌 테이블(MyISAM 등)을 "
-                                             "묻지 않고 빼고 내보냅니다. InnoDB가 아닌 테이블은 구조와 데이터가 통째로 빠집니다. "
-                                             "결과는 완전한 백업이 아닙니다. 계산 열·CHECK 제약처럼 빼면 테이블 정의가 달라지는 것은 "
-                                             "빼고 내보낼 수 없습니다.")
+        self.chk_allow_incomplete.setToolTip(_INCOMPLETE_EXPORT_TOOLTIP_POSTGRESQL if self._engine() == "postgresql" else _INCOMPLETE_EXPORT_TOOLTIP_MYSQL)
         self.chk_allow_incomplete.toggled.connect(self._update_advanced_summary)
         panel_layout.addWidget(self.chk_allow_incomplete)
 
@@ -1261,7 +1260,9 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _refusal_lines(self, objects: List[str]) -> List[str]:
         """One plain sentence per refused object, up to the list limit plus a count of the rest."""
         limit = _INCOMPLETE_EXPORT_LIST_LIMIT
-        listed = [f"• {line}" for line in describe_export_refusal(objects[:limit])]
+        refusal = getattr(self.worker, "export_refusal", None)
+        reasons = refusal.get("reasons") if isinstance(refusal, dict) else None
+        listed = [f"• {line}" for line in describe_export_refusal(objects[:limit], reasons)]
         if len(objects) > limit:
             listed.append(translate_text("외 {}개").format(len(objects) - limit))
         return listed
@@ -1399,7 +1400,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             logger.info("Export refused by the core: %s", message)
             objects = list(refusal["objects"])
             message = " ".join([translate_text("담을 수 없는 객체가 있어 Export를 시작하지 않았습니다."),
-                                "; ".join(describe_export_refusal(objects[:_INCOMPLETE_EXPORT_LIST_LIMIT]))])
+                                "; ".join(describe_export_refusal(objects[:_INCOMPLETE_EXPORT_LIST_LIMIT], refusal.get("reasons")))])
             if len(objects) > _INCOMPLETE_EXPORT_LIST_LIMIT:
                 message += " " + translate_text("외 {}개").format(len(objects) - _INCOMPLETE_EXPORT_LIST_LIMIT)
         run = getattr(self.worker, "export_run", None)

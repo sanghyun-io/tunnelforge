@@ -5,6 +5,11 @@ use mysql::prelude::Queryable;
 use crate::*;
 use crate::query::skip_sql_comment;
 
+fn mysql_on_update(extra: &str) -> Option<String> {
+    let start = extra.to_ascii_lowercase().find("on update ")?;
+    extra[start + "on update ".len()..].split_whitespace().next().map(str::to_string)
+}
+
 pub(crate) fn normalized_schema_diff(source: &NormalizedSchema, target: &NormalizedSchema) -> Vec<Value> {
     let source_tables: BTreeMap<String, &NormalizedTable> = source
         .tables
@@ -273,10 +278,24 @@ fn inspect_generic<A: InspectAdapter>(
 
 struct MysqlInspectAdapter {
     conn: mysql::PooledConn,
+    generated: BTreeMap<String, (String, bool)>,
 }
 
 impl InspectAdapter for MysqlInspectAdapter {
     fn enrich_table(&mut self, schema: &str, table: &mut NormalizedTable) -> Result<(), String> {
+        if !self.generated.is_empty() {
+            let create: Option<mysql::Row> = self.conn.query_first(format!(
+                "SHOW CREATE TABLE {}.{}", quote_ident("mysql", schema), quote_ident("mysql", &table.name)
+            )).map_err(|err| format!("mysql generated column inspect error: {err}"))?;
+            let definition = create.and_then(|row| row.get::<String, _>("Create Table"));
+            for column in &mut table.columns {
+                if let (Some((raw, stored)), Some(create)) = (self.generated.get(&column.name), definition.as_deref()) {
+                    column.generated = mysql_generation_expression(raw, &column.name, create, *stored)
+                        .map(|expression| NormalizedGenerated { expression, stored: *stored });
+                }
+            }
+            self.generated.clear();
+        }
         let options: Option<(Option<u64>, String)> = self.conn.exec_first(
             "SELECT AUTO_INCREMENT,TABLE_COMMENT FROM information_schema.tables WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", (schema,&table.name)
         ).map_err(|err| format!("mysql table options inspect error: {err}"))?;
@@ -338,6 +357,7 @@ impl InspectAdapter for MysqlInspectAdapter {
                     default_value,
                     extra,
                     column_comment,
+                    generation_expression,
                 ): (
                     String,
                     String,
@@ -347,11 +367,14 @@ impl InspectAdapter for MysqlInspectAdapter {
                     Option<String>,
                     String,
                     String,
+                    String,
                 )| {
+                    if extra.contains("VIRTUAL GENERATED") || extra.contains("STORED GENERATED") {
+                        self.generated.insert(name.clone(), (generation_expression, extra.contains("STORED GENERATED")));
+                    }
                     let type_name =
                         mysql_type_with_character_options(&type_name, character_set, collation);
-                    let on_update = extra.to_ascii_lowercase().find("on update ")
-                        .map(|start| extra[start + "on update ".len()..].trim().to_string());
+                    let on_update = mysql_on_update(&extra);
                     // MySQL exposes literal strings without SQL quotes. Preserve empty
                     // strings, the word null, and function-looking text as literals.
                     let default_value = default_value.map(|value| {
@@ -374,6 +397,8 @@ impl InspectAdapter for MysqlInspectAdapter {
                         comment: if column_comment.is_empty() { None } else { Some(column_comment) },
                         default_is_expression: extra.contains("DEFAULT_GENERATED"),
                         on_update,
+                        generated: None,
+                        invisible: extra.split_whitespace().any(|word| word == "INVISIBLE"),
                     }
                 },
             )
@@ -434,7 +459,7 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     // 24-hour information_schema statistics cache.
     conn.query_drop("SET SESSION information_schema_stats_expiry=0")
         .map_err(|err| format!("mysql fresh metadata session error: {err}"))?;
-    let mut adapter = MysqlInspectAdapter { conn };
+    let mut adapter = MysqlInspectAdapter { conn, generated: BTreeMap::new() };
     inspect_generic(&mut adapter, &schema_name)
 }
 
@@ -536,6 +561,41 @@ pub(crate) fn mysql_check_clause(raw: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Match only this column's SHOW CREATE line; another column cannot prove it.
+/// I_S may include parentheses belonging to the expression. Do not strip those:
+/// SHOW CREATE adds one further AS (...) pair on both MySQL 8.0 and 8.4.
+pub(crate) fn mysql_generation_expression(raw: &str, column: &str, create: &str, stored: bool) -> Option<String> {
+    let prefix = format!("{} ", quote_ident("mysql", column));
+    let line = create.lines().find(|line| line.trim_start().starts_with(&prefix))?;
+    // Locate the first clause outside identifiers/literals, never a COMMENT or ENUM value.
+    let bytes = line.as_bytes();
+    let marker = b" GENERATED ALWAYS AS (";
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let quote = bytes[i];
+            i += 1;
+            loop {
+                let byte = *bytes.get(i)?;
+                i += 1;
+                if byte == b'\\' && quote != b'`' { i += 1; }
+                else if byte == quote {
+                    if bytes.get(i) == Some(&quote) { i += 1; } else { break; }
+                }
+            }
+        } else if bytes[i..].starts_with(marker) { break; }
+        else { i += 1; }
+    }
+    let clause = line.get(i..)?;
+    let storage = if stored { "STORED" } else { "VIRTUAL" };
+    [Some(raw.to_string()), mysql_check_clause(raw)].into_iter().flatten()
+        .find(|expression| {
+            let expected = format!(" GENERATED ALWAYS AS ({expression}) {storage}");
+            is_safe_check_expression(expression) && clause.strip_prefix(&expected)
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', ',']))
+        })
+}
+
 fn inspect_mysql_deprecated_engines_sql() -> &'static str {
     "SELECT TABLE_NAME, ENGINE FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' AND ENGINE IN ('MyISAM') ORDER BY TABLE_NAME"
 }
@@ -590,6 +650,8 @@ impl InspectAdapter for PostgresInspectAdapter {
                     comment: None,
                     default_is_expression: false,
                     on_update: None,
+                    generated: None,
+                    invisible: false,
                 }
             })
             .collect())
@@ -1058,10 +1120,11 @@ pub(crate) fn mysql_definition_has_residual_definer(sql: &str) -> bool {
 
 /// View 정의가 단일 `CREATE [OR REPLACE] VIEW ...` 문인지 가볍게 검증한다.
 ///
-/// 주목적은 PostgreSQL `batch_execute` 경로다 — 이 드라이버는 세미콜론으로 구분된
-/// multi-statement를 모두 실행하므로, 변조된 manifest가 `CREATE VIEW x AS ...; DROP TABLE y; GRANT ...`
-/// 같은 SQL 체인을 심으면 그대로 실행된다. MySQL `query_drop`은 기본적으로 multi-statement를
-/// 거부하지만, 일관성과 방어를 위해 양쪽 엔진 모두에 동일한 shape 검증을 적용한다.
+/// PostgreSQL `batch_execute`도, MySQL `query_drop`도 세미콜론으로 구분된 multi-statement를
+/// 모두 실행한다(vendored mysql 드라이버는 CLIENT_MULTI_STATEMENTS를 기본으로 켠다;
+/// 끄는 연결은 `mysql_single_statement_conn`뿐이다). 그래서 변조된 manifest가
+/// `CREATE VIEW x AS ...; DROP TABLE y; GRANT ...` 같은 SQL 체인을 심으면 그대로 실행되므로,
+/// 양쪽 엔진 모두에 동일한 shape 검증을 적용한다.
 ///
 /// 허용: 문자열 리터럴/식별자/주석 바깥의 세미콜론이 끝에만(또는 없음) 존재하고,
 /// 첫 유효 토큰이 `CREATE`인 경우. 그 외(추가 statement, CREATE 아닌 시작)는 거부한다.
@@ -1242,6 +1305,38 @@ pub(crate) fn validate_import_view_target(sql: &str, expected: &str, engine: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_update_extra_keeps_precision_and_excludes_visibility_flags() {
+        assert_eq!(mysql_on_update("DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3) INVISIBLE"), Some("CURRENT_TIMESTAMP(3)".into()));
+        assert_eq!(mysql_on_update("on update CURRENT_TIMESTAMP INVISIBLE"), Some("CURRENT_TIMESTAMP".into()));
+        assert_eq!(mysql_on_update("DEFAULT_GENERATED INVISIBLE"), None);
+    }
+
+    #[test]
+    fn generated_expression_ignores_comment_enum_and_checks_storage() {
+        let create = "CREATE TABLE `t` (\n  `g` int GENERATED ALWAYS AS (`a` + 2) STORED COMMENT ' GENERATED ALWAYS AS (`a` + 1) STORED',\n  `plain` int COMMENT ' GENERATED ALWAYS AS (`a` + 1) STORED',\n  `e` enum(' GENERATED ALWAYS AS (fake) STORED') GENERATED ALWAYS AS ('ok') VIRTUAL\n)";
+        assert_eq!(mysql_generation_expression("`a` + 1", "g", create, true),None);
+        assert_eq!(mysql_generation_expression("`a` + 1", "plain", create, true),None);
+        assert_eq!(mysql_generation_expression("`a` + 2", "g", create, false),None);
+        assert_eq!(mysql_generation_expression("`a` + 2", "g", create, true).as_deref(),Some("`a` + 2"));
+        assert_eq!(mysql_generation_expression("'ok'", "e", create, false).as_deref(),Some("'ok'"));
+    }
+
+    #[test]
+    fn generated_expression_requires_own_column_and_safe_decoded_sql() {
+        let create = "CREATE TABLE `t` (\n  `a` int,\n  `g` int GENERATED ALWAYS AS ((`a` + 1)) STORED,\n  `txt` text GENERATED ALWAYS AS (concat(`a`,_utf8mb4'한글')) VIRTUAL\n)";
+        assert_eq!(mysql_generation_expression("(`a` + 1)", "g", create, true).as_deref(), Some("(`a` + 1)"));
+        assert_eq!(mysql_generation_expression("(`a` + 1)", "a", create, true), None);
+        assert_eq!(mysql_generation_expression("`a` + 1", "g", create, true), None);
+        let decoded = "concat(`a`,_utf8mb4'한글')";
+        let escaped: String = decoded.bytes().map(char::from).collect();
+        assert_eq!(mysql_generation_expression(&escaped, "txt", create, false).as_deref(), Some(decoded));
+        for expression in ["`a`; DROP TABLE t", "@a", "`a` + 2"] {
+            assert_eq!(mysql_generation_expression(expression, "g", create, true), None);
+        }
+    }
+
     
     
     
