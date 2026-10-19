@@ -663,7 +663,6 @@ CORE_CODE_SENTENCES = {
     "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
     "program_probe_failed": "저장 프로그램을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "program_source_schema_reference": "저장 프로그램 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
-    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
     "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거·루틴·이벤트를 만들지 않습니다.",
     "programs_skipped_partial": "선택한 테이블에 딸린 객체만 가져오므로 나머지 객체는 만들지 않습니다.",
     "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
@@ -697,7 +696,6 @@ CORE_CODE_SENTENCES = {
     "copy_create_privilege_missing": "이 계정에 복사본과 백업을 둘 DB(PostgreSQL은 스키마)를 만들 권한이 없거나, 권한 목록으로 확인할 수 없습니다.",
     "metadata_visibility_unproven": "이 계정에 서버 전체를 조회하는 권한(SELECT, SHOW VIEW, PROCESS)이 없거나 확인할 수 없어, 대상에 이어진 것을 모두 확인할 수 없습니다.",
     "target_routines": "대상에 저장 프로시저나 함수가 있어, 교체 뒤에도 제대로 동작하는지 확인할 수 없습니다.",
-    "target_events": "대상에 예약 이벤트가 있어, 교체 뒤에도 제대로 동작하는지 확인할 수 없습니다.",
     "target_triggers": "대상 테이블에 트리거가 있어 교체할 수 없습니다.",
     "linked_target_only": "덤프에 없는 테이블이나 뷰가 외래 키나 뷰로 덤프 테이블과 이어져 있어, 그대로 둔 채 교체할 수 없습니다.",
     "saved_view_alias": "이전 교체에서 남긴 옛 뷰가 있습니다. 작업 목록에서 이전 Import 기록의 '복원 백업 관리'에서 먼저 정리하세요.",
@@ -1068,7 +1066,7 @@ class RustDumpImporter(_RustDumpClientBase):
 
             if import_mode == "safe":
                 candidate = restore_target_connection_info(result.get("candidate_target"))
-                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "candidate_created", "restore_id", "report_path", "plan_digest")}
+                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "candidate_created", "restore_id", "report_path", "plan_digest", "triggers_dropped", "programs", "programs_kept", "events_enabled", "programs_skipped_toggle")}
                 state.update(event="safe_restore_ready", candidate_target=candidate,
                              original_target=restore_target_connection_info(result.get("original_target")))
                 if raw_output_callback:
@@ -1081,9 +1079,6 @@ class RustDumpImporter(_RustDumpClientBase):
                     self.last_error_code = classify_error_code(result.get("error_code"), reason)
                     stops = describe_copy_blockers(result.get("copy_blockers"))
                     if stops:
-                        # Rehearsals have no interactive verify toggle.
-                        if not verify_only and any(item.get("code") == "dump_programs_unsupported_in_copy" for item in result.get("copy_blockers") or [] if isinstance(item, dict)):
-                            stops.append(translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."))
                         return False, "\n".join([describe_core_code("copy_refused"), *stops]), import_results
                     return False, "\n".join([reason, *(str(item) for item in result.get("blockers") or [])]), import_results
                 new_target = result.get("status") == "completed_new_target" and result.get("namespace_existed") is False and result.get("namespace_created") is True
@@ -1107,6 +1102,13 @@ class RustDumpImporter(_RustDumpClientBase):
                 message = f"복사본 {candidate_name}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다."
                 if new_target:
                     message = f"새 대상 {candidate_name}을 만들어 넣고 검증했습니다."
+                for key, sentence in (("programs_kept", "그대로 둘 루틴·이벤트: {}"),):
+                    if result.get(key):
+                        message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in result[key]))
+                programs = result.get("programs") or {}
+                for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 저장 프로그램: {}")):
+                    if programs.get(key):
+                        message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in programs[key]))
                 if result.get("status") == "ready_for_review":
                     message += " 교체 전에 따로 확인할 것이 있습니다."
                     for blocker in result.get("blockers") or []:

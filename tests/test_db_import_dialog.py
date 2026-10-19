@@ -141,7 +141,7 @@ def test_failure_report_names_tables_whose_triggers_were_lost(monkeypatch):
 
 
 @pytest.mark.parametrize("engine", ["mysql", "postgresql"])
-def test_trigger_skip_toggle_applies_only_to_mysql_replace(monkeypatch, engine):
+def test_trigger_skip_toggle_applies_to_mysql_replace_and_safe(monkeypatch, engine):
     app = QApplication.instance() or QApplication([])  # noqa: F841
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
     connector = MagicMock(host="localhost", port=3306, user="root", password="pw", engine=engine, database="app")
@@ -153,10 +153,11 @@ def test_trigger_skip_toggle_applies_only_to_mysql_replace(monkeypatch, engine):
         if engine == "mysql":
             dialog.chk_skip_triggers.setChecked(True)
         dialog.chk_verify_copy.setChecked(True)
-        assert not dialog.chk_skip_triggers.isEnabled() and not dialog.chk_skip_triggers.isChecked()
+        assert dialog.chk_skip_triggers.isEnabled() is (engine == "mysql")
+        assert dialog.chk_skip_triggers.isChecked() is (engine == "mysql")
         dialog.chk_verify_copy.setChecked(False)
         assert dialog.chk_skip_triggers.isEnabled() is (engine == "mysql")
-        assert not dialog.chk_skip_triggers.isChecked()
+        assert dialog.chk_skip_triggers.isChecked() is (engine == "mysql")
     finally:
         dialog.close()
 
@@ -2566,3 +2567,24 @@ def test_view_failures_survive_import_audit_capture():
     failed=[{"name":"v_orders","error":"missing function"}]
     _capture_import_audit(audit,{"event":"import_report","views_failed":failed})
     assert audit["views_failed"]==failed
+
+
+@pytest.mark.parametrize("status", ["promoted_incomplete", "failed_original_triggers_missing"])
+def test_program_restore_failures_are_known_incomplete_states(monkeypatch, status):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.finish_promotion_job", lambda *args: None)
+    dialog = RustDumpImportDialog()
+    dialog._promotion_action = "confirm"
+    dialog._show_failure = MagicMock()
+    try:
+        dialog._on_promotion_finished(False, "program restore failed", {
+            "status": status, "original_unchanged": False, "missing_programs": ["trigger:sample:guard"]})
+        assert dialog.import_success is False
+        assert dialog.import_audit["restore_status"] == status
+        assert dialog.import_audit["original_unchanged"] is False
+        assert "프로그램" in dialog._show_failure.call_args.args[0]
+        assert "sample.guard" in dialog._show_failure.call_args.args[1]
+        assert "확인하지 못했습니다" not in dialog.label_status.text()
+    finally:
+        dialog.close()

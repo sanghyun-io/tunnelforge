@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 type Db = mysql::PooledConn;
+type ProgramName = (String, String, Option<String>);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct NativeTable {
     name: String,
@@ -57,6 +58,8 @@ pub(crate) struct PromotionPlan {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     original_programs: Vec<NormalizedStoredProgram>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    original_program_inventory: Vec<ProgramName>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     promoted_programs: Vec<NormalizedStoredProgram>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -591,6 +594,42 @@ fn prevalidate_final_views(conn: &mut Db, plan: &PromotionPlan) -> Result<(), St
     Ok(())
 }
 
+fn program_inventory(conn: &mut Db, database: &str) -> Result<Vec<ProgramName>, String> {
+    let mut names = crate::mysql_programs::target_trigger_names(conn, database)?.into_iter()
+        .map(|(table,name)| ("TRIGGER".into(),name,Some(table))).collect::<Vec<_>>();
+    names.extend(crate::mysql_schema_programs::target_schema_programs(conn, database)?.into_iter()
+        .map(|(kind,name,_,_)| (kind,name,None)));
+    names.sort();
+    reset_session(conn)?;
+    Ok(names)
+}
+
+fn capture_affected_programs(conn: &mut Db, database: &str, affected_tables: &BTreeSet<String>, schema_programs: &[NormalizedStoredProgram]) -> Result<Vec<NormalizedStoredProgram>, String> {
+    let schema = NormalizedSchema { tables: affected_tables.iter()
+        .map(|name| serde_json::from_value(json!({"name":name,"columns":[]})).unwrap()).collect() };
+    let (mut programs, reasons) = crate::mysql_programs::collect_trigger_programs(conn, database, &schema, false)?;
+    if !reasons.is_empty() { return Err(format!("stored program definitions cannot be saved: {reasons:?}")) }
+    for (kind,name,_,_) in crate::mysql_schema_programs::target_schema_programs(conn, database)? {
+        if !schema_programs.iter().any(|p| p.kind == kind && p.name.eq_ignore_ascii_case(&name)) { continue }
+        let program = crate::mysql_schema_programs::read_schema_program(conn, database, &kind, &name)?;
+        crate::mysql_schema_programs::schema_program_sql(&program, &name, Some(database))?;
+        programs.push(program);
+    }
+    programs.sort_by(|a,b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
+    reset_session(conn)?;
+    Ok(programs)
+}
+
+fn final_program_inventory(plan: &PromotionPlan) -> Vec<ProgramName> {
+    let mut names = plan.original_program_inventory.iter().filter(|(kind,name,table)| {
+        if kind == "TRIGGER" { !table.as_ref().is_some_and(|t| plan.candidate_tables.contains_key(t)) }
+        else { !plan.promoted_programs.iter().any(|p| &p.kind == kind && p.name.eq_ignore_ascii_case(name)) }
+    }).cloned().collect::<Vec<_>>();
+    names.extend(plan.promoted_programs.iter().map(|p| (p.kind.clone(),p.name.clone(),p.table.clone())));
+    names.sort(); names
+}
+
+#[cfg(test)]
 fn capture_programs(conn: &mut Db, database: &str) -> Result<Vec<NormalizedStoredProgram>, String> {
     let schema = NormalizedSchema { tables: tables(conn, database)?.into_iter().filter(|(_, kind)| kind != "VIEW")
         .map(|(name, _)| serde_json::from_value(json!({"name":name,"columns":[]})).unwrap()).collect() };
@@ -633,12 +672,49 @@ fn program_matches(actual: &NormalizedStoredProgram, expected: &NormalizedStored
         == crate::mysql_schema_programs::schema_program_sql(expected, &expected.name, None).ok() }
 }
 
+fn matches_recorded_program(conn: &mut Db, database: &str, actual: &NormalizedStoredProgram, expected: &[NormalizedStoredProgram]) -> Result<bool, String> {
+    for p in expected.iter().filter(|p| same_program(actual, p)) {
+        if program_matches(actual, p) { return Ok(true) }
+        if p.kind == "EVENT" && p.status != actual.status {
+            crate::mysql_schema_programs::set_program_context(conn, p)?;
+            let state = crate::mysql_schema_programs::event_state(conn, database, &p.name);
+            reset_session(conn)?;
+            let (status, completed) = state?;
+            if crate::mysql_schema_programs::event_state_matches(&status, completed, p.status.as_deref().unwrap_or_default()) {
+                let mut p = p.clone(); p.status = actual.status.clone();
+                if program_matches(actual, &p) { return Ok(true) }
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn missing_programs(conn: &mut Db, database: &str, expected: &[NormalizedStoredProgram]) -> Result<Vec<String>, String> {
-    let actual = capture_programs(conn, database)?;
-    let mut missing = expected.iter().filter(|p| !actual.iter().any(|a| program_matches(a, p)))
-        .map(crate::mysql_programs::program_id).collect::<Vec<_>>();
+    let affected_tables = expected.iter().filter_map(|p| p.table.clone()).collect();
+    let actual = capture_affected_programs(conn, database, &affected_tables, expected)?;
+    let mut missing = Vec::new();
+    for p in expected {
+        let matched = match actual.iter().find(|a| same_program(a,p)) {
+            Some(a) => matches_recorded_program(conn, database, a, std::slice::from_ref(p))?,
+            None => false,
+        };
+        if !matched { missing.push(crate::mysql_programs::program_id(p)); }
+    }
     missing.extend(actual.iter().filter(|p| !expected.iter().any(|e| same_program(e, p)))
         .map(|p| format!("unexpected:{}", crate::mysql_programs::program_id(p))));
+    Ok(missing)
+}
+
+fn program_differences(conn: &mut Db, plan: &PromotionPlan, promoted: bool) -> Result<Vec<String>, String> {
+    let expected = if promoted { final_programs(plan) } else { plan.original_programs.clone() };
+    let mut missing = missing_programs(conn, &plan.original_database, &expected)?;
+    let wanted = if promoted { final_program_inventory(plan) } else { plan.original_program_inventory.clone() };
+    let actual = program_inventory(conn, &plan.original_database)?;
+    let id = |(kind,name,table): &ProgramName| if kind == "TRIGGER" { format!("trigger:{}:{name}",table.as_deref().unwrap_or_default()) }
+        else { format!("{}:{name}",if kind == "EVENT" { "event" } else { "routine" }) };
+    missing.extend(wanted.iter().filter(|name| !actual.contains(name)).map(id));
+    missing.extend(actual.iter().filter(|name| !wanted.contains(name)).map(|name|format!("unexpected:{}",id(name))));
+    missing.sort(); missing.dedup();
     Ok(missing)
 }
 
@@ -674,8 +750,9 @@ fn attach_triggers(conn: &mut Db, plan: &PromotionPlan, originals: bool, warning
     }
     reset_session(conn)?;
     // No writes after attachment: a trigger may reference a table outside the WRITE lock.
-    let expected = programs.into_iter().filter(|p| p.kind == "TRIGGER").collect::<Vec<_>>();
-    let actual = capture_programs(conn, &plan.original_database)?.into_iter().filter(|p| p.kind == "TRIGGER").collect::<Vec<_>>();
+    let expected = programs.into_iter().filter(|p| p.kind == "TRIGGER" && p.table.as_ref().is_some_and(|t| tables.contains(t))).collect::<Vec<_>>();
+    let affected = expected.iter().filter_map(|p| p.table.clone()).collect();
+    let actual = capture_affected_programs(conn, &plan.original_database, &affected, &[])?.into_iter().filter(|p| p.kind == "TRIGGER").collect::<Vec<_>>();
     if actual != expected && expected.iter().any(|p| !actual.iter().any(|a| program_matches(a,p))) {
         return Err("trigger definitions could not be verified after attachment".into());
     }
@@ -683,21 +760,20 @@ fn attach_triggers(conn: &mut Db, plan: &PromotionPlan, originals: bool, warning
 }
 
 fn classify_programs(conn: &mut Db, plan: &PromotionPlan, status: String) -> String {
+    if plan.original_programs.is_empty() && plan.promoted_programs.is_empty() && plan.original_program_inventory.is_empty() { return status }
     if status == "failed_original_unchanged" {
         let expected = moved_original_triggers(plan);
         if expected.is_empty() { return status }
-        return match capture_programs(conn, &plan.original_database) {
+        let affected = expected.iter().filter_map(|p| p.table.clone()).collect();
+        return match capture_affected_programs(conn, &plan.original_database, &affected, &[]) {
             Ok(actual) if expected.iter().all(|p| actual.iter().any(|a| program_matches(a, p))) => status,
             _ => "failed_original_triggers_missing".into(),
         }
     }
-    let (expected, incomplete) = match status.as_str() {
-        "promoted" => (final_programs(plan), "promoted_incomplete"),
-        _ => return status,
-    };
-    match missing_programs(conn, &plan.original_database, &expected) {
+    if status != "promoted" { return status }
+    match program_differences(conn, plan, true) {
         Ok(missing) if missing.is_empty() => status,
-        _ => incomplete.into(),
+        _ => "promoted_incomplete".into(),
     }
 }
 
@@ -867,8 +943,9 @@ pub(crate) fn plan(
             saved.insert(name.clone(), backup);
         }
     }
-    let original_programs = capture_programs(&mut conn, &original.database)?;
-    if !capture_programs(&mut conn, &candidate.database)?.is_empty() {
+    let original_program_inventory = program_inventory(&mut conn, &original.database)?;
+    let original_programs = capture_affected_programs(&mut conn, &original.database, &old.keys().cloned().collect(), programs)?;
+    if !program_inventory(&mut conn, &candidate.database)?.is_empty() {
         return Err("candidate must not contain stored programs".into());
     }
     let target_triggers = crate::mysql_programs::target_trigger_names(&mut conn, &original.database)?;
@@ -887,7 +964,7 @@ pub(crate) fn plan(
         server_uuid: conn.query_first("SELECT @@server_uuid").map_err(|e|e.to_string())?.ok_or("server UUID unavailable")?,
         backup_database: format!("tf_backup_{nonce}"), clone_database: format!("tf_promote_{nonce}"), nonce,
         original_tables: old, candidate_tables: new,
-        original_programs, promoted_programs: programs.to_vec(), original_trigger_definitions,
+        original_programs, original_program_inventory, promoted_programs: programs.to_vec(), original_trigger_definitions,
         original_fks: ofks.into_iter().filter(|f|closure.contains(&f.child)).collect(), candidate_fks: cfks,
         view_order: view_order(&replacement_views)?, original_views, replacement_views,
         hidden_views: hidden, saved_views: saved,
@@ -909,6 +986,18 @@ fn plan_digest(plan: &PromotionPlan) -> Result<String, String> {
     copy.digest.clear();
     hash(&copy)
 }
+fn program_summary(plan: &PromotionPlan) -> Value {
+    let ids = |programs: Vec<&NormalizedStoredProgram>| programs.into_iter().map(crate::mysql_programs::program_id).collect::<Vec<_>>();
+    let created = ids(plan.promoted_programs.iter().filter(|p| p.kind == "TRIGGER" || !plan.original_programs.iter().any(|old| same_program(old,p))).collect());
+    let replaced = ids(plan.promoted_programs.iter().filter(|p| p.kind != "TRIGGER" && plan.original_programs.iter().any(|old| same_program(old,p))).collect());
+    let kept = plan.original_program_inventory.iter().filter(|(kind,name,_)| kind != "TRIGGER" && !plan.promoted_programs.iter().any(|p| &p.kind == kind && p.name.eq_ignore_ascii_case(name)))
+        .map(|(kind,name,_)| format!("{}:{name}",if kind == "EVENT" {"event"} else {"routine"})).collect::<Vec<_>>();
+    let dropped = plan.original_programs.iter().filter(|p| p.kind == "TRIGGER" && p.table.as_ref().is_some_and(|t| plan.candidate_tables.contains_key(t))
+        && !plan.promoted_programs.iter().any(|new| same_program(new,p)))
+        .map(|p| json!({"table":p.table,"name":p.name})).collect::<Vec<_>>();
+    json!({"programs":{"create":created,"replace":replaced},"programs_kept":kept,"triggers_dropped":dropped})
+}
+
 pub(crate) fn summary(plan: &PromotionPlan) -> Value {
     let normalize = |table: &NativeTable, from: &str| {
         let locations = plan
@@ -1013,10 +1102,11 @@ fn assert_plan_binding(
 }
 fn verify_inventory(conn: &mut Db, plan: &PromotionPlan, check_data: bool) -> Result<(), String> {
     prove_metadata_visibility(conn)?;
-    if capture_programs(conn, &plan.original_database)? != plan.original_programs {
+    if program_inventory(conn, &plan.original_database)? != plan.original_program_inventory
+        || capture_affected_programs(conn, &plan.original_database, &plan.original_tables.keys().cloned().collect(), &plan.original_programs)? != plan.original_programs {
         return Err("original stored programs changed after confirmation".into());
     }
-    if !capture_programs(conn, &plan.candidate_database)?.is_empty() {
+    if !program_inventory(conn, &plan.candidate_database)?.is_empty() {
         return Err("candidate must not contain stored programs".into());
     }
     let uuid: Option<String> = conn
@@ -1384,6 +1474,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
     })?;
     let report_path = dump_import_report_path(&journal_dir)?.display().to_string();
     let mut state = json!({"success":false,"status":"preparing","restore_id":plan.restore_id,"plan_digest":plan.digest,"original_database":plan.original_database,"candidate_database":plan.candidate_database,"backup_database":plan.backup_database,"backup_namespace":plan.backup_database,"clone_database":plan.clone_database,"backup_views":plan.saved_views,"original_unchanged":true,"report_path":report_path,"phase":"validation","plan":plan,"warnings":plan.warnings,"automatic_rollback":false});
+    for (key, value) in program_summary(plan).as_object().unwrap() { state[key] = value.clone(); }
     write_dump_import_report(&journal_dir, &state)?;
     let mut conn = connect(original)?;
     let mut created_backup = false;
@@ -1392,6 +1483,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
     let mut locked = false;
     let mut triggers_detaching = false;
     let mut rename_attempted = false;
+    let mut rename_rejected = false;
     let mut rename_committed = false;
     let mut new_ids = BTreeMap::new();
     let cutover_session: u64 = conn
@@ -1583,8 +1675,10 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         write_dump_import_report(&journal_dir, &state)?;
         hook("before_rename", &mut conn)?;
         rename_attempted = true;
-        conn.query_drop(rename_sql(plan))
-            .map_err(|e| error("atomic rename", e))?;
+        if let Err(err) = conn.query_drop(rename_sql(plan)) {
+            rename_rejected = matches!(err, mysql::Error::MySqlError(_));
+            return Err(error("atomic rename", err));
+        }
         rename_committed = true;
         state["status"] = json!("promoted_incomplete");
         state["success"] = json!(false);
@@ -1619,8 +1713,10 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
                 write_dump_import_report(&journal_dir, &state)?;
             }
         }
-        let missing = missing_programs(&mut conn, &plan.original_database, &final_programs(plan))?;
-        if !missing.is_empty() { state["missing_programs"] = json!(missing); return Err("저장 프로그램 복원 결과를 확인하지 못했습니다.".into()) }
+        let missing = program_differences(&mut conn, plan, true)?;
+        if !missing.is_empty() {
+            state["missing_programs"] = json!(missing); return Err("저장 프로그램 복원 결과를 확인하지 못했습니다.".into())
+        }
         state["phase"] = json!("programs_replaced");
         state["status"] = json!("promoted");
         state["success"] = json!(true);
@@ -1628,8 +1724,9 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         hook("programs_replaced", &mut conn)?;
         Ok(())
     })();
-    if outcome.is_err() && triggers_detaching && !rename_committed && !moved_original_triggers(plan).is_empty() {
+    if outcome.is_err() && triggers_detaching && (!rename_attempted || rename_rejected) && !moved_original_triggers(plan).is_empty() {
         let restore = (|| -> Result<(), String> {
+            hook("before_original_trigger_recovery", &mut conn)?;
             drop_triggers(&mut conn, &plan.original_database, &moved_original_triggers(plan))?;
             attach_triggers(&mut conn, plan, true, &mut Vec::new())
         })();
@@ -1653,8 +1750,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
                 .unwrap_or_else(|| if plan.original_trigger_definitions.is_empty() { "failed_original_unchanged".into() } else { "failed_original_triggers_missing".into() })
         };
         if let Some(db) = cleanup.as_mut() {
-            let expected = if matches!(status.as_str(), "promoted" | "promoted_incomplete") { final_programs(plan) } else { plan.original_programs.clone() };
-            match missing_programs(db, &plan.original_database, &expected) {
+            match program_differences(db, plan, matches!(status.as_str(), "promoted" | "promoted_incomplete")) {
                 Ok(missing) => state["missing_programs"] = json!(missing),
                 Err(err) => state["program_verification_error"] = json!(err),
             }
@@ -1814,6 +1910,12 @@ pub(crate) fn inspect_backup(endpoint: &Endpoint, plan: &PromotionPlan, deep: bo
         optional_table_id(&mut conn, db, name)
     });
     let verdict = classify_programs(&mut conn, plan, verdict);
+    if matches!(verdict.as_str(), "promoted_incomplete" | "failed_original_triggers_missing") {
+        match program_differences(&mut conn, plan, verdict == "promoted_incomplete") {
+            Ok(missing) => result["missing_programs"] = json!(missing),
+            Err(err) => result["program_verification_error"] = json!(err),
+        }
+    }
     result["verdict"] = json!(match verdict.as_str() {
         "promoted" => "promoted",
         "promoted_incomplete" => "promoted_incomplete",
@@ -2022,14 +2124,22 @@ fn rollback_blockers(
         blockers.push("views now depend on tables in the original namespace".into());
     }
     let expected = final_programs(plan);
-    for actual in capture_programs(conn, original)? {
+    let scopes = expected.iter().chain(&plan.original_programs).cloned().collect::<Vec<_>>();
+    let affected = active_names(plan);
+    for actual in capture_affected_programs(conn, original, &affected, &scopes)? {
         let previous_pending = plan.promoted_programs.iter().any(|p| same_program(&actual, p))
-            && plan.original_programs.iter().any(|p| program_matches(&actual, p));
-        if !expected.iter().any(|p| program_matches(&actual, p)) && !previous_pending {
+            && matches_recorded_program(conn, original, &actual, &plan.original_programs)?;
+        if !matches_recorded_program(conn, original, &actual, &expected)? && !previous_pending {
             blockers.push(format!("저장 프로그램이 전환 뒤 바뀌었습니다: {}", crate::mysql_programs::program_id(&actual)));
         }
     }
-    if !capture_programs(conn, backup)?.is_empty() {
+    let wanted = final_program_inventory(plan);
+    let actual_names = program_inventory(conn, original)?;
+    if actual_names.iter().any(|name| !wanted.contains(name)) || wanted.iter().any(|name| !actual_names.contains(name)
+        && !scopes.iter().any(|p| (&p.kind,&p.name,&p.table) == (&name.0,&name.1,&name.2))) {
+        blockers.push("저장 프로그램 목록이 전환 뒤 바뀌었습니다.".into());
+    }
+    if !program_inventory(conn, backup)?.is_empty() {
         blockers.push("백업 데이터베이스에 예상하지 않은 저장 프로그램이 있습니다.".into());
     }
     if let Some(out) = rows_out {
@@ -2086,6 +2196,8 @@ pub(crate) fn rollback_apply(
     let mut locked = false;
     let mut created = false;
     let mut renamed = false;
+    let mut rename_attempted = false;
+    let mut rename_rejected = false;
     let outcome = (|| -> Result<(), String> {
         create_owned_database(&mut conn, displaced, original)?;
         created = true;
@@ -2130,7 +2242,11 @@ pub(crate) fn rollback_apply(
         state["phase"] = json!("rename_started");
         state["status"] = json!("rollback_unknown");
         write_dump_import_report(journal_dir, &state)?;
-        conn.query_drop(format!("RENAME TABLE {}", renames.join(", "))).map_err(|e| error("atomic recovery rename", e))?;
+        rename_attempted = true;
+        if let Err(err) = conn.query_drop(format!("RENAME TABLE {}", renames.join(", "))) {
+            rename_rejected = matches!(err, mysql::Error::MySqlError(_));
+            return Err(error("atomic recovery rename", err));
+        }
         renamed = true;
         state["phase"] = json!("tables_restored");
         write_dump_import_report(journal_dir, &state)?;
@@ -2156,7 +2272,7 @@ pub(crate) fn rollback_apply(
         write_dump_import_report(journal_dir, &state)?;
         Ok(())
     })();
-    if outcome.is_err() && !renamed {
+    if outcome.is_err() && (!rename_attempted || rename_rejected) {
         let restore = (|| -> Result<(), String> {
             let moved = final_programs(plan).into_iter().filter(|p| p.table.as_ref().is_some_and(|t| active.contains(t))).collect::<Vec<_>>();
             drop_triggers(&mut conn, original, &moved)?;
@@ -2177,7 +2293,7 @@ pub(crate) fn rollback_apply(
             let displaced_ok = new_ids_map.iter().all(|(n, id)| id_of(db, displaced, n) == Some(*id));
             let intact = new_ids_map.iter().all(|(n, id)| id_of(db, original, n) == Some(*id));
             if restored && displaced_ok {
-                if missing_programs(db, original, &plan.original_programs).is_ok_and(|missing| missing.is_empty()) { "rolled_back".to_string() }
+                if program_differences(db, plan, false).is_ok_and(|missing| missing.is_empty()) { "rolled_back".to_string() }
                 else { "rollback_incomplete".to_string() }
             } else if intact && !renamed && missing_programs(db, original, &final_programs(plan)).is_ok_and(|missing| missing.is_empty()) {
                 "failed_no_change".to_string()
@@ -2405,6 +2521,7 @@ mod tests {
     fn safe_promote_carries_original_and_dump_triggers_and_recovers_programs() {
         let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+        let before=capture_programs(&mut conn,&original.database).unwrap();
         let p=plan(&original,&candidate,"programs",&programs).unwrap();
         let result=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
         assert_eq!(result["status"],"promoted","{result:#}");
@@ -2416,7 +2533,7 @@ mod tests {
         assert_eq!(reviewed["blockers"],json!([]),"{reviewed:#}");
         let recovered=rollback_apply(&original,&p,result.get("backup_fingerprint"),result.get("new_table_ids"),&displaced,&recovery_dir).unwrap();
         assert_eq!(recovered["status"],"rolled_back","{recovered:#}");
-        assert_eq!(capture_programs(&mut conn,&original.database).unwrap(),p.original_programs);
+        assert_eq!(capture_programs(&mut conn,&original.database).unwrap(),before);
         conn.query_drop(format!("DROP DATABASE {}",q(&displaced))).unwrap();
         cleanup(&mut conn,&p,&dir);
     }
@@ -2426,10 +2543,11 @@ mod tests {
         let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for phase in ["before_rename","after_rename"] {
             let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+            let before=capture_programs(&mut conn,&original.database).unwrap();
             let p=plan(&original,&candidate,"failure_programs",&programs).unwrap();
             let result=promote_with_hook(&original,&candidate,&p,&p.digest,&dir,|at,_|if at==phase {Err("injected".into())} else {Ok(())}).unwrap();
             assert_eq!(result["status"],if phase=="before_rename" {"failed_original_unchanged"} else {"promoted_incomplete"},"{result:#}");
-            if phase=="before_rename" { assert_eq!(capture_programs(&mut conn,&original.database).unwrap(),p.original_programs); }
+            if phase=="before_rename" { assert_eq!(capture_programs(&mut conn,&original.database).unwrap(),before); }
             else {
                 assert_eq!(result["success"],false);
                 assert!(result["missing_programs"].as_array().unwrap().iter().any(|id|id=="trigger:parent:guard"));
@@ -2443,6 +2561,70 @@ mod tests {
             }
             cleanup(&mut conn,&p,&dir);
         }
+    }
+
+    #[test]
+    fn safe_promote_failed_original_trigger_recovery_keeps_saved_definitions() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+        let p=plan(&original,&candidate,"missing_original",&programs).unwrap();
+        let result=promote_with_hook(&original,&candidate,&p,&p.digest,&dir,|phase,_| {
+            if matches!(phase,"before_rename" | "before_original_trigger_recovery") { Err("injected".into()) } else { Ok(()) }
+        }).unwrap();
+        assert_eq!(result["status"],"failed_original_triggers_missing","{result:#}");
+        assert_eq!(result["original_unchanged"],false);
+        assert!(result["plan"]["original_trigger_definitions"]["guard"].as_str().unwrap().contains("SET NEW.note='old'"));
+        let inspected=inspect_backup(&original,&p,false,None).unwrap();
+        assert_eq!(inspected["verdict"],"failed_original_triggers_missing");
+        cleanup(&mut conn,&p,&dir);
+    }
+
+    #[test]
+    fn safe_promote_completed_preserved_event_is_still_a_complete_promotion() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((original,candidate,mut conn,dir,mut programs))=program_fixture() else { return };
+        let scheduler:String=conn.query_first("SELECT @@event_scheduler").unwrap().unwrap();
+        struct Scheduler { endpoint:Endpoint, previous:String }
+        impl Drop for Scheduler { fn drop(&mut self) { let _=connect(&self.endpoint).and_then(|mut db|db.query_drop(format!("SET GLOBAL event_scheduler={}",self.previous)).map_err(|e|e.to_string())); } }
+        let _scheduler=Scheduler{endpoint:original.clone(),previous:scheduler};
+        conn.query_drop("SET GLOBAL event_scheduler=ON").unwrap();
+        let event=programs.iter_mut().find(|p|p.name=="new_e").unwrap();
+        event.definition="CREATE EVENT `new_e` ON SCHEDULE AT '2000-01-01 00:00:00' ON COMPLETION PRESERVE ENABLE DO SET @tf_finished=1".into();
+        let p=plan(&original,&candidate,"completed_event",&programs).unwrap();
+        let result=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
+        assert_eq!(result["status"],"promoted","{result:#}");
+        for _ in 0..100 {
+            let (state,completed)=crate::mysql_schema_programs::event_state(&mut conn,&original.database,"new_e").unwrap();
+            if state=="DISABLED" && completed { break }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (state,completed)=crate::mysql_schema_programs::event_state(&mut conn,&original.database,"new_e").unwrap();
+        assert_eq!((state.as_str(),completed),("DISABLED",true));
+        let inspected=inspect_backup(&original,&p,false,result.get("backup_fingerprint")).unwrap();
+        assert_eq!(inspected["verdict"],"promoted","{inspected:#}");
+        cleanup(&mut conn,&p,&dir);
+    }
+
+    #[test]
+    fn safe_promote_preserves_target_only_programs_without_replaying_their_bodies() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+        conn.query_drop(format!("USE {}",q(&original.database))).unwrap();
+        conn.query_drop("CREATE PROCEDURE opaque() SELECT /*!80000 1+ */ 2").unwrap();
+        conn.query_drop("SET SESSION character_set_client=latin1, collation_connection=latin1_swedish_ci").unwrap();
+        conn.query_drop("CREATE TRIGGER opaque_guard BEFORE INSERT ON unrelated FOR EACH ROW SET NEW.id=NEW.id+LENGTH('é')").unwrap();
+        reset_session(&mut conn).unwrap();
+        let before:Option<mysql::Row>=conn.query_first(format!("SHOW CREATE TRIGGER {}",qualified(&original.database,"opaque_guard"))).unwrap();
+        let before:String=before.unwrap().get("SQL Original Statement").unwrap();
+        assert!(capture_programs(&mut conn,&original.database).is_err());
+        let p=plan(&original,&candidate,"opaque_kept",&programs).unwrap();
+        assert!(!p.original_programs.iter().any(|p|matches!(p.name.as_str(),"opaque" | "opaque_guard")));
+        let result=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
+        assert_eq!(result["status"],"promoted","{result:#}");
+        let after:Option<mysql::Row>=conn.query_first(format!("SHOW CREATE TRIGGER {}",qualified(&original.database,"opaque_guard"))).unwrap();
+        assert_eq!(after.unwrap().get::<String,_>("SQL Original Statement").unwrap(),before);
+        assert!(result["programs_kept"].as_array().unwrap().contains(&json!("routine:opaque")));
+        cleanup(&mut conn,&p,&dir);
     }
 
     #[test]
@@ -2461,7 +2643,7 @@ mod tests {
         let Some((original,candidate,mut conn,dir))=fixture() else { return };
         let p=plan(&original,&candidate,"old_journal",&[]).unwrap();
         let value=serde_json::to_value(&p).unwrap();
-        for field in ["original_programs","promoted_programs","original_trigger_definitions"] { assert!(value.get(field).is_none()); }
+        for field in ["original_programs","original_program_inventory","promoted_programs","original_trigger_definitions"] { assert!(value.get(field).is_none()); }
         let loaded:PromotionPlan=serde_json::from_value(value.clone()).unwrap();
         assert_eq!(plan_digest(&loaded).unwrap(),p.digest);
         assert_eq!(serde_json::to_value(loaded).unwrap(),value);

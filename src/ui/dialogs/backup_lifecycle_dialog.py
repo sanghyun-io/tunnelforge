@@ -19,6 +19,9 @@ JOURNAL_LABELS = {
     "pending": "결과 미기록",
     "preparing": "전환 준비 중",
     "promoted": "전환 완료",
+    "promoted_incomplete": "테이블 교체됨 · 저장 프로그램 복원 필요",
+    "failed_original_triggers_missing": "테이블 유지됨 · 원래 트리거 복구 필요",
+    "rollback_incomplete": "테이블 복구됨 · 저장 프로그램 복원 필요",
     "cutover_unknown": "전환 결과 불명",
     "failed_no_change": "실패 (변경 없음)",
     "failed_original_unchanged": "실패 (원본 그대로)",
@@ -35,6 +38,8 @@ OWNERSHIP_LABELS = {
 VERDICT_LABELS = {
     "promoted": "전환됨",
     "not_promoted": "전환 안 됨",
+    "promoted_incomplete": "테이블 교체됨 · 저장 프로그램 복원 필요",
+    "failed_original_triggers_missing": "원래 트리거 복구 필요",
     "undeterminable": "판정 불가",
     "none": "해당 없음",
 }

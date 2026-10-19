@@ -152,14 +152,21 @@ fn routine_and_event_source_qualifiers_refuse_before_changes_and_partial_import_
 }
 
 #[test]
-fn schema_programs_skip_on_postgres_and_safe_refuses_before_copy() {
-    let (Some(s),Some(mut pg))=(Sandbox::new(),endpoint("postgresql")) else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+fn schema_programs_skip_on_postgres_and_safe_defers_until_cutover() {
+    let (Some(mut s),Some(mut pg))=(Sandbox::new(),endpoint("postgresql")) else {return}; let mut db=conn(&s.endpoint); table(&mut db);
     db.query_drop("CREATE PROCEDURE p() SELECT 1; CREATE EVENT e ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1").unwrap(); s.dump();
     let schema=s.endpoint.database.clone(); pg.schema=Some(schema.clone());
     let mut admin=LiveAdapter::connect(&pg).unwrap(); admin.execute_sql(&format!("CREATE SCHEMA \"{schema}\"")).unwrap();
     let preview=success(events("dump.import_preview",s.payload(&pg))); assert_eq!(preview["programs_skipped_cross_engine"].as_array().unwrap().len(),2);
     let imported=success(events("dump.import",s.payload(&pg))); assert_eq!(imported["programs_skipped_cross_engine"].as_array().unwrap().len(),2);
-    let mut payload=s.payload(&s.endpoint); payload["mode"]=json!("safe"); let refused=outcome(events("dump.import",payload)); assert_eq!(refused["status"],"failed_original_untouched"); assert_eq!(refused["copy_blockers"][0]["code"],"dump_programs_unsupported_in_copy");
+    let mut payload=s.payload(&s.endpoint); payload["mode"]=json!("safe");
+    let restored=success(events("dump.import",payload)); assert_eq!(restored["status"],"ready_for_switch","{restored}");
+    let candidate=restored["candidate_target"]["database"].as_str().unwrap().to_string();
+    let mut target=s.endpoint.clone(); target.database=candidate.clone();
+    let mut copy=conn(&target);
+    assert_eq!(copy.query_first::<u64,_>("SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE()").unwrap(),Some(0));
+    assert_eq!(copy.query_first::<u64,_>("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE()").unwrap(),Some(0));
+    s.databases.push(candidate);
     admin.execute_sql(&format!("DROP SCHEMA \"{schema}\" CASCADE")).unwrap();
 }
 

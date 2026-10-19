@@ -277,13 +277,19 @@ fn seed_after_delete(db: &mut mysql::PooledConn) {
 }
 
 #[test]
-fn safe_rehearsal_refuses_before_copy_even_with_skip_toggle() {
-    let Some(s)=Sandbox::new() else { return }; let mut db=conn(&s.endpoint); seed(&mut db); s.dump("jsonl",Value::Null);
-    let mut payload=s.payload(); payload["mode"]=json!("safe"); payload["verify_only"]=json!(true); payload["skip_triggers"]=json!(true);
-    let output=events("dump.import",payload); let result=output.iter().find(|e|e["event"]=="result").unwrap();
-    assert_eq!(result["status"],"failed_original_untouched"); assert_eq!(result["candidate_created"],false);
-    assert!(result["copy_blockers"].as_array().unwrap().iter().any(|b|b["code"]=="dump_programs_unsupported_in_copy"),"{output:#?}");
-    assert_eq!(metadata(&mut db).len(),1);
+fn safe_rehearsal_verifies_program_dump_without_creating_programs() {
+    let Some(mut s)=Sandbox::new() else { return }; let mut db=conn(&s.endpoint); seed(&mut db); s.dump("jsonl",Value::Null);
+    for skip in [false,true] {
+        let mut payload=s.payload(); payload["mode"]=json!("safe"); payload["verify_only"]=json!(true); payload["skip_triggers"]=json!(skip);
+        let result=success(events("dump.import",payload));
+        assert_eq!(result["status"],"ready_for_switch"); assert_eq!(result["candidate_created"],true);
+        let candidate=result["candidate_target"]["database"].as_str().unwrap().to_string();
+        let mut target=s.endpoint.clone(); target.database=candidate.clone();
+        assert!(metadata(&mut conn(&target)).is_empty());
+        s.databases.push(candidate);
+        if skip { assert_eq!(result["programs_skipped_toggle"],json!(["trigger:sample:guard_delete"])); }
+        assert_eq!(metadata(&mut db).len(),1);
+    }
 }
 
 #[test]

@@ -260,3 +260,11 @@ def test_status_cells_are_translated_and_list_summary_survives_follow_up_request
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
         dialog.close()
+
+
+def test_program_failure_statuses_have_plain_korean_labels():
+    from src.ui.dialogs.backup_lifecycle_dialog import JOURNAL_LABELS, VERDICT_LABELS, status_label
+    for status in ("promoted_incomplete", "failed_original_triggers_missing"):
+        assert status not in status_label(JOURNAL_LABELS, status)
+        assert status not in status_label(VERDICT_LABELS, status)
+    assert "저장 프로그램" in status_label(JOURNAL_LABELS, "rollback_incomplete")

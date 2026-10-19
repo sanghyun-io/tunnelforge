@@ -206,12 +206,12 @@ fn event_status(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Resul
         .map_err(|e|e.to_string())?.ok_or_else(||"program_event_dropped: event is missing".into())
 }
 
-fn event_state(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Result<(String,bool),String> {
+pub(crate) fn event_state(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Result<(String,bool),String> {
     conn.exec_first("SELECT STATUS, COALESCE(ON_COMPLETION='PRESERVE' AND LAST_EXECUTED IS NOT NULL AND ((EVENT_TYPE='ONE TIME' AND EXECUTE_AT<=CURRENT_TIMESTAMP) OR (EVENT_TYPE='RECURRING' AND ENDS<=CURRENT_TIMESTAMP)),FALSE) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME=?",(schema,name))
         .map_err(|e|e.to_string())?.ok_or_else(||"program_event_dropped: event is missing".into())
 }
 
-fn event_state_matches(actual: &str, completed: bool, expected: &str) -> bool {
+pub(crate) fn event_state_matches(actual: &str, completed: bool, expected: &str) -> bool {
     actual==expected || (expected=="ENABLED" && actual=="DISABLED" && completed)
         || (matches!(actual,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED") && matches!(expected,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED"))
 }

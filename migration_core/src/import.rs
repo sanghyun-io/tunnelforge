@@ -415,7 +415,9 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     let timezone_sql = import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), &endpoint.engine)?;
     check_mysql_spatial_import(&manifest, &selected, &endpoint.engine)?;
     let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
-    let table_ddls = validate_import_metadata(&manifest, &selected, &endpoint.engine, &endpoint_schema(&endpoint), skip_triggers)?;
+    let metadata_schema = journal.safe_context.as_ref().and_then(|context| context["original_target"]["schema"].as_str())
+        .map(str::to_string).unwrap_or_else(|| endpoint_schema(&endpoint));
+    let table_ddls = validate_import_metadata(&manifest, &selected, &endpoint.engine, &metadata_schema, skip_triggers)?;
     let tables: Vec<DumpTableManifest> = manifest
         .tables
         .iter()
@@ -630,7 +632,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.phase = "dump_import_post_load".into();
             journal.checkpoint()?;
             complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
-            let table_programs = programs.iter().filter(|p| p.table.as_deref() == Some(table.name.as_str())).collect::<Vec<_>>();
+            let table_programs = programs.iter().filter(|p| !journal.safe_context.as_ref().is_some_and(|context| context["cutover_pending"] == true)
+                && p.table.as_deref() == Some(table.name.as_str())).collect::<Vec<_>>();
             if !table_programs.is_empty() {
                 journal.phase = "dump_import_triggers".into();
                 let mut conn = import_trigger_connection(&endpoint).map_err(|err| {
@@ -1435,7 +1438,7 @@ fn finalize_dump_import<F: FnMut(Value)>(
     // Table data is already committed. View failures produce a partial result,
     // without suggesting that the restored rows were rolled back.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
-    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,false,&request_id,&mut emit)?; }
+    if selected.is_empty() && target_engine=="mysql" && !journal.safe_context.as_ref().is_some_and(|context| context["cutover_pending"] == true) { import_schema_programs(endpoint,manifest,journal,false,&request_id,&mut emit)?; }
     let view_outcome = if selected.is_empty() && !manifest.views.is_empty() {
         import_views(
             adapter,
@@ -1447,7 +1450,7 @@ fn finalize_dump_import<F: FnMut(Value)>(
     } else {
         ViewImportOutcome::default()
     };
-    if selected.is_empty() && target_engine=="mysql" { import_schema_programs(endpoint,manifest,journal,true,&request_id,&mut emit)?; }
+    if selected.is_empty() && target_engine=="mysql" && !journal.safe_context.as_ref().is_some_and(|context| context["cutover_pending"] == true) { import_schema_programs(endpoint,manifest,journal,true,&request_id,&mut emit)?; }
     let import_complete = view_outcome.failed.is_empty() && journal.programs_failed.is_empty() && journal.routines_skipped.is_empty();
     let status = if import_complete { "completed" } else { "partial" };
     let message = if import_complete {

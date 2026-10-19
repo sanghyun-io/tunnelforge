@@ -239,8 +239,12 @@ fn target_refusals(verified: &VerifiedSafeRestorePlan) -> Result<Vec<Refusal>, S
     let manifest = read_dump_manifest(&verified.input_path)?;
     let mut admin = maintenance_connection(&verified.original)?;
     let own = format!("{}.", endpoint_schema(&verified.candidate));
-    Ok(target_copy_refusals(&mut admin, &verified.original, &manifest)?
-        .into_iter()
+    let skip_triggers = verified.report["skip_triggers"] == true;
+    let mut refusals = target_copy_refusals(&mut admin, &verified.original, &manifest, skip_triggers)?;
+    if let LiveAdapter::MySql(conn) = &mut admin {
+        refusals.extend(crate::import::safe_restore::program_copy_refusals(conn, &verified.original, &manifest, skip_triggers)?);
+    }
+    Ok(refusals.into_iter()
         .filter(|(_, object, _)| !object.as_deref().is_some_and(|object| object.starts_with(&own)))
         .collect())
 }
@@ -279,12 +283,14 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
                 "blockers":refusals.iter().map(|(_, _, text)| detail(text)).collect::<Vec<_>>(),
                 "copy_blockers":refusals.iter().map(|(code, table, text)| json!({"code":code,"table":table,"detail":detail(text)})).collect::<Vec<_>>()}));
         }
+        let mut programs = read_dump_manifest(&verified.input_path)?.stored_programs;
+        if verified.report["skip_triggers"] == true { programs.retain(|p| p.kind != "TRIGGER"); }
         let engine_plan = match verified.original.engine.as_str() {
             "mysql" => crate::safe_promote_mysql::plan(
                 &verified.original,
                 &verified.candidate,
                 &verified.restore_id,
-                &read_dump_manifest(&verified.input_path)?.stored_programs,
+                &programs,
             )
             .map(EnginePlan::MySql),
             "postgresql" => crate::safe_promote_postgres::plan(
@@ -319,6 +325,19 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
         let backup = engine_plan.backup_namespace().to_string();
         let mut summary = engine_plan.summary();
         if let EnginePlan::MySql(_) = &engine_plan {
+            let preview = crate::import::import_preview::preview(&Request {
+                command: "dump.import_preview".into(), request_id: request.request_id.clone(),
+                payload: json!({"input_dir":verified.input_path,"skip_triggers":verified.report["skip_triggers"] == true}),
+            }, &verified.original)?;
+            for key in ["triggers_dropped", "programs", "events_enabled"] {
+                if verified.report.get(key).is_some_and(|reviewed| reviewed != &preview[key]) {
+                    return Ok(json!({"success":true,"can_promote":false,"status":"blocked","original_unchanged":true,
+                        "blockers":["저장 프로그램 교체 계획이 처음 확인한 내용과 달라졌습니다. 다시 가져오기를 시작해 바뀐 내용을 확인하세요."]}));
+                }
+            }
+            for key in ["triggers_dropped", "programs", "programs_kept", "events_enabled", "programs_skipped_toggle", "warnings"] {
+                summary[key] = preview[key].clone();
+            }
             // The MySQL plan covers only the dump's tables; the restore listed the others it keeps.
             summary["target_only_tables_preserved"] = verified.report["target_only_tables"].clone();
         }
@@ -410,6 +429,9 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
             json!({"success":false,"status":"failed_original_unchanged",
             "original_unchanged":true,"message":redact_endpoint_secret(&error,&credentials)})
         });
+        for key in ["programs_skipped_toggle", "events_enabled"] {
+            if let Some(value) = verified.report.get(key) { result[key] = value.clone(); }
+        }
         if let Err(error) = finish_attempt(&directory, &result) {
             result["attempt_journal_warning"] = json!(error);
         }

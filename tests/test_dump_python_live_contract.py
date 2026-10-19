@@ -61,15 +61,24 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
         for namespace in [source_schema] + ([target_schema] if restore_mode != "safe_new" else []):
             facade.execute_query(endpoint, f'CREATE SCHEMA {quote}{namespace}{quote}')
         temporal_type = "timestamp" if engine == "postgresql" else "datetime(6)"
-        facade.execute_query(endpoint, f'CREATE TABLE {table(source_schema)} (id integer PRIMARY KEY, note text, amount numeric(20,4), stamp {temporal_type})')
+        generated = ", doubled INT GENERATED ALWAYS AS (id*2) STORED" if engine == "mysql" else ""
+        facade.execute_query(endpoint, f'CREATE TABLE {table(source_schema)} (id integer PRIMARY KEY, note text, amount numeric(20,4), stamp {temporal_type}{generated})')
         facade.execute_query(endpoint, f'CREATE VIEW {quote}{source_schema}{quote}.v_samples AS SELECT id, note FROM {table(source_schema)}')
         if restore_mode != "safe_new":
-            facade.execute_query(endpoint, f'CREATE TABLE {table(target_schema)} (id integer PRIMARY KEY, note text, amount numeric(20,4), stamp {temporal_type})')
-            facade.execute_query(endpoint, f"INSERT INTO {table(target_schema)} VALUES (999, 'original sentinel', 1.0000, NULL)")
+            facade.execute_query(endpoint, f'CREATE TABLE {table(target_schema)} (id integer PRIMARY KEY, note text, amount numeric(20,4), stamp {temporal_type}{generated})')
+            facade.execute_query(endpoint, f"INSERT INTO {table(target_schema)} (id,note,amount,stamp) VALUES (999, 'original sentinel', 1.0000, NULL)")
             facade.execute_query(endpoint, f'CREATE VIEW {quote}{target_schema}{quote}.v_samples AS SELECT id, note FROM {table(target_schema)}')
         for row in [(1, "한글🙂\tline\nend", "12345678901234.5678", "2026-09-28 12:34:56.123456"),
                     (2, "", "-0.0001", None), (3, None, None, None)]:
-            facade.execute_query(endpoint, f'INSERT INTO {table(source_schema)} VALUES (%s, %s, %s, %s)', row)
+            facade.execute_query(endpoint, f'INSERT INTO {table(source_schema)} (id,note,amount,stamp) VALUES (%s, %s, %s, %s)', row)
+        if engine == "mysql":
+            facade.execute_query(endpoint, f'CREATE TRIGGER `{source_schema}`.sample_guard BEFORE UPDATE ON {table(source_schema)} FOR EACH ROW SET NEW.note=NEW.note')
+            facade.execute_query(endpoint, f'CREATE FUNCTION `{source_schema}`.answer() RETURNS INT DETERMINISTIC RETURN 2')
+            facade.execute_query(endpoint, f'CREATE PROCEDURE `{source_schema}`.greet() SELECT 2')
+            facade.execute_query(endpoint, f"CREATE EVENT `{source_schema}`.tick ON SCHEDULE AT '2099-01-01' DISABLE DO SET @tf_tick=1")
+            if restore_mode != "safe_new":
+                facade.execute_query(endpoint, f'CREATE TRIGGER `{target_schema}`.original_guard BEFORE UPDATE ON {table(target_schema)} FOR EACH ROW SET NEW.note=NEW.note')
+                facade.execute_query(endpoint, f'CREATE FUNCTION `{target_schema}`.answer() RETURNS INT DETERMINISTIC RETURN 1')
         assert connector.connect()[0]
         assert source_schema in connector.get_schemas(use_cache=False)
         assert connector.get_tables(source_schema, use_cache=False) == ["samples"]
@@ -77,7 +86,8 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
         def rows(namespace):
             amount = "amount::text" if engine == "postgresql" else "CAST(amount AS CHAR)"
             stamp = "stamp::text" if engine == "postgresql" else "CAST(stamp AS CHAR)"
-            return facade.execute_query(endpoint, f'SELECT id, note, {amount} AS amount, {stamp} AS stamp FROM {table(namespace)} ORDER BY id')
+            computed = ", doubled" if engine == "mysql" else ""
+            return facade.execute_query(endpoint, f'SELECT id, note, {amount} AS amount, {stamp} AS stamp{computed} FROM {table(namespace)} ORDER BY id')
         original_rows = rows(target_schema) if restore_mode != "safe_new" else None
         def view_rows(namespace):
             return facade.execute_query(endpoint, f'SELECT * FROM {quote}{namespace}{quote}.v_samples ORDER BY id')
@@ -97,6 +107,8 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
             return
         assert ok, message
         assert result["samples"]["status"] == "done"
+        if engine == "mysql":
+            assert "트리거" in message and "루틴" in message and "이벤트" in message, message
         if restore_mode.startswith("safe"):
             final = next(event for event in reversed(raw_events) if event.get("event") == "safe_restore_ready")
             candidate = final["candidate_target"]
@@ -111,6 +123,9 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
                 assert view_rows(target_schema) == original_view_rows
             assert rows(source_schema) == rows(candidate_namespace)
             assert view_rows(source_schema) == view_rows(candidate_namespace)
+            if engine == "mysql":
+                counts = facade.execute_query(endpoint, "SELECT COUNT(*) AS n FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=%s", [candidate_namespace])
+                assert int(counts[0]["n"]) == (1 if restore_mode == "safe_new" else 0)
             if restore_mode == "safe_promote":
                 promotion = {"action": "plan", "restore_id": final["restore_id"], "report_path": final["report_path"],
                     "target": dict(final["original_target"], user=connector.user, password=connector.password)}
@@ -132,6 +147,10 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
         else:
             assert rows(source_schema) == rows(target_schema)
             assert view_rows(source_schema) == view_rows(target_schema)
+        if engine == "mysql" and restore_mode in ("replace", "safe_new", "safe_promote"):
+            assert str(facade.execute_query(endpoint, f'SELECT `{target_schema}`.answer() AS value')[0]["value"]) == "2"
+            names = facade.execute_query(endpoint, "SELECT TRIGGER_NAME AS name FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=%s", [target_schema])
+            assert [row["name"] for row in names] == ["sample_guard"]
     finally:
         connector.disconnect()
         for namespace in [source_schema, target_schema] + ([candidate_namespace] if candidate_namespace and candidate_namespace.startswith("tf_restore_") else []) + extra_namespaces:

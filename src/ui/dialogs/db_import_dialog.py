@@ -1016,8 +1016,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         path = self.input_dir.text().strip()
         manifest = self._read_manifest(path) if path else {}
         has_triggers = not path or any(isinstance(p, dict) and p.get("kind") == "TRIGGER" for p in manifest.get("stored_programs") or [])
-        allowed = (getattr(self, "_ui_enabled", True) and has_triggers and build_rust_dump_config(self.connector).engine == "mysql"
-                   and not (self.chk_verify_copy.isChecked() and self._verify_allowed))
+        allowed = getattr(self, "_ui_enabled", True) and has_triggers and build_rust_dump_config(self.connector).engine == "mysql"
         self.chk_skip_triggers.setEnabled(allowed)
         if not allowed:
             self.chk_skip_triggers.setChecked(False)
@@ -2100,7 +2099,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self._show_report_link()
             sanitized = _sanitized_rust_event(result)
             self.import_audit["promotion_result"] = {key: sanitized.get(key) for key in (
-                "status", "success", "original_unchanged", "cutover_pending", "backup_namespace", "report_path", "phase", "message")}
+                "status", "success", "original_unchanged", "cutover_pending", "backup_namespace", "report_path", "phase", "message", "missing_programs", "programs_failed", "programs_imported", "program_warnings")}
         if action == "plan":
             if self._close_after_cancel:
                 pass
@@ -2135,6 +2134,23 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 sanitize_local_diagnostic(self.import_audit["backup_namespace"])))
             self.progress_bar.setValue(100)
             self._add_log(self.label_status.text())
+            for line in describe_plan(result, True)["warnings"]:
+                self._log_visible(line)
+            for line in describe_program_warnings(result.get("program_warnings")):
+                self._log_visible(line)
+        elif action == "confirm" and result.get("status") in ("promoted_incomplete", "failed_original_triggers_missing"):
+            self.import_success = False
+            self.import_end_time = datetime.now()
+            status = result["status"]
+            self.import_audit.update(restore_status=status, original_unchanged=False,
+                                     cutover_pending=False if status == "promoted_incomplete" else None)
+            self.import_audit["missing_programs"] = result.get("missing_programs") or []
+            sentence = ("테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 백업을 보존하고 복구하세요."
+                        if status == "promoted_incomplete" else
+                        "테이블은 교체하지 않았지만 원래 트리거를 되살리지 못했습니다. 보고서에 저장된 정의로 복구하세요.")
+            self.label_status.setText(translate_text(sentence))
+            names = ", ".join(display_program_name(item) for item in result.get("missing_programs") or [])
+            self._show_failure(translate_text("저장 프로그램 복원이 끝나지 않았습니다"), translate_text(sentence) + "\n" + names, message)
         elif action == "confirm":
             self.import_success = False
             self.import_end_time = datetime.now()

@@ -20,10 +20,10 @@ def test_skipped_triggers_and_changed_definers_are_must_see_with_names(code, war
     assert not plan["blockers"]
 
 
-def test_program_copy_refusal_is_a_plain_blocker():
-    plan = describe_plan({"copy_blockers": [{"code": "dump_programs_unsupported_in_copy"}]}, True)
+def test_program_privilege_refusal_is_a_plain_blocker():
+    plan = describe_plan({"copy_blockers": [{"code": "trigger_privilege_missing"}]}, True)
     assert plan["must_see"]
-    assert "트리거·루틴·이벤트가 담긴 덤프" in plan["blockers"][0]
+    assert "트리거" in plan["blockers"][0]
     assert " ".join(plan["blockers"]).count("끄면 진행할 수 있습니다") == 1
 
 
@@ -353,3 +353,14 @@ def test_short_replace_plan_sizes_to_its_content():
         assert dialog.height()<500
         assert dialog.btn_execute.mapTo(dialog,dialog.btn_execute.rect().bottomRight()).y()<dialog.height()
     finally: dialog.close()
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_safe_and_replace_program_plan_names_losses_kept_and_new_objects(verify):
+    plan = describe_plan({"triggers_dropped": [{"table": "sample", "name": "old_guard"}],
+                          "programs": {"replace": ["routine:answer"], "create": ["event:tick"]},
+                          "programs_kept": ["routine:kept"]}, verify)
+    assert plan["must_see"] and not plan["blockers"]
+    text = "\n".join(plan["warnings"])
+    assert all(name in text for name in ("sample.old_guard", "answer", "tick", "kept"))
+    assert "사라지는 트리거" in text and "그대로 둘" in text

@@ -1890,7 +1890,7 @@ def test_every_code_the_core_can_emit_has_a_korean_sentence():
             emitted.update(re.findall(r'"([a-z_]+)"', body))
     assert {"load_failed", "dependent_object", "views_outside_snapshot", "partial_table_filter", "no_tables",
             "safe_promotion", "safe_restore_content_mismatch"} <= emitted
-    assert {"copy_refused", "copy_checks_unavailable", "target_events", "linked_target_only", "previous_copy_leftover"} <= emitted
+    assert {"copy_refused", "copy_checks_unavailable", "target_routines", "linked_target_only", "previous_copy_leftover"} <= emitted
     assert sorted(emitted - set(CORE_CODE_SENTENCES)) == []
 
 

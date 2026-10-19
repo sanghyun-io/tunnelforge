@@ -137,6 +137,14 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
             if names:
                 data_warnings.append("- " + describe_core_code(code) + " " + sanitize_local_diagnostic(names_preview(names)))
 
+    programs = preview.get("programs") if isinstance(preview.get("programs"), dict) else {}
+    for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 저장 프로그램: {}")):
+        names = [display_program_name(item) for item in _strings(programs.get(key))]
+        if names:
+            notes.append(_line(sentence, names))
+    kept = [display_program_name(item) for item in _strings(preview.get("programs_kept"))]
+    if kept:
+        notes.append(_line("그대로 둘 루틴·이벤트: {}", kept))
     details = []
     for code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
         if _strings(preview.get(code)):
