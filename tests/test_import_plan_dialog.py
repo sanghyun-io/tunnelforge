@@ -103,12 +103,13 @@ def test_point_in_time_warning_only_for_unsynchronized_policies():
 
 
 def test_verify_preview_explains_orphan_rows_for_unsynchronized_dumps():
+    from src.core import i18n
+
     policy = "mysql_parallel_unsynchronized_snapshots"
     other_policy = "mysql_single_connection_consistent_snapshot"
     line = (
-        "- 복사본 검증은 테이블마다 다른 시점에 읽은 덤프에서 자식 행의 부모 행이 빠진 것을 발견하면 멈출 수 있습니다. "
-        "'먼저 복사본에서 검증하고 교체'를 끄고 mysqldump처럼 바로 가져오거나, 모든 테이블을 같은 시점에 읽도록 다시 내보내거나, "
-        "원본의 고아 레코드 검사에서 찾아 정리하세요."
+        "- 테이블마다 다른 시점에 읽은 덤프라, 부모 행이 빠진 자식 행이 있으면 복사본 검증이 교체 전에 멈춥니다. "
+        "그때는 '먼저 복사본에서 검증하고 교체'를 끄고 바로 가져오거나, 모든 테이블을 같은 시점에 읽도록 다시 내보내세요."
     )
     unsynchronized = {**PREVIEW, "snapshot_policy": policy}
     assert line not in describe_plan(unsynchronized, False)["warnings"]
@@ -116,6 +117,11 @@ def test_verify_preview_explains_orphan_rows_for_unsynchronized_dumps():
     assert plan["warnings"].count(line) == 1 and plan["must_see"] is True
     synchronized = {**PREVIEW, "snapshot_policy": other_policy}
     assert line not in describe_plan(synchronized, True)["warnings"]
+    i18n.set_language("en")
+    assert describe_plan(unsynchronized, True)["warnings"].count(
+        "- This dump read its tables at different moments, so verify-in-copy stops before switching if child rows lost their parent rows. "
+        "Then turn off 'Verify in a copy first, then swap' to import directly, or export again with all tables read at the same moment."
+    ) == 1
 
 
 def test_legacy_timezone_warning_names_the_choice_or_where_to_make_it():

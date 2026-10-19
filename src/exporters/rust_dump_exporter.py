@@ -751,10 +751,7 @@ _CORE_CODE_TOKEN = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_CORE_CODE = re.compile(r"\(error_code=([a-z_]+)\)")
-_CANDIDATE_FK_ORPHANS_FIELDS = re.compile(
-    r"(?:^|Safe restore failed; original database was not changed\. )"
-    r"candidate_fk_orphans:\s*fields=(\{[^\n]*\})"
-)
+_CANDIDATE_FK_ORPHANS_FIELDS = re.compile(r"\bcandidate_fk_orphans:\s*fields=(\{[^\n]*\})")
 
 
 def describe_core_code(code: object, name: object = "") -> Optional[str]:
@@ -832,15 +829,15 @@ def describe_core_failure(message: object) -> Optional[str]:
             pass
         else:
             snapshot_reason = (
-                translate_text("덤프에는 원본 테이블을 서로 다른 시점에 읽었다고 기록되어 있어 이런 차이가 생겼을 수 있습니다. 원본에 이미 이런 행이 있었을 수도 있습니다.")
+                translate_text("이 덤프는 테이블마다 다른 시점에 읽었다고 기록되어 있어, 내보내는 동안 원본이 바뀌어 생긴 차이일 수 있습니다. 원본에 원래 있던 행일 수도 있습니다.")
                 if snapshot_policy in _UNSYNCHRONIZED_SNAPSHOT_POLICIES
-                else translate_text("원본에 이미 이런 행이 있었을 수도 있습니다.")
+                else translate_text("원본에 원래 있던 행일 수 있습니다.")
             )
             template = (
-                "덤프의 {child_table} 테이블에 부모 행이 덤프에 없는 자식 행이 {row_count}개 있습니다 "
-                "(외래 키: {foreign_key}). {snapshot_reason} "
-                "'먼저 복사본에서 검증하고 교체'를 끄고 mysqldump처럼 바로 가져오거나, 모든 테이블을 같은 시점에 읽도록 "
-                "다시 내보내거나, 원본의 고아 레코드 검사에서 찾아 정리하세요."
+                "{child_table} 테이블의 행 {row_count}개가 가리키는 부모 행이 덤프에 없어 교체하지 않았습니다"
+                "(외래 키 {foreign_key}). {snapshot_reason} 이런 행까지 그대로 가져오려면 "
+                "'먼저 복사본에서 검증하고 교체'를 끄세요(mysqldump와 같은 동작). 아니면 모든 테이블을 같은 시점에 "
+                "읽도록 다시 내보내거나, 원본에서 '고아 레코드 분석'으로 이 행을 찾아 정리하세요."
             )
             return translate_text(template).format(
                 child_table=child_table,
