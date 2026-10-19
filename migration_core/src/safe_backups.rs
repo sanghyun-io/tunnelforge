@@ -111,10 +111,14 @@ fn discover_dir(dir: &Path, entries: &mut Vec<Entry>) {
 fn plan_journals(dir: &Path, restore_id: &str) -> (Option<StoredPlan>, Option<Value>) {
     let Ok(plan_dir) = plan_dir_for(dir, restore_id) else { return (None, None) };
     let attempt = prior_attempt(&plan_dir).ok().flatten();
-    let stored = attempt
+    let mut stored: Option<StoredPlan> = attempt
         .as_ref()
         .and_then(|a| serde_json::from_value(a["stored_plan"].clone()).ok())
         .or_else(|| read_json(&dump_import_report_path(&plan_dir).unwrap_or_default()).and_then(|v| serde_json::from_value(v).ok()));
+    if let Some(StoredPlan { engine_plan: EnginePlan::MySql(plan), .. }) = stored.as_mut() {
+        let warnings = attempt.as_ref().and_then(|a|a["result"]["program_warnings"].as_array()).cloned().unwrap_or_default();
+        *plan = crate::safe_promote_mysql::with_program_warnings(plan,&warnings);
+    }
     (stored, attempt)
 }
 

@@ -213,6 +213,12 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
         programs_kept = target_programs.iter().filter(|(kind,name,_,_)| !programs.iter().any(|p| p.kind==*kind && p.name.eq_ignore_ascii_case(name)))
             .map(|(kind,name,_,_)| format!("{}:{name}", if kind=="EVENT" {"event"} else {"routine"})).collect();
         let current: String = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?.unwrap_or_default();
+        if !preserves_foreign_definer(conn) {
+            let definitions = super::safe_restore::saved_target_programs(conn,endpoint,&manifest)?;
+            for p in definitions.iter().filter(|p|p.kind=="TRIGGER" && p.definer.as_deref()!=Some(&current)) {
+                warnings.push(warning_names("program_restore_definer_may_change",vec![format!("TRIGGER {} ({} -> {current})",p.name,p.definer.as_deref().unwrap_or_default())]));
+            }
+        }
         for p in &programs {
             if p.kind=="TRIGGER" { program_create.push(program_id(p)); continue }
             let previous = target_programs.iter().find(|(k,n,_,_)| k==&p.kind && n.eq_ignore_ascii_case(&p.name));

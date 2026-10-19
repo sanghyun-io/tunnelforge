@@ -291,8 +291,43 @@ pub(crate) fn probe_routines(conn: &mut mysql::PooledConn, programs: &[Normalize
     Ok(())
 }
 
+/// Compare saved metadata without executing a program or changing its owner.
+pub(crate) fn schema_program_matches(actual: &NormalizedStoredProgram, expected: &NormalizedStoredProgram) -> bool {
+    actual.kind == expected.kind && actual.name.eq_ignore_ascii_case(&expected.name)
+        && actual.definer == expected.definer && actual.sql_mode == expected.sql_mode
+        && actual.character_set_client == expected.character_set_client && actual.collation_connection == expected.collation_connection
+        && actual.time_zone == expected.time_zone && actual.status == expected.status
+        && schema_program_sql(actual, &expected.name, None).ok().zip(schema_program_sql(expected, &expected.name, None).ok()).is_some_and(|(a,b)|a==b)
+}
+
+/// A missing one-shot event is complete only when its recorded absolute schedule has passed.
+pub(crate) fn recorded_event_completed(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram) -> Result<bool,String> {
+    if p.kind != "EVENT" { return Ok(false) }
+    let (ts,_) = suffix_start(p,None)?;
+    let header = &ts[..ts.iter().position(|t|keyword(t,"DO")).ok_or("event body missing")?];
+    let at = header.windows(3).find(|w|keyword(&w[0],"SCHEDULE") && keyword(&w[1],"AT") && w[2].quote==b'\'');
+    let expires = header.windows(4).any(|w|keyword(&w[0],"ON") && keyword(&w[1],"COMPLETION") && keyword(&w[2],"NOT") && keyword(&w[3],"PRESERVE"));
+    let Some(at) = at.filter(|_|expires) else { return Ok(false) };
+    set_program_context(conn,p)?;
+    conn.exec_first::<bool,_,_>("SELECT CAST(? AS DATETIME) <= CURRENT_TIMESTAMP",(&at[2].text,)).map_err(|e|e.to_string()).map(|v|v.unwrap_or(false))
+}
+
 /// Replay the target definition, then verify state and definer after any corrective ALTER.
 pub(crate) fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: &NormalizedStoredProgram, failure: &mut Value) -> Result<(),String> {
+    if let Ok(actual) = read_schema_program(conn,schema,&previous.kind,&previous.name) {
+        if schema_program_matches(&actual,previous) {
+            failure["previous_definer_preserved"] = json!(true);
+            failure["previous_unchanged"] = json!(true);
+            return Ok(())
+        }
+    }
+    if previous.kind == "FUNCTION" {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
+        let mut skipped = BTreeSet::new(); let mut warnings = Vec::new();
+        probe_routines(conn,std::slice::from_ref(previous),&format!("tf_probe_restore_{}_{nonce}",std::process::id()),&mut skipped,&mut warnings)?;
+        if !skipped.is_empty() { failure["restore_warnings"] = json!(warnings); return Err("previous function fails binary log checks".into()) }
+    }
+    if recorded_event_completed(conn,previous)? { return Err("previous event would expire immediately if recreated".into()) }
     set_program_context(conn,previous)?;
     conn.query_drop(format!("DROP {} IF EXISTS {}",previous.kind,quote_ident("mysql",&previous.name))).map_err(|e|e.to_string())?;
     let current:Option<String>=conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?;

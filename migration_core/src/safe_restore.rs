@@ -549,6 +549,13 @@ fn copy_stop(state: &mut Value, refusals: &[Refusal]) -> String {
     classified_import_error("copy_refused", &format!("verify-in-copy stopped before making a copy: {}", details.join("; ")), None)
 }
 
+pub(crate) fn saved_target_programs(conn: &mut mysql::PooledConn, original: &Endpoint, manifest: &DumpManifest) -> Result<Vec<NormalizedStoredProgram>,String> {
+    let fold = mysql_folds_table_names(conn)?;
+    let present: Vec<String> = conn.exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?",(&original.database,)).map_err(|e|e.to_string())?;
+    let affected = present.into_iter().filter(|name|manifest.tables.iter().any(|t| if fold {t.name.eq_ignore_ascii_case(name)} else {t.name==*name})).collect();
+    crate::safe_promote_mysql::capture_affected_programs(conn,&original.database,&affected,&manifest.stored_programs)
+}
+
 pub(crate) fn program_copy_refusals(conn: &mut mysql::PooledConn, original: &Endpoint, manifest: &DumpManifest, skip_triggers: bool) -> Result<Vec<Refusal>, String> {
     use crate::mysql_programs::trigger_binlog_blocked;
     use super::import_preview::mysql_grants_allow;
