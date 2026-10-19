@@ -144,7 +144,7 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
             }
             let super_grant=mysql_grants_allow(conn,"SUPER",None);
             let blocked=programs.iter().filter(|p|p.kind=="FUNCTION" && function_binlog_preview_blocked(p,log_bin,trusted,super_grant)).map(|p|p.name.clone()).collect::<Vec<_>>();
-            if !blocked.is_empty() { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
+            if !blocked.is_empty() && request.payload.get("mode").and_then(Value::as_str)!=Some("safe") { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
             let events=programs.iter().filter(|p|p.kind=="EVENT").map(|p|p.name.clone()).collect::<Vec<_>>();
             if !events.is_empty() && mysql_grants_allow(conn,"EVENT",Some(&endpoint.database)).is_none() {
                 warnings.push(warning_names("event_privilege_unproven",events));
@@ -214,7 +214,7 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
             .map(|(kind,name,_,_)| format!("{}:{name}", if kind=="EVENT" {"event"} else {"routine"})).collect();
         let current: String = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?.unwrap_or_default();
         if !preserves_foreign_definer(conn) {
-            let definitions = super::safe_restore::saved_target_programs(conn,endpoint,&manifest)?;
+            let definitions = super::safe_restore::saved_target_programs(conn,endpoint,&manifest).unwrap_or_default();
             for p in definitions.iter().filter(|p|p.kind=="TRIGGER" && p.definer.as_deref()!=Some(&current)) {
                 warnings.push(warning_names("program_restore_definer_may_change",vec![format!("TRIGGER {} ({} -> {current})",p.name,p.definer.as_deref().unwrap_or_default())]));
             }

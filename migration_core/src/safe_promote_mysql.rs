@@ -2201,6 +2201,18 @@ fn rollback_blockers(
     if views.unwrap_or(0) > 0 {
         blockers.push("views now depend on tables in the original namespace".into());
     }
+    if !plan.original_trigger_definitions.is_empty() {
+        blockers.extend(crate::import::safe_restore::target_trigger_refusals(conn,original)?.into_iter().map(|(code,name,message)|format!("{code}: {}: {message}",name.unwrap_or_default())));
+    }
+    for (needed,privilege) in [
+        (plan.original_programs.iter().chain(&plan.promoted_programs).any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"CREATE ROUTINE"),
+        (plan.promoted_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"ALTER ROUTINE"),
+        (plan.original_programs.iter().chain(&plan.promoted_programs).any(|p|p.kind=="EVENT"),"EVENT"),
+    ] {
+        if needed && crate::import::import_preview::mysql_grants_allow(conn,privilege,Some(original))==Some(false) {
+            blockers.push(format!("{privilege} is required to restore saved programs"));
+        }
+    }
     let expected = final_programs(plan);
     let scopes = expected.iter().chain(&plan.original_programs).cloned().collect::<Vec<_>>();
     let affected = active_names(plan);

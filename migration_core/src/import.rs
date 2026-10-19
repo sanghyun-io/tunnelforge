@@ -549,7 +549,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             probe?;
         }
         if let LiveAdapter::MySql(conn)=&mut adapter {
-            if selected.is_empty() && manifest.stored_programs.iter().any(|p|p.kind=="EVENT") {
+            if selected.is_empty() && !journal.safe_context.as_ref().is_some_and(|context|context["cutover_pending"]==true) && manifest.stored_programs.iter().any(|p|p.kind=="EVENT") {
                 match import_preview::mysql_grants_allow(conn,"EVENT",Some(&target_schema)) {
                     Some(false) => return Err(classified_import_error("program_privilege_missing","EVENT privilege is required",None)),
                     None => journal.program_warnings.push(json!({"code":"event_privilege_unproven"})),

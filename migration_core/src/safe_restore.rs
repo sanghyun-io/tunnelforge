@@ -571,12 +571,28 @@ pub(crate) fn program_copy_refusals(conn: &mut mysql::PooledConn, original: &End
             refusals.push((code, None, message.into()));
         }
     }
-    if programs.iter().any(|p| p.kind == "TRIGGER") {
+    if programs.iter().any(|p| matches!(p.kind.as_str(), "TRIGGER" | "FUNCTION")) {
         let (log_bin, trusted): (bool, bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators")
             .map_err(|e| e.to_string())?.ok_or("trigger binlog variables unreadable")?;
-        if trigger_binlog_blocked(log_bin, trusted, mysql_grants_allow(conn, "SUPER", None)) {
+        let super_grant = mysql_grants_allow(conn, "SUPER", None);
+        if programs.iter().any(|p|p.kind=="TRIGGER") && trigger_binlog_blocked(log_bin, trusted, super_grant) {
             refusals.push(("trigger_binlog_privilege", None, "현재 서버 설정과 계정 권한으로는 트리거를 만들 수 없습니다. 서버 설정을 바꾸거나 '트리거 없이 테이블만 가져오기'를 켜세요.".into()));
         }
+        for p in programs.iter().filter(|p|p.kind=="FUNCTION" && crate::mysql_schema_programs::function_binlog_preview_blocked(p,log_bin,trusted,super_grant)) {
+            refusals.push(("copy_routine_binlog_unsafe",Some(p.name.clone()),"this function cannot be created with the current binary log settings and privileges".into()));
+        }
+    }
+    Ok(refusals)
+}
+
+pub(crate) fn target_trigger_refusals(conn: &mut mysql::PooledConn, database: &str) -> Result<Vec<Refusal>,String> {
+    let mut refusals = Vec::new();
+    if super::import_preview::mysql_grants_allow(conn,"TRIGGER",Some(database)) == Some(false) {
+        refusals.push(("program_privilege_missing",Some("original triggers".into()),"TRIGGER privilege is required to recreate original target triggers".into()));
+    }
+    let (log_bin,trusted): (bool,bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators").map_err(|e|e.to_string())?.ok_or("binlog variables unreadable")?;
+    if crate::mysql_programs::trigger_binlog_blocked(log_bin,trusted,super::import_preview::mysql_grants_allow(conn,"SUPER",None)) {
+        refusals.push(("target_trigger_binlog_privilege",None,"original target triggers cannot be recreated with current binary log settings and privileges".into()));
     }
     Ok(refusals)
 }
@@ -615,6 +631,21 @@ pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
             let programs = if skip_triggers { Vec::new() } else { crate::mysql_programs::selected_triggers(&manifest.stored_programs, &dumped) };
             for conflict in crate::mysql_programs::trigger_name_conflicts(&triggers, &programs, fold) {
                 refusals.push(("trigger_name_conflict", Some(conflict), "덤프의 트리거 이름이 그대로 둘 테이블의 트리거 이름과 같습니다. 이름을 바꾼 뒤 다시 시도하세요.".into()));
+            }
+            if triggers.iter().any(|(table,_)|dumped.iter().any(|name|if fold { name.eq_ignore_ascii_case(table) } else { name==table })) {
+                refusals.extend(target_trigger_refusals(conn,&schema)?);
+            }
+            for (needed,privilege) in [
+                (!programs.is_empty(),"TRIGGER"),
+                (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"CREATE ROUTINE"),
+                (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"ALTER ROUTINE"),
+            ] {
+                if needed && super::import_preview::mysql_grants_allow(conn,privilege,Some("tf_restore_0")) != Some(true) {
+                    refusals.push(("program_privilege_missing",Some("tf_restore_*".into()),format!("{privilege} is required on the verification copy")));
+                }
+            }
+            if let Err(error) = saved_target_programs(conn,original,manifest) {
+                refusals.push(("target_program_unsavable",None,error));
             }
             let present: Vec<String> = conn.exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (&schema,)).map_err(inspect)?;
             let foreign_keys: Vec<ForeignKeyLink> = conn.exec(
