@@ -331,7 +331,9 @@ pub(crate) fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str,
     if previous.kind == "FUNCTION" {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
         let mut skipped = BTreeSet::new(); let mut warnings = Vec::new();
-        probe_routines(conn,std::slice::from_ref(previous),&format!("tf_probe_restore_{}_{nonce}",std::process::id()),&mut skipped,&mut warnings)?;
+        let probe = probe_routines(conn,std::slice::from_ref(previous),&format!("tf_probe_restore_{}_{nonce}",std::process::id()),&mut skipped,&mut warnings);
+        failure["restore_warnings"] = json!(warnings);
+        probe?;
         if !skipped.is_empty() { failure["restore_warnings"] = json!(warnings); return Err("previous function fails binary log checks".into()) }
     }
     if recorded_event_completed(conn,previous)? { return Err("previous event would expire immediately if recreated".into()) }

@@ -826,10 +826,13 @@ fn recover_triggers(conn: &mut Db, plan: &PromotionPlan, programs: &[NormalizedS
     }
     let tables = programs.iter().filter_map(|p|p.table.clone()).collect();
     let mut warnings = state["program_warnings"].as_array().cloned().unwrap_or_default();
-    let actual = capture_affected_programs(conn,&plan.original_database,&tables,&[])?;
+    let actual = match capture_affected_programs(conn,&plan.original_database,&tables,&[]) {
+        Ok(actual) => actual,
+        Err(err) => { errors.push(err); Vec::new() }
+    };
     let originals = programs.iter().all(|p|plan.original_programs.iter().any(|old|program_matches(p,old)));
     let mut attachment_errors = Vec::new();
-    for p in programs.iter().filter(|p|p.kind=="TRIGGER") {
+    for p in crate::mysql_programs::selected_triggers(programs,&tables) {
         if actual.iter().any(|a|program_matches(a,p)) { continue }
         let tables = p.table.iter().cloned().collect();
         if let Err(err) = attach_trigger_set(conn,plan,std::slice::from_ref(p),&tables,originals,&mut warnings,&mut |_,_|Ok(())) { attachment_errors.push(err); }
@@ -2723,6 +2726,7 @@ mod tests {
         // ok_after_kill=false: the connection dies before RENAME is sent (recovery runs on the dead conn).
         for ok_after_kill in [true, false] {
             let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+            conn.query_drop(format!("CREATE TRIGGER {} BEFORE UPDATE ON {} FOR EACH ROW FOLLOWS guard SET NEW.note=CONCAT(NEW.note,'!')",qualified(&original.database,"a_later"),qualified(&original.database,"parent"))).unwrap();
             let before=capture_programs(&mut conn,&original.database).unwrap();
             let old_parent=table_id(&mut conn,&original.database,"parent").unwrap();
             let p=plan(&original,&candidate,"killed_cutover",&programs).unwrap();
@@ -2750,6 +2754,7 @@ mod tests {
             assert!(p.original_trigger_definitions.contains_key("guard"),"saved definition is available");
             assert_eq!(result["status"],"failed_original_unchanged","{result:#}");
             assert!(guard_present,"original trigger must be recovered using a fresh connection");
+            assert_eq!(after,before,"recovery must preserve definitions and ACTION_ORDER, rather than name order");
             assert_eq!(inspected["verdict"],"not_promoted");
             cleanup(&mut conn,&p,&dir);
         }

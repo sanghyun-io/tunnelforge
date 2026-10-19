@@ -722,4 +722,3 @@ fn rv204_dumped_not_preserve_event_firing_after_promotion_flips_verdict() {
     assert_eq!(cleanup["can_cleanup"], true);
     fx.finish();
 }
-

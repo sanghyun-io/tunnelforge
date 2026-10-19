@@ -64,4 +64,3 @@ def test_raw_log_and_audit_keep_programs_failed(monkeypatch):
         assert "1227" in _logs(d)
     finally:
         d.close()
-
