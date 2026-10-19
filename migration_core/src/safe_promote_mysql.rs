@@ -740,7 +740,12 @@ fn attach_triggers(conn: &mut Db, plan: &PromotionPlan, originals: bool, warning
     conn.query_drop(format!("USE {}", q(&plan.original_database))).map_err(|e| e.to_string())?;
     let tables = if originals { plan.original_tables.keys().cloned().collect() } else { active_names(plan) };
     let programs = if originals { plan.original_programs.clone() } else { final_programs(plan) };
-    for p in crate::mysql_programs::selected_triggers(&programs, &tables) {
+    attach_trigger_set(conn, plan, &programs, &tables, originals, warnings, &mut |_, _| Ok(()))
+}
+
+fn attach_trigger_set(conn: &mut Db, plan: &PromotionPlan, programs: &[NormalizedStoredProgram], tables: &BTreeSet<String>, originals: bool, warnings: &mut Vec<Value>, hook: &mut impl FnMut(&str, &mut Db) -> Result<(), String>) -> Result<(), String> {
+    conn.query_drop(format!("USE {}", q(&plan.original_database))).map_err(|e|e.to_string())?;
+    for p in crate::mysql_programs::selected_triggers(programs, tables) {
         let preserved = originals || !plan.candidate_tables.contains_key(p.table.as_ref().unwrap());
         if preserved {
             crate::mysql_schema_programs::set_program_context(conn, p)?;
@@ -750,13 +755,30 @@ fn attach_triggers(conn: &mut Db, plan: &PromotionPlan, originals: bool, warning
     }
     reset_session(conn)?;
     // No writes after attachment: a trigger may reference a table outside the WRITE lock.
-    let expected = programs.into_iter().filter(|p| p.kind == "TRIGGER" && p.table.as_ref().is_some_and(|t| tables.contains(t))).collect::<Vec<_>>();
+    hook("before_trigger_verification", conn)?;
+    let expected = programs.iter().filter(|p| p.kind == "TRIGGER" && p.table.as_ref().is_some_and(|t| tables.contains(t))).cloned().collect::<Vec<_>>();
     let affected = expected.iter().filter_map(|p| p.table.clone()).collect();
     let actual = capture_affected_programs(conn, &plan.original_database, &affected, &[])?.into_iter().filter(|p| p.kind == "TRIGGER").collect::<Vec<_>>();
     if actual != expected && expected.iter().any(|p| !actual.iter().any(|a| program_matches(a,p))) {
         return Err("trigger definitions could not be verified after attachment".into());
     }
     Ok(())
+}
+
+// Recovery attempts every DROP and still recreates the definitions when one DROP fails.
+// The caller must own WRITE locks on all affected tables.
+fn recover_triggers(conn: &mut Db, plan: &PromotionPlan, programs: &[NormalizedStoredProgram], state: &mut Value) -> Result<(), String> {
+    reset_session(conn)?;
+    let mut errors = Vec::new();
+    for p in programs.iter().filter(|p| p.kind == "TRIGGER") {
+        if let Err(err) = conn.query_drop(format!("DROP TRIGGER IF EXISTS {}",qualified(&plan.original_database,&p.name))) { errors.push(err.to_string()); }
+    }
+    let tables = programs.iter().filter_map(|p|p.table.clone()).collect();
+    let mut warnings = state["program_warnings"].as_array().cloned().unwrap_or_default();
+    let result = attach_trigger_set(conn, plan, programs, &tables, false, &mut warnings, &mut |_,_|Ok(()));
+    state["program_warnings"] = json!(warnings);
+    state["trigger_recovery_drop_errors"] = json!(errors);
+    result
 }
 
 fn classify_programs(conn: &mut Db, plan: &PromotionPlan, status: String) -> String {
@@ -1394,7 +1416,7 @@ fn classify(
             name,
         )
     });
-    classify_programs(conn, plan, status)
+    status
 }
 fn classify_table_ids<F: FnMut(bool, &str) -> Result<Option<u64>, String>>(
     old_ids: &BTreeMap<String, u64>,
@@ -1483,7 +1505,6 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
     let mut locked = false;
     let mut triggers_detaching = false;
     let mut rename_attempted = false;
-    let mut rename_rejected = false;
     let mut rename_committed = false;
     let mut new_ids = BTreeMap::new();
     let cutover_session: u64 = conn
@@ -1676,7 +1697,6 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         hook("before_rename", &mut conn)?;
         rename_attempted = true;
         if let Err(err) = conn.query_drop(rename_sql(plan)) {
-            rename_rejected = matches!(err, mysql::Error::MySqlError(_));
             return Err(error("atomic rename", err));
         }
         rename_committed = true;
@@ -1724,21 +1744,13 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         hook("programs_replaced", &mut conn)?;
         Ok(())
     })();
-    if outcome.is_err() && triggers_detaching && (!rename_attempted || rename_rejected) && !moved_original_triggers(plan).is_empty() {
-        let restore = (|| -> Result<(), String> {
-            hook("before_original_trigger_recovery", &mut conn)?;
-            drop_triggers(&mut conn, &plan.original_database, &moved_original_triggers(plan))?;
-            attach_triggers(&mut conn, plan, true, &mut Vec::new())
-        })();
-        if let Err(err) = restore { state["trigger_recovery_error"] = json!(err); }
-    }
     if locked {
         let _ = conn.query_drop("UNLOCK TABLES");
     }
     drop(conn);
     if let Err(failure) = outcome {
         let mut cleanup = connect(original).ok();
-        let status = if rename_committed {
+        let mut status = if rename_committed {
             cleanup.as_mut().map(|db| classify_programs(db, plan, "promoted".into())).unwrap_or_else(|| "promoted_incomplete".into())
         } else if rename_attempted {
             cleanup
@@ -1746,9 +1758,26 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
                 .map(|db| classify(db, plan, &new_ids, cutover_session))
                 .unwrap_or_else(|| "cutover_unknown".into())
         } else {
-            cleanup.as_mut().map(|db| classify_programs(db, plan, "failed_original_unchanged".into()))
-                .unwrap_or_else(|| if plan.original_trigger_definitions.is_empty() { "failed_original_unchanged".into() } else { "failed_original_triggers_missing".into() })
+            cleanup.as_mut().map(|db| {
+                if plan.original_tables.iter().all(|(name,t)| optional_table_id(db, &plan.original_database, name).ok().flatten() == Some(t.table_id)) { "failed_original_unchanged".into() } else { "cutover_unknown".into() }
+            })
+                .unwrap_or_else(|| if !triggers_detaching || plan.original_trigger_definitions.is_empty() { "failed_original_unchanged".into() } else { "failed_original_triggers_missing".into() })
         };
+        if let Some(db) = cleanup.as_mut() {
+            if status == "failed_original_unchanged" && triggers_detaching {
+                let originals = moved_original_triggers(plan);
+                let recovery = (|| -> Result<(), String> {
+                    hook("before_original_trigger_recovery", db)?;
+                    let locks = plan.original_tables.keys().map(|name| format!("{} WRITE", qualified(&plan.original_database,name))).collect::<Vec<_>>();
+                    if !locks.is_empty() { db.query_drop(format!("LOCK TABLES {}",locks.join(", "))).map_err(|e|e.to_string())?; }
+                    let result = recover_triggers(db, plan, &originals, &mut state);
+                    let _ = db.query_drop("UNLOCK TABLES");
+                    result
+                })();
+                if let Err(err) = recovery { state["trigger_recovery_error"] = json!(err); }
+            }
+            status = classify_programs(db, plan, status);
+        }
         if let Some(db) = cleanup.as_mut() {
             match program_differences(db, plan, matches!(status.as_str(), "promoted" | "promoted_incomplete")) {
                 Ok(missing) => state["missing_programs"] = json!(missing),
@@ -1765,7 +1794,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         } else {
             Value::Null
         };
-        if status == "failed_original_unchanged" {
+        if matches!(status.as_str(), "failed_original_unchanged" | "failed_original_triggers_missing") {
             let mut cleanup_errors = Vec::new();
             if let Some(db) = cleanup.as_mut() {
                 for name in hidden_created.iter().rev() {
@@ -2175,6 +2204,11 @@ pub(crate) fn rollback_apply(
     displaced: &str,
     journal_dir: &Path,
 ) -> Result<Value, String> {
+    rollback_apply_with_hook(endpoint, plan, fingerprint, new_ids, displaced, journal_dir, |_,_|Ok(()))
+}
+
+fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, fingerprint: Option<&Value>, new_ids: Option<&Value>, displaced: &str, journal_dir: &Path, mut hook: impl FnMut(&str, &mut Db) -> Result<(), String>) -> Result<Value, String> {
+    let endpoint = mut_endpoint;
     let mut conn = lifecycle_connect(endpoint, plan)?;
     let blockers = rollback_blockers(&mut conn, plan, fingerprint, new_ids, Some(displaced), None)?;
     if !blockers.is_empty() {
@@ -2183,6 +2217,10 @@ pub(crate) fn rollback_apply(
     let original = plan.original_database.as_str();
     let backup = plan.backup_database.as_str();
     let active = active_names(plan);
+    let scopes = final_programs(plan).into_iter().chain(plan.original_programs.clone()).collect::<Vec<_>>();
+    let start_programs = capture_affected_programs(&mut conn, original, &active, &scopes)?;
+    let start_triggers = start_programs.iter().filter(|p|p.kind == "TRIGGER").cloned().collect::<Vec<_>>();
+    let session: u64 = conn.query_first("SELECT CONNECTION_ID()").map_err(|e|e.to_string())?.ok_or("missing connection id")?;
     let old_ids: BTreeMap<String, u64> = plan.original_tables.iter().map(|(n, t)| (n.clone(), t.table_id)).collect();
     let new_ids_map: BTreeMap<String, u64> = new_ids.and_then(Value::as_object).into_iter().flatten().filter_map(|(k, v)| v.as_u64().map(|id| (k.clone(), id))).collect();
     let displaced_digests: BTreeMap<String, Value> = match fingerprint.and_then(Value::as_object) {
@@ -2197,8 +2235,10 @@ pub(crate) fn rollback_apply(
     let mut created = false;
     let mut renamed = false;
     let mut rename_attempted = false;
-    let mut rename_rejected = false;
+    let mut triggers_detaching = false;
+    let mut triggers_recreated = false;
     let outcome = (|| -> Result<(), String> {
+        hook("before_create", &mut conn)?;
         create_owned_database(&mut conn, displaced, original)?;
         created = true;
         conn.query_drop("SET SESSION foreign_key_checks=0").map_err(|e| e.to_string())?;
@@ -2218,9 +2258,11 @@ pub(crate) fn rollback_apply(
             locks.insert(format!("{} AS {} READ", qualified(backup, &fk.child), q(&format!("tf_fc{}", restored_offset + i))));
             locks.insert(format!("{} AS {} READ", qualified(backup, &fk.parent), q(&format!("tf_fp{}", restored_offset + i))));
         }
+        hook("before_lock", &mut conn)?;
         conn.query_drop(format!("LOCK TABLES {}", locks.into_iter().collect::<Vec<_>>().join(", ")))
             .map_err(|e| error("bounded WRITE lock acquisition (2 seconds)", e))?;
         locked = true;
+        hook("locked", &mut conn)?;
         // Re-verify under the locks (content cannot change any more).
         let blockers = rollback_blockers(&mut conn, plan, fingerprint, new_ids, None, None)?;
         if !blockers.is_empty() {
@@ -2235,16 +2277,16 @@ pub(crate) fn rollback_apply(
         }
         state["phase"] = json!("detaching_triggers");
         write_dump_import_report(journal_dir, &state)?;
-        let moved = final_programs(plan).into_iter().filter(|p| p.table.as_ref().is_some_and(|t| active.contains(t))).collect::<Vec<_>>();
-        drop_triggers(&mut conn, original, &moved)?;
+        triggers_detaching = true;
+        drop_triggers(&mut conn, original, &start_triggers)?;
         state["phase"] = json!("triggers_detached");
         write_dump_import_report(journal_dir, &state)?;
         state["phase"] = json!("rename_started");
         state["status"] = json!("rollback_unknown");
         write_dump_import_report(journal_dir, &state)?;
+        hook("before_rename", &mut conn)?;
         rename_attempted = true;
         if let Err(err) = conn.query_drop(format!("RENAME TABLE {}", renames.join(", "))) {
-            rename_rejected = matches!(err, mysql::Error::MySqlError(_));
             return Err(error("atomic recovery rename", err));
         }
         renamed = true;
@@ -2272,37 +2314,59 @@ pub(crate) fn rollback_apply(
         write_dump_import_report(journal_dir, &state)?;
         Ok(())
     })();
-    if outcome.is_err() && (!rename_attempted || rename_rejected) {
-        let restore = (|| -> Result<(), String> {
-            let moved = final_programs(plan).into_iter().filter(|p| p.table.as_ref().is_some_and(|t| active.contains(t))).collect::<Vec<_>>();
-            drop_triggers(&mut conn, original, &moved)?;
-            attach_triggers(&mut conn, plan, false, &mut Vec::new())
-        })();
-        if let Err(err) = restore { state["trigger_recovery_error"] = json!(err); }
+    if locked && outcome.is_err() && triggers_detaching && !rename_attempted {
+        let result = recover_triggers(&mut conn, plan, &start_triggers, &mut state);
+        triggers_recreated = !start_triggers.is_empty();
+        if let Err(err) = result { state["trigger_recovery_error"] = json!(err); }
     }
-    if locked {
-        let _ = conn.query_drop("UNLOCK TABLES");
-    }
+    if locked { let _ = conn.query_drop("UNLOCK TABLES"); }
+    drop(conn);
     let mut verify = connect(endpoint).ok();
     let status = match verify.as_mut() {
         None => "rollback_unknown".to_string(),
         Some(db) => {
+            if rename_attempted {
+                let mut ended = false;
+                for _ in 0..40 {
+                    if db.exec_first::<u64,_,_>("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID=?",(session,)).ok().flatten() == Some(0) { ended = true; break; }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !ended { state["session_outcome_unknown"] = json!(true); }
+            }
             // Classify by identity: a lost reply must not be read as "nothing happened".
             let id_of = |db: &mut Db, ns: &str, n: &str| optional_table_id(db, ns, n).ok().flatten();
             let restored = old_ids.iter().all(|(n, id)| id_of(db, original, n) == Some(*id));
             let displaced_ok = new_ids_map.iter().all(|(n, id)| id_of(db, displaced, n) == Some(*id));
             let intact = new_ids_map.iter().all(|(n, id)| id_of(db, original, n) == Some(*id));
-            if restored && displaced_ok {
-                if program_differences(db, plan, false).is_ok_and(|missing| missing.is_empty()) { "rolled_back".to_string() }
-                else { "rollback_incomplete".to_string() }
-            } else if intact && !renamed && missing_programs(db, original, &final_programs(plan)).is_ok_and(|missing| missing.is_empty()) {
-                "failed_no_change".to_string()
+            if state["session_outcome_unknown"] == true { "rollback_unknown".into() }
+            else if restored && displaced_ok {
+                match program_differences(db, plan, false) {
+                    Ok(missing) => { state["missing_programs"] = json!(missing); if missing.is_empty() { "rolled_back".into() } else { "rollback_incomplete".into() } }
+                    Err(err) => { state["program_verification_error"] = json!(err); "rollback_incomplete".into() }
+                }
+            } else if intact && !renamed {
+                if triggers_detaching && rename_attempted {
+                    let locks = active.iter().map(|n|format!("{} WRITE",qualified(original,n))).collect::<Vec<_>>();
+                    let result = db.query_drop(format!("LOCK TABLES {}",locks.join(", "))).map_err(|e|e.to_string()).and_then(|_|recover_triggers(db,plan,&start_triggers,&mut state));
+                    let _ = db.query_drop("UNLOCK TABLES");
+                    triggers_recreated = !start_triggers.is_empty();
+                    if let Err(err) = result { state["trigger_recovery_error"] = json!(err); }
+                }
+                if missing_programs(db, original, &start_programs).is_ok_and(|m|m.is_empty()) {
+                    if triggers_recreated { "failed_triggers_recreated".into() } else { "failed_no_change".into() }
+                } else { "rollback_unknown".into() }
             } else {
                 "rollback_unknown".to_string()
             }
         }
     };
-    if status == "failed_no_change" && created {
+    state["triggers_recreated"] = json!(triggers_recreated);
+    if triggers_recreated {
+        let mut warnings = state["program_warnings"].as_array().cloned().unwrap_or_default();
+        warnings.push(json!({"code":"rollback_triggers_recreated","message":"Recovery recreated the starting triggers; their creation metadata may differ."}));
+        state["program_warnings"] = json!(warnings);
+    }
+    if matches!(status.as_str(), "failed_no_change" | "failed_triggers_recreated") && created {
         if let Some(db) = verify.as_mut() {
             let _ = db.query_drop(format!("DROP DATABASE {}", q(displaced)));
         }
@@ -2496,6 +2560,214 @@ mod tests {
     use std::sync::{mpsc, Mutex};
     static LIVE_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn safe_promote_rollback_lock_failure_leaves_active_triggers_untouched() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // holder: which table another session keeps open (SR metadata lock) during recovery.
+        let mut report = Vec::new();
+        for holder in ["original_parent", "backup_parent"] {
+            let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+            // A second active-table trigger, ordered before the dump trigger on `parent`.
+            conn.query_drop(format!("CREATE TRIGGER {} BEFORE UPDATE ON {} FOR EACH ROW SET NEW.score=NEW.score+1",
+                qualified(&original.database,"child_guard"),qualified(&original.database,"child"))).unwrap();
+            let p=plan(&original,&candidate,"rollback_lock",&programs).unwrap();
+            let result=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
+            let triggers=|db:&mut Db|->Vec<(String,String,String)>{ db.exec(
+                "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, CONCAT(CREATED,'|',DEFINER) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=? ORDER BY TRIGGER_NAME",
+                (&original.database,)).unwrap() };
+            let before=triggers(&mut conn);
+            let recovery_dir=dir.join("recovery"); std::fs::create_dir(&recovery_dir).unwrap();
+            let displaced=format!("tf_backup_recovery_{}",p.nonce);
+            let reviewed=rollback_plan(&original,&p,result.get("backup_fingerprint"),result.get("new_table_ids"),&displaced).unwrap();
+            let held_db = if holder=="original_parent" { &p.original_database } else { &p.backup_database };
+            let mut reader=connect(&original).unwrap();
+            reader.query_drop("BEGIN").unwrap();
+            reader.query_drop(format!("SELECT * FROM {} LIMIT 1",qualified(held_db,"parent"))).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let recovered=rollback_apply(&original,&p,result.get("backup_fingerprint"),result.get("new_table_ids"),&displaced,&recovery_dir).unwrap();
+            reader.query_drop("ROLLBACK").unwrap();
+            drop(reader);
+            let after=triggers(&mut conn);
+            eprintln!("HOLDER={holder}\nPROMOTE_STATUS={}\nREVIEW_BLOCKERS={}\nRECOVERED_STATUS={}\nRECOVERED_ERROR={}\nTRIGGER_RECOVERY_ERROR={}\nBEFORE={before:?}\nAFTER={after:?}",
+                result["status"],reviewed["blockers"],recovered["status"],recovered["error"],recovered["trigger_recovery_error"]);
+            report.push((holder,result["status"].clone(),reviewed["blockers"].clone(),recovered["status"].clone(),before,after));
+            let _=conn.query_drop(format!("DROP DATABASE IF EXISTS {}",q(&displaced)));
+            cleanup(&mut conn,&p,&dir);
+        }
+        // Expected: a recovery that never acquired its locks touches nothing.
+        for (holder,promoted,blockers,status,before,after) in report {
+            assert_eq!(promoted,"promoted","{holder}");
+            assert_eq!(blockers,json!([]),"{holder}");
+            assert_eq!(after,before,"{holder}: active triggers were dropped/recreated although the recovery failed before detaching them");
+            assert_eq!(status,"failed_no_change","{holder}");
+        }
+    }
+    #[test]
+    fn safe_promote_killed_cutover_session_recovers_original_triggers() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // ok_after_kill=true: RENAME is sent on the killed connection (lost-connection RENAME).
+        // ok_after_kill=false: the connection dies before RENAME is sent (recovery runs on the dead conn).
+        for ok_after_kill in [true, false] {
+            let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+            let before=capture_programs(&mut conn,&original.database).unwrap();
+            let old_parent=table_id(&mut conn,&original.database,"parent").unwrap();
+            let p=plan(&original,&candidate,"killed_cutover",&programs).unwrap();
+            let mut killed=None;
+            let result=promote_with_hook(&original,&candidate,&p,&p.digest,&dir,|phase,db| {
+                if phase=="before_rename" {
+                    let id:u64=db.query_first("SELECT CONNECTION_ID()").map_err(|e|e.to_string())?.unwrap();
+                    let mut killer=connect(&original)?;
+                    killer.query_drop(format!("KILL {id}")).map_err(|e|e.to_string())?;
+                    killed=Some(id);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    if !ok_after_kill { return Err("connection lost before RENAME".into()) }
+                }
+                Ok(())
+            }).unwrap();
+            let after=capture_programs(&mut conn,&original.database).unwrap();
+            let guard_present=after.iter().any(|x|x.kind=="TRIGGER"&&x.name=="guard");
+            let parent_now=table_id(&mut conn,&original.database,"parent").unwrap();
+            eprintln!("RV204 ok_after_kill={ok_after_kill} killed={killed:?} status={} original_unchanged={} error={} trigger_recovery_error={} missing_programs={} parent_id_before={old_parent} parent_id_now={parent_now} guard_present={guard_present} programs_before={} programs_after={}",
+                result["status"],result["original_unchanged"],result["error"],result["trigger_recovery_error"],result["missing_programs"],before.len(),after.len());
+            let inspected=inspect_backup(&original,&p,false,None).unwrap();
+            eprintln!("RV204 ok_after_kill={ok_after_kill} inspect_backup verdict={}",inspected["verdict"]);
+            assert!(killed.is_some());
+            assert_eq!(parent_now,old_parent,"original table was never renamed");
+            assert!(p.original_trigger_definitions.contains_key("guard"),"saved definition is available");
+            assert_eq!(result["status"],"failed_original_unchanged","{result:#}");
+            assert!(guard_present,"original trigger must be recovered using a fresh connection");
+            assert_eq!(inspected["verdict"],"not_promoted");
+            cleanup(&mut conn,&p,&dir);
+        }
+    }
+    #[test]
+    fn safe_promote_lost_cleanup_connection_before_detach_reports_unchanged() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+        let before=capture_programs(&mut conn,&original.database).unwrap();
+        let user=format!("tf_rv_{}",&original.database[16..35]);
+        conn.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_rv_pw'")).unwrap();
+        conn.query_drop(format!("GRANT ALL PRIVILEGES ON *.* TO '{user}'@'%' WITH GRANT OPTION")).unwrap();
+        let (mut o,mut c)=(original.clone(),candidate.clone());
+        for e in [&mut o,&mut c] { e.user=user.clone(); e.password="tf_rv_pw".into(); }
+        let p=plan(&o,&c,"cleanup_conn_lost",&programs).unwrap();
+        assert!(!moved_original_triggers(&p).is_empty());
+        let lock_sql=format!("ALTER USER '{user}'@'%' ACCOUNT LOCK");
+        // Fail before any trigger is detached, and make every later connect(original) fail.
+        let result=promote_with_hook(&o,&c,&p,&p.digest,&dir,|phase,db| {
+            if phase=="before_lock" { db.query_drop(&lock_sql).map_err(|e|e.to_string())?; Err("injected before lock".into()) } else { Ok(()) }
+        }).unwrap();
+        let after=capture_programs(&mut conn,&original.database).unwrap();
+        eprintln!("RV204 status={} original_unchanged={} cleanup_errors={} error={}",result["status"],result["original_unchanged"],result.get("cleanup_errors").cloned().unwrap_or(Value::Null),result["error"]);
+        eprintln!("RV204 triggers_unchanged={}",after==before);
+        conn.query_drop(format!("DROP USER '{user}'@'%'")).unwrap();
+        cleanup(&mut conn,&p,&dir);
+        assert_eq!(after,before,"original programs must be untouched");
+        assert_eq!(result["status"],"failed_original_unchanged","{result:#}");
+        assert_eq!(result["original_unchanged"],true);
+    }
+    #[test]
+    fn safe_promote_incomplete_recovery_lock_timeout_is_failed_no_change() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+        let p=plan(&original,&candidate,"rv_incomplete",&programs).unwrap();
+        // Triggers attached, routines/events not yet replaced -> promoted_incomplete with original p/f/e.
+        let result=promote_with_hook(&original,&candidate,&p,&p.digest,&dir,|at,_|if at=="triggers_attached" {Err("injected".into())} else {Ok(())}).unwrap();
+        assert_eq!(result["status"],"promoted_incomplete","{result:#}");
+        let displaced=format!("tf_backup_recovery_{}",p.nonce);
+        let reviewed=rollback_plan(&original,&p,result.get("backup_fingerprint"),result.get("new_table_ids"),&displaced).unwrap();
+        assert_eq!(reviewed["blockers"],json!([]),"{reviewed:#}");
+        let snapshot=|conn:&mut Db| -> (Vec<NormalizedStoredProgram>, Vec<(String,Option<u64>)>) {
+            let programs=capture_programs(conn,&original.database).unwrap();
+            let ids=tables(conn,&original.database).unwrap().into_keys().map(|n|{let id=optional_table_id(conn,&original.database,&n).unwrap();(n,id)}).collect();
+            (programs,ids)
+        };
+        let before=snapshot(&mut conn);
+        // Session 2: an app transaction that has read the active table holds its metadata lock.
+        let mut other=connect(&original).unwrap();
+        other.query_drop("START TRANSACTION").unwrap();
+        let _:Option<u64>=other.query_first(format!("SELECT COUNT(*) FROM {}",qualified(&original.database,"parent"))).unwrap();
+        let recovery_dir=dir.join("recovery"); std::fs::create_dir(&recovery_dir).unwrap();
+        let recovered=rollback_apply(&original,&p,result.get("backup_fingerprint"),result.get("new_table_ids"),&displaced,&recovery_dir).unwrap();
+        other.query_drop("ROLLBACK").unwrap(); drop(other);
+        let after=snapshot(&mut conn);
+        let displaced_left=database_exists(&mut conn,&displaced).unwrap();
+        let again=rollback_plan(&original,&p,result.get("backup_fingerprint"),result.get("new_table_ids"),&displaced).unwrap();
+        let missing=missing_programs(&mut conn,&original.database,&final_programs(&p)).unwrap();
+        eprintln!("RV status={} error={} trigger_recovery_error={} programs_unchanged={} ids_unchanged={} displaced_left={displaced_left} missing_vs_final={missing:?} retry_blockers={}",
+            recovered["status"],recovered["error"],recovered["trigger_recovery_error"],after.0==before.0,after.1==before.1,again["blockers"]);
+        let _=conn.query_drop(format!("DROP DATABASE IF EXISTS {}",q(&displaced)));
+        cleanup(&mut conn,&p,&dir);
+        assert!(recovered["error"].as_str().unwrap_or("").contains("lock"),"{recovered:#}");
+        assert_eq!(after,before,"the failed recovery changed nothing");
+        assert_eq!(recovered["status"],"failed_no_change","{recovered:#}");
+    }
+    #[test]
+    fn safe_promote_triggers_missing_cleans_preparatory_objects() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for recovery_fails in [false, true] {
+            let Some((original,candidate,mut conn,dir))=fixture() else { return };
+            for (db, note) in [(&original.database,"old"),(&candidate.database,"dump")] {
+                conn.query_drop(format!("CREATE TRIGGER {} BEFORE UPDATE ON {} FOR EACH ROW SET NEW.note='{note}'",qualified(db,"guard"),qualified(db,"parent"))).unwrap();
+            }
+            let programs=capture_programs(&mut conn,&candidate.database).unwrap();
+            for p in &programs { conn.query_drop(format!("DROP {} {}",p.kind,qualified(&candidate.database,&p.name))).unwrap(); }
+            let p=plan(&original,&candidate,"rv11",&programs).unwrap();
+            assert!(!p.hidden_views.is_empty(), "fixture must prepare hidden views");
+            let result=promote_with_hook(&original,&candidate,&p,&p.digest,&dir,|phase,_| {
+                if phase=="before_rename" || (recovery_fails && phase=="before_original_trigger_recovery") { Err("injected".into()) } else { Ok(()) }
+            }).unwrap();
+            let status=result["status"].as_str().unwrap().to_string();
+            let present=tables(&mut conn,&p.original_database).unwrap();
+            let hidden_left=p.hidden_views.values().filter(|n|present.contains_key(*n)).cloned().collect::<Vec<_>>();
+            let clone_left=database_exists(&mut conn,&p.clone_database).unwrap();
+            let backup_left=database_exists(&mut conn,&p.backup_database).unwrap();
+            let tables_unchanged=p.original_tables.iter().all(|(n,t)|table_id(&mut conn,&p.original_database,n).unwrap()==t.table_id);
+            eprintln!("RV11 recovery_fails={recovery_fails} status={status} tables_unchanged={tables_unchanged} hidden_left={hidden_left:?} clone_left={clone_left} backup_left={backup_left} cleanup_errors={}",result["cleanup_errors"]);
+            assert!(tables_unchanged);
+            if !recovery_fails {
+                assert_eq!(status,"failed_original_unchanged","{result:#}");
+                assert!(hidden_left.is_empty() && !clone_left && !backup_left);
+                cleanup(&mut conn,&p,&dir);
+                continue;
+            }
+            assert_eq!(status,"failed_original_triggers_missing","{result:#}");
+            // Session-default replay keeps the verdict stuck (context mismatch); replay with the saved context as recovery does.
+            conn.query_drop(format!("USE {}",q(&p.original_database))).unwrap();
+            conn.query_drop(result["plan"]["original_trigger_definitions"]["guard"].as_str().unwrap()).unwrap();
+            eprintln!("RV11 verdict_after_plain_replay={}",inspect_backup(&original,&p,false,None).unwrap()["verdict"]);
+            drop_triggers(&mut conn,&p.original_database,&moved_original_triggers(&p)).unwrap();
+            attach_triggers(&mut conn,&p,true,&mut Vec::new()).unwrap();
+            let verdict=inspect_backup(&original,&p,false,None).unwrap()["verdict"].clone();
+            eprintln!("RV11 verdict_after_context_replay={verdict}");
+            // Attempt journal as safe_promotion::finish_attempt leaves it.
+            let input=dir.join("input");
+            let attempt=input.join(".tunnelforge_promotion_plan_rv11").join("attempt");
+            std::fs::create_dir_all(&attempt).unwrap();
+            let stored=json!({"restore_id":"rv11","restore_digest":"x","original_target":crate::safe_promotion::public_target(&original),
+                "candidate_target":crate::safe_promotion::public_target(&candidate),
+                "engine_plan":{"engine":"mysql","plan":serde_json::to_value(&p).unwrap()},"attempt_nonce":p.nonce});
+            write_dump_import_report(&attempt,&json!({"status":status,"original_unchanged":false,"plan_digest":"x","stored_plan":stored,"result":result})).unwrap();
+            let call=|payload:Value| { let mut out=Value::Null; crate::safe_backups::handle(&Request{command:"restore.backups".into(),request_id:None,payload},|v|out=v); out };
+            let body=|action:&str,target:&str| json!({"action":action,"target":target,"restore_id":"rv11","input_dirs":[input.to_string_lossy()],"connection":serde_json::to_value(&original).unwrap()});
+            let mut allowed=Vec::new();
+            for target in ["clone","backup","view_aliases","candidate"] {
+                let r=call(body("cleanup_plan",target));
+                eprintln!("RV11 cleanup_plan {target}: event={} can_cleanup={} blockers={} message={}",r["event"],r["can_cleanup"],r["blockers"],r["message"]);
+                allowed.push(r["can_cleanup"]==true);
+            }
+            let rb=call(body("rollback_plan",""));
+            eprintln!("RV11 rollback_plan: event={} can_rollback={} blockers={} message={}",rb["event"],rb["can_rollback"],rb["blockers"],rb["message"]);
+            let rc=call(body("reconcile",""));
+            eprintln!("RV11 reconcile: conclusion={} cleanup_allowed={}",rc["conclusion"],rc["cleanup_allowed"]);
+            assert_eq!(verdict,"not_promoted");
+            assert!(hidden_left.is_empty() && !clone_left && !backup_left, "preparatory objects must be cleaned");
+            // The synthetic journal has no verified import report; that independent guard still applies.
+            let candidate_cleanup=call(body("cleanup_plan","candidate"));
+            assert!(!candidate_cleanup["blockers"].to_string().contains("only a verified, unpromoted candidate"), "{candidate_cleanup:#}");
+            cleanup(&mut conn,&p,&dir);
+        }
+    }
     fn program_fixture() -> Option<(Endpoint, Endpoint, Db, std::path::PathBuf, Vec<NormalizedStoredProgram>)> {
         let (original, candidate, mut conn, dir) = fixture()?;
         for (db, view) in [(&original.database,"child_view"),(&original.database,"v"),(&candidate.database,"v")] {

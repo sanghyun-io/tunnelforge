@@ -486,7 +486,7 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
                     .map(|b| b["verdict"].as_str().unwrap_or("undeterminable").to_string())
                     .unwrap_or_else(|| "none".into());
                 let unpromoted = matches!(verdict.as_str(), "none" | "not_promoted")
-                    && !matches!(status.as_str(), "promoted" | "promoted_incomplete" | "failed_original_triggers_missing" | "cutover_unknown" | "pending");
+                    && !matches!(status.as_str(), "promoted" | "promoted_incomplete" | "cutover_unknown" | "pending");
                 if !unpromoted {
                     blockers.push(format!("the candidate still holds data and the promotion state is {status}/{verdict}; only a verified, unpromoted candidate can be discarded"));
                 }

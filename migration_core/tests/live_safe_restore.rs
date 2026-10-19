@@ -878,3 +878,55 @@ fn safe_restore_source_schema_reference_is_checked_against_final_target_before_c
     for ns in [same["candidate_target"]["database"].as_str().unwrap(),skipped["candidate_target"]["database"].as_str().unwrap(),&other_name,&name] { drop_namespace(&mut admin,"mysql",ns); }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn rv204_rollback_lock_timeout_does_not_drop_promoted_triggers() {
+    use mysql::prelude::Queryable;
+    let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
+    let mut db = LiveAdapter::connect(&original).unwrap();
+    for sql in [
+        "CREATE TABLE zz(id INT PRIMARY KEY)",
+        "INSERT INTO zz VALUES(1)",
+        "CREATE TRIGGER a_trg BEFORE INSERT ON parents FOR EACH ROW SET NEW.value=NEW.value",
+        "CREATE TRIGGER z_trg BEFORE INSERT ON zz FOR EACH ROW SET NEW.id=NEW.id",
+    ] { db.execute_sql(sql).unwrap(); }
+    let output = root.join("programs");
+    let exported = run("dump.run", json!({"source":original,"output_dir":output,"data_format":"jsonl","compression":"none","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(!exported.iter().any(|e| e["event"] == "error"), "{exported:#?}");
+    let restored = safe_import(&original, &output);
+    assert_eq!(restored["status"], "ready_for_switch", "{restored:#}");
+    let planned = promote_plan(&original, &restored);
+    assert_eq!(planned["can_promote"], true, "{planned:#}");
+    let done = run("dump.promote", json!({"endpoint":original,"action":"confirm","report_path":restored["report_path"],"restore_id":restored["restore_id"],"plan_digest":planned["plan_digest"],"overwrite_confirmed":true}));
+    let done = done.iter().find(|e| e["event"] == "result").cloned().unwrap_or_else(|| panic!("{done:#?}"));
+    assert_eq!(done["status"], "promoted", "{done:#}");
+    let triggers_sql = "SELECT IFNULL(GROUP_CONCAT(TRIGGER_NAME ORDER BY TRIGGER_NAME),'') AS n FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()";
+    let before = first_value(&original, triggers_sql);
+    let backups = |action: &str, extra: Value| {
+        let mut payload = json!({"endpoint":original,"input_dirs":[output],"restore_id":restored["restore_id"],"action":action});
+        payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let events = run("restore.backups", payload);
+        events.iter().find(|e| e["event"] == "result" || e["event"] == "error").cloned().unwrap_or_else(|| panic!("{events:#?}"))
+    };
+    let recovery = backups("rollback_plan", json!({}));
+    assert_eq!(recovery["can_rollback"], true, "{recovery:#}");
+    // Session 2: an open read transaction holds a shared metadata lock on zz.
+    let LiveAdapter::MySql(mut other) = LiveAdapter::connect(&original).unwrap() else { unreachable!() };
+    other.query_drop("START TRANSACTION").unwrap();
+    let _: Vec<i64> = other.query("SELECT id FROM zz").unwrap();
+    let recovered = backups("rollback_apply", json!({"confirmed":true,"plan_digest":recovery["plan_digest"]}));
+    other.query_drop("ROLLBACK").unwrap();
+    drop(other);
+    let after = first_value(&original, triggers_sql);
+    let retry = backups("rollback_plan", json!({}));
+    eprintln!("RV204 before={before} after={after}\nRV204 recovered={recovered:#}\nRV204 retry={retry:#}");
+    let mut namespaces = vec![name.clone()];
+    for v in [&restored["candidate_target"]["database"], &done["backup_namespace"], &done["clone_database"], &recovered["displaced_backup"]] {
+        if let Some(ns) = v.as_str() { namespaces.push(ns.to_string()); }
+    }
+    for ns in &namespaces { drop_namespace(&mut admin, "mysql", ns); }
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(before, "a_trg,z_trg");
+    assert_eq!(after, "a_trg,z_trg", "promoted trigger lost after a failed recovery lock: {recovered:#}");
+    assert_eq!(recovered["status"], "failed_no_change", "{recovered:#}");
+}
