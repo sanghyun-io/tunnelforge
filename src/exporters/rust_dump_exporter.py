@@ -119,10 +119,11 @@ _TABLE_REFUSAL_REASONS = {
     "custom_type": "열 {}의 사용자 정의 형식을 덤프에 담을 수 없습니다",
     "unsupported_index": "인덱스({})는 덤프에 담을 수 없습니다",
     "cross_schema_fk": "외래 키({})가 다른 DB나 스키마의 테이블을 가리켜 덤프에 담을 수 없습니다",
+    "table_inheritance": "테이블 {}은 상속이나 파티션으로 다른 테이블과 이어져 있어 아직 덤프에 담을 수 없습니다.",
 }
 # dump.rs LOSSY_SCHEMA_KINDS: refused without a way to leave them out (bypassable false).
 LOSSY_REFUSAL_KINDS = frozenset({
-    "generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk",
+    "generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk", "table_inheritance",
 })
 _SCHEMA_REFUSAL_REASONS = {
     "routine": "저장 프로시저·함수 {}: 덤프에 담을 수 없습니다",
@@ -140,9 +141,15 @@ def describe_export_refusal(objects: object, reasons: Optional[Dict[str, str]] =
     for item in objects if isinstance(objects, list) else []:
         kind, _, rest = str(item).partition(":")
         table, _, name = rest.partition(":")
+        code = (reasons or {}).get(str(item)) or {
+            "policy": "row_security_unsupported", "rule": "rule_unsupported",
+            "table_inheritance": "table_inheritance_unsupported",
+        }.get(kind)
         if kind in _SCHEMA_REFUSAL_REASONS:
             reason = describe_core_code((reasons or {}).get(str(item)), rest)
             lines.append(reason or translate_text(_SCHEMA_REFUSAL_REASONS[kind]).format(rest))
+        elif code in ("row_security_unsupported", "rule_unsupported", "table_inheritance_unsupported"):
+            lines.append(describe_core_code(code, table))
         elif name:
             code = (reasons or {}).get(str(item))
             reason = (translate_text(CORE_CODE_SENTENCES[code]).format(name) if code in CORE_CODE_SENTENCES
@@ -635,6 +642,27 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "identity_always_unsupported": "열 {}은 GENERATED ALWAYS identity라서 아직 덤프에 담을 수 없습니다.",
+    "sequence_options_unsupported": "열 {}의 시퀀스가 시작값 1·증가 1이 아니거나 이 테이블 소유가 아니어서 덤프에 담을 수 없습니다.",
+    "default_expression_unsupported": "열 {}의 기본값이 상수·now()·gen_random_uuid() 같은 옮길 수 있는 형태가 아니어서 덤프에 담을 수 없습니다.",
+    "check_constraint_unsupported": "PostgreSQL CHECK 제약 {}은 아직 덤프에 담을 수 없습니다.",
+    "custom_type_unsupported": "열 {}이 enum·domain·확장 형식 같은 사용자 정의 형식을 써서 아직 덤프에 담을 수 없습니다.",
+    "index_shape_unsupported": "인덱스 {}는 식·부분·btree가 아닌·내림차순·INCLUDE 인덱스라 아직 덤프에 담을 수 없습니다.",
+    "cross_schema_fk_unsupported": "외래 키 {}가 다른 스키마의 테이블을 가리켜 덤프에 담을 수 없습니다.",
+    "materialized_view_unsupported": "구체화 뷰 {}는 아직 덤프에 담을 수 없습니다. 빼고 내보내려면 고급 설정의 \"담을 수 없는 객체는 빼고 내보내기\"를 켜세요.",
+    "postgres_trigger_unsupported": "PostgreSQL 트리거 {}는 아직 덤프에 담을 수 없습니다. 빼고 내보내려면 고급 설정의 \"담을 수 없는 객체는 빼고 내보내기\"를 켜세요.",
+    "postgres_routine_unsupported": "PostgreSQL 함수·프로시저 {}는 아직 덤프에 담을 수 없습니다. 빼고 내보내려면 고급 설정의 \"담을 수 없는 객체는 빼고 내보내기\"를 켜세요.",
+    "row_security_unsupported": "테이블 {}에 행 수준 보안(RLS) 정책이 있어 아직 덤프에 담을 수 없습니다. 정책 없이 내보내려면 고급 설정의 '담을 수 없는 객체는 빼고 내보내기'를 켜고, 가져온 뒤 정책을 다시 만드세요.",
+    "rule_unsupported": "테이블 {}에 걸린 규칙(RULE)은 아직 덤프에 담을 수 없습니다. 규칙 없이 내보내려면 고급 설정의 '담을 수 없는 객체는 빼고 내보내기'를 켜세요.",
+    "table_inheritance_unsupported": "테이블 {}은 상속이나 파티션으로 다른 테이블과 이어져 있어 아직 덤프에 담을 수 없습니다.",
+    "comments_not_exported": "테이블·열 주석(COMMENT)은 덤프에 담지 않았습니다: {}",
+    "generated_expression_unsafe": "계산 열 {}의 식에 덤프로 옮길 수 없는 부분(;, 주석, 괄호 밖 쉼표 등)이 있어 담지 않았습니다.",
+    "generated_dependency_unsupported": "계산 열 {}의 식이 PostgreSQL 기본 함수가 아닌 함수나 형식을 써서 아직 덤프에 담을 수 없습니다.",
+    "generated_expression_changed": "대상 DB가 계산 열의 식을 원본과 다르게 저장해 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "program_name_resolution_changed": "대상 스키마에 이름이 같은 함수나 연산자가 있어, 계산 열이나 트리거가 원본과 다른 객체를 부르게 됩니다. 대상 스키마의 그 객체 이름을 바꾸거나 지운 뒤 다시 가져오세요. 대상 테이블은 바뀌지 않았습니다.",
+    "generated_virtual_unsupported_on_target": "대상 PostgreSQL이 18보다 낮아 VIRTUAL 계산 열을 만들 수 없습니다. 대상 테이블은 바뀌지 않았습니다.",
+    "generated_values_recomputed": "계산 열 값은 대상 DB에서 다시 계산했습니다. 원본 값과 같은지는 복사본 검증에서 확인할 수 있습니다: {}",
+
     "target_trigger_hidden": "교체할 테이블에 지금 계정으로는 보이지 않는 트리거가 있어 교체하지 않았습니다. 원본은 그대로입니다. TRIGGER 권한이 있는 계정으로 다시 교체하세요.",
     "rollback_routine_binlog_unsafe": "원래 함수를 지금 서버 설정으로는 다시 만들 수 없어 복구를 시작하지 않았습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 복구하세요.",
     "rollback_trigger_privilege_missing": "원래 트리거를 다시 만들 TRIGGER 권한이 없어 복구를 시작하지 않았습니다. TRIGGER 권한이 있는 계정으로 복구하세요.",
@@ -741,7 +769,7 @@ CORE_CODE_SENTENCES = {
     "program_finalize_failed": "객체를 만들었지만 활성화나 마무리 확인을 끝내지 못했습니다. 보고서에서 남아 있는 객체와 실행 상태를 확인하세요.",
     "event_privilege_unproven": "이벤트 생성 권한을 확인하지 못했습니다. 권한이 없으면 이 객체는 만들지 못하고 결과가 일부 완료로 남을 수 있습니다.",
     "program_execution_account": "이 객체들은 가져오는 계정의 권한으로 실행됩니다. 신뢰하는 덤프인지 확인하세요.",
-    "unsupported_generated_column": "이 테이블의 계산 열은 MySQL 대상에서만 복원할 수 있습니다. MySQL 대상으로 가져오세요.",
+    "unsupported_generated_column": "계산 열은 덤프를 만든 DB와 같은 종류의 대상으로만 복원할 수 있습니다. 같은 종류의 DB로 가져오세요.",
     "unsupported_invisible_column": "이 테이블의 숨김 열은 MySQL 대상에서만 복원할 수 있습니다. MySQL 대상으로 가져오세요.",
     "trigger_definition_invalid": "트리거 {}의 정의나 생성 설정을 안전하게 읽을 수 없습니다. 원본 트리거 정의를 확인한 뒤 다시 내보내세요.",
     "trigger_create_failed": "데이터를 넣은 뒤 트리거를 만들다가 Import가 멈췄습니다. 앞서 완료한 테이블은 유지됩니다. 보고서에서 트리거가 없는 테이블을 확인하세요.",
@@ -824,6 +852,7 @@ def describe_program_results(result: dict) -> Tuple[List[str], List[str]]:
 # How the core's manifest warnings begin (adapters.rs WARNING_*) and the code Import gives
 # them (import.rs manifest_warning_code).
 _MANIFEST_WARNING_CODES = (
+    ("comments_not_exported:", "comments_not_exported"),
     ("Workers used independent snapshots", "unsynchronized_snapshot"),
     ("View definitions were collected outside the table data snapshot", "views_outside_snapshot"),
     ("Object not exported:", "omitted_object"),
@@ -836,7 +865,7 @@ def manifest_warning_code(warning: str) -> Tuple[str, str]:
     """(code, detail) of one manifest warning: an omitted object keeps its name, an unknown warning its text."""
     for prefix, known in _MANIFEST_WARNING_CODES:
         if warning.startswith(prefix):
-            return known, (warning[len(prefix):].strip() if known == "omitted_object" else "")
+            return known, (warning[len(prefix):].strip() if known in ("omitted_object", "comments_not_exported") else "")
     return "source_dump_warning", warning
 
 
@@ -844,6 +873,8 @@ def describe_manifest_warning(warning: str) -> str:
     """The sentence for one manifest warning; an omitted object keeps its name and an unknown
     warning its text, e.g. "내보낼 때 일부 객체가 빠졌습니다. (trigger:orders:trg)"."""
     code, detail = manifest_warning_code(warning)
+    if code == "comments_not_exported":
+        return describe_core_code(code, detail)
     sentence = describe_core_code(code)
     return f"{sentence} ({detail})" if detail else sentence
 

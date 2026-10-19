@@ -1972,9 +1972,13 @@ def test_every_refusal_kind_the_core_reports_has_a_sentence():
     assert {"generated_column", "cross_schema_fk", "trigger", "non_transactional_table", "routine", "event"} <= kinds
 
     for kind in sorted(kinds):
-        line = describe_export_refusal([f"{kind}:orders:x"])[0]
+        object_id = f"{kind}:orders" if kind in ("policy", "table_inheritance") else f"{kind}:orders:x"
+        line = describe_export_refusal([object_id])[0]
         assert "이 객체는 담을 수 없습니다" not in line, kind
-        assert "x" in line and ":" in line, kind
+        if kind in ("policy", "rule", "table_inheritance"):
+            assert "orders" in line, kind
+        else:
+            assert "x" in line and ":" in line, kind
     i18n.set_language("en")
     try:
         lines = describe_export_refusal([f"{kind}:orders:x" for kind in sorted(kinds)] + ["future_kind:orders:x"])

@@ -1034,10 +1034,10 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     Ok((manifest, views_count))
 }
 
-const LOSSY_SCHEMA_KINDS: [&str; 6] = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk"];
+const LOSSY_SCHEMA_KINDS: [&str; 7] = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk", "table_inheritance"];
 
-fn mysql_dump_ddl_refusal(schema: &NormalizedSchema) -> Option<DumpRefusal> {
-    let objects = schema.tables.iter().filter(|table| generate_table_ddl(table, "mysql", "mysql").is_none())
+fn dump_ddl_refusal(schema: &NormalizedSchema, engine: &str) -> Option<DumpRefusal> {
+    let objects = schema.tables.iter().filter(|table| generate_table_ddl(table, engine, engine).is_none())
         .map(|table| format!("table_definition:{}:DDL", table.name)).collect::<Vec<_>>();
     if objects.is_empty() { return None }
     let reasons = objects.iter().map(|id| (id.clone(), "table_definition_unrestorable".into())).collect();
@@ -1047,7 +1047,15 @@ fn mysql_dump_ddl_refusal(schema: &NormalizedSchema) -> Option<DumpRefusal> {
 fn scoped_unrepresentable(objects: &[String], schema: &NormalizedSchema) -> Vec<String> {
     objects.iter().filter(|object| {
         LOSSY_SCHEMA_KINDS.iter().any(|kind| schema.tables.iter().any(|table| object.starts_with(&format!("{kind}:{}:", table.name))))
+            || schema.tables.iter().any(|table| **object==format!("table_inheritance:{}",table.name))
     }).cloned().collect()
+}
+
+fn inspected_scope_refusal(objects: &[String], schema: &NormalizedSchema, full_export: bool, allow_incomplete: bool,
+    reasons: &BTreeMap<String,String>) -> Option<DumpRefusal> {
+    let mut refusal=dump_scope_refusal(objects,schema,full_export,allow_incomplete)?;
+    refusal.reasons.extend(refusal.objects.iter().filter_map(|id|reasons.get(id).map(|code|(id.clone(),code.clone()))));
+    Some(refusal)
 }
 
 /// Objects inside the export scope that the dump omits. Triggers and
@@ -1058,7 +1066,7 @@ fn scoped_omitted_objects(objects: &[String], schema: &NormalizedSchema, full_ex
     objects.iter().filter(|object| {
         let mut parts = object.splitn(3, ':');
         match (parts.next(), parts.next()) {
-            (Some("trigger" | "deprecated_engine" | "non_transactional_table"), Some(table)) => selected(table),
+            (Some("trigger" | "deprecated_engine" | "non_transactional_table" | "policy" | "rule"), Some(table)) => selected(table),
             (Some("routine" | "event" | "materialized_view"), _) => full_export,
             _ => false,
         }
@@ -1251,13 +1259,13 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         return Err("dump.run found no tables to export".to_string());
     }
     let (mut stored_programs, program_reasons) = crate::mysql_programs::collect_mysql_stored_programs(&endpoint, &schema, full_export)?;
-    let held = if endpoint.engine == "mysql" { crate::dump_format::held_object_ids(&schema, &stored_programs) } else { BTreeSet::new() };
+    let held = crate::dump_format::held_object_ids(&schema, &stored_programs);
     let unheld: Vec<String> = inspection.unsupported_objects.iter().filter(|object| !held.contains(*object)).cloned().collect();
     let mut scope_objects = unheld.clone();
     if endpoint.engine == "mysql" {
         scope_objects.extend(mysql_non_transactional_objects(&endpoint, &schema)?);
     }
-    if let Some(mut refusal) = dump_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete) {
+    if let Some(mut refusal) = inspected_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete, &inspection.object_reasons) {
         if endpoint.engine == "mysql" {
             refusal.reasons = refusal.objects.iter().filter(|id| id.starts_with("generated_column:"))
                 .map(|id| (id.clone(), "generated_column_unproven".to_string())).collect();
@@ -1273,11 +1281,11 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         *refusal_slot = Some(refusal);
         return Err(message);
     }
-    if endpoint.engine == "mysql" {
+    {
         let mut exported = schema.clone();
         exported.tables.retain(|table| !scope_objects.iter().any(|id|
             id.starts_with(&format!("non_transactional_table:{}:", table.name)) || id.starts_with(&format!("deprecated_engine:{}:", table.name))));
-        if let Some(refusal) = mysql_dump_ddl_refusal(&exported) {
+        if let Some(refusal) = dump_ddl_refusal(&exported, &endpoint.engine) {
             let message = format!("table_definition_unrestorable: {}", refusal.objects.join(", "));
             *refusal_slot = Some(refusal);
             return Err(message);
@@ -1291,6 +1299,14 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     if endpoint.engine == "mysql" {
         let tables: Vec<&str> = schema.tables.iter().map(|table| table.name.as_str()).collect();
         export_warnings.extend(mysql_visibility_warning(&endpoint, &tables, full_export));
+    } else if endpoint.engine=="postgresql" {
+        let comments = unheld.iter().filter(|id|schema.tables.iter().any(|table|id.starts_with(&format!("comment:{}:",table.name)))).collect::<Vec<_>>();
+        if !comments.is_empty() {
+            let mut names = comments.iter().take(20).map(|id|id.as_str()).collect::<Vec<_>>().join(", ");
+            if comments.len()>20 { names.push_str(&format!(", … (+{})", comments.len()-20)); }
+            debug_assert_eq!(crate::schema::POSTGRES_WARNING_REASONS[0],"comments_not_exported");
+            export_warnings.push(format!("{WARNING_COMMENTS_NOT_EXPORTED} {names}"));
+        }
     }
     prepare_dump_output_dir(output_path, options.overwrite)?;
 
@@ -2569,9 +2585,9 @@ mod tests {
     #[test]
     fn mysql_export_refuses_definitions_its_import_cannot_recreate() {
         let mut schema = crate::adapters::test_support::schema();
-        assert!(mysql_dump_ddl_refusal(&schema).is_none());
+        assert!(dump_ddl_refusal(&schema, "mysql").is_none());
         schema.tables[0].columns[0].on_update = Some("CURRENT_TIMESTAMP INVISIBLE".into());
-        let refusal = mysql_dump_ddl_refusal(&schema).unwrap();
+        let refusal = dump_ddl_refusal(&schema, "mysql").unwrap();
         assert!(!refusal.bypassable);
         assert_eq!(refusal.objects,["table_definition:users:DDL"]);
         assert_eq!(refusal.reasons["table_definition:users:DDL"],"table_definition_unrestorable");
@@ -3446,5 +3462,21 @@ mod tests {
             bounded_dump_chunk_limit(120_000, 100_000, 50_000),
             Some(20_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod postgres_refusal_tests {
+    use super::*;
+    #[test]
+    fn postgres_refusal_carries_inspection_reasons() {
+        let inspection=InspectionResult {
+            schema:crate::adapters::test_support::schema(),
+            unsupported_objects:vec!["unsupported_default:users:id".into()],
+            object_reasons:BTreeMap::from([("unsupported_default:users:id".into(),"identity_always_unsupported".into())]),
+        };
+        let refused=inspected_scope_refusal(&inspection.unsupported_objects,&inspection.schema,true,false,&inspection.object_reasons).unwrap();
+        assert!(!refused.bypassable);
+        assert_eq!(refused.reasons,inspection.object_reasons);
     }
 }

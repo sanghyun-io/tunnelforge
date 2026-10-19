@@ -126,7 +126,7 @@ pub struct NormalizedColumn {
 
 /// A proven MySQL generated column. `expression` is decoded SQL without the
 /// enclosing AS (...) parentheses (parentheses belonging to the expression stay).
-/// `stored`: true = STORED, false = VIRTUAL; supported only MySQL -> MySQL.
+/// `stored`: true = STORED, false = VIRTUAL; restored only within the same engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedGenerated {
     pub expression: String,
@@ -416,6 +416,8 @@ pub(crate) enum ImportChunkEvent {
 pub struct InspectionResult {
     pub schema: NormalizedSchema,
     pub unsupported_objects: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object_reasons: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -565,6 +567,15 @@ pub enum LiveAdapter {
 }
 
 impl LiveAdapter {
+    /// PostgreSQL's extended protocol refuses statement chains even if metadata validation errs.
+    pub(crate) fn execute_single(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Self::MySql(conn) => conn.query_drop(sql).map_err(|err| format!("mysql SQL execution error: {err}")),
+            Self::PostgreSql(client) => client.execute(sql, &[]).map(|_| ())
+                .map_err(|err| format_postgres_error("postgresql SQL execution error", &err)),
+        }
+    }
+
     pub fn connect(endpoint: &Endpoint) -> Result<Self, String> {
         match endpoint.engine.as_str() {
             "mysql" => Ok(Self::MySql(mysql_conn(endpoint)?)),
@@ -574,7 +585,7 @@ impl LiveAdapter {
                 let schema = endpoint_schema(endpoint);
                 client
                     .batch_execute(&format!(
-                        "SET search_path TO {}",
+                        "SET standard_conforming_strings=on; SET search_path TO {}",
                         quote_ident("postgresql", &schema)
                     ))
                     .map_err(|err| format!("postgresql schema selection error: {err}"))?;
@@ -824,7 +835,7 @@ impl LiveAdapter {
                 .query_drop(ddl)
                 .map_err(|err| format!("mysql create table error: {err}")),
             Self::PostgreSql(client) => client
-                .batch_execute(ddl)
+                .execute(ddl, &[]).map(|_| ())
                 .map_err(|err| format_postgres_error("postgresql create table error", &err)),
         }
     }
@@ -996,6 +1007,7 @@ fn default_snapshot_policy() -> String {
 pub(crate) const WARNING_UNSYNCHRONIZED_SNAPSHOTS: &str = "Workers used independent snapshots";
 pub(crate) const WARNING_VIEWS_OUTSIDE_SNAPSHOT: &str = "View definitions were collected outside the table data snapshot";
 pub(crate) const WARNING_OBJECT_NOT_EXPORTED: &str = "Object not exported:";
+pub(crate) const WARNING_COMMENTS_NOT_EXPORTED: &str = "comments_not_exported:";
 pub(crate) const WARNING_NON_TRANSACTIONAL_EXCLUDED: &str = "Non-transactional tables excluded from export:";
 pub(crate) const WARNING_VISIBILITY_UNPROVEN: &str = "The export account's privileges do not prove it sees every object, so some may be missing:";
 

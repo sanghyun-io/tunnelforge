@@ -304,7 +304,7 @@ fn invisible_columns_parallel_range_and_unkeyed_stream_export() {
 }
 
 #[test]
-fn postgres_generated_refusal_has_no_mysql_unproven_reason() {
+fn postgres_generated_export_holds_its_definition() {
     let Some(s)=Sandbox::new() else { return };
     let Some(mut pg)=endpoint("postgresql") else { return };
     let schema=s.endpoint.database.clone();
@@ -313,9 +313,10 @@ fn postgres_generated_refusal_has_no_mysql_unproven_reason() {
     pg.schema=Some(schema.clone());
     let exported=events("dump.run",json!({"source":pg,"output_dir":s.output,"threads":1}));
     admin.execute_sql(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
-    let error=exported.iter().find(|event|event["event"]=="error").unwrap_or_else(||panic!("{exported:#?}"));
-    assert_eq!(error["objects"],json!(["generated_column:sample:g"]));
-    assert!(error["reasons"].as_object().unwrap().is_empty(),"{error:#?}");
+    assert!(!exported.iter().any(|event|event["event"]=="error"),"{exported:#?}");
+    let manifest=s.manifest();
+    assert_eq!(manifest["format_version"],6);
+    assert_eq!(manifest["schema"]["tables"][0]["columns"][1]["generated"]["stored"],true);
 }
 
 #[test]
@@ -423,7 +424,7 @@ fn generated_mysql_to_postgres_is_blocked_before_drop() {
         "execution_options":{"cleanup_before_migrate":true}}));
     let untouched=result("query.execute",json!({"connection":pg,"sql":"SELECT id FROM sample"}));
     admin.execute_sql(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
-    assert!(imported.iter().any(|e|e["event"]=="error" && e["message"].as_str().unwrap_or_default().contains("generated column sample.g")),"{imported:#?}");
+    assert!(imported.iter().any(|e|e["event"]=="error" && e["message"].as_str().unwrap_or_default().starts_with("unsupported_generated_column:")),"{imported:#?}");
     assert!(migrated.iter().any(|e|e["event"]=="error" && e["message"].as_str().unwrap_or_default().contains("generated column")),"{migrated:#?}");
     assert_eq!(untouched["rows"],json!([{"id":91}]));
     assert_eq!(preflight["issues"].as_array().unwrap().iter().filter(|issue|issue["issue_type"]=="unsupported_generated_column").count(),1,"{preflight:#?}");

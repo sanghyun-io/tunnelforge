@@ -12,6 +12,27 @@ from typing import Optional
 
 # Stable codes emitted by migration_core (classified_import_error and friends).
 RUST_CORE_CODES = frozenset({
+    "identity_always_unsupported",
+    "sequence_options_unsupported",
+    "default_expression_unsupported",
+    "check_constraint_unsupported",
+    "custom_type_unsupported",
+    "index_shape_unsupported",
+    "cross_schema_fk_unsupported",
+    "materialized_view_unsupported",
+    "postgres_trigger_unsupported",
+    "postgres_routine_unsupported",
+    "row_security_unsupported",
+    "rule_unsupported",
+    "table_inheritance_unsupported",
+    "comments_not_exported",
+    "generated_expression_unsafe",
+    "generated_dependency_unsupported",
+    "generated_expression_changed",
+    "program_name_resolution_changed",
+    "generated_virtual_unsupported_on_target",
+    "generated_values_recomputed",
+
     "target_trigger_hidden",
     "rollback_routine_binlog_unsafe",
     "rollback_trigger_privilege_missing",

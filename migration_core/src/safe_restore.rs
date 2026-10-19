@@ -321,7 +321,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             .collect::<Vec<_>>();
         // Target-only tables and views linked to the dump stopped the run above; the swap leaves
         // the rest, and whatever belongs to them, where they are.
-        let held = if manifest.source_engine == "mysql" && original.engine == "mysql" {
+        let held = if manifest.source_engine == original.engine {
             crate::dump_format::held_object_ids(&manifest.schema, &manifest.stored_programs)
         } else { BTreeSet::new() };
         let unrepresented = original_inspection
@@ -886,7 +886,7 @@ fn verify_candidate(
     }
     unsupported.sort();
     unsupported.dedup();
-    let held = if manifest.source_engine == "mysql" && endpoint.engine == "mysql" {
+    let held = if manifest.source_engine == endpoint.engine {
         crate::dump_format::held_object_ids(&manifest.schema, &manifest.stored_programs)
     } else { BTreeSet::new() };
     let rejected = unsupported
@@ -1060,7 +1060,7 @@ fn verify_candidate(
     )
 }
 
-fn canonical_sql(value: &str) -> String {
+pub(super) fn canonical_sql(value: &str) -> String {
     let mut result = String::new();
     let mut quote = None;
     for ch in value.chars() {

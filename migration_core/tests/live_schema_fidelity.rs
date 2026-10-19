@@ -104,6 +104,10 @@ fn assert_export_rejected(endpoint: &Endpoint, marker: &str) {
     let dir=std::env::temp_dir().join(unique_name());
     let events=handle_request(Request{command:"dump.run".into(),request_id:None,payload:json!({"source":endpoint,"tables":["sample"],"output_dir":dir,"threads":1})});
     assert!(events.iter().any(|e| e["event"]=="error" && e["message"].as_str().unwrap_or("").contains(marker)), "{events:#?}");
+    if endpoint.engine=="postgresql" {
+        let error=events.iter().find(|event|event["event"]=="error").unwrap();
+        assert!(error["reasons"][marker].as_str().is_some_and(|code|!code.is_empty()),"{error:#}");
+    }
     assert!(!dir.join("manifest.json").exists(), "unsupported schema must not produce a success manifest");
 }
 #[test]
@@ -130,8 +134,11 @@ fn unsupported_schema_features_are_rejected_before_export() {
     if let Some(mut endpoint)=endpoint("postgresql") {
         let mut client=postgres::Config::new().host(&endpoint.host).user(&endpoint.user).password(&endpoint.password).dbname(&endpoint.database).connect(postgres::NoTls).unwrap();
         let schema=unique_name(); client.batch_execute(&format!("CREATE SCHEMA {schema}; SET search_path TO {schema}")).unwrap(); endpoint.schema=Some(schema.clone());
+        client.batch_execute("CREATE TABLE sample(id int,doubled int GENERATED ALWAYS AS(id*2) STORED); INSERT INTO sample(id) VALUES(2)").unwrap();
+        restore(&endpoint,&endpoint);
+        assert_eq!(client.query_one("SELECT doubled FROM sample",&[]).unwrap().get::<_,i32>(0),4);
+        client.batch_execute("DROP TABLE sample").unwrap();
         for (ddl,marker) in [
-            ("CREATE TABLE sample (id int, doubled int GENERATED ALWAYS AS (id*2) STORED)","generated_column:sample:doubled"),
             ("CREATE TABLE sample (id int CONSTRAINT positive_id CHECK(id>0))","check_constraint:sample:positive_id"),
             ("CREATE TABLE sample (id int, token text DEFAULT lower('X'))","unsupported_default:sample:token"),
             ("CREATE TABLE sample (id bigint GENERATED ALWAYS AS IDENTITY)","unsupported_default:sample:id"),
