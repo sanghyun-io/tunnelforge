@@ -328,6 +328,8 @@ fn reconcile(request: &Request, credentials: &Endpoint) -> Result<Value, String>
     let (conclusion, message) = match (status.as_str(), verdict.as_str()) {
         ("promoted", "promoted") => ("promoted", "The journal and the live objects agree: the cutover took effect."),
         (_, "promoted") => ("promoted", "The live objects show the cutover took effect although the journal did not record a final result."),
+        (_, "promoted_incomplete") => ("promoted_incomplete", "테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 백업을 보존하고 복구하세요."),
+        (_, "failed_original_triggers_missing") => ("failed_original_triggers_missing", "테이블은 교체하지 않았지만 원래 트리거가 빠져 있습니다. 저장된 정의로 복구하세요."),
         (_, "not_promoted") => ("not_promoted", "The live objects show the original tables are intact and the cutover did not take effect."),
         _ => ("undeterminable", "The live objects do not match either the pre- or post-cutover state. Retry and cleanup stay blocked."),
     };
@@ -425,7 +427,7 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
             let backup = inspect_backup(entry, credentials, true)?.ok_or("this restore has no promotion journal on this server")?;
             blockers.extend(backup["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
             let verdict = backup["verdict"].as_str().unwrap_or("undeterminable");
-            if status != "promoted" && verdict != "promoted" {
+            if !matches!(verdict, "promoted") {
                 blockers.push(format!("promotion outcome is not confirmed (journal {status}, live objects {verdict}); reconcile first"));
             }
             if backup["ownership"] != "proven" {
@@ -484,7 +486,7 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
                     .map(|b| b["verdict"].as_str().unwrap_or("undeterminable").to_string())
                     .unwrap_or_else(|| "none".into());
                 let unpromoted = matches!(verdict.as_str(), "none" | "not_promoted")
-                    && !matches!(status.as_str(), "promoted" | "cutover_unknown" | "pending");
+                    && !matches!(status.as_str(), "promoted" | "promoted_incomplete" | "failed_original_triggers_missing" | "cutover_unknown" | "pending");
                 if !unpromoted {
                     blockers.push(format!("the candidate still holds data and the promotion state is {status}/{verdict}; only a verified, unpromoted candidate can be discarded"));
                 }
@@ -540,7 +542,7 @@ fn rollback_context<'a>(entries: &'a [Entry], request: &Request, credentials: &E
     let mut blockers = Vec::new();
     let status = entry.journal_status();
     let verdict = inspect_backup(entry, credentials, false)?.map(|b| b["verdict"].as_str().unwrap_or("undeterminable").to_string()).unwrap_or_default();
-    if status != "promoted" && verdict != "promoted" {
+    if !matches!(verdict.as_str(), "promoted" | "promoted_incomplete") {
         blockers.push(format!("promotion outcome is not confirmed (journal {status}, live objects {verdict}); reconcile first"));
     }
     if entry.rollbacks().iter().any(|r| r["status"] != "failed_no_change") {

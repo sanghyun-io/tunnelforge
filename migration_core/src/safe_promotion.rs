@@ -284,6 +284,7 @@ fn run<F: FnMut(Value)>(request: &Request, emit: &mut F) -> Result<Value, String
                 &verified.original,
                 &verified.candidate,
                 &verified.restore_id,
+                &read_dump_manifest(&verified.input_path)?.stored_programs,
             )
             .map(EnginePlan::MySql),
             "postgresql" => crate::safe_promote_postgres::plan(

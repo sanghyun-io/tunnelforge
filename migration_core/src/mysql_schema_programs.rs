@@ -292,7 +292,7 @@ pub(crate) fn probe_routines(conn: &mut mysql::PooledConn, programs: &[Normalize
 }
 
 /// Replay the target definition, then verify state and definer after any corrective ALTER.
-fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: &NormalizedStoredProgram, failure: &mut Value) -> Result<(),String> {
+pub(crate) fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: &NormalizedStoredProgram, failure: &mut Value) -> Result<(),String> {
     set_program_context(conn,previous)?;
     conn.query_drop(format!("DROP {} IF EXISTS {}",previous.kind,quote_ident("mysql",&previous.name))).map_err(|e|e.to_string())?;
     let current:Option<String>=conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?;
