@@ -1772,7 +1772,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         rename_attempted = true;
         if let Err(err) = conn.query_drop(rename_sql(plan)) {
             rename_rejected = matches!(err,mysql::Error::MySqlError(_));
-            if matches!(&err,mysql::Error::MySqlError(e) if e.code==1435) { return Err(error("atomic rename: an account with TRIGGER privilege is required to move tables with hidden triggers",err)) }
+            if matches!(&err,mysql::Error::MySqlError(e) if e.code==1435) { return Err(error("target_trigger_hidden: an account with TRIGGER privilege is required to move tables with hidden triggers",err)) }
             return Err(error("atomic rename", err));
         }
         rename_committed = true;
@@ -1829,7 +1829,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         && !moved_original_triggers(plan).is_empty() && conn.query_first::<u8,_>("SELECT 1").ok().flatten()==Some(1) {
         let recovery = hook("before_original_trigger_recovery", &mut conn)
             .and_then(|_|recover_triggers(&mut conn,plan,&moved_original_triggers(plan),&mut state));
-        recovered_locked = true;
+        recovered_locked = recovery.is_ok() || conn.query_first::<u8,_>("SELECT 1").ok().flatten()==Some(1);
         if let Err(err) = recovery { state["trigger_recovery_error"] = json!(err); }
     }
     if locked {
@@ -1922,6 +1922,10 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         state["phase"] = json!("completed");
     }
     state["message"]=json!(match state["status"].as_str() { Some("promoted")=>"Verified candidate promoted at the original database name. Original tables are retained in the recorded backup namespace.",Some("failed_original_unchanged")=>"Promotion did not change original tables or their foreign keys. The verified candidate remains available.",Some("promoted_incomplete")=>"Tables were promoted, but stored programs are missing. Check the report before recovery.",Some("failed_original_triggers_missing")=>"Tables were not promoted, but original triggers could not be restored. Recover them from the definitions saved in the report.",_=>"Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery." });
+    if state["error"].as_str().is_some_and(|error|error.starts_with("target_trigger_hidden:")) {
+        state["error_code"] = json!("target_trigger_hidden");
+        state["message"] = state["error"].clone();
+    }
     state["interrupted_attempt_policy"]=json!("A checkpoint at cutover_started is UNKNOWN after process loss. Compare recorded InnoDB table identities at original/candidate/backup locations; never retry or roll back blindly.");
     if matches!(state["status"].as_str(), Some("promoted" | "promoted_incomplete")) {
         // Retention evidence for TF-STATUS-119: content/definition digests of the
@@ -2006,10 +2010,10 @@ pub(crate) fn external_references(endpoint: &Endpoint, namespace: &str) -> Resul
 /// catalog identities and estimates are used.
 #[cfg(test)]
 pub(crate) fn inspect_backup(endpoint: &Endpoint, plan: &PromotionPlan, deep: bool, journal_fingerprint: Option<&Value>) -> Result<Value, String> {
-    inspect_backup_recorded(endpoint,plan,deep,journal_fingerprint,false)
+    inspect_backup_recorded(endpoint,plan,deep,journal_fingerprint,false,false)
 }
 
-pub(crate) fn inspect_backup_recorded(endpoint: &Endpoint, plan: &PromotionPlan, deep: bool, journal_fingerprint: Option<&Value>, completed: bool) -> Result<Value,String> {
+pub(crate) fn inspect_backup_recorded(endpoint: &Endpoint, plan: &PromotionPlan, deep: bool, journal_fingerprint: Option<&Value>, completed: bool, recorded_unchanged: bool) -> Result<Value,String> {
     let mut conn = lifecycle_connect(endpoint, plan)?;
     let mut blockers: Vec<String> = Vec::new();
     let server_uuid: String = conn.query_first("SELECT @@server_uuid").map_err(|e| e.to_string())?.unwrap_or_default();
@@ -2035,7 +2039,14 @@ pub(crate) fn inspect_backup_recorded(endpoint: &Endpoint, plan: &PromotionPlan,
         let db = if in_backup { &plan.backup_database } else { &plan.original_database };
         optional_table_id(&mut conn, db, name)
     });
-    let verdict = if completed { verdict } else { classify_programs(&mut conn,plan,verdict) };
+    let candidate_intact = recorded_unchanged && plan.candidate_tables.iter().all(|(name,t)|
+        optional_table_id(&mut conn,&plan.candidate_database,name).ok().flatten()==Some(t.table_id));
+    let verdict = if candidate_intact {
+        if !plan.original_tables.iter().all(|(name,t)|optional_table_id(&mut conn,&plan.original_database,name).ok().flatten()==Some(t.table_id)) {
+            result["note"] = json!("The original table identities changed after the recorded failed attempt. The candidate still has its recorded table identities; a new promotion plan can be made.");
+        }
+        "failed_original_unchanged".into()
+    } else if completed { verdict } else { classify_programs(&mut conn,plan,verdict) };
     if matches!(verdict.as_str(), "promoted_incomplete" | "failed_original_triggers_missing") {
         match program_differences(&mut conn,plan,verdict=="promoted_incomplete") {
             Ok(missing) => result["missing_programs"] = json!(missing),
@@ -2250,7 +2261,7 @@ fn rollback_blockers(
         blockers.push("views now depend on tables in the original namespace".into());
     }
     if !plan.original_trigger_definitions.is_empty() {
-        blockers.extend(crate::import::safe_restore::target_trigger_refusals(conn,original)?.into_iter().map(|(code,name,message)|format!("{code}: {}: {message}",name.unwrap_or_default())));
+        blockers.extend(crate::import::safe_restore::target_trigger_refusals(conn,original)?.into_iter().map(|(code,name,message)|format!("{}: {}: {message}",match code {"program_privilege_missing"=>"rollback_trigger_privilege_missing",_=>"rollback_trigger_binlog_privilege"},name.unwrap_or_default())));
     }
     for (needed,privilege) in [
         (plan.original_programs.iter().chain(&plan.promoted_programs).any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"CREATE ROUTINE"),
@@ -2266,7 +2277,7 @@ fn rollback_blockers(
         let actual = crate::mysql_schema_programs::read_schema_program(conn,original,"FUNCTION",&previous.name);
         if !actual.as_ref().is_ok_and(|actual|crate::mysql_schema_programs::schema_program_matches(actual,previous)) { recreate.push(previous.clone()); }
     }
-    blockers.extend(crate::import::safe_restore::target_function_refusals(conn,&recreate)?.into_iter().map(|(code,name,message)|format!("{code}: {}: {message}",name.unwrap_or_default())));
+    blockers.extend(crate::import::safe_restore::target_function_refusals(conn,&recreate)?.into_iter().map(|(_,name,message)|format!("rollback_routine_binlog_unsafe: {}: {message}",name.unwrap_or_default())));
     reset_session(conn)?;
     let expected = final_programs(plan);
     let scopes = expected.iter().chain(&plan.original_programs).cloned().collect::<Vec<_>>();
@@ -2455,8 +2466,9 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
     })();
     if locked && outcome.is_err() && triggers_detaching && !renamed && (!rename_attempted || rename_rejected)
         && conn.query_first::<u8,_>("SELECT 1").ok().flatten()==Some(1) {
-        recovered_locked = true;
-        match recover_triggers(&mut conn, plan, &start_triggers, &mut state) {
+        let recovery = recover_triggers(&mut conn, plan, &start_triggers, &mut state);
+        recovered_locked = recovery.is_ok() || conn.query_first::<u8,_>("SELECT 1").ok().flatten()==Some(1);
+        match recovery {
             Ok(count) => triggers_recreated = count > 0,
             Err(err) => state["trigger_recovery_error"] = json!(err),
         }
@@ -2532,9 +2544,6 @@ pub(crate) fn inspect_rollback(endpoint: &Endpoint, plan: &PromotionPlan, record
     let mut conn = lifecycle_connect(endpoint,plan)?;
     if !plan.original_tables.iter().all(|(name,t)|optional_table_id(&mut conn,&plan.original_database,name).ok().flatten()==Some(t.table_id)) { return Ok(None) }
     if record["status"]=="rolled_back" { return Ok(Some(Vec::new())) }
-    let Some(displaced) = record["displaced_backup"].as_str() else { return Ok(None) };
-    let Some(ids) = record["displaced_tables"].as_object() else { return Ok(None) };
-    if !ids.iter().all(|(name,id)|optional_table_id(&mut conn,displaced,name).ok().flatten()==id.as_u64()) { return Ok(None) }
     let effective = with_program_warnings(plan,record["program_warnings"].as_array().map(Vec::as_slice).unwrap_or_default());
     restored_program_differences(&mut conn,&effective).map(Some)
 }
@@ -2716,6 +2725,7 @@ mod tests {
     use std::sync::{mpsc, Mutex};
     static LIVE_LOCK: Mutex<()> = Mutex::new(());
     include!("../tests/support/safe_promote_round2.rs");
+    include!("../tests/support/safe_promote_round3.rs");
 
     #[test]
     fn safe_promote_rollback_lock_failure_leaves_active_triggers_untouched() {
@@ -3127,7 +3137,7 @@ mod tests {
 #[test]
 fn safe_promote_completed_lifecycle_ignores_unrelated_program_changes() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let verdict=|o:&Endpoint,p:&PromotionPlan,r:&Value| { let v=inspect_backup_recorded(o,p,false,r.get("backup_fingerprint"),true).unwrap(); eprintln!("RV12 {}",v["missing_programs"]); v["verdict"].as_str().unwrap().to_string() };
+    let verdict=|o:&Endpoint,p:&PromotionPlan,r:&Value| { let v=inspect_backup_recorded(o,p,false,r.get("backup_fingerprint"),true,false).unwrap(); eprintln!("RV12 {}",v["missing_programs"]); v["verdict"].as_str().unwrap().to_string() };
     // A: plan with programs; unrelated additions / DISABLE after a clean promoted.
     let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
     let p=plan(&original,&candidate,"rv12a",&programs).unwrap();

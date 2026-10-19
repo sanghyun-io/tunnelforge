@@ -27,7 +27,7 @@ fn rvf_triggers(db: &mut Db, database: &str) -> Vec<String> {
     db.exec("SELECT CONCAT(EVENT_OBJECT_TABLE,'.',TRIGGER_NAME) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=? ORDER BY 1", (database,)).unwrap()
 }
 #[test]
-fn safe_promote_rvf_a0_rollback_connection_lost_after_detach_gets_no_fresh_recovery() {
+fn safe_promote_rvf_a0_rollback_connection_lost_after_detach_recovers_on_fresh_connection() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, programs)) = program_fixture() else { return };
     let p = plan(&original, &candidate, "rvfa0", &programs).unwrap();
@@ -61,7 +61,7 @@ fn safe_promote_rvf_a0_rollback_connection_lost_after_detach_gets_no_fresh_recov
 }
 
 #[test]
-fn safe_promote_rvf_a1_rebuilt_original_before_detach_is_cutover_unknown() {
+fn safe_promote_rvf_a1_rebuilt_original_before_detach_fails_without_changing_original() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut seen = Vec::new();
     for case in ["control", "rebuild_at_validated"] {
@@ -96,7 +96,7 @@ fn safe_promote_rvf_a1_rebuilt_original_before_detach_is_cutover_unknown() {
 
 
 #[test]
-fn safe_promote_rvf_a2_refused_rename_recreates_triggers_and_blocks_retry() {
+fn safe_promote_rvf_a2_refused_rename_recreates_triggers_and_allows_retry() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, programs)) = program_fixture() else { return };
     let p = plan(&original, &candidate, "rvfa2", &programs).unwrap();
@@ -131,7 +131,7 @@ fn safe_promote_rvf_a2_refused_rename_recreates_triggers_and_blocks_retry() {
 }
 
 #[test]
-fn safe_promote_rvf_a3_refused_rename_relock_window_and_timeout() {
+fn safe_promote_rvf_a3_refused_rename_recovers_before_unlock() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, programs)) = program_fixture() else { return };
     let p = plan(&original, &candidate, "rvfa3", &programs).unwrap();
@@ -178,7 +178,7 @@ fn safe_promote_rvf_a3_refused_rename_relock_window_and_timeout() {
     assert!(recovered["program_warnings"].to_string().contains("rollback_triggers_recreated"));
 }
 #[test]
-fn safe_promote_rvf_a4_promote_relocks_without_original_triggers() {
+fn safe_promote_rvf_a4_promote_skips_relock_without_original_triggers() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir)) = fixture() else { return };
     let p = plan(&original, &candidate, "rvfa4", &[]).unwrap();
@@ -213,7 +213,7 @@ fn safe_promote_rvf_a4_promote_relocks_without_original_triggers() {
 }
 
 #[test]
-fn safe_promote_rvf_b5_event_restored_with_new_definer_blocks_rollback() {
+fn safe_promote_rvf_b5_event_restored_with_new_definer_allows_rollback() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, mut programs)) = program_fixture() else { return };
     let pid = std::process::id();
@@ -261,7 +261,7 @@ fn safe_promote_rvf_b5_event_restored_with_new_definer_blocks_rollback() {
     assert_eq!(reviewed["blockers"],json!([]),"{reviewed:#}");
 }
 #[test]
-fn safe_promote_rvf_c9_rollback_function_binlog_rule_not_prechecked() {
+fn safe_promote_rvf_c9_rollback_function_binlog_rule_is_prechecked() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir)) = fixture() else { return };
     for (db, view) in [(&original.database, "child_view"), (&original.database, "v"), (&candidate.database, "v")] {
@@ -301,14 +301,14 @@ fn safe_promote_rvf_c9_rollback_function_binlog_rule_not_prechecked() {
     cleanup(&mut conn, &p, &dir);
     let refused = recovered.unwrap_err();
     assert_eq!(log_bin, 1);
-    assert!(reviewed["blockers"].to_string().contains("target_routine_binlog_unsafe"));
+    assert!(reviewed["blockers"].to_string().contains("rollback_routine_binlog_unsafe"));
     assert!(!tables_back);
     assert!(refused.contains("recovery is blocked"));
 
     assert_eq!(f_now, Some(2));
 }
 #[test]
-fn safe_promote_rvf_d12_edited_original_trigger_after_failed_attempt_blocks_candidate_cleanup() {
+fn safe_promote_rvf_d12_edited_original_trigger_after_failed_attempt_allows_candidate_cleanup() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, programs)) = program_fixture() else { return };
     let p = plan(&original, &candidate, "rvfd12", &programs).unwrap();
@@ -330,7 +330,7 @@ fn safe_promote_rvf_d12_edited_original_trigger_after_failed_attempt_blocks_cand
     assert!(!cp["blockers"].to_string().contains("only a verified, unpromoted candidate can be discarded"));
 }
 #[test]
-fn safe_promote_rvf_d13_recurring_not_preserve_event_after_ends_is_promoted_incomplete() {
+fn safe_promote_rvf_d13_completed_promotion_ignores_expired_recurring_event() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, mut programs)) = program_fixture() else { return };
     let scheduler: String = conn.query_first("SELECT @@event_scheduler").unwrap().unwrap();
@@ -366,7 +366,7 @@ fn safe_promote_rvf_d13_recurring_not_preserve_event_after_ends_is_promoted_inco
     assert_eq!(rc["conclusion"], "promoted");
 }
 #[test]
-fn safe_promote_rvf_d14_completed_event_timezone_breaks_backup_digest() {
+fn safe_promote_rvf_d14_completed_event_timezone_does_not_change_backup_digest() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, mut programs)) = program_fixture() else { return };
     let scheduler: String = conn.query_first("SELECT @@event_scheduler").unwrap().unwrap();
@@ -406,7 +406,7 @@ fn safe_promote_rvf_d14_completed_event_timezone_breaks_backup_digest() {
     assert_eq!(cp["can_cleanup"], true,"{cp:#}");
 }
 #[test]
-fn safe_promote_rvf_d17_unsavable_trigger_after_completed_promotion_fails_backup_list() {
+fn safe_promote_rvf_d17_completed_promotion_does_not_reread_unsavable_trigger() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, programs)) = program_fixture() else { return };
     let p = plan(&original, &candidate, "rvfd17", &programs).unwrap();
@@ -431,7 +431,7 @@ fn safe_promote_rvf_d17_unsavable_trigger_after_completed_promotion_fails_backup
     assert_eq!(rc["conclusion"],"promoted");
 }
 #[test]
-fn safe_promote_rvf_d18_rolled_back_verdict_flips_after_normal_changes() {
+fn safe_promote_rvf_d18_rolled_back_verdict_survives_normal_program_changes() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir, programs)) = program_fixture() else { return };
     let p = plan(&original, &candidate, "rvfd18", &programs).unwrap();
@@ -467,7 +467,7 @@ fn safe_promote_rvf_d18_rolled_back_verdict_flips_after_normal_changes() {
     assert_eq!(va.2, "rolled_back");
 }
 #[test]
-fn safe_promote_rvf_d19_displaced_cleanup_turns_rolled_back_into_triggers_missing() {
+fn safe_promote_rvf_d19_displaced_cleanup_preserves_rolled_back_verdict() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some((original, candidate, mut conn, dir)) = fixture() else { return };
     let trust: String = conn.query_first("SELECT CAST(@@GLOBAL.log_bin_trust_function_creators AS CHAR)").unwrap().unwrap();
@@ -535,12 +535,18 @@ fn safe_promote_rvf_list_keeps_other_entries_after_inspection_error() {
     let result=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
     let input=rvf_journal(&dir,"list_good",&original,&candidate,&p,&result);
     let mut bad=p.clone(); bad.restore_id="list_bad".into(); bad.port=original.port+1;
+    bad.backup_database=format!("tf_backup_list_bad_{}",p.nonce);
+    conn.query_drop(format!("CREATE DATABASE {}",q(&bad.backup_database))).unwrap();
     rvf_journal(&dir,"list_bad",&original,&candidate,&bad,&result);
     let listed=rvf_backups(&input,"list_good",&original,"list",json!({}));
     assert_eq!(listed["event"],"result","{listed:#}");
     assert_eq!(listed["backups"].as_array().unwrap().len(),2);
     assert!(listed["backups"].as_array().unwrap().iter().any(|b|b["inspection_error"].is_string()));
     assert!(listed["backups"].as_array().unwrap().iter().any(|b|b["backup"]["verdict"]=="promoted"));
+    let failed=listed["backups"].as_array().unwrap().iter().find(|b|b["restore_id"]=="list_bad").unwrap();
+    assert_eq!(failed["backup"]["namespace"],bad.backup_database);
+    assert!(!listed["unproven_namespaces"].as_array().unwrap().iter().any(|b|b["namespace"]==bad.backup_database));
+    conn.query_drop(format!("DROP DATABASE {}",q(&bad.backup_database))).unwrap();
     cleanup(&mut conn,&p,&dir);
 }
 

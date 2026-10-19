@@ -48,8 +48,13 @@ impl Entry {
         dirs.iter().filter_map(|dir| read_json(&dump_import_report_path(dir).ok()?)).collect()
     }
 
-    fn rolled_back(&self) -> Option<Value> {
-        self.rollbacks().into_iter().rev().find(|r| r["status"] == "rolled_back")
+    fn rolled_back(&self, credentials: &Endpoint) -> Result<Option<Value>,String> {
+        let Some(record) = self.rollbacks().pop().filter(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete"))) else {return Ok(None)};
+        let restored = match self.stored.as_ref().map(|s|&s.engine_plan) {
+            Some(EnginePlan::MySql(plan)) => crate::safe_promote_mysql::inspect_rollback(credentials,plan,&record)?.is_some_and(|missing|missing.is_empty()),
+            _ => record["status"]=="rolled_back",
+        };
+        Ok(if restored {Some(record)} else {None})
     }
 
     fn new_table_ids(&self) -> Option<Value> {
@@ -182,12 +187,12 @@ fn inspect_backup(entry: &Entry, credentials: &Endpoint, deep: bool) -> Result<O
     match &stored.engine_plan {
         EnginePlan::MySql(plan) => {
             let completed = (entry.journal_status()=="promoted" && entry.attempt.as_ref().is_some_and(|a|a["result"]["phase"]=="completed"))
-                || entry.journal_status()=="failed_original_unchanged" || entry.rolled_back().is_some();
-            let mut backup = crate::safe_promote_mysql::inspect_backup_recorded(&endpoint,plan,deep,fingerprint.as_ref(),completed)?;
+                || entry.journal_status()=="failed_original_unchanged" || entry.rollbacks().last().is_some_and(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete")));
+            let mut backup = crate::safe_promote_mysql::inspect_backup_recorded(&endpoint,plan,deep,fingerprint.as_ref(),completed,entry.journal_status()=="failed_original_unchanged")?;
             if let Some(record) = entry.rollbacks().last().filter(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete"))) {
                 match crate::safe_promote_mysql::inspect_rollback(&endpoint,plan,record) {
                     Ok(Some(missing)) => {
-                        backup["verdict"] = json!(if record["status"]=="rolled_back" && missing.is_empty() {"rolled_back"} else {"rollback_incomplete"});
+                        backup["verdict"] = json!(if missing.is_empty() {"rolled_back"} else {"rollback_incomplete"});
                         backup["missing_programs"] = json!(missing);
                     }
                     Err(err) => {
@@ -197,7 +202,7 @@ fn inspect_backup(entry: &Entry, credentials: &Endpoint, deep: bool) -> Result<O
                     }
                     Ok(None) => {}
                 }
-                backup["pending_program"] = record["pending_program"].clone();
+                backup["pending_program"] = if backup["verdict"]=="rolled_back" {Value::Null} else {record["pending_program"].clone()};
             }
             Ok(Some(backup))
         },
@@ -299,7 +304,7 @@ fn entry_json(entry: &Entry, credentials: &Endpoint) -> Result<Value, String> {
     if !rollbacks.is_empty() {
         out["rollbacks"] = json!(rollbacks.iter().map(|r| json!({"status": r["status"], "displaced_backup": r["displaced_backup"], "missing_programs":r["missing_programs"],"pending_program":r["pending_program"],"program_warnings":r["program_warnings"]})).collect::<Vec<_>>());
     }
-    if let Some(record) = entry.rolled_back() {
+    if let Some(record) = entry.rolled_back(credentials)? {
         if let Some(displaced) = inspect_displaced(entry, credentials, &record, false)? {
             out["displaced"] = displaced;
         }
@@ -330,7 +335,7 @@ fn list(request: &Request, credentials: &Endpoint) -> Result<Value, String> {
             Some(target) if same_server(credentials, &target) => {
                 match entry_json(entry,credentials) {
                     Ok(item) => items.push(item),
-                    Err(err) => items.push(json!({"restore_id":entry.restore_id,"original_target":target,"journal_status":entry.journal_status(),"inspection_error":redact_endpoint_secret(&err,credentials),"backup":{"verdict":"undeterminable","blockers":[redact_endpoint_secret(&err,credentials)]}})),
+                    Err(err) => items.push(json!({"restore_id":entry.restore_id,"original_target":target,"journal_status":entry.journal_status(),"inspection_error":redact_endpoint_secret(&err,credentials),"backup":{"namespace":entry.stored.as_ref().map(|s|match &s.engine_plan {EnginePlan::MySql(p)=>p.backup_database.clone(),EnginePlan::Postgres(p)=>p.backup_schema.clone()}),"verdict":"undeterminable","blockers":[redact_endpoint_secret(&err,credentials)]}})),
                 }
             },
             _ => skipped += 1,
@@ -361,12 +366,13 @@ fn reconcile(request: &Request, credentials: &Endpoint) -> Result<Value, String>
         (_, "promoted") => ("promoted", "The live objects show the cutover took effect although the journal did not record a final result."),
         (_, "promoted_incomplete") => ("promoted_incomplete", "Tables were promoted, but stored programs are missing. Retain the backup and recover the programs."),
         (_, "failed_original_triggers_missing") => ("failed_original_triggers_missing", "Tables were not promoted, but original triggers are missing. Recover them from their saved definitions."),
+        ("failed_original_unchanged", "not_promoted") => ("not_promoted", "Promotion did not change the originals. The candidate retains its recorded table identities; a new promotion plan can be made."),
         (_, "not_promoted") => ("not_promoted", "The live objects show the original tables are intact and the cutover did not take effect."),
         _ => ("undeterminable", "The live objects do not match either the pre- or post-cutover state. Retry and cleanup stay blocked."),
     };
     Ok(json!({"success": true, "restore_id": entry.restore_id, "journal_status": status, "conclusion": conclusion,
         "message": message, "evidence": backup,
-        "retry_allowed": false,
+        "retry_allowed": status=="failed_original_unchanged" && verdict=="not_promoted" && !plan_dir_for(&entry.input_dir,&entry.restore_id)?.join("active-attempt").exists(),
         "cleanup_allowed": conclusion == "promoted",
         "note": "Reconciliation is report-only: it never changes the journal or any database object."}))
 }
@@ -380,7 +386,7 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
     let (namespace, tables, notes): (String, Vec<Value>, Vec<String>);
     let mut engine_endpoint = credentials.clone();
     match target {
-        "backup" if entry.rolled_back().is_some() => {
+        "backup" if entry.rolled_back(credentials)?.is_some() => {
             // After a recovery the promotion backup namespace is an empty shell.
             let backup = inspect_backup(entry, credentials, false)?.ok_or("this restore has no promotion journal on this server")?;
             namespace = backup["namespace"].as_str().unwrap_or("").to_string();
@@ -441,7 +447,7 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
             notes = vec!["Old view definitions the promotion kept under these names in the original database; the active views are not touched.".into()];
         }
         "displaced" => {
-            let record = entry.rolled_back().ok_or("no completed recovery is recorded for this restore")?;
+            let record = entry.rolled_back(credentials)?.ok_or("no completed recovery is recorded for this restore")?;
             let displaced = inspect_displaced(entry, credentials, &record, true)?.ok_or("this restore has no promotion journal")?;
             blockers.extend(displaced["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
             if displaced["ownership"] != "proven" || displaced["unchanged"] != true {

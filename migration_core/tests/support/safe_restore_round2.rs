@@ -16,7 +16,7 @@ impl Drop for Trust {fn drop(&mut self){let _=self.admin.execute_sql(&format!("S
 fn trust_guard(admin: &mut LiveAdapter,value:u8) -> Trust {let ep=endpoint("mysql").unwrap();let previous=first_value(&ep,"SELECT CAST(@@GLOBAL.log_bin_trust_function_creators AS CHAR) AS n").as_str().unwrap().to_string();admin.execute_sql(&format!("SET GLOBAL log_bin_trust_function_creators={value}")).unwrap();Trust{admin:LiveAdapter::connect(&ep).unwrap(),previous}}
 
 #[test]
-fn rvf_i_a1_rebuild_after_plan_is_cutover_unknown_and_blocks_retry() {
+fn rvf_i_a1_rebuild_after_plan_allows_fresh_plan_and_candidate_cleanup() {
     let Some((mut admin, original, name, output)) = exported() else { return };
     let mut db = LiveAdapter::connect(&original).unwrap();
     db.execute_sql("UPDATE parents SET value='live'").unwrap();
@@ -44,10 +44,10 @@ fn rvf_i_a1_rebuild_after_plan_is_cutover_unknown_and_blocks_retry() {
     assert!(!active);
     // Old plan identities need not match an externally rebuilt table.
     assert_ne!(rc["conclusion"],"failed_original_triggers_missing");
-    assert_eq!(cand["can_cleanup"], false);
+    assert_eq!(cand["can_cleanup"], true);
 }
 #[test]
-fn rvf_i_b7_replace_preview_warns_trigger_definer_change() {
+fn rvf_i_b7_only_safe_selected_trigger_preview_warns_definer_change() {
     let Some((mut admin, original, name, root)) = exported() else { return };
     let mut db = LiveAdapter::connect(&original).unwrap();
     db.execute_sql("CREATE TABLE extra(id INT PRIMARY KEY)").unwrap();
@@ -81,7 +81,7 @@ fn rvf_i_b7_replace_preview_warns_trigger_definer_change() {
     assert_eq!(guard_left, "0");
 }
 #[test]
-fn rvf_i_c8_rehearsal_skips_candidate_program_grants() {
+fn rvf_i_c8_rehearsal_checks_candidate_program_grants() {
     let mut outcomes = Vec::new();
     for (privilege, program) in [("CREATE ROUTINE", "CREATE PROCEDURE p() SELECT 1"), ("TRIGGER", "CREATE TRIGGER guard BEFORE INSERT ON parents FOR EACH ROW SET NEW.value='g'")] {
         let Some((mut admin, original, name, root)) = exported() else { return };
@@ -115,7 +115,7 @@ fn rvf_i_c8_rehearsal_skips_candidate_program_grants() {
     }
 }
 #[test]
-fn rvf_i_c10_target_function_binlog_rule_found_only_after_switch() {
+fn rvf_i_c10_target_function_binlog_rule_blocks_before_copy() {
     let Some((mut admin, original, name, root)) = exported() else { return };
     let mut db = LiveAdapter::connect(&original).unwrap();
     db.execute_sql("CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 2").unwrap();
@@ -157,7 +157,7 @@ fn rvf_i_c10_target_function_binlog_rule_found_only_after_switch() {
     assert_eq!(f, "1");
 }
 #[test]
-fn rvf_i_c11_promote_plan_requires_candidate_program_grants() {
+fn rvf_i_c11_promote_plan_and_confirm_need_no_candidate_program_grants() {
     let Some((mut admin, original, name, root)) = exported() else { return };
     let trust = trust_guard(&mut admin, 1);
     let mut db = LiveAdapter::connect(&original).unwrap();
@@ -232,7 +232,7 @@ fn rvf_i_g21_rehearsal_with_view_calling_dump_function() {
     assert!(codes(&rehearsal["copy_blockers"]).iter().any(|c|c.starts_with("view_calls_dump_routine")));
 }
 #[test]
-fn rvf_i_g22_view_literal_with_escaped_quote_fails_safe_mode() {
+fn rvf_i_g22_view_literal_with_escaped_quote_allows_safe_mode() {
     let Some((mut admin, original, name, root)) = exported() else { return };
     let mut db = LiveAdapter::connect(&original).unwrap();
     db.execute_sql("CREATE FUNCTION fn1() RETURNS INT DETERMINISTIC RETURN 1").unwrap();
@@ -252,7 +252,7 @@ fn rvf_i_g22_view_literal_with_escaped_quote_fails_safe_mode() {
 }
 
 #[test]
-fn rvf_i_g23_safe_preview_hides_moved_trigger_conflict() {
+fn rvf_i_g23_safe_preview_exposes_direct_import_trigger_conflict() {
     let Some((mut admin, original, name, root)) = exported() else { return };
     let trust = trust_guard(&mut admin, 1);
     let mut db = LiveAdapter::connect(&original).unwrap();
@@ -289,7 +289,7 @@ fn rvf_i_g23_safe_preview_hides_moved_trigger_conflict() {
 }
 
 #[test]
-fn rvf_i_g24_view_column_list_named_like_function_is_refused() {
+fn rvf_i_g24_view_column_list_named_like_function_is_allowed() {
     let Some((mut admin, original, name, root)) = exported() else { return };
     let mut db = LiveAdapter::connect(&original).unwrap();
     db.execute_sql("CREATE FUNCTION monthly_total() RETURNS INT DETERMINISTIC RETURN 1").unwrap();
@@ -331,7 +331,7 @@ fn rvf_i_i25_privilege_blockers_preview_json() {
 }
 
 #[test]
-fn rvf_i_i28_trigger_grant_missing_without_any_trigger() {
+fn rvf_i_i28_no_trigger_grant_needed_without_any_trigger() {
     let Some((mut admin, original, name, root)) = exported() else { return };
     let trust = trust_guard(&mut admin, 0);
     let user = format!("rvf28_{}", &name[name.len() - 10..]);
@@ -394,3 +394,5 @@ fn rvf_i_show_create_view_escaping_is_independent_of_no_backslash_mode() {
     save_json("show_create_view_escaping.json",&json!({"default":definitions[0],"no_backslash_escapes":definitions[1]}));
     drop_db(&mut admin,&name);std::fs::remove_dir_all(root).unwrap();
 }
+
+include!("safe_restore_round3.rs");
