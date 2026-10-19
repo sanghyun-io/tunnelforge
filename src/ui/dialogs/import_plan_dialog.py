@@ -72,12 +72,17 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
     """
     # A blocker the application cannot read still blocks (fail closed).
     raw_blockers = preview.get("blockers") if isinstance(preview.get("blockers"), list) else []
-    blockers = describe_copy_blockers([item if isinstance(item, dict) else {} for item in raw_blockers],
-                                      unknown=_UNKNOWN_BLOCKER)
     def blocker_key(item):
         return item.get("code"), str(item.get("table") or item.get("name") or "")
 
-    seen = {blocker_key(item) for item in raw_blockers if isinstance(item, dict)}
+    seen = set()
+    direct = []
+    for item in raw_blockers:
+        item = item if isinstance(item, dict) else {}
+        if blocker_key(item) not in seen:
+            direct.append(item)
+            seen.add(blocker_key(item))
+    blockers = describe_copy_blockers(direct, unknown=_UNKNOWN_BLOCKER)
     copy_only = []
     for item in _dicts(preview.get("copy_blockers")) if verify else []:
         key = blocker_key(item)

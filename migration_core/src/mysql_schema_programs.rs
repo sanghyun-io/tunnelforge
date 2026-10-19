@@ -438,6 +438,16 @@ pub(crate) fn replace_schema_program(conn: &mut mysql::PooledConn, schema: &str,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn view_function_calls_ignore_literals_comments_and_other_names() {
+        for sql in ["SELECT f()", "SELECT `f` ()", "SELECT `db`.`f` /* call */ ()", "SELECT db.F()"] {
+            assert!(super::view_calls_function(sql,"f").unwrap(),"{sql}");
+        }
+        for sql in ["SELECT 'f()'", "SELECT 1 /* f() */", "SELECT ff()", "SELECT 1 -- f()\n"] {
+            assert!(!super::view_calls_function(sql,"f").unwrap(),"{sql}");
+        }
+    }
+
     use super::*;
     fn program(kind: &str, definition: &str) -> NormalizedStoredProgram {
         serde_json::from_value(json!({"kind":kind,"name":"p","definition":definition,"sql_mode":"","character_set_client":"utf8mb4","collation_connection":"utf8mb4_bin","time_zone":"+00:00","status":"ENABLED"})).unwrap()

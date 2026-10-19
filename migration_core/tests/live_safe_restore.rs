@@ -1129,7 +1129,7 @@ fn rv18_unsavable_target_program_is_refused_only_after_the_copy() {
     }
     drop_namespace(&mut admin, "mysql", &name);
     std::fs::remove_dir_all(root).unwrap();
-    for (case, restored, planned) in seen {
+    for (case, restored, _planned) in seen {
         assert_stopped_before_copy(&restored,case);
         assert!(restored["copy_blockers"].to_string().contains("target_program_unsavable"),"{restored:#}");
     }

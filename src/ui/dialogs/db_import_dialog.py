@@ -1714,7 +1714,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         try:
             event = json.loads(line)
             if isinstance(event, dict):
-                sanitized_event = {key: sanitize_local_diagnostic_data(value) for key, value in event.items() if key != "plan"}
+                sanitized_event = _sanitized_rust_event({key: value for key, value in event.items() if key != "plan"})
                 self.import_audit = getattr(self, "import_audit", {})
                 known = (self.import_audit.get("report_path"), self.import_audit.get("candidate_created"))
                 _capture_import_audit(self.import_audit, sanitized_event)
@@ -2097,7 +2097,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_save_log.setEnabled(True)
         if action == "confirm":
             self._show_report_link()
-            self.import_audit["promotion_result"] = {key: sanitize_local_diagnostic_data(result.get(key)) for key in (
+            self.import_audit["promotion_result"] = {key: sanitize_local_diagnostic_data({key: result.get(key)}).get(key) for key in (
                 "status", "success", "original_unchanged", "cutover_pending", "backup_namespace", "report_path", "phase", "message", "missing_programs", "pending_program", "programs_failed", "programs_imported", "program_warnings", "program_verification_error")}
 
         if action == "plan":

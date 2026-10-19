@@ -1053,7 +1053,7 @@ class TestRustDumpImporter:
 
     @pytest.mark.parametrize("skip_triggers", [False, True])
     @pytest.mark.parametrize("import_mode", ["replace", "safe"])
-    def test_preview_payload_is_import_payload_without_mode(self, tmp_path, import_mode, skip_triggers):
+    def test_preview_payload_includes_import_mode(self, tmp_path, import_mode, skip_triggers):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
 
         dump_dir = self._write_dump(tmp_path)
@@ -1062,13 +1062,13 @@ class TestRustDumpImporter:
         options = dict(target_schema="other", threads=4, timezone_sql="SET SESSION time_zone = '+09:00'",
                        use_source_timezone=False, skip_triggers=skip_triggers)
 
-        ok, message, preview = importer.preview_import(dump_dir, **options)
+        ok, message, preview = importer.preview_import(dump_dir, import_mode=import_mode, **options)
         importer.import_dump(dump_dir, import_mode=import_mode, **options)
 
         assert ok is True and message == ""
         assert preview == {"dry_run": True, "replace": ["users"], "blockers": []}
-        assert "mode" not in facade.preview_payload
-        assert facade.preview_payload == {key: value for key, value in facade.import_payload.items() if key != "mode"}
+        assert facade.preview_payload["mode"] == import_mode
+        assert facade.preview_payload == facade.import_payload
         assert facade.preview_payload["target"]["database"] == "other"
         assert facade.import_payload.get("skip_triggers", False) is skip_triggers
 
@@ -2114,7 +2114,7 @@ def test_safe_message_view_counts_have_their_own_line(tmp_path, engine, with_pro
     class Facade:
         def import_dump(self, payload, on_event=None):
             return {"success":True,"status":"ready_for_switch","verified":True,"original_unchanged":True,"cutover_pending":True,"candidate_target":{"engine":engine,"database":"app","schema":"tf_restore_x"},"views_imported":["v"],"programs":{"create":["routine:f"] if with_programs else []}}
-    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost",3306,"root","test",engine=engine),facade=Facade()).import_dump(str(tmp_path),import_mode="safe")
+    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost",3306,"root","test",engine=engine),facade=Facade()).import_dump(str(tmp_path),target_schema="app",import_mode="safe")
     assert ok,message
     assert "View 1개" in message.splitlines()
     assert not any(line.endswith(", View 1개") for line in message.splitlines())

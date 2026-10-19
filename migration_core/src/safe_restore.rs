@@ -633,7 +633,7 @@ pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
             for conflict in crate::mysql_programs::trigger_name_conflicts(&retained_triggers, &programs, fold) {
                 refusals.push(("trigger_name_conflict", Some(conflict), "덤프의 트리거 이름이 그대로 둘 테이블의 트리거 이름과 같습니다. 이름을 바꾼 뒤 다시 시도하세요.".into()));
             }
-            if triggers.iter().any(|(table,_)|dumped.iter().any(|name|if fold { name.eq_ignore_ascii_case(table) } else { name==table })) {
+            if super::import_preview::mysql_grants_allow(conn,"TRIGGER",Some(&schema))==Some(false) || triggers.iter().any(|(table,_)|dumped.iter().any(|name|if fold { name.eq_ignore_ascii_case(table) } else { name==table })) {
                 refusals.extend(target_trigger_refusals(conn,&schema)?);
             }
             for (needed,privilege) in [

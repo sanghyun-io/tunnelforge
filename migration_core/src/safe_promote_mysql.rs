@@ -784,7 +784,7 @@ fn attach_triggers(conn: &mut Db, plan: &PromotionPlan, originals: bool, warning
 fn attach_trigger_set(conn: &mut Db, plan: &PromotionPlan, programs: &[NormalizedStoredProgram], tables: &BTreeSet<String>, originals: bool, warnings: &mut Vec<Value>, hook: &mut impl FnMut(&str, &mut Db) -> Result<(), String>) -> Result<(), String> {
     conn.query_drop(format!("USE {}", q(&plan.original_database))).map_err(|e|e.to_string())?;
     for p in crate::mysql_programs::selected_triggers(programs, tables) {
-        let preserved = originals || !plan.candidate_tables.contains_key(p.table.as_ref().unwrap());
+        let preserved = originals || plan.original_programs.iter().any(|old|program_matches(p,old)) || !plan.candidate_tables.contains_key(p.table.as_ref().unwrap());
         if preserved {
             crate::mysql_schema_programs::set_program_context(conn, p)?;
             let sql = plan.original_trigger_definitions.get(&p.name).ok_or("saved original trigger definition missing")?;
@@ -1845,7 +1845,8 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
             status = classify_programs(db, &effective, status);
         }
         if let Some(db) = cleanup.as_mut() {
-            match program_differences(db, plan, matches!(status.as_str(), "promoted" | "promoted_incomplete")) {
+            let effective = with_program_warnings(plan,state["program_warnings"].as_array().map(Vec::as_slice).unwrap_or_default());
+            match program_differences(db, &effective, matches!(status.as_str(), "promoted" | "promoted_incomplete")) {
                 Ok(missing) => state["missing_programs"] = json!(missing),
                 Err(err) => state["program_verification_error"] = json!(err),
             }
@@ -1978,6 +1979,7 @@ pub(crate) fn external_references(endpoint: &Endpoint, namespace: &str) -> Resul
 /// Inspect the promotion backup database. `deep` reads every row (digests, exact
 /// counts, metadata-visibility proof, external references); otherwise only
 /// catalog identities and estimates are used.
+#[cfg(test)]
 pub(crate) fn inspect_backup(endpoint: &Endpoint, plan: &PromotionPlan, deep: bool, journal_fingerprint: Option<&Value>) -> Result<Value, String> {
     inspect_backup_recorded(endpoint,plan,deep,journal_fingerprint,false)
 }

@@ -812,7 +812,7 @@ def describe_program_results(result: dict) -> Tuple[List[str], List[str]]:
         warnings.extend(failure.get("restore_warnings") or [])
     if result.get("program_verification_error"):
         details.append(sanitize_local_diagnostic(str(result["program_verification_error"])))
-    lines.extend(describe_program_warnings(warnings))
+    lines.extend(sanitize_local_diagnostic(line) for line in describe_program_warnings(warnings))
     return list(dict.fromkeys(lines)), list(dict.fromkeys(details))
 
 

@@ -1509,7 +1509,7 @@ def test_import_default_is_replace_and_has_no_mode_radios(monkeypatch, tmp_path)
         dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
         dialog.do_import()
         assert [worker.kwargs["import_mode"] for worker in _imports(created)] == ["replace"]
-        assert "import_mode" not in created[0].kwargs  # the preview takes the payload without its mode
+        assert created[0].kwargs["import_mode"] == "replace"  # preview applies safe-mode conflict rules
     finally:
         dialog.close()
 
@@ -1533,7 +1533,7 @@ def test_import_default_is_replace_and_has_no_mode_radios(monkeypatch, tmp_path)
      {"import_mode": "safe", "target_schema": "other"}),
 ])
 def test_import_toggle_payloads(monkeypatch, tmp_path, setup, expected):
-    """Each toggle changes only its own field, and the preview gets the same payload without the mode."""
+    """Each toggle changes only its own field, and the preview receives the same mode."""
     app = QApplication.instance() or QApplication([])  # noqa: F841 - keep the app alive
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
     created = _fake_workers(monkeypatch)
@@ -1548,7 +1548,7 @@ def test_import_toggle_payloads(monkeypatch, tmp_path, setup, expected):
         default = {"input_dir": str(tmp_path / "dump"), "import_mode": "replace", "target_schema": "app", "threads": 8,
                    "timezone_sql": None, "use_source_timezone": True, "skip_triggers": False}
         assert imported.kwargs == {**default, **expected}
-        assert preview.kwargs == {key: value for key, value in imported.kwargs.items() if key != "import_mode"}
+        assert preview.kwargs == imported.kwargs
     finally:
         dialog.close()
 

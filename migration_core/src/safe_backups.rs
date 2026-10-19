@@ -642,6 +642,10 @@ fn rollback_apply(request: &Request, credentials: &Endpoint) -> Result<Value, St
         Some("failed_triggers_recreated") => "The table switch did not happen, but recovery recreated the starting triggers. Review the recorded warnings before retrying.",
         _ => "The recovery outcome is unknown. Reconcile the recorded identities before any retry; nothing was deleted.",
     });
+    if result["status"] == "rollback_incomplete" {
+        let names = result["missing_programs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+        result["message"] = json!(format!("The original tables are active again, but these programs need to be recreated or dropped: {names}. Their saved definitions remain in the promotion journal."));
+    }
     Ok(result)
 }
 
