@@ -27,7 +27,7 @@ from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component
 from src.core.production_guard import ProductionGuard
 from src.exporters.rust_dump_exporter import (
-    DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure, describe_specific_promotion_failure,
+    DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure, describe_incomplete_promotion, describe_specific_promotion_failure,
     dump_original_namespace, restore_target_connection_info, describe_program_results, describe_program_warnings, describe_core_code, display_program_name,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
@@ -2145,9 +2145,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_audit.update(restore_status=status, original_unchanged=False,
                                      cutover_pending=False if status == "promoted_incomplete" else None)
             self.import_audit["missing_programs"] = result.get("missing_programs") or []
-            sentence = ("테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 백업을 보존하고 복구하세요."
-                        if status == "promoted_incomplete" else
-                        "테이블은 교체하지 않았지만 원래 트리거를 되살리지 못했습니다. 보고서에 저장된 정의로 복구하세요.")
+            sentence = describe_incomplete_promotion(status)
             self.label_status.setText(translate_text(sentence))
             names = ", ".join(display_program_name(item) for item in result.get("missing_programs") or [])
             program_lines, details = describe_program_results(result)
@@ -2178,7 +2176,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             if not known_unchanged:  # stopped or not: what the swap did is unknown, so it is never only a status line
                 self._show_failure(translate_text("교체 결과를 확인하지 못했습니다"), "\n\n".join(filter(None, [
                     translate_text("교체가 끝났는지 확인하지 못했습니다. 원본·백업·복사본 상태를 Import 보고서와 DB에서 확인하세요."),
-                    cause or result.get("message")])), message)
+                    cause or result.get("message")])), "\n\n".join(filter(None, [message, str(result.get("error") or "")])))
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 

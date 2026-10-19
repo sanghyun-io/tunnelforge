@@ -888,6 +888,16 @@ def describe_core_failure(message: object) -> Optional[str]:
     return " ".join(sentences) or None
 
 
+_INCOMPLETE_PROMOTION_SENTENCES = {
+    "promoted_incomplete": "테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 백업을 보존하고 복구하세요.",
+    "failed_original_triggers_missing": "테이블은 교체하지 않았지만 원래 트리거를 되살리지 못했습니다. 보고서에 저장된 정의로 복구하세요.",
+}
+
+
+def describe_incomplete_promotion(status: object) -> str:
+    return translate_text(_INCOMPLETE_PROMOTION_SENTENCES.get(str(status or ""), ""))
+
+
 def describe_specific_promotion_failure(result: dict, message: object = "") -> Optional[str]:
     """Keep generic promotion wrappers behind the recorded outcome's guidance."""
     code = str(result.get("error_code") or "").lower()
@@ -909,8 +919,9 @@ def without_import_toggle_hints(sentence: str) -> str:
     # A toggle-dependent prefix can qualify an otherwise useful base sentence.
     for name in _IMPORT_TOGGLE_NAMES:
         sentence = sentence.replace(f"'{name}'를 켜서 ", "")
+    names = (*_IMPORT_TOGGLE_NAMES, *(translate_text(name) for name in _IMPORT_TOGGLE_NAMES))
     return " ".join(part for part in re.split(r"(?<=[.!?])\s+", sentence)
-                    if not any(name in part for name in _IMPORT_TOGGLE_NAMES))
+                    if not any(name in part for name in names))
 
 
 IMPORT_PREVIEW_CAPABILITY = "dump.import_preview"

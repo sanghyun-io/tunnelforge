@@ -49,6 +49,7 @@ VERDICT_LABELS = {
 
 
 BACKUP_NOTE_LABELS = {
+    "The original tables were rebuilt after the recorded recovery, so its result cannot be re-checked. The recorded state is kept. Check the stored programs yourself and drop the recovery backup in the database if it is no longer needed.": "복구가 기록된 뒤 원본 테이블이 다시 만들어져 복구 결과를 다시 확인할 수 없습니다. 기록된 상태를 유지합니다. 저장 프로그램을 직접 확인한 뒤, 필요 없으면 복구 백업을 DB에서 직접 지우세요.",
     "The original table identities changed after the recorded failed attempt. The candidate still has its recorded table identities; a new promotion plan can be made.": "실패가 기록된 뒤 원본 테이블이 다시 만들어졌습니다. 복사본은 그대로라 새 교체 계획을 만들 수 있습니다.",
     "This account cannot see all stored programs, so the recovery result was not re-checked. The recorded state is kept.": "이 계정으로는 저장 프로그램을 모두 볼 수 없어 복구 결과를 다시 확인하지 못했습니다. 기록된 상태를 유지합니다."
 }

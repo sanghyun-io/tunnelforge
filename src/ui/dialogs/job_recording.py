@@ -196,12 +196,22 @@ def finish_promotion_job(dialog, success: bool, message: str, result: Dict[str, 
         outcome = str((result or {}).get("status") or "")
         error = ""
         if status != STATUS_COMPLETED:
-            from src.exporters.rust_dump_exporter import describe_specific_promotion_failure
-            error = describe_specific_promotion_failure(result or {}, message) or message or str((result or {}).get("message") or "")
+            from src.exporters.rust_dump_exporter import (
+                describe_incomplete_promotion, describe_specific_promotion_failure, without_import_toggle_hints,
+            )
+            specific = describe_specific_promotion_failure(result or {}, message)
+            sentence = describe_incomplete_promotion(outcome)
+            if sentence:
+                error = "\n".join(filter(None, [sentence, without_import_toggle_hints(specific) if specific else ""]))
+            else:
+                error = specific or message or str((result or {}).get("message") or "")
             if outcome in ("cutover_unknown", "pending", "preparing", ""):
                 error = ("전환 결과를 알 수 없습니다. 원본/백업/복원 대상의 상태를 확인하세요. " + error).strip()
+        details = {"outcome": outcome, "backup_namespace": str((result or {}).get("backup_namespace") or "")}
+        if outcome == "cutover_unknown" and (result or {}).get("error"):
+            details["core_error"] = str(result["error"])
         job_finish(job_id, status, error=error, report_path=str((result or {}).get("report_path") or ""),
-                   details={"outcome": outcome, "backup_namespace": str((result or {}).get("backup_namespace") or "")})
+                   details=details)
     except Exception:
         pass
     finally:

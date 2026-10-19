@@ -17,6 +17,7 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "복구가 기록된 뒤 원본 테이블이 다시 만들어져 복구 결과를 다시 확인할 수 없습니다. 기록된 상태를 유지합니다. 저장 프로그램을 직접 확인한 뒤, 필요 없으면 복구 백업을 DB에서 직접 지우세요.": "The original tables were rebuilt after the recorded recovery, so its result cannot be re-checked. The recorded state is kept. Check the stored programs yourself and drop the recovery backup in the database if it is no longer needed.",
     "실패가 기록된 뒤 원본 테이블이 다시 만들어졌습니다. 복사본은 그대로라 새 교체 계획을 만들 수 있습니다.": "The original table identities changed after the recorded failed attempt. The candidate still has its recorded table identities; a new promotion plan can be made.",
     "이 계정으로는 저장 프로그램을 모두 볼 수 없어 복구 결과를 다시 확인하지 못했습니다. 기록된 상태를 유지합니다.": "This account cannot see all stored programs, so the recovery result was not re-checked. The recorded state is kept.",
     "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다.": "Creating triggers requires log_bin_trust_function_creators=1 or SUPER.",

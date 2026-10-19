@@ -1,0 +1,7 @@
+{
+  "status": "cutover_unknown",
+  "success": false,
+  "original_unchanged": false,
+  "message": "Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery.",
+  "error": "db error"
+}

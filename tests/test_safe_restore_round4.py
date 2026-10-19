@@ -81,7 +81,11 @@ def test_promotion_failure_retains_status_guidance_in_window_and_job(monkeypatch
         error = recorded["error"]
         generic = i18n.translate_text(CORE_CODE_SENTENCES["safe_promotion"])
         assert generic not in error
-        assert done["message"] in error
+        if done["status"] in ("promoted_incomplete","failed_original_triggers_missing"):
+            from src.exporters.rust_dump_exporter import describe_incomplete_promotion
+            assert error.startswith(describe_incomplete_promotion(done["status"]))
+        else:
+            assert done["message"] in error
         if case == "rvh4a":
             body = stub._show_failure.call_args.args[1]
             assert "Retain all recorded namespaces" in body
