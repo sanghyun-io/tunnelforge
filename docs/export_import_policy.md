@@ -305,8 +305,10 @@ the dump is read (`partial_table_filter`); `legacy_bit_unverifiable` and
 | --- | --- |
 | `copy_create_privilege_missing` | MySQL: the grants do not show that the account can create `tf_restore_*`, `tf_backup_*` and `tf_promote_*` databases (unreadable grants count as missing); PostgreSQL: it has no CREATE on the database. |
 | `metadata_visibility_unproven` | MySQL: no direct global SELECT, SHOW VIEW and PROCESS grants (roles and partial revokes count as unproven). |
-| `target_routines`, `target_events` | The target namespace has stored routines (PostgreSQL: functions) or MySQL events; the swap does not move them and cannot prove they still work afterwards. |
-| `target_triggers` | MySQL: a dump table has a trigger in the target; PostgreSQL: any table in the schema has one. |
+| `target_routines` | PostgreSQL: the target schema has functions; the swap cannot prove they still work afterwards. |
+| `target_triggers` | PostgreSQL: a table in the target schema has a trigger. |
+| `trigger_name_conflict` | MySQL: a dump trigger conflicts with a trigger on a table that the safe switch keeps. Moving a trigger between replaced tables is supported. |
+| `view_calls_dump_routine` | MySQL: a dump view calls a dump function. Existing-target copy verification creates functions after the switch, so it refuses this case before making a copy. Direct import remains available. |
 | `linked_target_only` | A table or view outside the dump is linked to a dump table or view: an FK in either direction (from the target catalog or the dump's own FK definitions) or a view reading one, in this or another schema. On PostgreSQL, a dump view whose current definition reads a table outside the dump in the same schema does not count: the swap replaces that view in place and leaves the table alone. |
 | `external_parent_missing` | A dump table's own FK names a parent that is neither in the dump nor in the target. |
 | `saved_view_alias` | The linked object is an old view definition an earlier MySQL swap kept (`tf_p_<nonce>_oldv<i>`); clean it up first (`target: "view_aliases"` below). |

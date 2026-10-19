@@ -912,6 +912,7 @@ class RustDumpImporter(_RustDumpClientBase):
         timezone_sql: Optional[str] = None,
         use_source_timezone: bool = True,
         skip_triggers: bool = False,
+        import_mode: str = "replace",
     ) -> Tuple[bool, str, dict]:
         """What a replace import would do, read from the target without changing it.
 
@@ -931,6 +932,7 @@ class RustDumpImporter(_RustDumpClientBase):
             )
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, {}
+            payload["mode"] = import_mode
             if skip_triggers:
                 payload["skip_triggers"] = True
             if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):

@@ -1342,3 +1342,71 @@ fn rv204_promoted_verdict_survives_normal_post_cutover_program_changes() {
     assert_eq!(reconciled["conclusion"], "promoted", "BUG reproduced: completed kept event flips verdict: {reconciled:#}");
     assert_eq!(after["can_cleanup"], true, "BUG reproduced: backup cleanup blocked: {after:#}");
 }
+
+#[test]
+fn repro_view_calling_dump_function_in_safe_copy() {
+    let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
+    let mut db = LiveAdapter::connect(&original).unwrap();
+    db.execute_sql("CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 1").unwrap();
+    db.execute_sql("CREATE VIEW v AS SELECT f() AS x").unwrap();
+    let view_def = first_value(&original, "SELECT VIEW_DEFINITION FROM information_schema.VIEWS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='v'");
+    let output = root.join("programs");
+    let exported = run("dump.run", json!({"source":original,"output_dir":output,"data_format":"jsonl","compression":"none","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(!exported.iter().any(|e| e["event"] == "error"), "{exported:#?}");
+    // Case A: target exists but no longer has f (and v).
+    db.execute_sql("DROP VIEW v").unwrap();
+    db.execute_sql("DROP FUNCTION f").unwrap();
+    let a = safe_import(&original, &output);
+    eprintln!("VIEW_DEF={view_def}\nCASE_A={a:#}");
+    let a_candidate = a["candidate_target"]["database"].as_str().map(str::to_string);
+    // Case B: target still has the same f.
+    db.execute_sql("CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 1").unwrap();
+    let b = safe_import(&original, &output);
+    let b_candidate = b["candidate_target"]["database"].as_str().map(str::to_string);
+    let b_plan = if b["status"] == "ready_for_switch" { promote_plan(&original, &b) } else { json!(null) };
+    eprintln!("CASE_B={b:#}\nCASE_B_PLAN={b_plan:#}");
+    // Contrast: plain replace into the original.
+    db.execute_sql("DROP FUNCTION f").unwrap();
+    let r = run("dump.import", json!({"target":original,"input_dir":output,"mode":"replace","threads":1}))
+        .into_iter().find(|e| e["event"] == "result" || e["event"] == "error").unwrap();
+    eprintln!("REPLACE={r:#}");
+    for ns in [a_candidate.as_deref(), b_candidate.as_deref(), Some(name.as_str())].into_iter().flatten() {
+        drop_namespace(&mut admin, "mysql", ns);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+    assert_stopped_before_copy(&a,"view calls dump function without target function");
+    assert_stopped_before_copy(&b,"view calls dump function with target function");
+    assert!(a["copy_blockers"].to_string().contains("view_calls_dump_routine"));
+    assert_eq!(r["success"], true, "{r:#}");
+}
+
+/// A safe switch detaches triggers from both replaced tables before renaming.
+#[test]
+fn rv_patched_moved_trigger_promotes() {
+    let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
+    let mut db=LiveAdapter::connect(&original).unwrap();
+    db.execute_sql("CREATE TABLE children(id INT PRIMARY KEY)").unwrap();
+    db.execute_sql("CREATE TRIGGER trg BEFORE INSERT ON children FOR EACH ROW SET NEW.id=NEW.id").unwrap();
+    let output=root.join("programs");
+    let exported=run("dump.run",json!({"source":original,"output_dir":output,"data_format":"jsonl","compression":"none","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(!exported.iter().any(|e|e["event"]=="error"),"{exported:#?}");
+    db.execute_sql("DROP TRIGGER trg").unwrap();
+    db.execute_sql("CREATE TRIGGER trg BEFORE INSERT ON parents FOR EACH ROW SET NEW.value=NEW.value").unwrap();
+    let restored=safe_import(&original,&output);
+    let mut drop=vec![name.clone()];
+    if let Some(c)=restored["candidate_target"]["database"].as_str() { drop.push(c.into()); }
+    let mut done=Value::Null;
+    if restored["status"]=="ready_for_switch" {
+        let plan=promote_plan(&original,&restored);
+        if plan["can_promote"]==true {
+            let events=run("dump.promote",json!({"endpoint":original,"action":"confirm","report_path":restored["report_path"],"restore_id":restored["restore_id"],"plan_digest":plan["plan_digest"],"overwrite_confirmed":true}));
+            done=events.iter().find(|e|e["event"]=="result"||e["event"]=="error").cloned().unwrap();
+            for k in ["backup_namespace","clone_database"] { if let Some(n)=done[k].as_str() { drop.push(n.into()); } }
+        }
+    }
+    let on=if done["status"]=="promoted" { first_value(&original,"SELECT EVENT_OBJECT_TABLE FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME='trg'") } else { Value::Null };
+    for ns in &drop { drop_namespace(&mut admin,"mysql",ns); }
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(done["status"],"promoted","{done:#}");
+    assert_eq!(on,"children");
+}

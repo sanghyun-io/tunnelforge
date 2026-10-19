@@ -223,6 +223,7 @@ class RustDumpWorker(QThread):
             self.kwargs.get('timezone_sql'),
             use_source_timezone=self.kwargs.get('use_source_timezone', True),
             skip_triggers=self.kwargs.get('skip_triggers', False),
+            import_mode=self.kwargs.get("import_mode", "replace"),
         )
         self.error_code = getattr(importer, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)

@@ -629,7 +629,8 @@ pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
             let dumped = manifest.tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
             let triggers = crate::mysql_programs::target_trigger_names(conn, &schema)?;
             let programs = if skip_triggers { Vec::new() } else { crate::mysql_programs::selected_triggers(&manifest.stored_programs, &dumped) };
-            for conflict in crate::mysql_programs::trigger_name_conflicts(&triggers, &programs, fold) {
+            let retained_triggers = triggers.iter().filter(|(table,_)|!dumped.iter().any(|name|if fold {name.eq_ignore_ascii_case(table)} else {name==table})).cloned().collect::<Vec<_>>();
+            for conflict in crate::mysql_programs::trigger_name_conflicts(&retained_triggers, &programs, fold) {
                 refusals.push(("trigger_name_conflict", Some(conflict), "덤프의 트리거 이름이 그대로 둘 테이블의 트리거 이름과 같습니다. 이름을 바꾼 뒤 다시 시도하세요.".into()));
             }
             if triggers.iter().any(|(table,_)|dumped.iter().any(|name|if fold { name.eq_ignore_ascii_case(table) } else { name==table })) {
@@ -642,6 +643,13 @@ pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
             ] {
                 if needed && super::import_preview::mysql_grants_allow(conn,privilege,Some("tf_restore_0")) != Some(true) {
                     refusals.push(("program_privilege_missing",Some("tf_restore_*".into()),format!("{privilege} is required on the verification copy")));
+                }
+            }
+            for view in &manifest.views {
+                for function in manifest.stored_programs.iter().filter(|p|p.kind=="FUNCTION") {
+                    if crate::mysql_schema_programs::view_calls_function(&view.definition,&function.name)? {
+                        refusals.push(("view_calls_dump_routine",Some(view.name.clone()),format!("view {} calls dump function {}",view.name,function.name)));
+                    }
                 }
             }
             if let Err(error) = saved_target_programs(conn,original,manifest) {

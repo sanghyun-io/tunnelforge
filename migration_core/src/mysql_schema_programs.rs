@@ -45,6 +45,13 @@ fn tokens(sql: &str, no_escape: bool) -> Result<Vec<Token>, String> {
     Ok(out)
 }
 
+pub(crate) fn view_calls_function(sql: &str, name: &str) -> Result<bool,String> {
+    for no_escape in [false,true] {
+        if tokens(sql,no_escape)?.windows(2).any(|w|matches!(w[0].quote,0 | b'`') && w[0].text.eq_ignore_ascii_case(name) && w[1].text=="(" && w[1].quote==0) { return Ok(true) }
+    }
+    Ok(false)
+}
+
 fn keyword(t: &Token, word: &str) -> bool { t.quote == 0 && t.text.eq_ignore_ascii_case(word) }
 
 /// Only backtick object identifiers from SHOW CREATE are accepted. DEFINER is never replayed.

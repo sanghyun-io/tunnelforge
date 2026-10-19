@@ -88,6 +88,7 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
     let engine = endpoint.engine.as_str();
     let selected: BTreeSet<String> = string_list(request.payload.get("tables")).into_iter().collect();
     let strict = request.payload.get("strict_manifest").and_then(Value::as_bool).unwrap_or(true);
+    let safe_mode = request.payload.get("mode").or_else(||request.payload.get("import_mode")).and_then(Value::as_str)==Some("safe");
     let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
     let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict, &endpoint_schema(endpoint), skip_triggers)?;
     // A timezone the import would refuse is a bad request, not a property of the target.
@@ -144,7 +145,7 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
             }
             let super_grant=mysql_grants_allow(conn,"SUPER",None);
             let blocked=programs.iter().filter(|p|p.kind=="FUNCTION" && function_binlog_preview_blocked(p,log_bin,trusted,super_grant)).map(|p|p.name.clone()).collect::<Vec<_>>();
-            if !blocked.is_empty() && request.payload.get("mode").and_then(Value::as_str)!=Some("safe") { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
+            if !blocked.is_empty() && !safe_mode { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
             let events=programs.iter().filter(|p|p.kind=="EVENT").map(|p|p.name.clone()).collect::<Vec<_>>();
             if !events.is_empty() && mysql_grants_allow(conn,"EVENT",Some(&endpoint.database)).is_none() {
                 warnings.push(warning_names("event_privilege_unproven",events));
@@ -202,7 +203,8 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
     let target_views = target.views.iter().map(|(name, _)| key(name)).collect::<BTreeSet<_>>();
     let (views_replace, views_create): (Vec<String>, Vec<String>) = dump_views.into_iter().partition(|name| target_views.contains(&key(name)));
     let replaced_views = views_replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
-    for conflict in trigger_name_conflicts(&target.triggers, &programs, fold) {
+    let conflict_triggers = target.triggers.iter().filter(|(table,_)|!safe_mode || !dumped.contains(&key(table))).cloned().collect::<Vec<_>>();
+    for conflict in trigger_name_conflicts(&conflict_triggers, &programs, fold) {
         blockers.push(issue("trigger_name_conflict", Some(&conflict), &conflict));
     }
 

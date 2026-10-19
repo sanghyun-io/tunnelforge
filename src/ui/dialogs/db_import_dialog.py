@@ -1350,7 +1350,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_import.setText("⏳ 대상 확인 중…")
         self._previewing = True
         # Kept apart from self.worker, which the import replaces while this thread may still be ending.
-        self._preview_worker = RustDumpWorker("import_preview", self.restore_config, **self._worker_options(request))
+        self._preview_worker = RustDumpWorker("import_preview", self.restore_config, import_mode=request["import_mode"], **self._worker_options(request))
         self.worker = self._preview_worker
         self.worker.preview_finished.connect(self._on_preview_finished)
         self.worker.start()

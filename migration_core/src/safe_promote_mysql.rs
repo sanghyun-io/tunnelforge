@@ -1030,8 +1030,10 @@ pub(crate) fn plan(
         return Err("candidate must not contain stored programs".into());
     }
     let target_triggers = crate::mysql_programs::target_trigger_names(&mut conn, &original.database)?;
+    let fold = mysql_folds_table_names(&mut conn)?;
+    let target_triggers = target_triggers.into_iter().filter(|(table,_)|!old.keys().any(|name|if fold {name.eq_ignore_ascii_case(table)} else {name==table})).collect::<Vec<_>>();
     let selected = programs.iter().filter(|p| p.kind == "TRIGGER").collect::<Vec<_>>();
-    let conflicts = crate::mysql_programs::trigger_name_conflicts(&target_triggers, &selected, mysql_folds_table_names(&mut conn)?);
+    let conflicts = crate::mysql_programs::trigger_name_conflicts(&target_triggers, &selected, fold);
     if !conflicts.is_empty() { return Err(format!("trigger_name_conflict: {}", conflicts.join(", "))) }
     let current_definer: Option<String> = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?;
     let promoted_programs = programs.to_vec();
