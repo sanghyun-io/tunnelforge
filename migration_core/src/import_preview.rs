@@ -57,7 +57,7 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     }
     match super::import_table_ddls(manifest, selected, engine, target_schema, skip_triggers) {
         Ok((_, untranslatable)) => blockers.extend(untranslatable.into_iter()
-            .map(|(table, reason)| issue(if reason.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else { "untranslatable_table" }, Some(table.as_str()), reason))),
+            .map(|(table, reason)| issue(if reason.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else if reason.starts_with("unsupported_generated_column:") {"unsupported_generated_column"} else if reason.starts_with("unsupported_invisible_column:") {"unsupported_invisible_column"} else { "untranslatable_table" }, Some(table.as_str()), reason))),
         Err(err) => blockers.push(issue(if err.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else { "dump_invalid" }, None, err)),
     }
     let tables = manifest.tables.iter()
@@ -75,6 +75,10 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     let copy_blockers = super::safe_restore::copy_refusals(manifest, engine, !selected.is_empty()).into_iter()
         .map(|(code, table, detail)| issue(code, table.as_deref(), detail)).collect::<Vec<_>>();
     Ok(DumpFindings { tables: dependency_ordered_dump_tables(&manifest.schema, tables), blockers, warnings, copy_blockers })
+}
+
+fn warning_names(code: &str, names: Vec<String>) -> Value {
+    let mut item=warning(code,names.join(", ")); item["names"]=json!(names); item
 }
 
 fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
@@ -136,14 +140,20 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             if programs.iter().any(|p|matches!(p.kind.as_str(),"PROCEDURE" | "FUNCTION")) && mysql_grants_allow(conn,"ALTER ROUTINE",Some(&endpoint.database))==Some(false) {
                 warnings.push(warning("program_probe_cleanup_unproven","ALTER ROUTINE is needed to remove routine probes"));
             }
-            if programs.iter().any(|p|p.kind=="FUNCTION" && function_binlog_preview_blocked(p,log_bin,trusted,mysql_grants_allow(conn,"SUPER",None))) {
-                warnings.push(warning("routine_binlog_unsafe","functions that fail binary log creation checks will be skipped"));
+            let super_grant=mysql_grants_allow(conn,"SUPER",None);
+            let blocked=programs.iter().filter(|p|p.kind=="FUNCTION" && function_binlog_preview_blocked(p,log_bin,trusted,super_grant)).map(|p|p.name.clone()).collect::<Vec<_>>();
+            if !blocked.is_empty() { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
+            let events=programs.iter().filter(|p|p.kind=="EVENT").map(|p|p.name.clone()).collect::<Vec<_>>();
+            if !events.is_empty() && mysql_grants_allow(conn,"EVENT",Some(&endpoint.database)).is_none() {
+                warnings.push(warning_names("event_privilege_unproven",events));
             }
             let current: Option<String> = conn.query_first("SELECT CURRENT_USER()")
                 .map_err(|err| format!("current account inspection failed: {err}"))?;
             let changed = programs.iter().filter(|p| p.definer != current).map(|p| format!("{} ({} -> {})", p.name,
                 p.definer.as_deref().unwrap_or("?"), current.as_deref().unwrap_or("?"))).collect::<Vec<_>>();
-            if !changed.is_empty() { warnings.push(warning("program_definer_replaced", changed.join(", "))); }
+            if !changed.is_empty() { warnings.push(warning_names("program_definer_replaced", changed)); }
+            let privileged=programs.iter().filter(|p|program_runs_as_importer(p)).map(|p|format!("{} {}",p.kind,p.name)).collect::<Vec<_>>();
+            if !privileged.is_empty() { warnings.push(warning_names("program_execution_account",privileged)); }
         }
     }
     // A cross-engine dump is already refused as a whole.
@@ -203,9 +213,9 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             let previous = target_programs.iter().find(|(k,n,_,_)| k==&p.kind && n.eq_ignore_ascii_case(&p.name));
             if let Some((_,_,definer,_)) = previous {
                 program_replace.push(program_id(p));
-                if p.kind!="EVENT" { warnings.push(warning("routine_grants_reset",format!("{} {}",p.kind,p.name))); }
+                if p.kind!="EVENT" { warnings.push(warning_names("routine_grants_reset",vec![format!("{} {}",p.kind,p.name)])); }
                 if definer!=&current && !preserves_foreign_definer(conn) {
-                    warnings.push(warning("program_restore_definer_may_change",format!("{} {} ({definer} -> {current})",p.kind,p.name)));
+                    warnings.push(warning_names("program_restore_definer_may_change",vec![format!("{} {} ({definer} -> {current})",p.kind,p.name)]));
                 }
                 if definer!=&current && mysql_grants_allow(conn,"SYSTEM_USER",None)!=Some(true) {
                     program_may_not_replace.push(json!({"name":p.name,"kind":p.kind,"definer":definer}));
@@ -214,8 +224,8 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             if p.kind=="EVENT" && preview_event_due(conn,p,previous.and_then(|(_,_,_,status)|status.as_deref()),&mut warnings) { events_enabled.push(p.name.clone()); }
         }
     } else if !exists { program_create = programs.iter().map(|p|program_id(p)).collect(); }
-    if !events_enabled.is_empty() { warnings.push(warning("events_enabled",events_enabled.join(", "))); }
-    if !program_may_not_replace.is_empty() { warnings.push(warning("program_replace_privilege_unproven",program_may_not_replace.iter().map(|p|p["name"].as_str().unwrap()).collect::<Vec<_>>().join(", "))); }
+    if !events_enabled.is_empty() { warnings.push(warning_names("events_enabled",events_enabled.clone())); }
+    if !program_may_not_replace.is_empty() { warnings.push(warning_names("program_replace_privilege_unproven",program_may_not_replace.iter().map(|p|format!("{} {}",p["kind"].as_str().unwrap(),p["name"].as_str().unwrap())).collect())); }
     let mut external_parents = Vec::new();
     for table in &import_schema.tables {
         for fk in table.foreign_keys.iter().filter(|fk| !dumped.contains(&key(&fk.referenced_table))) {
@@ -310,7 +320,7 @@ fn preview_event_due(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, 
     let due=reset_program_context(conn).and_then(|()|event_due_now(conn,p,target));
     match due {
         Ok(due) => due,
-        Err(err) => { warnings.push(warning("program_session_unavailable",format!("{}: {err}",p.name))); false }
+        Err(err) => { let mut item=warning_names("program_session_unavailable",vec![p.name.clone()]); item["raw_error"]=json!(err); warnings.push(item); false }
     }
 }
 

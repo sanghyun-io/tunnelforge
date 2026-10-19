@@ -442,8 +442,9 @@ class RustDumpExporter(_RustDumpClientBase):
         message = f"Export 완료: 테이블 {table_count}개, 행 {rows:,}개"
         if view_count:
             message += f", 뷰 {view_count}개"
-        if result.get("triggers"):
-            message += f", 트리거 {int(result['triggers'])}개"
+        for key,template in [("triggers","트리거 {}개"),("routines","루틴 {}개"),("events","이벤트 {}개")]:
+            if result.get(key):
+                message += ", " + translate_text(template).format(int(result[key]))
         method = describe_snapshot_method(result, effective_threads)
         if method:
             message += f" · {method}"
@@ -635,7 +636,7 @@ CORE_CODE_SENTENCES = {
     "program_restore_unavailable": "대상의 이전 정의를 안전하게 복구할 수 있는지 확인하지 못해 이 객체는 교체하지 않았습니다. 보고서에서 세션 설정과 권한을 확인하세요.",
     "program_event_dropped": "과거의 일회성 이벤트를 서버가 생성 직후 삭제했습니다. 교체 실패로 처리하고 이전 정의 복구 결과를 보고합니다.",
     "routine_grants_reset": "동명 루틴을 교체하면 그 루틴에 직접 부여한 EXECUTE·ALTER ROUTINE 권한이 사라질 수 있습니다. 필요한 권한을 다시 부여하세요.",
-    "program_session_unavailable": "이 객체의 원본 세션 설정을 대상에서 적용할 수 없습니다. 시간대 설정을 확인하세요. 이 객체는 교체 전에 설정을 다시 확인합니다.",
+    "program_session_unavailable": "원본 세션 설정을 적용할 수 없어 이 객체는 바꾸지 않고 남겨 둡니다(결과는 일부 완료). 대상 서버의 시간대 설정을 확인하세요.",
 
     "events_enabled": "가져온 뒤 바로 실행될 수 있는 이벤트가 있습니다. 이름과 일정을 확인하세요.",
     "routine_body_unreadable": "루틴 {}의 본문을 읽지 못해 담지 않았습니다. SHOW_ROUTINE 권한 또는 원본 소유 계정이 필요합니다.",
@@ -651,21 +652,21 @@ CORE_CODE_SENTENCES = {
     "program_server_warning": "저장 프로그램을 만들 때 서버가 경고를 보냈습니다.",
     "program_create_failed": "데이터를 넣은 뒤 저장 프로그램을 만들지 못했습니다. Import 보고서에서 실패한 객체와 이전 정의 복구 결과를 확인하세요.",
     "trigger_body_unproven": "트리거 {}의 본문이 원본과 같은지 확인하지 못해 담지 않았습니다. 원본 트리거 정의를 확인하세요.",
-    "program_definition_invalid": "저장 프로그램 {}의 종류, 실행 시점, 이벤트 또는 세션 설정을 안전하게 확인하지 못했습니다.",
+    "program_definition_invalid": "루틴·이벤트 {}의 정의나 생성 설정을 안전하게 읽을 수 없습니다. 원본 객체의 정의와 문자셋·시간대를 확인한 뒤 다시 내보내세요.",
     "program_charset_unsupported": "저장 프로그램 {}의 문자셋으로는 정의를 안전하게 복원할 수 없습니다. 원본 객체를 utf8mb4 문자셋으로 다시 만든 뒤 내보내세요.",
     "trigger_name_conflict": "같은 이름의 트리거가 대상의 다른 테이블에 있습니다. 그 트리거를 삭제하거나 다른 이름으로 다시 만든 뒤 가져오세요.",
     "trigger_binlog_privilege": "트리거를 만들려면 log_bin_trust_function_creators=1 설정 또는 SUPER 권한이 필요합니다. 트리거를 제외하려면 고급 설정의 '트리거 없이 테이블만 가져오기'를 켜세요.",
     "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
     "program_probe_failed": "저장 프로그램을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "program_source_schema_reference": "저장 프로그램 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
-    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
+    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 일반 Import로 가져오세요.",
     "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거·루틴·이벤트를 만들지 않습니다.",
-    "programs_skipped_partial": "선택하지 않은 테이블의 트리거와 스키마 전체의 뷰·루틴·이벤트는 만들지 않습니다.",
+    "programs_skipped_partial": "선택한 테이블에 딸린 객체만 가져오므로 나머지 객체는 만들지 않습니다.",
     "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
     "program_definer_replaced": "저장 프로그램 정의자가 가져오는 계정으로 바뀝니다.",
     "program_database_collation_changed": "대상 DB의 기본 정렬 규칙이 저장 프로그램 원본과 다릅니다.",
 
-    "generated_column_unproven": "계산 열 {}의 식을 안전하게 해석하고 원본 테이블 정의와 일치하는지 확인하지 못했습니다. 원본의 SHOW CREATE TABLE 정의와 생성식을 확인하세요.",
+    "generated_column_unproven": "계산 열 {}의 식이 원본과 같은지 확인하지 못했습니다. 이모지처럼 원본 DB가 다시 표시하지 못하는 문자가 있을 수 있습니다. 그 문자를 쓰지 않도록 식을 고치거나 이 테이블의 체크를 풀어 나머지만 내보내세요.",
     **CONNECTION_ERROR_MESSAGES,
     # Import errors
     "load_failed": "이 테이블을 지우고 다시 만들거나 데이터를 넣는 중에 멈췄습니다.",
@@ -723,6 +724,14 @@ CORE_CODE_SENTENCES = {
     "create_privilege_unproven": "대상 DB(스키마)가 없는데 이 계정이 만들 수 있는지 권한 목록으로는 알 수 없습니다.",
     "drop_privilege_unproven": "이 계정이 대상 테이블을 지울 수 있는지 권한 목록으로는 알 수 없습니다.",
     "view_dependencies_unknown": "교체할 테이블을 쓰는 뷰를 확인하지 못했습니다(MySQL 8.0.13 이상 필요).",
+    "program_finalize_failed": "객체를 만들었지만 활성화나 마무리 확인을 끝내지 못했습니다. 보고서에서 남아 있는 객체와 실행 상태를 확인하세요.",
+    "event_privilege_unproven": "이벤트 생성 권한을 확인하지 못했습니다. 권한이 없으면 이 객체는 만들지 못하고 결과가 일부 완료로 남을 수 있습니다.",
+    "program_execution_account": "이 객체들은 가져오는 계정의 권한으로 실행됩니다. 신뢰하는 덤프인지 확인하세요.",
+    "unsupported_generated_column": "이 테이블의 계산 열은 MySQL 대상에서만 복원할 수 있습니다. MySQL 대상으로 가져오세요.",
+    "unsupported_invisible_column": "이 테이블의 숨김 열은 MySQL 대상에서만 복원할 수 있습니다. MySQL 대상으로 가져오세요.",
+    "trigger_definition_invalid": "트리거 {}의 정의나 생성 설정을 안전하게 읽을 수 없습니다. 원본 트리거 정의를 확인한 뒤 다시 내보내세요.",
+    "trigger_create_failed": "데이터를 넣은 뒤 트리거를 만들다가 Import가 멈췄습니다. 앞서 완료한 테이블은 유지됩니다. 보고서에서 트리거가 없는 테이블을 확인하세요.",
+    "trigger_finalize_failed": "트리거는 만들었지만 마무리 확인 중 Import가 멈췄습니다. 보고서에서 만들어진 트리거와 남은 테이블을 확인하세요.",
 }
 _REPORT_NOT_SAVED = "Import 보고서를 저장하지 못했습니다. 보고서 내용은 최신이 아닙니다."
 
@@ -748,6 +757,14 @@ def describe_core_code(code: object, name: object = "") -> Optional[str]:
     if "{}" in sentence:
         return sentence.format(name) if name else re.sub(r"\{\}(?:의|은|는|이|가|을|를)?\s*", "", sentence).strip()
     return f"{name}: {sentence}" if name else sentence
+
+
+def display_program_name(value: object) -> str:
+    kind, _, rest = str(value).partition(":")
+    if kind == "trigger":
+        return rest.replace(":", ".", 1)
+    templates = {"routine": "루틴 {}", "event": "이벤트 {}", "view": "뷰 {}"}
+    return translate_text(templates[kind]).format(rest) if kind in templates else str(value)
 
 
 def describe_program_warnings(items: object) -> List[str]:
@@ -1066,7 +1083,7 @@ class RustDumpImporter(_RustDumpClientBase):
             for kinds, label in [(("TRIGGER",), "트리거"), (("PROCEDURE", "FUNCTION"), "루틴"), (("EVENT",), "이벤트")]:
                 count = sum(item.get("kind", "TRIGGER") in kinds for item in result.get("programs_imported") or [] if isinstance(item, dict))
                 if count:
-                    message += f", {label} {count}개"
+                    message += ", " + translate_text({"트리거":"트리거 {}개","루틴":"루틴 {}개","이벤트":"이벤트 {}개"}[label]).format(count)
             programs_failed = result.get("programs_failed") or []
             for failure in programs_failed:
                 name = str(failure.get("name", ""))
@@ -1076,7 +1093,10 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += "\n" + line
             for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
                 if result.get(key):
-                    message += "\n" + describe_core_code(key) + " " + ", ".join(map(str, result[key]))
+                    skipped_line = describe_core_code(key) + " " + ", ".join(display_program_name(item) for item in result[key])
+                    message += "\n" + skipped_line
+                    if progress_callback:
+                        progress_callback(skipped_line)
             for warning_line in describe_program_warnings(result.get("program_warnings")):
                 message += "\n" + warning_line
                 if progress_callback:

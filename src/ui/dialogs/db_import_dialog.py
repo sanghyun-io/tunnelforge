@@ -28,7 +28,7 @@ from src.core.path_safety import safe_filename_component
 from src.core.production_guard import ProductionGuard
 from src.exporters.rust_dump_exporter import (
     DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure,
-    dump_original_namespace, restore_target_connection_info, describe_program_warnings,
+    dump_original_namespace, restore_target_connection_info, describe_program_warnings, describe_core_code, display_program_name,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.dialogs.import_plan_dialog import ImportPlanDialog, describe_plan, names_preview as _names_preview
@@ -75,6 +75,10 @@ def _capture_import_audit(audit: dict, event: dict):
                     "programs_skipped_partial", "programs_skipped_cross_engine", "program_warnings"):
             if isinstance(event.get(key), list):
                 audit[key] = event[key]
+        if isinstance(event.get("data_imported"), bool):
+            audit["data_imported"] = event["data_imported"]
+        if isinstance(event.get("programs_failed"), list):
+            audit["programs_failed"] = event["programs_failed"]
         target = event.get("target")
         if isinstance(target, dict) and isinstance(target.get("schema"), str):
             name = target["schema"]
@@ -134,6 +138,17 @@ def _replace_failure_details(audit: dict) -> str:
         lines.append(translate_text("이번 Import에서 새로 만든 대상(지우지 않고 남겨 둠): {}").format(audit["created_namespace"]))
     if audit.get("namespace_outcome_unknown"):
         lines.append(translate_text("새 대상을 만들었는지 확인하지 못함: {}").format(audit["namespace_outcome_unknown"]))
+    failed_triggers = [f"{item.get('table')}.{item.get('name')}" for item in audit.get("programs_failed") or []
+                       if isinstance(item, dict) and item.get("kind") == "TRIGGER"]
+    if failed_triggers:
+        lines.append(translate_text("Import가 멈춘 트리거: {}").format(_names_preview(failed_triggers)))
+    made = [f"{item.get('table')}.{item.get('name')}" for item in audit.get("triggers_created") or [] if isinstance(item, dict)]
+    if made:
+        lines.append(translate_text("만든 트리거: {}").format(_names_preview(made)))
+    for code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
+        names = [display_program_name(item) for item in audit.get(code) or []]
+        if names:
+            lines.append(describe_core_code(code) + " " + _names_preview(names))
     lines.extend(describe_program_warnings(audit.get("program_warnings")))
     return "\n".join(lines)
 
@@ -686,6 +701,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.chk_skip_triggers.toggled.connect(self._update_advanced_summary)
         panel_layout.addWidget(self.chk_skip_triggers)
         self.chk_verify_copy.toggled.connect(self._update_trigger_options)
+        self.input_dir.textChanged.connect(self._update_trigger_options)
 
         timezone_line = QHBoxLayout()
         self.chk_timezone = QCheckBox("시간대 직접 정하기")
@@ -997,7 +1013,11 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._refresh_target_line()
 
     def _update_trigger_options(self, *_):
-        allowed = build_rust_dump_config(self.connector).engine == "mysql" and not (self.chk_verify_copy.isChecked() and self._verify_allowed)
+        path = self.input_dir.text().strip()
+        manifest = self._read_manifest(path) if path else {}
+        has_triggers = not path or any(isinstance(p, dict) and p.get("kind") == "TRIGGER" for p in manifest.get("stored_programs") or [])
+        allowed = (getattr(self, "_ui_enabled", True) and has_triggers and build_rust_dump_config(self.connector).engine == "mysql"
+                   and not (self.chk_verify_copy.isChecked() and self._verify_allowed))
         self.chk_skip_triggers.setEnabled(allowed)
         if not allowed:
             self.chk_skip_triggers.setChecked(False)
@@ -1225,9 +1245,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def set_ui_enabled(self, enabled: bool):
         """Import 진행 중 UI 요소 활성화/비활성화"""
+        self._ui_enabled = enabled
         for widget in (self.input_dir, self.btn_browse, self.chk_other_name, self.combo_target_schema,
                        self.chk_verify_copy, self.chk_timezone, self.combo_timezone, self.spin_threads, self.btn_import,
-                       self.btn_rerun, self.btn_manage_backups):
+                       self.btn_rerun, self.btn_manage_backups, self.chk_skip_triggers):
             widget.setEnabled(enabled)
         self.btn_stop.setVisible(not enabled)
         if not enabled:
@@ -1814,10 +1835,12 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         blocked_count = self._count_by_status(table_results, 'blocked')
         total_count = len(table_results)
 
+        partial = (not success and not self._cancel_requested and self.last_import_mode != "safe"
+                   and self.import_audit.get("status") == "partial" and self.import_audit.get("data_imported") is True and error_count == 0)
         finish_import_job(self, success, message, done_count, error_count, blocked_count)
 
         self._add_log(f"{'='*60}")
-        self._add_log(f"Import {'성공' if success else '실패'}")
+        self._add_log(translate_text("Import 일부 완료") if partial else f"Import {'성공' if success else '실패'}")
         self._add_log(f"종료 시간: {self.import_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         if self.import_start_time:
             elapsed = self.import_end_time - self.import_start_time
@@ -1866,6 +1889,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 QTimer.singleShot(0, self._plan_promotion)
             else:
                 self._stop_and_explain(["- " + translate_text(_REVIEW_REASON)])
+        elif partial:
+            self.progress_bar.setValue(100)
+            sentence = translate_text("Import 일부 완료: 테이블 데이터는 가져왔지만 일부 객체는 복원하지 못했습니다.")
+            self.label_status.setText("⚠️ " + sentence)
+            visible = {self.txt_log.item(i).text() for i in range(self.txt_log.count())}
+            for line in message.splitlines():
+                if line not in visible:
+                    self._log_visible(line)
+            self._show_failure("Import 일부 완료", message)
         elif success:
             sentence = self._success_sentence(new_target, total_count)
             self.label_status.setText(f"✅ {sentence}")

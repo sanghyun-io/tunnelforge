@@ -186,9 +186,9 @@ fn failed_trigger_on_a_newly_created_table_is_reported_as_a_loss() {
         }
         output.push(e);
     });
-    assert!(injected); refused(&output,"program_create_failed");
+    assert!(injected); refused(&output,"trigger_create_failed");
     let error=output.iter().find(|e|e["event"]=="error").unwrap()["message"].as_str().unwrap();
-    assert_eq!(error.matches("program_create_failed:").count(),1,"{error}");
+    assert_eq!(error.matches("trigger_create_failed:").count(),1,"{error}");
     assert!(!output.iter().any(|e| e["event"] == "error" && e["message"].as_str().unwrap().contains("program_probe_failed")));
     let report = output.iter().rev().find(|e|e["event"] == "import_report").unwrap();
     assert_eq!(report["dropped_tables"],json!([])); assert_eq!(report["created_tables"],json!(["sample"]));
@@ -342,7 +342,7 @@ impl Drop for RestrictedAccount {
 fn binlog_without_super_refuses_unchanged_and_toggle_allows_tables() {
     let Some(s)=Sandbox::new() else { return }; let mut db=conn(&s.endpoint); seed(&mut db); s.dump("jsonl",Value::Null);
     let (log_bin,trust):(bool,bool)=db.query_first("SELECT @@log_bin,@@log_bin_trust_function_creators").unwrap().unwrap();
-    if !log_bin { eprintln!("SKIP binlog account path: @@log_bin=0"); return }
+    assert!(log_bin || std::env::var_os("TF_LIVE_REQUIRED").is_none(),"binary log required"); if !log_bin { return }
     let user=format!("tf_tr_u_{}",std::process::id()); let _account=RestrictedAccount { endpoint:s.endpoint.clone(),name:user.clone(),trust };
     db.query_drop("SET GLOBAL log_bin_trust_function_creators=0").unwrap();
     db.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'")).unwrap();

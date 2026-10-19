@@ -12,9 +12,9 @@ class TestRustDumpChecker:
     def test_export_completion_reports_held_trigger_count(self, tmp_path):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
         facade = MagicMock()
-        facade.run_dump.return_value = {"success": True, "tables": 1, "rows_dumped": 2, "triggers": 3}
+        facade.run_dump.return_value = {"success": True, "tables": 1, "rows_dumped": 2, "triggers": 3, "routines": 4, "events": 5}
         ok, message = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).export_full_schema("app", str(tmp_path))
-        assert ok and "트리거 3개" in message
+        assert ok and "트리거 3개" in message and "루틴 4개" in message and "이벤트 5개" in message
 
     def test_export_surfaces_manifest_warnings(self, tmp_path):
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
@@ -1944,13 +1944,13 @@ def test_generated_refusal_reason_has_plain_korean_and_english():
     object_id = "generated_column:orders:total"
     line = describe_export_refusal([object_id], {object_id: "generated_column_unproven"})[0]
     assert line.startswith("테이블 orders:")
-    assert "계산 열 total의 식을" in line
-    assert "SHOW CREATE TABLE" in line and "확인하지 못했습니다" in line
+    assert "계산 열 total의 식이" in line
+    assert "이모지" in line and "체크를 풀어" in line
     assert "generated_column_unproven" not in line
     i18n.set_language("en")
     try:
         english = describe_export_refusal([object_id], {object_id: "generated_column_unproven"})[0]
-        assert "Could not safely decode generated column total" in english
+        assert "Could not verify generated column total" in english
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
 
@@ -1971,7 +1971,7 @@ def test_import_reports_each_skipped_trigger_and_created_count(tmp_path, skipped
     progress = []
     ok, message, _ = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "pw"), facade=facade).import_dump(str(folder), import_mode="replace", progress_callback=progress.append)
     assert ok and "트리거 1개" in message
-    assert CORE_CODE_SENTENCES[skipped] in message and "sample:guard" in message and "other:audit" in message
+    assert CORE_CODE_SENTENCES[skipped] in message and "sample.guard" in message and "other.audit" in message
 
     assert "정렬 규칙" in message and "guard" in message and "utf8mb4_bin" in message
     assert "1287" in message and "old syntax" in message
@@ -2049,3 +2049,11 @@ def test_nameless_code_sentences_drop_placeholder_and_korean_particle(code):
         assert "{}" not in describe_core_code(code)
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("korean,english", [("루틴 복원 중: rebuild","Restoring routine: rebuild"),("이벤트 복원 중: nightly","Restoring event: nightly"),("트리거 {}개","{} triggers"),("루틴 {}개","{} routines"),("이벤트 {}개","{} events")])
+def test_program_progress_and_count_templates_translate_exactly(korean, english):
+    from src.core import i18n
+    i18n.set_language("en")
+    try: assert i18n.translate_text(korean)==english
+    finally: i18n.set_language(i18n.DEFAULT_LANGUAGE)

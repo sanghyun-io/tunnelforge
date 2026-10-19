@@ -119,12 +119,12 @@ def test_trigger_skip_toggle_is_shared_with_preview_and_never_persisted(monkeypa
     dialog = RustDumpImportDialog(config_manager=config, tunnel_config={"environment": "development"})
     try:
         assert not dialog.chk_skip_triggers.isChecked()
-        dialog.input_dir.setText(_write_dump(tmp_path / "dump"))
+        dialog.input_dir.setText(_write_dump(tmp_path / "dump", stored_programs=[{"kind":"TRIGGER","name":"guard","table":"sample"}]))
         dialog.chk_skip_triggers.setChecked(True)
         assert "트리거 없이" in dialog._advanced_summary()
         dialog.do_import()
         assert shown[0]["plan"]["must_see"] is True
-        assert "sample:guard" in "\n".join(shown[0]["plan"]["warnings"])
+        assert "sample.guard" in "\n".join(shown[0]["plan"]["warnings"])
         assert all(worker.kwargs["skip_triggers"] is True for worker in created)
     finally:
         dialog.close()
@@ -2488,3 +2488,49 @@ def test_safe_restore_failure_names_the_copy_it_left(monkeypatch, tmp_path, name
         assert "MySqlError" not in text
     finally:
         dialog.close()
+
+
+@pytest.mark.parametrize("programs", [[], [{"kind":"PROCEDURE","name":"p"}], [{"kind":"TRIGGER","table":"users","name":"guard"}]])
+def test_skip_trigger_toggle_follows_dump_and_locks_during_preview(monkeypatch, tmp_path, programs):
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda:(True,"ok"))
+    created=_fake_workers(monkeypatch,hold_preview=True)
+    dialog=RustDumpImportDialog()
+    try:
+        dialog.input_dir.setText(_write_dump(tmp_path/"dump", stored_programs=programs))
+        applies=any(p["kind"]=="TRIGGER" for p in programs)
+        assert dialog.chk_skip_triggers.isEnabled() is applies
+        if applies: dialog.chk_skip_triggers.setChecked(True)
+        dialog.do_import()
+        assert created and not dialog.chk_skip_triggers.isEnabled()
+        dialog.set_ui_enabled(True)
+        assert dialog.chk_skip_triggers.isEnabled() is applies
+    finally:
+        for worker in created: worker.running=False
+        dialog.worker=None
+        dialog.close()
+
+
+def test_program_partial_has_warning_outcome_once_and_no_anonymous_report(monkeypatch):
+    from src.core.job_history import STATUS_PARTIAL
+    from src.ui.dialogs import job_recording
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda:(True,"ok"))
+    finish=MagicMock()
+    monkeypatch.setattr(job_recording,"job_finish",finish)
+    dialog=RustDumpImportDialog()
+    try:
+        dialog._job_id="job-partial"
+        dialog.last_import_mode="replace"
+        dialog.import_results={"users":{"status":"done"}}
+        dialog.import_audit={"status":"partial","data_imported":True,"program_warnings":[{"code":"routine_binlog_unsafe","name":"f"}]}
+        dialog._show_failure=MagicMock()
+        dialog._report_error_anonymously=MagicMock()
+        message="테이블 데이터는 가져왔지만 일부 객체를 복원하지 못했습니다.\nf: binlog warning"
+        dialog.on_finished(False,message)
+        assert "일부 완료" in dialog.label_status.text()
+        assert dialog._show_failure.call_args.args[1].count("binlog warning")==1
+        dialog._report_error_anonymously.assert_not_called()
+        assert finish.call_args.args[1]==STATUS_PARTIAL
+        assert any("binlog warning" in dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count()))
+    finally: dialog.close()

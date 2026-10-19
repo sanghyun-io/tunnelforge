@@ -140,12 +140,12 @@ def record_import_report(dialog) -> None:
                        mode=_import_label(dialog))
 
 
-def import_status(success: bool, cancelled: bool, done: int, errors: int) -> str:
+def import_status(success: bool, cancelled: bool, done: int, errors: int, *, core_status: str = "", data_imported: bool = False) -> str:
     if cancelled:
         return STATUS_CANCELLED
     if success:
         return STATUS_COMPLETED
-    return STATUS_PARTIAL if done > 0 and errors > 0 else STATUS_FAILED
+    return STATUS_PARTIAL if (done > 0 and errors > 0) or (core_status == "partial" and data_imported) else STATUS_FAILED
 
 
 def finish_import_job(dialog, success: bool, message: str, done: int, errors: int, blocked: int) -> None:
@@ -153,8 +153,9 @@ def finish_import_job(dialog, success: bool, message: str, done: int, errors: in
     if not job_id:
         return
     try:
-        status = import_status(success, getattr(dialog, "_cancel_requested", False), done, errors)
         audit = getattr(dialog, "import_audit", {}) or {}
+        status = import_status(success, getattr(dialog, "_cancel_requested", False), done, errors,
+                               core_status=audit.get("status", ""), data_imported=audit.get("data_imported") is True)
         report = audit.get("report_path") or ""
         job_finish(job_id, status, error="" if success else message, report_path=str(report),
                    mode=_import_label(dialog),

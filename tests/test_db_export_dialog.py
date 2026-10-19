@@ -1874,10 +1874,10 @@ def test_generated_refusal_reason_reaches_finished_dialog_and_saved_log(monkeypa
             boxes = dialog.findChildren(QMessageBox)
             assert len(boxes) == 1
             text = boxes[0].text()
-            expected = "계산 열 total의 식을" if language == "ko" else "generated column total"
-            assert expected in text and "SHOW CREATE TABLE" in text
+            expected = "계산 열 total의 식이" if language == "ko" else "generated column total"
+            assert expected in text and ("이모지" in text if language == "ko" else "emoji" in text)
             assert "orders" in text and "generated_column_unproven" not in text
-            saved = next(entry for entry in dialog.log_entries if "SHOW CREATE TABLE" in entry)
+            saved = next(entry for entry in dialog.log_entries if ("이모지" in entry if language == "ko" else "emoji" in entry))
             assert expected in saved
             boxes[0].close()
         finally:

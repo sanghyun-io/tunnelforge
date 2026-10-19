@@ -21,7 +21,7 @@ pub(crate) fn validate_trigger(p: &NormalizedStoredProgram) -> Result<(), String
         || p.action_order.unwrap_or(0) == 0 || p.definition.trim().is_empty()
         || p.sql_mode.is_none() || p.character_set_client.is_none() || p.collation_connection.is_none()
     {
-        return Err(format!("program_definition_invalid: {}", p.name));
+        return Err(format!("trigger_definition_invalid: {}", p.name));
     }
     if !supported_program_charset(p) {
         return Err(format!("program_charset_unsupported: {}", p.name));
@@ -72,7 +72,7 @@ pub(crate) fn collect_mysql_stored_programs(endpoint: &Endpoint, schema: &Normal
         } else if !supported_program_charset(&p) {
             Some("program_charset_unsupported")
         } else if validate_trigger(&p).is_err() {
-            Some("program_definition_invalid")
+            Some("trigger_definition_invalid")
         } else { None };
         if let Some(reason) = reason { reasons.insert(program_id(&p), reason.into()); }
         else { programs.push(p); }
@@ -142,10 +142,15 @@ pub(crate) fn trigger_create_error(err: &mysql::Error) -> String {
 }
 
 pub(crate) fn create_trigger(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, name: &str, table: &str) -> Result<Vec<Value>, String> {
+    create_trigger_with_checkpoint(conn,p,name,table,||Ok(()))
+}
+
+pub(crate) fn create_trigger_with_checkpoint<F: FnMut()->Result<(),String>>(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, name: &str, table: &str, mut created: F) -> Result<Vec<Value>,String> {
     let sql = program_create_sql(p, name, table)?;
     conn.exec_drop("SET SESSION sql_mode=?, character_set_client=?, collation_connection=?",
         (&p.sql_mode, &p.character_set_client, &p.collation_connection)).map_err(|err| trigger_create_error(&err))?;
     conn.query_drop(sql).map_err(|err| trigger_create_error(&err))?;
+    created()?;
     let warnings: Vec<(String, u32, String)> = conn.query("SHOW WARNINGS").map_err(|err| trigger_create_error(&err))?;
     let mut warnings = warnings.into_iter().map(|(level, code, message)| json!({"name":p.name,"level":level,"code":code,"message":message})).collect::<Vec<_>>();
     let current: Option<String> = conn.query_first("SELECT CURRENT_USER()").map_err(|err| trigger_create_error(&err))?;

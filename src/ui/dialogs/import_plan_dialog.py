@@ -1,12 +1,12 @@
 """Import 전 확인 창: dump.import_preview 결과로 무엇을 덮어쓰고 새로 만드는지 한 번에 보여 준다."""
 from typing import Dict, List, Tuple
 
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
 
 from src.core.error_report_sanitizer import sanitize_local_diagnostic
 from src.core.i18n import translate_text
 from src.core.production_guard import ENV_NAMES, Environment, SchemaConfirmDialog
-from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES, describe_copy_blockers, describe_core_code
+from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES, describe_copy_blockers, describe_core_code, display_program_name
 
 # Only these export policies lack a common point in time (import.rs coded_source_dump_warnings).
 _UNSYNCHRONIZED_POLICIES = ("mysql_parallel_unsynchronized_snapshots",
@@ -36,6 +36,27 @@ def _line(template: str, names: List[str]) -> str:
     return "- " + translate_text(template).format(sanitize_local_diagnostic(names_preview(names)))
 
 
+def _warning_names(preview: dict, code: str) -> List[str]:
+    if code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
+        ids = _strings(preview.get(code))
+        if ids:
+            return [display_program_name(item) for item in ids]
+    names = []
+    for item in _dicts(preview.get("warnings")):
+        if item.get("code") != code:
+            continue
+        names.extend(_strings(item.get("names")) or str(item.get("detail", "")).split(", "))
+    return [display_program_name(name) for name in names if name]
+
+
+def _detail_line(item) -> str:
+    if not isinstance(item, dict):
+        return sanitize_local_diagnostic(str(item))
+    names = _strings(item.get("names"))
+    detail = ", ".join(sanitize_local_diagnostic(name) for name in names) if names else sanitize_local_diagnostic(str(item.get("detail") or ""))
+    return f"{item.get('code')}: {detail} " + sanitize_local_diagnostic(str(item.get("raw_error") or ""))
+
+
 def _target_word(preview: dict) -> str:
     """What the user calls the target: a MySQL DB or a PostgreSQL schema."""
     target = preview.get("target") if isinstance(preview.get("target"), dict) else {}
@@ -60,7 +81,7 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
     data_warnings, notes = [], []
     enabled = _strings(preview.get("events_enabled"))
     if enabled:
-        data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(enabled), sanitize_local_diagnostic(", ".join(enabled))))
+        data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(enabled), sanitize_local_diagnostic(names_preview(enabled))))
     views = preview.get("views") if isinstance(preview.get("views"), dict) else {}
     parents = _dicts(preview.get("external_parents"))
 
@@ -82,18 +103,14 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
             data_warnings.append(_line(template, names))
     for code in dict.fromkeys(str(item.get("code") or "") for item in _dicts(preview.get("warnings"))):
         sentence = describe_core_code(code) or translate_text(CORE_CODE_SENTENCES["source_dump_warning"])
-        if code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced"):
-            names = _strings(preview.get(code)) or [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
-            data_warnings.append(f"- {sentence} " + sanitize_local_diagnostic(", ".join(names)))
-        elif code == "events_enabled":
+        if code == "events_enabled":
             if not enabled:
-                names = [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
-                data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(names), ", ".join(names)))
-        elif code in ("routine_grants_reset", "program_restore_definer_may_change", "program_session_unavailable"):
-            names = [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
-            data_warnings.append(f"- {sentence} " + sanitize_local_diagnostic(", ".join(names)))
-        elif code in ("program_replace_privilege_unproven", "program_event_system_timezone", "routine_binlog_unsafe"):
-            data_warnings.append(f"- {sentence}")
+                names = _warning_names(preview, code)
+                data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(names), names_preview(names)))
+        elif code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced",
+                      "routine_grants_reset", "program_restore_definer_may_change", "program_session_unavailable",
+                      "program_replace_privilege_unproven", "routine_binlog_unsafe", "program_execution_account", "event_privilege_unproven"):
+            data_warnings.append(f"- {sentence} " + sanitize_local_diagnostic(names_preview(_warning_names(preview, code))))
         elif code == "unsynchronized_snapshot":
             if preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:
                 data_warnings.append(f"- {sentence}")
@@ -109,16 +126,16 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         else:
             notes.append(f"- {sentence}")
 
-    for code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced"):
-        if any(item.get("code") == code for item in _dicts(preview.get("warnings"))):
-            continue
-        names = _strings(preview.get(code))
-        if code == "program_definer_replaced":
-            names = [str(item.get("detail", "")) for item in _dicts(preview.get("warnings")) if item.get("code") == code]
-        if names:
-            data_warnings.append("- " + describe_core_code(code) + " " + sanitize_local_diagnostic(", ".join(names)))
+    for code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
+        if not any(item.get("code") == code for item in _dicts(preview.get("warnings"))):
+            names = _warning_names(preview, code)
+            if names:
+                data_warnings.append("- " + describe_core_code(code) + " " + sanitize_local_diagnostic(names_preview(names)))
 
     details = []
+    for code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
+        if _strings(preview.get(code)):
+            details.append(code + ": " + ", ".join(_strings(preview.get(code))))
     children = [f"{item.get('table')}.{item.get('constraint')} → {item.get('parent')}" for item in _dicts(preview.get("kept_children"))]
     if children:
         details.append(_line("그대로 두는 대상 테이블의 외래 키: {}", children))
@@ -132,8 +149,7 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
         details.append(_line("교체할 저장 프로그램: {}", _strings(programs.get("replace"))))
     for key in ("blockers", "copy_blockers", "warnings"):
         items = preview.get(key) if isinstance(preview.get(key), list) else []
-        details += [sanitize_local_diagnostic(f"{item.get('code')}: {item.get('detail')}" if isinstance(item, dict) else str(item))
-                    for item in items]
+        details += [_detail_line(item) for item in items]
     return {"blockers": blockers, "warnings": data_warnings + notes, "details": details, "verify": verify,
             "must_see": bool(blockers or data_warnings)}
 
@@ -158,8 +174,15 @@ class ImportPlanDialog(SchemaConfirmDialog):
         self.setMinimumWidth(520)
         self.setModal(True)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(10)
+        self.content_area = QScrollArea()
+        self.content_area.setWidgetResizable(True)
+        self.content_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_area.setWidget(content)
+        outer.addWidget(self.content_area, 1)
         if environment != Environment.DEVELOPMENT:
             layout.addWidget(self._build_header_frame(*colors))
         if not replace and replaced_views:
@@ -203,8 +226,11 @@ class ImportPlanDialog(SchemaConfirmDialog):
             widgets[1].setText(translate_text(f"계속하려면 <b>{word} 이름을 똑같이 입력</b>하세요:"))
             self.input_schema.setPlaceholderText(translate_text(f"{word} 이름 입력"))
             for widget in widgets:
-                layout.addWidget(widget)
-        layout.addLayout(self._build_button_row(colors[0]))
+                outer.addWidget(widget)
+        outer.addLayout(self._build_button_row(colors[0]))
+        screen = self.screen().availableGeometry()
+        self.resize(620, min(740, screen.height() - 60))
+        self.setMaximumHeight(screen.height())
         if environment != Environment.PRODUCTION:
             self.btn_execute.setEnabled(not self.blockers)
         if environment in (Environment.STAGING, Environment.UNKNOWN):

@@ -500,7 +500,7 @@ fn partial_filter_refusal() -> Refusal {
 pub(super) fn copy_refusals(manifest: &DumpManifest, engine: &str, filtered: bool) -> Vec<Refusal> {
     let mut refusals = Vec::new();
     if !manifest.stored_programs.is_empty() {
-        refusals.push(("dump_programs_unsupported_in_copy", None, "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.".into()));
+        refusals.push(("dump_programs_unsupported_in_copy", None, "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다. 일반 Import로 가져오세요.".into()));
     }
     if filtered {
         refusals.push(partial_filter_refusal());

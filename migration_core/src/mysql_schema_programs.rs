@@ -11,8 +11,14 @@ fn tokens(sql: &str, no_escape: bool) -> Result<Vec<Token>, String> {
     let mut out = Vec::new(); let mut i = 0;
     while i < b.len() {
         if b[i].is_ascii_whitespace() { i += 1; continue }
+        if b[i..].starts_with(b"--") && b.get(i+2).is_some_and(|c| c.is_ascii_control() && !matches!(c,b'\t' | b'\n' | b'\r')) {
+            return Err("program_definition_invalid: ambiguous line comment".into())
+        }
+        if b[i..].starts_with(b"/*!") || b[i..].starts_with(b"/*M!") || b[i..].starts_with(b"/*m!") {
+            return Err("program_definition_invalid: executable comments are not supported".into())
+        }
         if b[i]==b'#' || (b[i..].starts_with(b"--") && b.get(i+2).is_some_and(u8::is_ascii_whitespace)) {
-            i += sql[i..].find('\n').unwrap_or(b.len()-i); continue;
+            i += sql[i..].find(|c|c=='\n' || c=='\r').unwrap_or(b.len()-i); continue;
         }
         if b[i..].starts_with(b"/*") {
             i += 2; i += sql[i..].find("*/").ok_or("program_definition_invalid: unterminated comment")?+2; continue;
@@ -149,6 +155,19 @@ pub(crate) fn target_schema_programs(conn: &mut mysql::PooledConn, schema: &str)
     out.extend(rows.into_iter().map(|(n,d,s)|("EVENT".into(),n,d,Some(s)))); Ok(out)
 }
 
+pub(crate) fn program_runs_as_importer(p: &NormalizedStoredProgram) -> bool {
+    if matches!(p.kind.as_str(),"TRIGGER" | "EVENT") { return true }
+    let Ok((ts,end))=suffix_start(p,None) else { return true };
+    let mut depth=0; let mut start=None;
+    for (i,t) in ts.iter().enumerate().filter(|(_,t)|t.start>=end) {
+        if keyword(t,"(") { depth+=1; }
+        if keyword(t,")") { depth-=1; if depth==0 { start=Some(i+1); break } }
+    }
+    let Some(start)=start else { return true };
+    let header=ts[start..].iter().take_while(|t|!["BEGIN","RETURN","SELECT","SET","INSERT","UPDATE","DELETE","SIGNAL"].iter().any(|w|keyword(t,w))).collect::<Vec<_>>();
+    !header.windows(3).any(|w|keyword(w[0],"SQL") && keyword(w[1],"SECURITY") && keyword(w[2],"INVOKER"))
+}
+
 pub(crate) fn event_enabled(source: Option<&str>, target: Option<&str>) -> bool { target.or(source) == Some("ENABLED") }
 
 pub(crate) fn event_due_now(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, target: Option<&str>) -> Result<bool,String> {
@@ -158,6 +177,8 @@ pub(crate) fn event_due_now(conn: &mut mysql::PooledConn, p: &NormalizedStoredPr
     let at = ts.iter().enumerate().find(|(_,t)| t.start >= end && t.start < do_at && (keyword(t,"AT") || keyword(t,"STARTS")));
     let Some((i,_)) = at else { return Ok(true) };
     let Some(stamp) = ts.get(i+1).filter(|t| t.quote == b'\'') else { return Ok(true) };
+    // SHOW CREATE emits literal timestamps. Expressions must be treated as possibly due.
+    if ts.get(i+2).is_some_and(|t| !["ENDS","ON","ENABLE","DISABLE","COMMENT","DO"].iter().any(|word|keyword(t,word))) { return Ok(true) }
     conn.exec_drop("SET SESSION time_zone=?",(&p.time_zone,)).map_err(|e|e.to_string())?;
     let due: Option<bool> = conn.exec_first("SELECT CAST(? AS DATETIME) <= CURRENT_TIMESTAMP",(&stamp.text,)).map_err(|e|e.to_string())?;
     Ok(due.unwrap_or(true))
@@ -177,14 +198,15 @@ pub(crate) fn set_program_context(conn: &mut mysql::PooledConn, p: &NormalizedSt
 
 fn create_schema_program(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, name: &str) -> Result<Vec<Value>,String> {
     set_program_context(conn,p)?;
-    create_schema_program_in_context(conn,p,name)
+    create_schema_program_in_context(conn,p,name,&mut false,||{})
 }
 
-fn create_schema_program_in_context(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, name: &str) -> Result<Vec<Value>,String> {
+fn create_schema_program_in_context(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram, name: &str, created: &mut bool, mut on_created: impl FnMut()) -> Result<Vec<Value>,String> {
     conn.query_drop(schema_program_sql(p,name,None)?).map_err(|e| match &e {
         mysql::Error::MySqlError(e) if routine_binlog_error(e.code) && p.kind=="FUNCTION" => format!("routine_binlog_unsafe: {e}"),
         _ => format!("program_create_failed: {e}")
     })?;
+    *created=true; on_created();
     let warnings: Vec<(String,u32,String)> = conn.query("SHOW WARNINGS").map_err(|e|e.to_string())?;
     let mut out = warnings.into_iter().map(|(level,code,message)| json!({"name":p.name,"kind":p.kind,"level":level,"code":code,"message":message})).collect::<Vec<_>>();
     let current: Option<String> = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?;
@@ -264,7 +286,7 @@ pub(crate) fn preserves_foreign_definer(conn: &mut mysql::PooledConn) -> bool {
     ["SUPER","SET_ANY_DEFINER","SET_USER_ID"].iter().any(|privilege|crate::import::import_preview::mysql_grants_allow(conn,privilege,None)==Some(true))
 }
 
-pub(crate) fn replace_schema_program(conn: &mut mysql::PooledConn, schema: &str, p: &NormalizedStoredProgram) -> Result<(Vec<Value>,Value),Value> {
+pub(crate) fn replace_schema_program(conn: &mut mysql::PooledConn, schema: &str, p: &NormalizedStoredProgram, on_created: impl FnMut()) -> Result<(Vec<Value>,Value),Value> {
     let unchanged = |err:String| json!({"kind":p.kind,"name":p.name,"code":"program_restore_unavailable","error":err,"target_unchanged":true});
     reset_program_context(conn).map_err(unchanged)?;
     let target = target_schema_programs(conn,schema).map_err(unchanged)?;
@@ -294,19 +316,22 @@ pub(crate) fn replace_schema_program(conn: &mut mysql::PooledConn, schema: &str,
     conn.query_drop(format!("DROP {} IF EXISTS {}",p.kind,quote_ident("mysql",&p.name))).map_err(|e|unchanged(e.to_string()))?;
     let mut warnings = Vec::new();
     if previous.is_some() && p.kind!="EVENT" { warnings.push(json!({"name":p.name,"kind":p.kind,"code":"routine_grants_reset"})); }
-    let result = create_schema_program_in_context(conn,p,&p.name).and_then(|created_warnings| {
+    let mut created=false; let mut activation_attempted=false;
+    let result = create_schema_program_in_context(conn,p,&p.name,&mut created,on_created).and_then(|created_warnings| {
         warnings.extend(created_warnings);
-        if warnings.iter().any(|w|w["code"]==1588) { return Err("program_event_dropped: event was immediately removed by the server".into()) }
-        if enable { conn.query_drop(format!("ALTER EVENT {} ENABLE",quote_ident("mysql",&p.name))).map_err(|e|e.to_string())?; }
+        if warnings.iter().any(|w|w["code"]==1588) { created=false; return Err("program_event_dropped: event was immediately removed by the server".into()) }
+        if enable { activation_attempted=true; conn.query_drop(format!("ALTER EVENT {} ENABLE",quote_ident("mysql",&p.name))).map_err(|e|e.to_string())?; }
         Ok(())
     });
     match result {
         Ok(()) => Ok((warnings,json!({"kind":p.kind,"name":p.name,"enabled":enable}))),
         Err(err) => {
-            let code=if err.starts_with("routine_binlog_unsafe:") {"routine_binlog_unsafe"} else if err.starts_with("program_event_dropped:") {"program_event_dropped"} else {"program_create_failed"};
-            let mut failure = json!({"kind":p.kind,"name":p.name,"code":code,"error":err,"warnings":warnings,"previous_definition":previous.as_ref().map(|p|&p.definition)});
+            let code=if err.starts_with("routine_binlog_unsafe:") {"routine_binlog_unsafe"} else if err.starts_with("program_event_dropped:") {"program_event_dropped"} else if created {"program_finalize_failed"} else {"program_create_failed"};
+            let mut failure = json!({"kind":p.kind,"name":p.name,"code":code,"error":err,"created":created,"object_left":created && previous.is_none(),"warnings":warnings,"previous_definition":previous.as_ref().map(|p|&p.definition)});
+            if p.kind=="EVENT" { failure["enabled"]=if activation_attempted {Value::Null} else {json!(false)}; }
             if let Some(previous) = previous {
                 let restore=restore_schema_program(conn,schema,&previous,&mut failure);
+                if created && restore.is_err() { failure["object_left"]=Value::Null; }
                 failure["previous_restored"] = json!(restore.is_ok());
                 failure["restore_error"] = json!(restore.err());
             }
@@ -347,6 +372,40 @@ mod tests {
         let mut p=p; p.character_set_client=Some("latin1".into());
         assert!(schema_program_sql(&p,"p",None).unwrap_err().starts_with("program_charset_unsupported:"));
         assert!(schema_program_sql(&program("FUNCTION","CREATE FUNCTION \"p\"() RETURNS INT RETURN 1"),"p",None).is_err());
+    }
+
+    #[test]
+    fn executable_and_ambiguous_comments_cannot_hide_qualifiers_or_enabled_states() {
+        for sql in [
+            "CREATE EVENT `p` /*!.`outside`*/ ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1",
+            "CREATE EVENT `p` /*M!.`outside`*/ ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1",
+            "CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY /*! ENABLE COMMENT '*/ DISABLE /*' */ DO SET @a=1",
+            "CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY ENABLE --\u{1}DISABLE\nDO SET @a=1",
+            "CREATE EVENT `p` ON SCHEDULE EVERY 1 DAY ENABLE --\u{b}DISABLE\nDO SET @a=1",
+        ] {
+            let p=program("EVENT",sql);
+            assert!(schema_program_sql(&p,"p",Some("source")).unwrap_err().starts_with("program_definition_invalid:"));
+            assert!(schema_program_sql(&p,"p",None).is_err());
+        }
+        for kind in ["PROCEDURE","FUNCTION"] {
+            assert!(schema_program_sql(&program(kind,&format!("CREATE {kind} `p` /*!.`outside`*/() SELECT 1")),"p",None).is_err());
+        }
+        let p=program("PROCEDURE","CREATE PROCEDURE `p`() SELECT '/*! data, not code */ --\u{1}'");
+        assert!(schema_program_sql(&p,"p",None).is_ok());
+    }
+
+    #[test]
+    fn importing_account_execution_does_not_depend_on_manifest_definer() {
+        let mut p=program("PROCEDURE","CREATE PROCEDURE `p`() SQL SECURITY INVOKER SELECT 1");
+        assert!(!program_runs_as_importer(&p));
+        p.definition="CREATE PROCEDURE `p`(x SET('a','b')) SQL SECURITY INVOKER SELECT 1".into();
+        assert!(!program_runs_as_importer(&p));
+        p.definition="CREATE PROCEDURE `p`() SQL SECURITY DEFINER SELECT 1".into();
+        assert!(program_runs_as_importer(&p));
+        p.definition="CREATE PROCEDURE `p`() SELECT 1".into();
+        assert!(program_runs_as_importer(&p));
+        p.kind="EVENT".into(); assert!(program_runs_as_importer(&p));
+        p.kind="TRIGGER".into(); assert!(program_runs_as_importer(&p));
     }
     #[test]
     fn event_headers_disable_replica_and_enabled_states_without_editing_body() {
