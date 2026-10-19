@@ -571,6 +571,7 @@ fn due_preserved_events_complete_once_without_failed_import_or_replacement_rollb
         let one_shot=schedule.starts_with("AT ");
         db.query_drop("CREATE TABLE audit(id INT)").unwrap();
         db.query_drop(format!("CREATE EVENT e ON SCHEDULE {schedule} ON COMPLETION PRESERVE ENABLE DO INSERT INTO audit VALUES(1)")).unwrap();
+        db.query_drop("ALTER EVENT e ENABLE").unwrap();
         s.dump();
         // An unrelated enabled event can change whether an already-ended recurring
         // event executes. Check each target's actual state, without a native oracle.
@@ -603,8 +604,10 @@ fn due_preserved_events_complete_once_without_failed_import_or_replacement_rollb
                 assert_eq!(imported["enabled"],imported["status"]=="ENABLED");
                 if let Some(before)=observed_before_read {assert_eq!(imported["status"],before.0);}
                 else {assert!(imported["status"]==observed.0 || (imported["status"]=="ENABLED" && observed.1));}
-                let inspected=success(events("inspect",json!({"source":target})));
-                let event=inspected["schema"]["stored_programs"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT" && p["name"]=="e").unwrap();
+                let inspection_dir=s.output.join(format!("inspect_{}",target.database));
+                success(events("dump.run",json!({"source":target,"output_dir":inspection_dir,"data_format":"jsonl","compression":"none","threads":1,"mysql_snapshot_mode":"single_connection"})));
+                let inspected:Value=serde_json::from_slice(&std::fs::read(inspection_dir.join("_tunnelforge_dump.json")).unwrap()).unwrap();
+                let event=inspected["stored_programs"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT" && p["name"]=="e").unwrap();
                 assert_eq!(event["status"],observed.0);
                 fresh.query_drop("DROP EVENT e").unwrap();
             }}
