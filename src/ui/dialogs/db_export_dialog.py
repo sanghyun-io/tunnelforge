@@ -21,13 +21,13 @@ from src.core.db_core_service import RustDbConnector
 from src.core.error_report_sanitizer import (
     sanitize_local_diagnostic,
 )
-from src.core.i18n import translate_text
+from src.core.i18n import VerbatimText, translate_text
 from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component, safe_output_dir
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, build_rust_dump_config, check_rust_dump,
     DEFAULT_DUMP_COMPRESSION, DEFAULT_DUMP_THREADS,
-    describe_export_refusal, fk_parent_closure, fk_parents_outside, LOSSY_REFUSAL_KINDS,
+    describe_export_refusal, describe_core_failure, fk_parent_closure, fk_parents_outside, LOSSY_REFUSAL_KINDS,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.workers.error_reporting_worker import (
@@ -1386,6 +1386,11 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def on_finished(self, success: bool, message: str):
         message = sanitize_local_diagnostic(message)
+        rls_sentence = (describe_core_failure(message) if not success and "row_security_blocks_read:" in message else None)
+        rls_detail = message if rls_sentence else ""
+        if rls_sentence:
+            logger.info("Export source read refused: %s", message)
+            message = rls_sentence
         # The core refused before writing anything: objects the dump cannot keep. No privilege question
         # ever: a missing privilege only moved the core on to the next method (mysql_snapshot_mode "auto").
         refusal = getattr(self.worker, "export_refusal", None)
@@ -1487,6 +1492,11 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 # 덤프에 담을 수 없는 것은 앱 오류가 아니다: 오류 보고 없이 이유만 보여 준다.
                 if not refusal.get("bypassable"):
                     self._show_lossy_refusal(list(refusal["objects"]))
+            elif rls_sentence:
+                box = QMessageBox(QMessageBox.Icon.Warning, translate_text("Export 실패"), message,
+                                  QMessageBox.StandardButton.Ok, self)
+                box.setDetailedText(VerbatimText(sanitize_local_diagnostic(rls_detail)))
+                box.exec()
             else:
                 QMessageBox.warning(self, "Export 실패", f"❌ {message}")
 

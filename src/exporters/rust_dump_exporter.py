@@ -893,6 +893,9 @@ def describe_manifest_warning(warning: str) -> str:
 def describe_core_failure(message: object) -> Optional[str]:
     """The sentences for the core codes in a failure text; None when it carries none."""
     text = str(message or "")
+    # Source scans can wrap this code in another diagnostic. Keep the full table name.
+    if rls := re.search(r"(?:^|: )row_security_blocks_read: (.*?): postgresql ", text):
+        return describe_core_code("row_security_blocks_read", rls.group(1))
     if fields_match := _CANDIDATE_FK_ORPHANS_FIELDS.search(text):
         try:
             fields = json.loads(fields_match.group(1))

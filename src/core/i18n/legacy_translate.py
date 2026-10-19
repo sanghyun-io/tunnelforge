@@ -1884,13 +1884,17 @@ def _strip_korean_particles(translated):
     return translated
 
 
+class VerbatimText(str):
+    """A diagnostic or already localized text that Qt hooks must preserve exactly."""
+
+
 def translate_text(value):
     """Translate hardcoded UI text at runtime.
 
     This intentionally accepts any object because Qt setters often receive
     non-string overloads; those values pass through unchanged.
     """
-    if not isinstance(value, str) or current_language() == DEFAULT_LANGUAGE or not _has_hangul(value):
+    if isinstance(value, VerbatimText) or not isinstance(value, str) or current_language() == DEFAULT_LANGUAGE or not _has_hangul(value):
         return value
 
     if value in _EN_TEXT_TRANSLATIONS:

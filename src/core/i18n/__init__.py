@@ -29,10 +29,11 @@ from src.core.i18n.keys import (
     set_language,
     tr,
 )
-from src.core.i18n.legacy_translate import _translate_sequence, translate_text
+from src.core.i18n.legacy_translate import VerbatimText, _translate_sequence, translate_text
 from src.core.i18n.qt_hooks import install_qt_i18n
 
 __all__ = [
+    "VerbatimText",
     "DEFAULT_LANGUAGE",
     "INSTALLER_LANGUAGE_HINT_FILE",
     "SUPPORTED_LANGUAGES",
