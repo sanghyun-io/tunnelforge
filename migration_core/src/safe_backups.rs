@@ -180,7 +180,26 @@ fn inspect_backup(entry: &Entry, credentials: &Endpoint, deep: bool) -> Result<O
     let endpoint = endpoint_for(credentials, &original);
     let fingerprint = entry.fingerprint();
     match &stored.engine_plan {
-        EnginePlan::MySql(plan) => crate::safe_promote_mysql::inspect_backup(&endpoint, plan, deep, fingerprint.as_ref()).map(Some),
+        EnginePlan::MySql(plan) => {
+            let completed = entry.journal_status()=="promoted" && entry.attempt.as_ref().is_some_and(|a|a["result"]["phase"]=="completed");
+            let mut backup = crate::safe_promote_mysql::inspect_backup_recorded(&endpoint,plan,deep,fingerprint.as_ref(),completed)?;
+            if let Some(record) = entry.rollbacks().last().filter(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete"))) {
+                match crate::safe_promote_mysql::inspect_rollback(&endpoint,plan,record) {
+                    Ok(Some(missing)) => {
+                        backup["verdict"] = json!(if missing.is_empty() {"rolled_back"} else {"rollback_incomplete"});
+                        backup["missing_programs"] = json!(missing);
+                    }
+                    Err(err) => {
+                        backup["verdict"] = record["status"].clone();
+                        backup["missing_programs"] = record["missing_programs"].clone();
+                        backup["program_verification_error"] = json!(err);
+                    }
+                    Ok(None) => {}
+                }
+                backup["pending_program"] = record["pending_program"].clone();
+            }
+            Ok(Some(backup))
+        },
         EnginePlan::Postgres(plan) => crate::safe_promote_postgres::inspect_backup(&endpoint, plan, deep, fingerprint.as_ref()).map(Some),
     }
 }
@@ -277,7 +296,7 @@ fn entry_json(entry: &Entry, credentials: &Endpoint) -> Result<Value, String> {
     }
     let rollbacks = entry.rollbacks();
     if !rollbacks.is_empty() {
-        out["rollbacks"] = json!(rollbacks.iter().map(|r| json!({"status": r["status"], "displaced_backup": r["displaced_backup"]})).collect::<Vec<_>>());
+        out["rollbacks"] = json!(rollbacks.iter().map(|r| json!({"status": r["status"], "displaced_backup": r["displaced_backup"], "missing_programs":r["missing_programs"],"pending_program":r["pending_program"],"program_warnings":r["program_warnings"]})).collect::<Vec<_>>());
     }
     if let Some(record) = entry.rolled_back() {
         if let Some(displaced) = inspect_displaced(entry, credentials, &record, false)? {
@@ -330,10 +349,12 @@ fn reconcile(request: &Request, credentials: &Endpoint) -> Result<Value, String>
     let status = entry.journal_status();
     let verdict = backup["verdict"].as_str().unwrap_or("undeterminable").to_string();
     let (conclusion, message) = match (status.as_str(), verdict.as_str()) {
+        (_, "rolled_back") => ("rolled_back", "The retained original tables and programs are active again."),
+        (_, "rollback_incomplete") => ("rollback_incomplete", "The original tables are active again, but some programs still need to be recreated or dropped. Their saved definitions remain in the promotion journal."),
         ("promoted", "promoted") => ("promoted", "The journal and the live objects agree: the cutover took effect."),
         (_, "promoted") => ("promoted", "The live objects show the cutover took effect although the journal did not record a final result."),
-        (_, "promoted_incomplete") => ("promoted_incomplete", "테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 백업을 보존하고 복구하세요."),
-        (_, "failed_original_triggers_missing") => ("failed_original_triggers_missing", "테이블은 교체하지 않았지만 원래 트리거가 빠져 있습니다. 저장된 정의로 복구하세요."),
+        (_, "promoted_incomplete") => ("promoted_incomplete", "Tables were promoted, but stored programs are missing. Retain the backup and recover the programs."),
+        (_, "failed_original_triggers_missing") => ("failed_original_triggers_missing", "Tables were not promoted, but original triggers are missing. Recover them from their saved definitions."),
         (_, "not_promoted") => ("not_promoted", "The live objects show the original tables are intact and the cutover did not take effect."),
         _ => ("undeterminable", "The live objects do not match either the pre- or post-cutover state. Retry and cleanup stay blocked."),
     };
@@ -617,6 +638,8 @@ fn rollback_apply(request: &Request, credentials: &Endpoint) -> Result<Value, St
     result["message"] = json!(match result["status"].as_str() {
         Some("rolled_back") => "The retained original tables are active again. The tables that were active are kept in the recovery backup namespace; nothing was deleted.",
         Some("failed_no_change") => "The recovery did not change anything.",
+        Some("rollback_incomplete") => "The original tables are active again, but some programs need to be recreated or dropped; see missing_programs and pending_program. Their saved definitions remain in the promotion journal.",
+        Some("failed_triggers_recreated") => "The table switch did not happen, but recovery recreated the starting triggers. Review the recorded warnings before retrying.",
         _ => "The recovery outcome is unknown. Reconcile the recorded identities before any retry; nothing was deleted.",
     });
     Ok(result)

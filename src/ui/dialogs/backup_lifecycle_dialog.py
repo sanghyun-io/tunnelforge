@@ -266,7 +266,19 @@ class BackupLifecycleDialog(QDialog):
             self._on_rolled_back)
 
     def _on_rolled_back(self, success: bool, message: str, result: dict) -> None:
-        if not success:
+        if not success or result.get("status") != "rolled_back":
+            names = list(result.get("missing_programs") or [])
+            pending = result.get("pending_program") or {}
+            if pending:
+                names.append(f"{pending.get('kind', '')} {pending.get('name', '')}".strip())
+            if result.get("status") == "rollback_incomplete":
+                message = translate_text("원래 테이블로 되돌렸지만 저장 프로그램 일부가 원래대로 돌아오지 않았습니다: {names}. 원래 정의는 승격 기록에 남아 있습니다.").format(names=", ".join(names))
+            elif names:
+                message += "\n" + ", ".join(names)
+            warnings = result.get("program_warnings") or []
+            if warnings:
+                from src.exporters.rust_dump_exporter import describe_program_warnings
+                message += "\n" + "\n".join(describe_program_warnings(warnings))
             QMessageBox.warning(self, "복구 실패", message)
         else:
             QMessageBox.information(self, "복구 결과", f"{status_label(JOURNAL_LABELS, result.get('status'))}\n{result.get('message', '')}")

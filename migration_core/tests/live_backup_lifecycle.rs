@@ -641,3 +641,85 @@ fn promoted_candidate_leftovers_are_cleaned_only_when_recorded() {
         fx.finish();
     }
 }
+
+fn drift_fixture(base: &Endpoint, before_dump: &[&str], after_dump: &[&str]) -> Fixture {
+    let name = unique("tf_drift");
+    let mut admin = LiveAdapter::connect(base).unwrap();
+    admin.execute_sql(&format!("CREATE DATABASE {name}")).unwrap();
+    let mut original = base.clone();
+    original.database = name.clone();
+    let mut old = LiveAdapter::connect(&original).unwrap();
+    old.execute_sql("CREATE TABLE parents(id INT PRIMARY KEY, value VARCHAR(40))").unwrap();
+    old.execute_sql("INSERT INTO parents VALUES(1,'backup')").unwrap();
+    for sql in before_dump { old.execute_sql(sql).unwrap(); }
+    let dir = std::env::temp_dir().join(unique("tf_drift_dump"));
+    let _ = result(call("dump.run", json!({"source": original, "output_dir": dir, "data_format": "jsonl", "compression": "none", "threads": 1, "mysql_snapshot_mode": "single_connection"})));
+    for sql in after_dump { old.execute_sql(sql).unwrap(); }
+    let restored = result(call("dump.import", json!({"connection": original, "target": original, "input_dir": dir, "mode": "safe", "threads": 1})));
+    assert_eq!(restored["success"], true, "{restored}");
+    let restore_id = restored["restore_id"].as_str().unwrap().to_string();
+    let report_path = PathBuf::from(restored["report_path"].as_str().unwrap());
+    let planned = result(call("dump.promote", json!({"endpoint": original, "action": "plan", "report_path": report_path, "restore_id": restore_id})));
+    assert_eq!(planned["can_promote"], true, "{planned}");
+    let done = result(call("dump.promote", json!({"endpoint": original, "action": "confirm", "overwrite_confirmed": true,
+        "report_path": report_path, "restore_id": restore_id, "plan_digest": planned["plan_digest"]})));
+    assert_eq!(done["status"], "promoted", "{done}");
+    Fixture { engine: base.engine.clone(), admin, original, name, dir, restore_id, report_path }
+}
+
+fn verdict(fx: &Fixture) -> Value {
+    let listed = fx.list();
+    listed["backups"].as_array().unwrap().iter().find(|b| b["restore_id"] == fx.restore_id.as_str()).unwrap()["backup"].clone()
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST"]
+fn rv204_unrelated_routine_created_after_promotion_blocks_backup_cleanup() {
+    let base = endpoints().into_iter().find(|e| e.engine == "mysql").unwrap();
+    let mut fx = drift_fixture(&base, &[], &["CREATE PROCEDURE app_proc() SELECT 1"]);
+    let before = verdict(&fx);
+    assert_eq!(before["verdict"], "promoted", "{before}");
+    assert_eq!(fx.cleanup_plan("backup")["can_cleanup"], true);
+    let name = fx.name.clone();
+    fx.admin.execute_sql(&format!("CREATE PROCEDURE {name}.later() SELECT 1")).unwrap();
+    let after = verdict(&fx);
+    let reconciled = result(backups(&fx.original, &fx.dir, "reconcile", json!({"restore_id": fx.restore_id})));
+    let cleanup = fx.cleanup_plan("backup");
+    let rollback = rollback_plan(&fx);
+    println!("RV204 after drift: verdict={} missing={}", after["verdict"], after["missing_programs"]);
+    println!("RV204 reconcile: conclusion={} cleanup_allowed={} message={}", reconciled["conclusion"], reconciled["cleanup_allowed"], reconciled["message"]);
+    println!("RV204 cleanup_plan(backup): can_cleanup={} blockers={}", cleanup["can_cleanup"], blockers(&cleanup));
+    println!("RV204 rollback_plan: can_rollback={} blockers={}", rollback["can_rollback"], blockers(&rollback));
+    assert_eq!(after["verdict"], "promoted", "{after}");
+    assert!(after["missing_programs"].is_null(), "{after}");
+    assert_eq!(reconciled["cleanup_allowed"], true);
+    assert_eq!(cleanup["can_cleanup"], true);
+    assert_eq!(rollback["can_rollback"],true,"{rollback}");
+    fx.admin.execute_sql(&format!("DROP PROCEDURE {name}.later")).unwrap();
+    assert_eq!(verdict(&fx)["verdict"], "promoted");
+    fx.finish();
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST"]
+fn rv204_dumped_not_preserve_event_firing_after_promotion_flips_verdict() {
+    let base = endpoints().into_iter().find(|e| e.engine == "mysql").unwrap();
+    let fx = drift_fixture(&base, &["CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 40 SECOND ON COMPLETION NOT PRESERVE ENABLE DO SET @tf_rv=1"], &[]);
+    let before = verdict(&fx);
+    assert_eq!(before["verdict"], "promoted", "{before}");
+    let mut gone = false;
+    for _ in 0..90 {
+        if fx.scalar("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'") == "0" { gone = true; break }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(gone, "event never fired");
+    let after = verdict(&fx);
+    let cleanup = fx.cleanup_plan("backup");
+    let rollback = rollback_plan(&fx);
+    println!("RV204 event after fire: verdict={} missing={}", after["verdict"], after["missing_programs"]);
+    println!("RV204 event rollback_plan: can_rollback={} blockers={}", rollback["can_rollback"], blockers(&rollback));
+    assert_eq!(after["verdict"], "promoted", "{after}");
+    assert_eq!(cleanup["can_cleanup"], true);
+    fx.finish();
+}
+

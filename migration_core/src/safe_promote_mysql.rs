@@ -713,13 +713,17 @@ fn matches_recorded_program(conn: &mut Db, database: &str, actual: &NormalizedSt
 }
 
 fn missing_programs(conn: &mut Db, database: &str, expected: &[NormalizedStoredProgram]) -> Result<Vec<String>, String> {
+    missing_recorded_programs(conn,database,expected,false)
+}
+
+fn missing_recorded_programs(conn: &mut Db, database: &str, expected: &[NormalizedStoredProgram], completed: bool) -> Result<Vec<String>,String> {
     let affected_tables = expected.iter().filter_map(|p| p.table.clone()).collect();
     let actual = capture_affected_programs(conn, database, &affected_tables, expected)?;
     let mut missing = Vec::new();
     for p in expected {
         let matched = match actual.iter().find(|a| same_program(a,p)) {
             Some(a) => matches_recorded_program(conn, database, a, std::slice::from_ref(p))?,
-            None => false,
+            None => completed && crate::mysql_schema_programs::recorded_event_completed(conn,p)?,
         };
         if !matched { missing.push(crate::mysql_programs::program_id(p)); }
     }
@@ -739,6 +743,17 @@ fn program_differences(conn: &mut Db, plan: &PromotionPlan, promoted: bool) -> R
     missing.extend(actual.iter().filter(|name| !wanted.contains(name)).map(|name|format!("unexpected:{}",id(name))));
     missing.sort(); missing.dedup();
     Ok(missing)
+}
+
+fn restored_program_differences(conn: &mut Db, plan: &PromotionPlan) -> Result<Vec<String>,String> {
+    let mut missing = missing_programs(conn,&plan.original_database,&plan.original_programs)?;
+    let actual = program_inventory(conn,&plan.original_database)?;
+    for p in plan.promoted_programs.iter().filter(|p|!plan.original_programs.iter().any(|old|same_program(old,p))) {
+        if actual.iter().any(|(kind,name,_)|kind==&p.kind && name.eq_ignore_ascii_case(&p.name)) {
+            missing.push(format!("unexpected:{}",crate::mysql_programs::program_id(p)));
+        }
+    }
+    missing.sort(); missing.dedup(); Ok(missing)
 }
 
 fn reset_session(conn: &mut Db) -> Result<(), String> {
@@ -1771,7 +1786,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
                     Ok((notes, created)) => { warnings.extend(notes); imported.push(created); }
                     Err(failure) => {
                         state["programs_failed"] = json!([failure]);
-                        return Err("저장 프로그램을 모두 복원하지 못했습니다. 저장된 보고서에서 빠진 객체를 확인하세요.".into());
+                        return Err("Some stored programs could not be restored. Check the saved report for the missing objects.".into());
                     }
                 }
                 state["programs_imported"] = json!(imported);
@@ -1783,7 +1798,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
         let effective = with_program_warnings(plan,&warnings);
         let missing = program_differences(&mut conn, &effective, true)?;
         if !missing.is_empty() {
-            state["missing_programs"] = json!(missing); return Err("저장 프로그램 복원 결과를 확인하지 못했습니다.".into())
+            state["missing_programs"] = json!(missing); return Err("Stored program restoration could not be verified.".into())
         }
         state["phase"] = json!("programs_replaced");
         state["status"] = json!("promoted");
@@ -1878,7 +1893,7 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
     } else {
         state["phase"] = json!("completed");
     }
-    state["message"]=json!(match state["status"].as_str() { Some("promoted")=>"Verified candidate promoted at the original database name. Original tables are retained in the recorded backup namespace.",Some("failed_original_unchanged")=>"Promotion did not change original tables or their foreign keys. The verified candidate remains available.",Some("promoted_incomplete")=>"테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 보고서를 확인하고 복구하세요.",Some("failed_original_triggers_missing")=>"테이블은 교체하지 않았지만 원래 트리거를 되살리지 못했습니다. 보고서에 저장된 정의로 복구하세요.",_=>"Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery." });
+    state["message"]=json!(match state["status"].as_str() { Some("promoted")=>"Verified candidate promoted at the original database name. Original tables are retained in the recorded backup namespace.",Some("failed_original_unchanged")=>"Promotion did not change original tables or their foreign keys. The verified candidate remains available.",Some("promoted_incomplete")=>"Tables were promoted, but stored programs are missing. Check the report before recovery.",Some("failed_original_triggers_missing")=>"Tables were not promoted, but original triggers could not be restored. Recover them from the definitions saved in the report.",_=>"Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery." });
     state["interrupted_attempt_policy"]=json!("A checkpoint at cutover_started is UNKNOWN after process loss. Compare recorded InnoDB table identities at original/candidate/backup locations; never retry or roll back blindly.");
     if matches!(state["status"].as_str(), Some("promoted" | "promoted_incomplete")) {
         // Retention evidence for TF-STATUS-119: content/definition digests of the
@@ -1962,6 +1977,10 @@ pub(crate) fn external_references(endpoint: &Endpoint, namespace: &str) -> Resul
 /// counts, metadata-visibility proof, external references); otherwise only
 /// catalog identities and estimates are used.
 pub(crate) fn inspect_backup(endpoint: &Endpoint, plan: &PromotionPlan, deep: bool, journal_fingerprint: Option<&Value>) -> Result<Value, String> {
+    inspect_backup_recorded(endpoint,plan,deep,journal_fingerprint,false)
+}
+
+pub(crate) fn inspect_backup_recorded(endpoint: &Endpoint, plan: &PromotionPlan, deep: bool, journal_fingerprint: Option<&Value>, completed: bool) -> Result<Value,String> {
     let mut conn = lifecycle_connect(endpoint, plan)?;
     let mut blockers: Vec<String> = Vec::new();
     let server_uuid: String = conn.query_first("SELECT @@server_uuid").map_err(|e| e.to_string())?.unwrap_or_default();
@@ -1987,9 +2006,14 @@ pub(crate) fn inspect_backup(endpoint: &Endpoint, plan: &PromotionPlan, deep: bo
         let db = if in_backup { &plan.backup_database } else { &plan.original_database };
         optional_table_id(&mut conn, db, name)
     });
-    let verdict = classify_programs(&mut conn, plan, verdict);
+    let differences = if completed && verdict=="promoted" {
+        Some(missing_recorded_programs(&mut conn,&plan.original_database,&final_programs(plan),true)?)
+    } else { None };
+    let verdict = if let Some(missing) = &differences {
+        if missing.is_empty() { "promoted".into() } else { "promoted_incomplete".into() }
+    } else { classify_programs(&mut conn, plan, verdict) };
     if matches!(verdict.as_str(), "promoted_incomplete" | "failed_original_triggers_missing") {
-        match program_differences(&mut conn, plan, verdict == "promoted_incomplete") {
+        match differences.map(Ok).unwrap_or_else(||program_differences(&mut conn, plan, verdict == "promoted_incomplete")) {
             Ok(missing) => result["missing_programs"] = json!(missing),
             Err(err) => result["program_verification_error"] = json!(err),
         }
@@ -2220,17 +2244,11 @@ fn rollback_blockers(
         let previous_pending = plan.promoted_programs.iter().any(|p| same_program(&actual, p))
             && matches_recorded_program(conn, original, &actual, &plan.original_programs)?;
         if !matches_recorded_program(conn, original, &actual, &expected)? && !previous_pending {
-            blockers.push(format!("저장 프로그램이 전환 뒤 바뀌었습니다: {}", crate::mysql_programs::program_id(&actual)));
+            blockers.push(format!("A recorded stored program changed after promotion: {}", crate::mysql_programs::program_id(&actual)));
         }
     }
-    let wanted = final_program_inventory(plan);
-    let actual_names = program_inventory(conn, original)?;
-    if actual_names.iter().any(|name| !wanted.contains(name)) || wanted.iter().any(|name| !actual_names.contains(name)
-        && !scopes.iter().any(|p| (&p.kind,&p.name,&p.table) == (&name.0,&name.1,&name.2))) {
-        blockers.push("저장 프로그램 목록이 전환 뒤 바뀌었습니다.".into());
-    }
     if !program_inventory(conn, backup)?.is_empty() {
-        blockers.push("백업 데이터베이스에 예상하지 않은 저장 프로그램이 있습니다.".into());
+        blockers.push("The backup database contains unexpected stored programs.".into());
     }
     if let Some(out) = rows_out {
         *out = rows;
@@ -2422,7 +2440,7 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
             if state["session_outcome_unknown"] == true { "rollback_unknown".into() }
             else if restored && displaced_ok {
                 let effective = with_program_warnings(plan,state["program_warnings"].as_array().map(Vec::as_slice).unwrap_or_default());
-                match program_differences(db, &effective, false) {
+                match restored_program_differences(db, &effective) {
                     Ok(missing) => { state["missing_programs"] = json!(missing); if missing.is_empty() { "rolled_back".into() } else { "rollback_incomplete".into() } }
                     Err(err) => { state["program_verification_error"] = json!(err); "rollback_incomplete".into() }
                 }
@@ -2463,6 +2481,16 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
         state["journal_error"] = json!(err);
     }
     Ok(state)
+}
+
+pub(crate) fn inspect_rollback(endpoint: &Endpoint, plan: &PromotionPlan, record: &Value) -> Result<Option<Vec<String>>,String> {
+    let mut conn = lifecycle_connect(endpoint,plan)?;
+    if !plan.original_tables.iter().all(|(name,t)|optional_table_id(&mut conn,&plan.original_database,name).ok().flatten()==Some(t.table_id)) { return Ok(None) }
+    let Some(displaced) = record["displaced_backup"].as_str() else { return Ok(None) };
+    let Some(ids) = record["displaced_tables"].as_object() else { return Ok(None) };
+    if !ids.iter().all(|(name,id)|optional_table_id(&mut conn,displaced,name).ok().flatten()==id.as_u64()) { return Ok(None) }
+    let effective = with_program_warnings(plan,record["program_warnings"].as_array().map(Vec::as_slice).unwrap_or_default());
+    restored_program_differences(&mut conn,&effective).map(Some)
 }
 
 /// Content digest a promoted table must still have: the verified candidate digest, or
@@ -3047,6 +3075,72 @@ mod tests {
             assert!(matches!(status.as_str(), "failed_original_unchanged" | "rolled_back"), "{phase}: {status}");
         }
     }
+#[test]
+fn safe_promote_completed_lifecycle_ignores_unrelated_program_changes() {
+    let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let verdict=|o:&Endpoint,p:&PromotionPlan,r:&Value| { let v=inspect_backup_recorded(o,p,false,r.get("backup_fingerprint"),true).unwrap(); eprintln!("RV12 {}",v["missing_programs"]); v["verdict"].as_str().unwrap().to_string() };
+    // A: plan with programs; unrelated additions / DISABLE after a clean promoted.
+    let Some((original,candidate,mut conn,dir,programs))=program_fixture() else { return };
+    let p=plan(&original,&candidate,"rv12a",&programs).unwrap();
+    let r=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
+    assert_eq!(r["status"],"promoted","{r:#}");
+    let mut seen=vec![("baseline",verdict(&original,&p,&r))];
+    conn.query_drop(format!("CREATE PROCEDURE {}() SELECT 1",qualified(&original.database,"extra_p"))).unwrap();
+    seen.push(("new_procedure",verdict(&original,&p,&r)));
+    conn.query_drop(format!("DROP PROCEDURE {}",qualified(&original.database,"extra_p"))).unwrap();
+    conn.query_drop(format!("CREATE TRIGGER {} AFTER INSERT ON {} FOR EACH ROW SET @x=1",qualified(&original.database,"extra_guard"),qualified(&original.database,"unrelated"))).unwrap();
+    seen.push(("new_trigger_unrelated_table",verdict(&original,&p,&r)));
+    conn.query_drop(format!("DROP TRIGGER {}",qualified(&original.database,"extra_guard"))).unwrap();
+    seen.push(("restored",verdict(&original,&p,&r)));
+    conn.query_drop(format!("ALTER EVENT {} DISABLE",qualified(&original.database,"new_e"))).unwrap();
+    seen.push(("alter_event_disable",verdict(&original,&p,&r)));
+    cleanup(&mut conn,&p,&dir);
+    // B: dump one-time NOT PRESERVE event fires and the server drops it.
+    let Some((original,candidate,mut conn,dir,mut programs))=program_fixture() else { return };
+    let scheduler:String=conn.query_first("SELECT @@event_scheduler").unwrap().unwrap();
+    struct Scheduler { endpoint:Endpoint, previous:String }
+    impl Drop for Scheduler { fn drop(&mut self) { let _=connect(&self.endpoint).and_then(|mut db|db.query_drop(format!("SET GLOBAL event_scheduler={}",self.previous)).map_err(|e|e.to_string())); } }
+    let _scheduler=Scheduler{endpoint:original.clone(),previous:scheduler};
+    conn.query_drop("SET GLOBAL event_scheduler=ON").unwrap();
+    let event=programs.iter_mut().find(|p|p.name=="new_e").unwrap();
+    conn.exec_drop("SET SESSION time_zone=?",(&event.time_zone,)).unwrap();
+    let at:String=conn.query_first("SELECT DATE_FORMAT(NOW()+INTERVAL 8 SECOND,'%Y-%m-%d %H:%i:%s')").unwrap().unwrap();
+    reset_session(&mut conn).unwrap();
+    event.definition=format!("CREATE EVENT `new_e` ON SCHEDULE AT '{at}' ON COMPLETION NOT PRESERVE ENABLE DO SET @tf_finished=1");
+    let p=plan(&original,&candidate,"rv12b",&programs).unwrap();
+    let r=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
+    assert_eq!(r["status"],"promoted","{r:#}");
+    seen.push(("not_preserve_before_fire",verdict(&original,&p,&r)));
+    let mut gone=false;
+    for _ in 0..60 {
+        let n:Option<u64>=conn.exec_first("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME='new_e'",(&original.database,)).unwrap();
+        if n==Some(0) { gone=true; break }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(gone,"event did not fire");
+    seen.push(("not_preserve_after_fire",verdict(&original,&p,&r)));
+    cleanup(&mut conn,&p,&dir);
+    // C: plan without programs (early return) with the same unrelated addition.
+    let Some((original,candidate,mut conn,dir))=fixture() else { return };
+    let p=plan(&original,&candidate,"rv12c",&[]).unwrap();
+    let r=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
+    assert_eq!(r["status"],"promoted","{r:#}");
+    conn.query_drop(format!("CREATE PROCEDURE {}() SELECT 1",qualified(&original.database,"extra_p"))).unwrap();
+    seen.push(("no_program_plan_new_procedure",verdict(&original,&p,&r)));
+    cleanup(&mut conn,&p,&dir);
+    eprintln!("RV12 RESULT {seen:?}");
+    let get=|k:&str| seen.iter().find(|(n,_)|*n==k).unwrap().1.clone();
+    assert_eq!(get("baseline"),"promoted");
+    assert_eq!(get("restored"),"promoted");
+    assert_eq!(get("not_preserve_before_fire"),"promoted");
+    assert_eq!(get("no_program_plan_new_procedure"),"promoted");
+    // Finding: these flip to promoted_incomplete.
+    assert_eq!(get("alter_event_disable"),"promoted_incomplete");
+    for k in ["new_procedure","new_trigger_unrelated_table","not_preserve_after_fire"] {
+        assert_eq!(get(k),"promoted","{k}: {seen:?}");
+    }
+}
+
     fn program_fixture() -> Option<(Endpoint, Endpoint, Db, std::path::PathBuf, Vec<NormalizedStoredProgram>)> {
         let (original, candidate, mut conn, dir) = fixture()?;
         for (db, view) in [(&original.database,"child_view"),(&original.database,"v"),(&candidate.database,"v")] {

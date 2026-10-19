@@ -1231,3 +1231,114 @@ fn rv22_rollback_incomplete_reports_unknown_and_no_missing_programs() {
     assert!(recovery["blockers"].to_string().contains("CREATE ROUTINE"));
     assert_eq!(f_left,"1");
 }
+
+#[test]
+fn rv10_rollback_incomplete_is_reported_and_reconciled() {
+    let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
+    let mut db = LiveAdapter::connect(&original).unwrap();
+    for sql in [
+        "CREATE PROCEDURE p() SELECT 'dump'",
+        "CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 2",
+        "CREATE EVENT new_e ON SCHEDULE AT '2099-01-01' ENABLE DO SET @tf_new=1",
+    ] { db.execute_sql(sql).unwrap(); }
+    let output = root.join("programs");
+    let exported = run("dump.run", json!({"source":original,"output_dir":output,"data_format":"jsonl","compression":"none","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(!exported.iter().any(|e| e["event"] == "error"), "{exported:#?}");
+    for sql in ["DROP PROCEDURE p", "CREATE PROCEDURE p() SELECT 'original'", "DROP FUNCTION f",
+        "CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 1", "DROP EVENT new_e"] { db.execute_sql(sql).unwrap(); }
+    let restored = safe_import(&original, &output);
+    assert_eq!(restored["status"], "ready_for_switch", "{restored:#}");
+    let planned = promote_plan(&original, &restored);
+    let done = run("dump.promote", json!({"endpoint":original,"action":"confirm","report_path":restored["report_path"],"restore_id":restored["restore_id"],"plan_digest":planned["plan_digest"],"overwrite_confirmed":true}));
+    let done = done.iter().find(|e| e["event"] == "result").cloned().unwrap_or_else(|| panic!("{done:#?}"));
+    assert_eq!(done["status"], "promoted", "{done:#}");
+    let backups = |action: &str, extra: Value| {
+        let mut payload = json!({"endpoint":original,"input_dirs":[output],"restore_id":restored["restore_id"],"action":action});
+        payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        run("restore.backups", payload).into_iter().find(|e| e["event"] == "result" || e["event"] == "error").unwrap()
+    };
+    let recovery = backups("rollback_plan", json!({}));
+    assert_eq!(recovery["can_rollback"], true, "{recovery:#}");
+    // An application session that used f() in an open transaction holds f's metadata lock,
+    // so the post-UNLOCK program loop hits lock_wait_timeout=2 on DROP FUNCTION f.
+    let mut holder = LiveAdapter::connect(&original).unwrap();
+    holder.execute_sql("START TRANSACTION").unwrap();
+    holder.execute_sql("SELECT f()").unwrap();
+    let recovered = backups("rollback_apply", json!({"confirmed":true,"plan_digest":recovery["plan_digest"]}));
+    holder.execute_sql("COMMIT").unwrap();
+    let f_now = first_value(&original, "SELECT CAST(f() AS CHAR) AS n");
+    let p_now = first_value(&original, "SELECT ROUTINE_DEFINITION FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE() AND ROUTINE_NAME='p'");
+    let new_e = first_value(&original, "SELECT COALESCE((SELECT STATUS FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='new_e'),'absent') AS n");
+    let reconciled = backups("reconcile", json!({}));
+    let listed = backups("list", json!({}));
+    let second = backups("rollback_plan", json!({}));
+    eprintln!("RV10 recovered={recovered:#}\nRV10 f()={f_now} p={p_now} new_e={new_e}\nRV10 reconcile={reconciled:#}\nRV10 list.verdict={} list.rollbacks={}\nRV10 second_plan.can_rollback={} blockers={}",
+        listed["backups"][0]["backup"]["verdict"], listed["backups"][0]["rollbacks"], second["can_rollback"], second["blockers"]);
+    for ns in [restored["candidate_target"]["database"].as_str().unwrap(), done["backup_namespace"].as_str().unwrap(),
+        done["clone_database"].as_str().unwrap(), recovered["displaced_backup"].as_str().unwrap_or("tf_none"), &name] {
+        drop_namespace(&mut admin, "mysql", ns);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(recovered["status"], "rollback_incomplete", "{recovered:#}");
+    // Expected behaviour: a message for this status and a reconcile that reports the programs.
+    assert!(!recovered["message"].as_str().unwrap().contains("outcome is unknown"), "rollback_incomplete message: {}", recovered["message"]);
+    assert_eq!(reconciled["conclusion"], "rollback_incomplete", "{reconciled:#}");
+    assert!(recovered["missing_programs"].to_string().contains("routine:f"));
+    assert_eq!(new_e,"absent","later programs are still restored after a failure");
+    assert!(p_now.as_str().unwrap().contains("original"));
+    assert!(reconciled["evidence"].get("missing_programs").is_some(), "{reconciled:#}");
+}
+#[test]
+fn rv204_promoted_verdict_survives_normal_post_cutover_program_changes() {
+    let Some((mut admin, original, name, root)) = exported_namespace("mysql") else { return };
+    let mut db = LiveAdapter::connect(&original).unwrap();
+    // App-owned one-shot event the dump does not have (default ON COMPLETION NOT PRESERVE).
+    db.execute_sql("CREATE EVENT kept_once ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 40 SECOND DO SET @tf_once=1").unwrap();
+    let restored = safe_import(&original, &root);
+    assert_eq!(restored["status"], "ready_for_switch", "{restored:#}");
+    let planned = promote_plan(&original, &restored);
+    assert_eq!(planned["can_promote"], true, "{planned:#}");
+    let done = run("dump.promote", json!({"endpoint":original,"action":"confirm","report_path":restored["report_path"],"restore_id":restored["restore_id"],"plan_digest":planned["plan_digest"],"overwrite_confirmed":true}));
+    let done = done.iter().find(|e| e["event"] == "result").cloned().unwrap_or_else(|| panic!("{done:#?}"));
+    assert_eq!(done["status"], "promoted", "{done:#}");
+    let backups = |action: &str, extra: Value| {
+        let mut payload = json!({"endpoint":original,"input_dirs":[root],"restore_id":restored["restore_id"],"action":action});
+        payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let events = run("restore.backups", payload);
+        events.iter().find(|e| e["event"] == "result").cloned().unwrap_or_else(|| panic!("{events:#?}"))
+    };
+    let summary = |label: &str, v: &Value| eprintln!("RV204 {label}: can_cleanup={} can_rollback={} conclusion={} message={} blockers={}",
+        v["can_cleanup"], v["can_rollback"], v["conclusion"], v["message"], v["blockers"]);
+    let control = backups("cleanup_plan", json!({"target":"backup"}));
+    summary("control cleanup (event pending)", &control);
+    // App deploy adds one routine after the cutover.
+    db.execute_sql("CREATE PROCEDURE app_added() SELECT 1").unwrap();
+    let added = backups("cleanup_plan", json!({"target":"backup"}));
+    summary("cleanup after app adds routine", &added);
+    let added_rec = backups("reconcile", json!({}));
+    summary("reconcile after app adds routine", &added_rec);
+    eprintln!("RV204 evidence missing_programs={}", added_rec["evidence"]["missing_programs"]);
+    db.execute_sql("DROP PROCEDURE app_added").unwrap();
+    // The server runs the kept NOT PRESERVE event and drops it.
+    let mut gone = false;
+    for _ in 0..60 {
+        if first_value(&original, "SELECT CAST(COUNT(*) AS CHAR) AS n FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='kept_once'") == "0" { gone = true; break }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    eprintln!("RV204 kept_once dropped by server: {gone}");
+    let after = backups("cleanup_plan", json!({"target":"backup"}));
+    summary("cleanup after kept event completed", &after);
+    let reconciled = backups("reconcile", json!({}));
+    summary("reconcile after kept event completed", &reconciled);
+    eprintln!("RV204 evidence missing_programs={}", reconciled["evidence"]["missing_programs"]);
+    let recovery = backups("rollback_plan", json!({}));
+    summary("rollback_plan after kept event completed", &recovery);
+    for ns in [restored["candidate_target"]["database"].as_str().unwrap(), done["backup_namespace"].as_str().unwrap(), done["clone_database"].as_str().unwrap(), &name] {
+        drop_namespace(&mut admin, "mysql", ns);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(control["can_cleanup"], true, "control: {control:#}");
+    assert!(gone);
+    assert_eq!(reconciled["conclusion"], "promoted", "BUG reproduced: completed kept event flips verdict: {reconciled:#}");
+    assert_eq!(after["can_cleanup"], true, "BUG reproduced: backup cleanup blocked: {after:#}");
+}
