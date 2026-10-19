@@ -635,6 +635,12 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "copy_routine_binlog_unsafe": "지금 서버 설정과 계정 권한으로는 이 함수를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수만 건너뛰고 가져옵니다.",
+    "target_trigger_binlog_privilege": "교체할 테이블에 이미 트리거가 있어, 교체하는 동안 그 트리거를 지웠다가 다시 만들어야 합니다. 지금 서버 설정과 계정 권한으로는 트리거를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 가져오세요.",
+    "target_program_unsavable": "교체 중에 저장했다가 되돌려야 하는 대상 프로그램을 저장할 수 없어 복사 전에 멈췄습니다.",
+    "view_calls_dump_routine": "덤프의 뷰가 덤프의 함수를 부릅니다. 복사본 검증에서는 함수를 교체한 뒤에 만들기 때문에 이 뷰를 미리 확인할 수 없어 복사 전에 멈췄습니다. '먼저 복사본에서 검증하고 교체'를 끄고 가져오세요.",
+    "rollback_triggers_recreated": "복구 중 트리거를 다시 만들었습니다. 트리거의 생성 기록이 달라졌을 수 있습니다.",
+
     "program_restore_definer_changed": "이전 정의를 복구하면서 정의자가 가져오는 계정으로 바뀌었습니다. 권한과 소유 계정을 확인하세요.",
     "program_restore_definer_may_change": "다른 계정의 정의자를 지정할 권한이 없어 교체 실패 후 복구하면 정의자가 가져오는 계정으로 바뀔 수 있습니다.",
     "program_restore_unavailable": "대상의 이전 정의를 안전하게 복구할 수 있는지 확인하지 못해 이 객체는 교체하지 않았습니다. 보고서에서 세션 설정과 권한을 확인하세요.",
@@ -784,6 +790,30 @@ def describe_program_warnings(items: object) -> List[str]:
             sentence += f" ({item['source']} → {item['target']})"
         lines.append(sentence)
     return lines
+
+
+def describe_program_results(result: dict) -> Tuple[List[str], List[str]]:
+    """Shared user sentences and sanitized details for failed or restored programs."""
+    from src.core.error_report_sanitizer import sanitize_local_diagnostic
+
+    lines, details, warnings = [], [], list(result.get("program_warnings") or [])
+    for failure in result.get("programs_failed") or []:
+        if not isinstance(failure, dict):
+            continue
+        name = sanitize_local_diagnostic(str(failure.get("name") or ""))
+        line = describe_core_code(failure.get("code") or "program_create_failed", name) or describe_core_code("program_create_failed", name)
+        if "previous_restored" in failure:
+            line += " " + translate_text("이전 정의 복구 성공" if failure["previous_restored"] else "이전 정의 복구 실패")
+        lines.append(line)
+        for key in ("error", "restore_error"):
+            if failure.get(key):
+                details.append(f"{name}: " + sanitize_local_diagnostic(str(failure[key])))
+        warnings.extend(failure.get("warnings") or [])
+        warnings.extend(failure.get("restore_warnings") or [])
+    if result.get("program_verification_error"):
+        details.append(sanitize_local_diagnostic(str(result["program_verification_error"])))
+    lines.extend(describe_program_warnings(warnings))
+    return list(dict.fromkeys(lines)), list(dict.fromkeys(details))
 
 
 # How the core's manifest warnings begin (adapters.rs WARNING_*) and the code Import gives
@@ -1121,37 +1151,32 @@ class RustDumpImporter(_RustDumpClientBase):
                     for blocker in result.get("blockers") or []:
                         message += f"\n{blocker}"
             if views_imported:
-                message += f", View {len(views_imported)}개"
+                message += ("\n" if import_mode == "safe" else ", ") + f"View {len(views_imported)}개"
             for kinds, label in [(("TRIGGER",), "트리거"), (("PROCEDURE", "FUNCTION"), "루틴"), (("EVENT",), "이벤트")]:
                 count = sum(item.get("kind", "TRIGGER") in kinds for item in result.get("programs_imported") or [] if isinstance(item, dict))
                 if count:
-                    message += ", " + translate_text({"트리거":"트리거 {}개","루틴":"루틴 {}개","이벤트":"이벤트 {}개"}[label]).format(count)
+                    message += ("\n" if import_mode == "safe" else ", ") + translate_text({"트리거":"트리거 {}개","루틴":"루틴 {}개","이벤트":"이벤트 {}개"}[label]).format(count)
             programs_failed = result.get("programs_failed") or []
             if programs_failed:
                 self.last_error_code = classify_error_code(programs_failed[0].get("code") or "program_create_failed", "")
-            for failure in programs_failed:
-                name = str(failure.get("name", ""))
-                line = describe_core_code(failure.get("code") or "program_create_failed", name)
-                if "previous_restored" in failure:
-                    line += " " + translate_text("이전 정의 복구 성공" if failure["previous_restored"] else "이전 정의 복구 실패")
+            program_lines, _ = describe_program_results(result)
+            for line in program_lines:
                 message += "\n" + line
+                if progress_callback:
+                    progress_callback(line)
             for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
                 if result.get(key):
                     skipped_line = describe_core_code(key) + " " + ", ".join(display_program_name(item) for item in result[key])
                     message += "\n" + skipped_line
                     if progress_callback:
                         progress_callback(skipped_line)
-            for warning_line in describe_program_warnings(result.get("program_warnings")):
-                message += "\n" + warning_line
-                if progress_callback:
-                    progress_callback(warning_line)
             if views_failed:
                 failed_names = ", ".join(
                     str(item.get("name", "")) for item in views_failed if isinstance(item, dict)
                 )
-                message += f" (View {len(views_failed)}개 생성 실패: {failed_names})"
+                message += ("\n" if import_mode == "safe" else " ") + f"(View {len(views_failed)}개 생성 실패: {failed_names})"
             if views_skipped:
-                message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
+                message += ("\n" if import_mode == "safe" else " ") + f"(크로스 엔진 View {len(views_skipped)}개 건너뜀)"
             if import_mode != "safe" and result.get("namespace_created") is True:
                 if self.config.engine == "postgresql":
                     # Without a configured database the schema lands in the `postgres` database.

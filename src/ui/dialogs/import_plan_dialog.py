@@ -74,9 +74,23 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
     raw_blockers = preview.get("blockers") if isinstance(preview.get("blockers"), list) else []
     blockers = describe_copy_blockers([item if isinstance(item, dict) else {} for item in raw_blockers],
                                       unknown=_UNKNOWN_BLOCKER)
-    copy_stops = describe_copy_blockers(_dicts(preview.get("copy_blockers")), unknown=_UNKNOWN_COPY_STOP) if verify else []
-    if copy_stops:
-        blockers += copy_stops + [translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다.")]
+    def blocker_key(item):
+        return item.get("code"), str(item.get("table") or item.get("name") or "")
+
+    seen = {blocker_key(item) for item in raw_blockers if isinstance(item, dict)}
+    copy_only = []
+    for item in _dicts(preview.get("copy_blockers")) if verify else []:
+        key = blocker_key(item)
+        if key not in seen:
+            copy_only.append(item)
+            seen.add(key)
+    blockers += describe_copy_blockers(copy_only, unknown=_UNKNOWN_COPY_STOP)
+    if copy_only and not raw_blockers and not any(item.get("code") in (
+        "copy_routine_binlog_unsafe", "view_calls_dump_routine", "trigger_privilege_missing", "trigger_binlog_privilege", "trigger_name_conflict"
+    ) for item in copy_only):
+        blockers.append(translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."))
+    if any(item.get("code") in ("trigger_privilege_missing", "trigger_name_conflict") for item in raw_blockers + copy_only if isinstance(item, dict)):
+        blockers.append(translate_text("트리거를 제외하려면 '트리거 없이 테이블만 가져오기'를 켜세요."))
 
     data_warnings, notes = [], []
     if verify and preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:

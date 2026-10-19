@@ -21,10 +21,12 @@ def test_skipped_triggers_and_changed_definers_are_must_see_with_names(code, war
 
 
 def test_program_privilege_refusal_is_a_plain_blocker():
-    plan = describe_plan({"copy_blockers": [{"code": "trigger_privilege_missing"}]}, True)
+    plan = describe_plan({"blockers": [{"code": "trigger_privilege_missing"}], "copy_blockers": [{"code": "trigger_privilege_missing"}]}, True)
     assert plan["must_see"]
     assert "트리거" in plan["blockers"][0]
-    assert " ".join(plan["blockers"]).count("끄면 진행할 수 있습니다") == 1
+    assert " ".join(plan["blockers"]).count("끄면 진행할 수 있습니다") == 0
+    assert len(plan["blockers"]) == 2
+    assert "트리거 없이 테이블만 가져오기" in plan["blockers"][1]
 
 
 @pytest.mark.parametrize("code", ["trigger_name_conflict", "program_source_schema_reference"])
@@ -364,3 +366,17 @@ def test_safe_and_replace_program_plan_names_losses_kept_and_new_objects(verify)
     text = "\n".join(plan["warnings"])
     assert all(name in text for name in ("sample.old_guard", "answer", "tick", "kept"))
     assert "사라지는 트리거" in text and "그대로 둘" in text
+
+
+@pytest.mark.parametrize("code", ["trigger_privilege_missing", "trigger_name_conflict", "program_privilege_missing"])
+def test_direct_and_copy_blockers_are_shown_once(code):
+    item = {"code":code,"table":"t.guard"}
+    preview = {"blockers":[item],"copy_blockers":[item,dict(item)]}
+    shown = describe_plan(preview,True)["blockers"]
+    assert sum("t.guard" in line for line in shown)==1
+    assert not any("끄면 진행할 수 있습니다" in line for line in shown)
+
+
+def test_candidate_grant_blocker_is_retained_with_direct_grant_blocker():
+    preview={"blockers":[{"code":"program_privilege_missing"}],"copy_blockers":[{"code":"program_privilege_missing","table":"tf_restore_*"}]}
+    assert any("tf_restore_*" in line for line in describe_plan(preview,True)["blockers"])

@@ -1049,7 +1049,7 @@ pub(crate) fn plan(
         server_uuid: conn.query_first("SELECT @@server_uuid").map_err(|e|e.to_string())?.ok_or("server UUID unavailable")?,
         backup_database: format!("tf_backup_{nonce}"), clone_database: format!("tf_promote_{nonce}"), nonce,
         original_tables: old, candidate_tables: new,
-        original_programs, original_program_inventory, promoted_programs, import_definer: current_definer, original_trigger_definitions,
+        original_programs, original_program_inventory, promoted_programs, import_definer: if programs.is_empty() {None} else {current_definer}, original_trigger_definitions,
         original_fks: ofks.into_iter().filter(|f|closure.contains(&f.child)).collect(), candidate_fks: cfks,
         view_order: view_order(&replacement_views)?, original_views, replacement_views,
         hidden_views: hidden, saved_views: saved,
@@ -3142,6 +3142,30 @@ fn safe_promote_completed_lifecycle_ignores_unrelated_program_changes() {
         assert_eq!(get(k),"promoted","{k}: {seen:?}");
     }
 }
+
+    #[test]
+    fn safe_promote_checks_created_trigger_order_before_unlocking() {
+        let _guard = LIVE_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        let Some((original,candidate,mut conn,dir,mut programs))=program_fixture() else {return};
+        let mut later = programs.iter().find(|p|p.kind=="TRIGGER" && p.name=="guard").unwrap().clone();
+        later.name="guard_later".into(); later.action_order=Some(2); programs.push(later);
+        let p=plan(&original,&candidate,"order_check",&programs).unwrap();
+        let mut verified=false;
+        let result=promote_with_hook(&original,&candidate,&p,&p.digest,&dir,|phase,db| {
+            if phase=="before_trigger_verification" {
+                let trigger=programs.iter().find(|p|p.kind=="TRIGGER" && p.name=="guard").unwrap();
+                db.query_drop(format!("DROP TRIGGER {}",qualified(&original.database,"guard"))).map_err(|e|e.to_string())?;
+                crate::mysql_programs::create_trigger(db,trigger,"guard","parent")?;
+            }
+            if phase=="triggers_attached" {verified=true;}
+            Ok(())
+        }).unwrap();
+        assert!(!verified,"mismatching ACTION_ORDER reached triggers_attached");
+        assert_eq!(result["status"],"promoted_incomplete","{result:#}");
+        assert_eq!(result["phase"],"promoted_locked","{result:#}");
+        assert!(result["error"].as_str().unwrap().contains("verified after attachment"));
+        cleanup(&mut conn,&p,&dir);
+    }
 
     fn program_fixture() -> Option<(Endpoint, Endpoint, Db, std::path::PathBuf, Vec<NormalizedStoredProgram>)> {
         let (original, candidate, mut conn, dir) = fixture()?;

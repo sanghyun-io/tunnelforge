@@ -268,3 +268,19 @@ def test_program_failure_statuses_have_plain_korean_labels():
         assert status not in status_label(JOURNAL_LABELS, status)
         assert status not in status_label(VERDICT_LABELS, status)
     assert "저장 프로그램" in status_label(JOURNAL_LABELS, "rollback_incomplete")
+
+
+def test_partial_rollback_uses_warning_and_names_remaining_programs(monkeypatch):
+    dialog = _dialog()
+    warning = MagicMock()
+    information = MagicMock()
+    monkeypatch.setattr(QMessageBox,"warning",warning)
+    monkeypatch.setattr(QMessageBox,"information",information)
+    dialog.refresh = MagicMock()
+    try:
+        dialog._on_rolled_back(True,"partial",{"status":"rollback_incomplete","missing_programs":["routine:f"],"pending_program":{"kind":"EVENT","name":"tick"}})
+        warning.assert_called_once()
+        information.assert_not_called()
+        assert "routine:f" in warning.call_args.args[2] and "tick" in warning.call_args.args[2]
+    finally:
+        dialog.close()

@@ -110,6 +110,8 @@ def test_python_export_import_named_schema_roundtrip(engine, restore_mode):
         if engine == "mysql":
             assert "트리거" in message and "루틴" in message and "이벤트" in message, message
         if restore_mode.startswith("safe"):
+            assert "View 1개" in message.splitlines(), message
+            assert not any(line.endswith(", View 1개") for line in message.splitlines()), message
             final = next(event for event in reversed(raw_events) if event.get("event") == "safe_restore_ready")
             candidate = final["candidate_target"]
             candidate_namespace = candidate["schema" if engine == "postgresql" else "database"]

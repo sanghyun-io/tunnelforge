@@ -2104,3 +2104,17 @@ def test_program_progress_and_count_templates_translate_exactly(korean, english)
     i18n.set_language("en")
     try: assert i18n.translate_text(korean)==english
     finally: i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgresql"])
+@pytest.mark.parametrize("with_programs", [False, True])
+def test_safe_message_view_counts_have_their_own_line(tmp_path, engine, with_programs):
+    from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+    (tmp_path / "_tunnelforge_dump.json").write_text(json.dumps({"format":"tunnelforge-dump","format_version":5,"source_engine":engine,"database":"app","schema":"app","tables":[{"name":"t","path":"t","rows":0,"chunks":0}]}),encoding="utf-8")
+    class Facade:
+        def import_dump(self, payload, on_event=None):
+            return {"success":True,"status":"ready_for_switch","verified":True,"original_unchanged":True,"cutover_pending":True,"candidate_target":{"engine":engine,"database":"app","schema":"tf_restore_x"},"views_imported":["v"],"programs":{"create":["routine:f"] if with_programs else []}}
+    ok, message, _ = RustDumpImporter(RustDumpConfig("localhost",3306,"root","test",engine=engine),facade=Facade()).import_dump(str(tmp_path),import_mode="safe")
+    assert ok,message
+    assert "View 1개" in message.splitlines()
+    assert not any(line.endswith(", View 1개") for line in message.splitlines())
