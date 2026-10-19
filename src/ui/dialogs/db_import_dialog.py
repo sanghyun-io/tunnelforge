@@ -2178,7 +2178,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             if not known_unchanged:  # stopped or not: what the swap did is unknown, so it is never only a status line
                 self._show_failure(translate_text("교체 결과를 확인하지 못했습니다"), "\n\n".join(filter(None, [
                     translate_text("교체가 끝났는지 확인하지 못했습니다. 원본·백업·복사본 상태를 Import 보고서와 DB에서 확인하세요."),
-                    cause or message])), message)
+                    cause or result.get("message")])), message)
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 
