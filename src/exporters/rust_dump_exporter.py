@@ -654,7 +654,7 @@ CORE_CODE_SENTENCES = {
     "routine_binlog_unsafe": "함수를 바이너리 로그 설정 때문에 만들지 못하면 건너뛰며, 대상의 같은 이름 함수는 유지합니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요.",
     "program_probe_cleanup_failed": "확인용 루틴을 지우지 못해 시작하지 않았습니다. 보고서의 남은 객체 이름과 ALTER ROUTINE 권한을 확인하세요.",
     "program_probe_cleanup_unproven": "확인용 루틴을 지우려면 ALTER ROUTINE 권한이 필요합니다.",
-    "program_privilege_missing": "루틴·이벤트를 만들 권한이 없습니다. CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.",
+    "program_privilege_missing": "저장 프로그램을 만들거나 되돌릴 권한이 없습니다. TRIGGER·CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.",
     "program_replace_privilege_unproven": "다른 계정이 만든 저장 프로그램은 교체하지 못할 수 있습니다.",
     "program_event_system_timezone": "이 이벤트의 SYSTEM 시간대는 대상 서버의 시스템 시간대로 해석됩니다.",
 

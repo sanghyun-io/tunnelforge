@@ -91,7 +91,7 @@ _EN_TEXT_TRANSLATIONS = {
     "함수를 바이너리 로그 설정 때문에 만들지 못하면 건너뛰며, 대상의 같은 이름 함수는 유지합니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요.": "Functions rejected by binary log checks are skipped and existing target functions are kept. Check log_bin_trust_function_creators and the function determinism and SQL access declarations.",
     "확인용 루틴을 지우지 못해 시작하지 않았습니다. 보고서의 남은 객체 이름과 ALTER ROUTINE 권한을 확인하세요.": "Import did not start because a probe routine could not be removed. Check the leftover object name in the report and ALTER ROUTINE privilege.",
     "확인용 루틴을 지우려면 ALTER ROUTINE 권한이 필요합니다.": "ALTER ROUTINE privilege is needed to remove probe routines.",
-    "루틴·이벤트를 만들 권한이 없습니다. CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.": "Missing privileges for routines or events. Check CREATE ROUTINE, ALTER ROUTINE and EVENT privileges.",
+    "저장 프로그램을 만들거나 되돌릴 권한이 없습니다. TRIGGER·CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.": "Missing privileges to create or restore stored programs. Check TRIGGER, CREATE ROUTINE, ALTER ROUTINE and EVENT privileges.",
     "다른 계정이 만든 저장 프로그램은 교체하지 못할 수 있습니다.": "Stored programs owned by another account might not be replaceable.",
     "이 이벤트의 SYSTEM 시간대는 대상 서버의 시스템 시간대로 해석됩니다.": "This event uses the target server system time zone for SYSTEM.",
     "바로 실행될 수 있는 이벤트 {}개: {}": "Events that may run immediately ({}): {}",
