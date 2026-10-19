@@ -355,3 +355,39 @@ def test_update_check_error_messages_are_fully_english_in_english_ui(monkeypatch
     ]
     html = i18n.translate_text(f'<div style="color: #e74c3c;">❌ {messages[0]}</div>')
     assert not has_hangul(html)
+
+
+def test_stored_program_recovery_strings_have_exact_english():
+    import re
+    from src.core.i18n.legacy_translate import translate_text
+    from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES
+    from src.ui.dialogs.backup_lifecycle_dialog import JOURNAL_LABELS, VERDICT_LABELS
+    strings = list(JOURNAL_LABELS.values()) + list(VERDICT_LABELS.values()) + ["지금 서버 설정과 계정 권한으로는 이 함수를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수만 건너뛰고 가져옵니다.", '교체할 테이블에 이미 트리거가 있어, 교체하는 동안 그 트리거를 지웠다가 다시 만들어야 합니다. 지금 서버 설정과 계정 권한으로는 트리거를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 가져오세요.', '교체 중에 저장했다가 되돌려야 하는 대상 프로그램을 저장할 수 없어 복사 전에 멈췄습니다.', "덤프의 뷰가 덤프의 함수를 부릅니다. 복사본 검증에서는 함수를 교체한 뒤에 만들기 때문에 이 뷰를 미리 확인할 수 없어 복사 전에 멈췄습니다. '먼저 복사본에서 검증하고 교체'를 끄고 가져오세요.", '복구 중 트리거를 다시 만들었습니다. 트리거의 생성 기록이 달라졌을 수 있습니다.', '원래 테이블로 되돌렸지만 저장 프로그램 일부가 원래대로 돌아오지 않았습니다: {names}. 원래 정의는 승격 기록에 남아 있습니다.', '테이블 교체됨 · 저장 프로그램 복원 필요', '테이블 유지됨 · 원래 트리거 복구 필요', '테이블 복구됨 · 저장 프로그램 복원 필요', '원래 트리거 복구 필요', '그대로 둘 루틴·이벤트: {}', '교체할 루틴·이벤트: {}', '만들 루틴·이벤트: {}', '만들 트리거: {}', '저장 프로그램 복원이 끝나지 않았습니다', '테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 백업을 보존하고 복구하세요.', '테이블은 교체하지 않았지만 원래 트리거를 되살리지 못했습니다. 보고서에 저장된 정의로 복구하세요.', '테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 보고서를 확인하고 복구하세요.', '테이블은 교체하지 않았지만 원래 트리거가 빠져 있습니다. 저장된 정의로 복구하세요.', '후보 데이터베이스에 예상하지 않은 저장 프로그램이 있습니다.', '저장 프로그램 교체 계획이 처음 확인한 내용과 달라졌습니다. 다시 가져오기를 시작해 바뀐 내용을 확인하세요.', "트리거를 제외하려면 '트리거 없이 테이블만 가져오기'를 켜세요."]
+    strings += [CORE_CODE_SENTENCES[code] for code in ("copy_routine_binlog_unsafe", "target_trigger_binlog_privilege", "target_program_unsavable", "view_calls_dump_routine", "rollback_triggers_recreated")]
+    i18n.set_language("en")
+    leaks = {source: translate_text(source) for source in strings if re.search(r"[가-힣]", translate_text(source))}
+    assert not leaks
+
+
+def test_core_lifecycle_outcomes_all_have_status_and_verdict_labels():
+    import re
+    from src.ui.dialogs.backup_lifecycle_dialog import JOURNAL_LABELS, VERDICT_LABELS
+    root=Path(__file__).resolve().parents[1]/"migration_core"/"src"
+    outcomes=set()
+    for name in ["safe_promote_mysql.rs","safe_promote_postgres.rs"]:
+        source=re.split(r"#\[cfg\(test\)\]\s*mod tests",(root/name).read_text(encoding="utf-8"),maxsplit=1)[0]
+        outcomes.update(re.findall(r'"((?:failed_|rollback_|cutover_)[a-z_]+|preparing|promoted(?:_incomplete)?|rolled_back)"\s*(?:\.into\(\)|\.to_string\(\))',source))
+        outcomes.update(re.findall(r'\["status"\]\s*=\s*json!\("([a-z_]+)"\)',source))
+        outcomes.update(re.findall(r'"status"\s*:\s*"([a-z_]+)"',source))
+    assert {"rolled_back","failed_triggers_recreated","rollback_incomplete","cutover_unknown"} <= outcomes
+    assert outcomes <= JOURNAL_LABELS.keys()
+    source=(root/"safe_backups.rs").read_text(encoding="utf-8")
+    journal=source[source.index("    fn journal_status("):source.index("    /// Recovery journals")]
+    assert set(re.findall(r'"([a-z_]+)"',journal)) - {"status"} <= JOURNAL_LABELS.keys()
+    reconcile=source[source.index("fn reconcile("):source.index("fn cleanup_plan(")]
+    conclusions=set(re.findall(r'=>\s*\("([a-z_]+)"',reconcile))
+    assert {"rolled_back","rollback_incomplete","not_promoted"}<=conclusions
+    assert conclusions<=VERDICT_LABELS.keys()
+    i18n.set_language("en")
+    for sentence in ("실패 (변경 없음, 트리거 다시 만듦)","원래 트리거","검증용 복사본","원래 테이블로 되돌렸지만 저장 프로그램 상태를 확인하지 못했습니다. 원래 정의는 승격 기록에 남아 있습니다. ({error})"):
+        assert not re.search(r"[가-힣]",i18n.translate_text(sentence))

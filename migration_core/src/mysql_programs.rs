@@ -45,9 +45,20 @@ pub(crate) fn collect_mysql_stored_programs(endpoint: &Endpoint, schema: &Normal
 {
     if endpoint.engine != "mysql" { return Ok(Default::default()) }
     let LiveAdapter::MySql(mut conn) = LiveAdapter::connect(endpoint)? else { unreachable!() };
+    let (mut programs, mut reasons) = collect_trigger_programs(&mut conn, &endpoint.database, schema, true)?;
+    if full_export {
+        let (captured, failures) = crate::mysql_schema_programs::collect_schema_programs(&mut conn, &endpoint.database)?;
+        programs.extend(captured); reasons.extend(failures);
+    }
+    Ok((programs, reasons))
+}
+
+pub(crate) fn collect_trigger_programs(conn: &mut mysql::PooledConn, database: &str, schema: &NormalizedSchema, prove_definition: bool)
+    -> Result<(Vec<NormalizedStoredProgram>, BTreeMap<String, String>), String>
+{
     let rows: Vec<mysql::Row> = conn.exec(
         "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, ACTION_ORDER, ACTION_STATEMENT, SQL_MODE, CHARACTER_SET_CLIENT, COLLATION_CONNECTION, DATABASE_COLLATION, DEFINER FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=? ORDER BY EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, ACTION_ORDER",
-        (&endpoint.database,),
+        (database,),
     ).map_err(|err| format!("trigger capture failed: {err}"))?;
     let mut programs = Vec::new();
     let mut reasons = BTreeMap::new();
@@ -63,11 +74,11 @@ pub(crate) fn collect_mysql_stored_programs(endpoint: &Endpoint, schema: &Normal
             collation_connection: field("COLLATION_CONNECTION"), database_collation: field("DATABASE_COLLATION"),
             definer: field("DEFINER"), time_zone: None, status: None,
         };
-        let original: Option<mysql::Row> = conn.query_first(format!("SHOW CREATE TRIGGER {}.{}",
-            quote_ident("mysql", &endpoint.database), quote_ident("mysql", &p.name)))
-            .map_err(|err| format!("SHOW CREATE TRIGGER {} failed: {err}", p.name))?;
+        let original: Option<mysql::Row> = if prove_definition { conn.query_first(format!("SHOW CREATE TRIGGER {}.{}",
+            quote_ident("mysql", database), quote_ident("mysql", &p.name)))
+            .map_err(|err| format!("SHOW CREATE TRIGGER {} failed: {err}", p.name))? } else { None };
         let original = original.and_then(|r| r.get::<String, _>("SQL Original Statement"));
-        let reason = if !original.as_deref().is_some_and(|sql| proven_body(&p.definition, sql)) {
+        let reason = if prove_definition && !original.as_deref().is_some_and(|sql| proven_body(&p.definition, sql)) {
             Some("trigger_body_unproven")
         } else if !supported_program_charset(&p) {
             Some("program_charset_unsupported")
@@ -76,10 +87,6 @@ pub(crate) fn collect_mysql_stored_programs(endpoint: &Endpoint, schema: &Normal
         } else { None };
         if let Some(reason) = reason { reasons.insert(program_id(&p), reason.into()); }
         else { programs.push(p); }
-    }
-    if full_export {
-        let (captured, failures) = crate::mysql_schema_programs::collect_schema_programs(&mut conn, &endpoint.database)?;
-        programs.extend(captured); reasons.extend(failures);
     }
     Ok((programs, reasons))
 }

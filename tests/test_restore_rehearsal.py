@@ -2,6 +2,7 @@
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -97,22 +98,22 @@ def records():
     return jh.make_history().list()
 
 
-def test_trigger_dump_refusal_reaches_scheduled_rehearsal_report(env, monkeypatch):
+def test_trigger_privilege_refusal_reaches_scheduled_rehearsal_report(env, monkeypatch):
     from src.exporters.rust_dump_exporter import RustDumpImporter, CORE_CODE_SENTENCES
     run = env.build()
     monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpImporter", RustDumpImporter)
     env.facade.import_dump = MagicMock(return_value={
         "success": False, "status": "failed_original_untouched", "error_code": "copy_refused",
         "original_unchanged": True, "candidate_created": False,
-        "copy_blockers": [{"code": "dump_programs_unsupported_in_copy"}],
+        "copy_blockers": [{"code": "trigger_privilege_missing"}],
     })
     outcome = run.run(schedule(), env.backup, conn(port=3307))
     assert outcome.ok is False
-    assert CORE_CODE_SENTENCES["dump_programs_unsupported_in_copy"] in outcome.message
-    assert "끄면" not in outcome.message and "끄세요" not in outcome.message
+    assert CORE_CODE_SENTENCES["trigger_privilege_missing"] in outcome.message
+    assert "끄면" not in outcome.message
     assert "Import로 가져오" not in outcome.message
     report = json.loads(open(os.path.join(env.backup, REPORT_NAME), encoding="utf-8").read())
-    assert CORE_CODE_SENTENCES["dump_programs_unsupported_in_copy"] in json.dumps(report, ensure_ascii=False)
+    assert CORE_CODE_SENTENCES["trigger_privilege_missing"] in json.dumps(report, ensure_ascii=False)
     assert "Import로 가져오" not in json.dumps(report, ensure_ascii=False)
 
 
@@ -234,3 +235,51 @@ def test_production_target_is_refused_at_run_time_too(env):
     env.tunnels["tgt"]["environment"] = "production"
     outcome = env.build().run(schedule(), env.backup, conn(port=3307))
     assert not outcome.ok and "운영" in outcome.message and env.facade.calls == []
+
+
+def test_program_dump_is_accepted_by_scheduled_rehearsal(env):
+    manifest_path = os.path.join(env.backup, "_tunnelforge_dump.json")
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    manifest["stored_programs"] = [{"kind": kind, "name": "guard"} for kind in ("TRIGGER", "PROCEDURE", "FUNCTION", "EVENT")]
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    outcome = env.build().run(schedule(), env.backup, conn(port=3307))
+    assert outcome.ok, outcome.message
+    assert env.holder.importer.seen["verify_only"] is True
+    assert "cleanup_apply" in env.facade.calls
+
+
+from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES
+
+_REHEARSAL_TOGGLES = ("먼저 복사본에서 검증하고 교체", "트리거 없이 테이블만 가져오기")
+
+
+@pytest.mark.parametrize("code", [code for code,sentence in CORE_CODE_SENTENCES.items()
+                                 if any(toggle in sentence for toggle in _REHEARSAL_TOGGLES)])
+@pytest.mark.parametrize("language", ["ko", "en"])
+def test_rehearsal_copy_refusal_never_recommends_a_verify_toggle(env, code, language):
+    from src.core import i18n
+    from src.exporters.rust_dump_exporter import CORE_CODE_SENTENCES
+    facade = MagicMock()
+    facade.import_dump.return_value = {"status": "failed_original_untouched", "copy_blockers": [{"code": code, "table": "f"}]}
+    run = RestoreRehearsal(lambda s: (conn(), ""), env.tunnels.get,
+                          lambda *a, **k: env.connector, lambda: facade)
+    i18n.set_language(language)
+    try:
+        outcome = run.run(schedule(), env.backup, conn(port=3307))
+        assert not outcome.ok
+        report = json.loads(Path(env.backup, REPORT_NAME).read_text(encoding="utf-8"))
+        for message in (outcome.message, report["error"]):
+            assert "먼저 복사본에서 검증하고 교체" not in message
+            assert "Verify in a copy first, then swap" not in message
+            assert "트리거 없이 테이블만 가져오기" not in message
+            assert "Import tables without triggers" not in message
+            base = CORE_CODE_SENTENCES[code].split(" '먼저 복사본에서 검증하고 교체'")[0].split(" 트리거를 제외하려면")[0]
+            if any(toggle in base for toggle in _REHEARSAL_TOGGLES):
+                base = base.split("켜서 ",1)[-1]
+            assert base and not any(toggle in base for toggle in _REHEARSAL_TOGGLES)
+            assert i18n.translate_text(base) in message
+        assert facade.import_dump.call_args.args[0]["verify_only"] is True
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)

@@ -22,9 +22,10 @@ pub(crate) struct VerifiedSafeRestorePlan {
 }
 
 fn plan_digest(report: &Value) -> String {
-    let bound = json!({"restore_id":report["restore_id"],"original_target":report["original_target"],
+    let mut bound = json!({"restore_id":report["restore_id"],"original_target":report["original_target"],
         "candidate_target":report["candidate_target"],"namespace_existed":report["namespace_existed"],
         "dump_manifest_sha256":report["dump_manifest_sha256"],"effective_timezone_sql":report["effective_timezone_sql"],"verification":report["verification"]});
+    if report["skip_triggers"] == true { bound["skip_triggers"] = json!(true); }
     format!("{:x}", Sha256::digest(bound.to_string().as_bytes()))
 }
 
@@ -136,6 +137,7 @@ pub(crate) fn reverify_candidate(plan: &VerifiedSafeRestorePlan) -> Result<Value
     let verified = verify_candidate(
         &plan.candidate,
         &manifest,
+        plan.report["namespace_existed"] == true,
         &plan.input_path,
         timezone.as_deref(),
         &mut |_, _, _| {},
@@ -164,6 +166,7 @@ fn first_difference(path: &str, before: &Value, after: &Value) -> Option<String>
 }
 
 pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
+    let skip_triggers = request.payload.get("skip_triggers") == Some(&Value::Bool(true));
     let mut original = request_endpoint(request)?;
     if original.engine == "mysql" {
         original.schema = Some(original.database.clone());
@@ -228,7 +231,14 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         {
             return Err(classified_import_error("dump_invalid", "unsupported dump format or compression", None));
         }
-        super::validate_import_metadata(&manifest, &BTreeSet::new(), &original.engine, &endpoint_schema(&original), false)?;
+        if skip_triggers { state["skip_triggers"] = json!(true); }
+        if let Err(error) = super::validate_import_metadata(&manifest, &BTreeSet::new(), &original.engine, &endpoint_schema(&original), skip_triggers) {
+            if error.contains("program_source_schema_reference:") {
+                return Err(copy_stop(&mut state, &[("program_source_schema_reference", None,
+                    "저장 프로그램이 원본 데이터베이스 이름을 직접 참조합니다. 본문의 데이터베이스 이름을 수정한 뒤 다시 시도하세요.".into())]));
+            }
+            return Err(error);
+        }
         let timezone = super::import_timezone_sql(
             &request.payload,
             manifest.source_timezone.as_deref(),
@@ -251,7 +261,11 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         let namespace_exists = {
             let mut admin = maintenance_connection(&original)?;
             let exists = target_namespace_exists(&mut admin, &original)?;
-            let refusals = if exists && swap_intended { target_copy_refusals(&mut admin, &original, &manifest)? } else { Vec::new() };
+            let mut refusals = if exists && swap_intended { target_copy_refusals(&mut admin, &original, &manifest, skip_triggers)? } else { Vec::new() };
+            if let LiveAdapter::MySql(conn) = &mut admin {
+                refusals.extend(program_copy_refusals(conn, &original, &manifest, skip_triggers)?);
+                if exists { refusals.extend(copy_program_refusals(conn,&manifest,skip_triggers,true)?); }
+            }
             if !refusals.is_empty() {
                 state["namespace_existed"] = json!(true);
                 return Err(copy_stop(&mut state, &refusals));
@@ -314,6 +328,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             .unsupported_objects
             .iter()
             .filter(|object| !object.to_ascii_lowercase().starts_with("view:") && !held.contains(*object))
+            .filter(|object| original.engine != "mysql" || !["trigger:", "routine:", "event:"].iter().any(|kind| object.starts_with(kind)))
             .filter(|object| object.split(':').nth(1).is_none_or(|table| !target_only.iter().any(|name| name == table)))
             .cloned()
             .collect::<Vec<_>>();
@@ -326,6 +341,12 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         state["unrepresented_original_objects"] = json!(unrepresented);
         state["blockers"] = json!(blockers);
 
+        if original.engine == "mysql" {
+            let preview = super::import_preview::preview(request, &original)?;
+            for key in ["triggers_dropped", "programs", "programs_kept", "events_enabled", "programs_skipped_toggle", "warnings"] {
+                state[key] = preview[key].clone();
+            }
+        }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
@@ -395,6 +416,9 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             }
         }
         state["candidate_import"] = imported.clone();
+        for key in ["programs_imported", "programs_failed", "program_warnings", "programs_skipped_toggle", "views_imported", "views_failed"] {
+            if let Some(value) = imported.get(key) { state[key] = value.clone(); }
+        }
         if imported.get("success").and_then(Value::as_bool) != Some(true) {
             return Err(imported
                 .get("message")
@@ -411,6 +435,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         let verification = verify_candidate(
             &candidate,
             &manifest,
+            namespace_exists,
             path,
             timezone.as_deref(),
             &mut |table, current, total| {
@@ -499,9 +524,6 @@ fn partial_filter_refusal() -> Refusal {
 /// What verify-in-copy refuses from the dump and the request alone.
 pub(super) fn copy_refusals(manifest: &DumpManifest, engine: &str, filtered: bool) -> Vec<Refusal> {
     let mut refusals = Vec::new();
-    if !manifest.stored_programs.is_empty() {
-        refusals.push(("dump_programs_unsupported_in_copy", None, "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.".into()));
-    }
     if filtered {
         refusals.push(partial_filter_refusal());
     }
@@ -528,10 +550,91 @@ fn copy_stop(state: &mut Value, refusals: &[Refusal]) -> String {
     classified_import_error("copy_refused", &format!("verify-in-copy stopped before making a copy: {}", details.join("; ")), None)
 }
 
+pub(crate) fn saved_target_programs(conn: &mut mysql::PooledConn, original: &Endpoint, manifest: &DumpManifest) -> Result<Vec<NormalizedStoredProgram>,String> {
+    let fold = mysql_folds_table_names(conn)?;
+    let present: Vec<String> = conn.exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?",(&original.database,)).map_err(|e|e.to_string())?;
+    let affected = present.into_iter().filter(|name|manifest.tables.iter().any(|t| if fold {t.name.eq_ignore_ascii_case(name)} else {t.name==*name})).collect();
+    crate::safe_promote_mysql::capture_affected_programs(conn,&original.database,&affected,&manifest.stored_programs)
+}
+
+pub(crate) fn program_copy_refusals(conn: &mut mysql::PooledConn, original: &Endpoint, manifest: &DumpManifest, skip_triggers: bool) -> Result<Vec<Refusal>, String> {
+    use crate::mysql_programs::trigger_binlog_blocked;
+    use super::import_preview::mysql_grants_allow;
+    let programs = manifest.stored_programs.iter().filter(|p| !skip_triggers || p.kind != "TRIGGER").collect::<Vec<_>>();
+    let mut refusals = Vec::new();
+    for (needed, privilege, code, message) in [
+        (programs.iter().any(|p| p.kind == "TRIGGER"), "TRIGGER", "trigger_privilege_missing", "트리거를 만들 권한이 없습니다. 트리거를 제외하려면 '트리거 없이 테이블만 가져오기'를 켜세요."),
+        (programs.iter().any(|p| matches!(p.kind.as_str(), "PROCEDURE" | "FUNCTION")), "CREATE ROUTINE", "program_privilege_missing", "루틴을 만들 권한이 없습니다."),
+        (programs.iter().any(|p| matches!(p.kind.as_str(), "PROCEDURE" | "FUNCTION")), "ALTER ROUTINE", "program_privilege_missing", "루틴을 교체하고 검증용 루틴을 정리할 권한이 없습니다."),
+        (programs.iter().any(|p| p.kind == "EVENT"), "EVENT", "program_privilege_missing", "이벤트를 만들거나 교체할 권한이 없습니다."),
+    ] {
+        if needed && mysql_grants_allow(conn, privilege, Some(&original.database)) == Some(false) {
+            refusals.push((code, None, message.into()));
+        }
+    }
+    if programs.iter().any(|p| matches!(p.kind.as_str(), "TRIGGER" | "FUNCTION")) {
+        let (log_bin, trusted): (bool, bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators")
+            .map_err(|e| e.to_string())?.ok_or("trigger binlog variables unreadable")?;
+        let super_grant = mysql_grants_allow(conn, "SUPER", None);
+        if programs.iter().any(|p|p.kind=="TRIGGER") && trigger_binlog_blocked(log_bin, trusted, super_grant) {
+            refusals.push(("trigger_binlog_privilege", None, "현재 서버 설정과 계정 권한으로는 트리거를 만들 수 없습니다. 서버 설정을 바꾸거나 '트리거 없이 테이블만 가져오기'를 켜세요.".into()));
+        }
+        for p in programs.iter().filter(|p|p.kind=="FUNCTION" && crate::mysql_schema_programs::function_binlog_preview_blocked(p,log_bin,trusted,super_grant)) {
+            refusals.push(("copy_routine_binlog_unsafe",Some(p.name.clone()),"this function cannot be created with the current binary log settings and privileges".into()));
+        }
+    }
+    Ok(refusals)
+}
+
+pub(crate) fn target_function_refusals(conn: &mut mysql::PooledConn, programs: &[NormalizedStoredProgram]) -> Result<Vec<Refusal>,String> {
+    if !programs.iter().any(|p|p.kind=="FUNCTION") { return Ok(Vec::new()) }
+    let (log_bin,trusted): (bool,bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators").map_err(|e|e.to_string())?.ok_or("binlog variables unreadable")?;
+    let super_grant = super::import_preview::mysql_grants_allow(conn,"SUPER",None);
+    Ok(programs.iter().filter(|p|p.kind=="FUNCTION" && crate::mysql_schema_programs::function_binlog_preview_blocked(p,log_bin,trusted,super_grant))
+        .map(|p|("target_routine_binlog_unsafe",Some(p.name.clone()),"the previous target function cannot be recreated with the current binary log settings and privileges".into())).collect())
+}
+
+pub(crate) fn copy_program_refusals(conn: &mut mysql::PooledConn, manifest: &DumpManifest, skip_triggers: bool, candidate_grants: bool) -> Result<Vec<Refusal>,String> {
+    let mut refusals = Vec::new();
+    if candidate_grants {
+        for (needed,privilege) in [
+            (!skip_triggers && manifest.stored_programs.iter().any(|p|p.kind=="TRIGGER"),"TRIGGER"),
+            (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"CREATE ROUTINE"),
+            (manifest.stored_programs.iter().any(|p|matches!(p.kind.as_str(),"FUNCTION" | "PROCEDURE")),"ALTER ROUTINE"),
+        ] {
+            if needed && super::import_preview::mysql_grants_allow(conn,privilege,Some("tf_restore_0"))!=Some(true) {
+                refusals.push(("program_privilege_missing",Some("tf_restore_*".into()),format!("{privilege} is required on the verification copy")));
+            }
+        }
+    }
+    for view in &manifest.views {
+        for function in manifest.stored_programs.iter().filter(|p|p.kind=="FUNCTION") {
+            match crate::mysql_schema_programs::view_calls_function(&view.definition,&function.name,view.sql_mode.as_deref()) {
+                Ok(true) => refusals.push(("view_calls_dump_routine",Some(view.name.clone()),format!("view {} calls dump function {}",view.name,function.name))),
+                Ok(false) => {},
+                Err(error) => { refusals.push(("copy_checks_unavailable",Some(view.name.clone()),error)); break; }
+            }
+        }
+    }
+    Ok(refusals)
+}
+
+pub(crate) fn target_trigger_refusals(conn: &mut mysql::PooledConn, database: &str) -> Result<Vec<Refusal>,String> {
+    let mut refusals = Vec::new();
+    if super::import_preview::mysql_grants_allow(conn,"TRIGGER",Some(database)) == Some(false) {
+        refusals.push(("program_privilege_missing",Some("original triggers".into()),"TRIGGER privilege is required to recreate original target triggers".into()));
+    }
+    let (log_bin,trusted): (bool,bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators").map_err(|e|e.to_string())?.ok_or("binlog variables unreadable")?;
+    if crate::mysql_programs::trigger_binlog_blocked(log_bin,trusted,super::import_preview::mysql_grants_allow(conn,"SUPER",None)) {
+        refusals.push(("target_trigger_binlog_privilege",None,"original target triggers cannot be recreated with current binary log settings and privileges".into()));
+    }
+    Ok(refusals)
+}
+
 /// What verify-in-copy refuses on an existing target, read before any copy is made: what the swap
 /// would refuse later, and every table or view outside the dump that an FK or a view links to it.
 /// The swap could keep such an object only by rebuilding it (TF-STATUS-173), so the run stops.
-pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint, manifest: &DumpManifest) -> Result<Vec<Refusal>, String> {
+pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint, manifest: &DumpManifest, skip_triggers: bool) -> Result<Vec<Refusal>, String> {
     fn inspect(err: impl std::fmt::Display) -> String {
         format!("verify-in-copy target inspection failed: {err}")
     }
@@ -556,21 +659,21 @@ pub(crate) fn target_copy_refusals(admin: &mut LiveAdapter, original: &Endpoint,
                 refusals.push(("metadata_visibility_unproven", None,
                     "verify-in-copy needs direct global SELECT, SHOW VIEW and PROCESS grants (no roles or partial revokes) to see every object that depends on the target".into()));
             }
-            let routines: Vec<String> = conn.exec("SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=? ORDER BY 1", (&schema,)).map_err(inspect)?;
-            refusals.extend(routines.into_iter().map(|name| ("target_routines", Some(name.clone()),
-                format!("the target has the stored routine {name}; the swap cannot prove it still works afterwards"))));
-            let events: Vec<String> = conn.exec("SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? ORDER BY 1", (&schema,)).map_err(inspect)?;
-            refusals.extend(events.into_iter().map(|name| ("target_events", Some(name.clone()),
-                format!("the target has the event {name}; the swap cannot prove it still works afterwards"))));
             let fold = mysql_folds_table_names(conn)?;
-            let dumped = manifest.tables.iter().map(|table| if fold { table.name.to_lowercase() } else { table.name.clone() }).collect::<BTreeSet<_>>();
-            // The MySQL swap moves only tables in the dump, so only their triggers stop it.
-            let triggers: Vec<(String, String)> = conn.exec(
-                "SELECT EVENT_OBJECT_TABLE, TRIGGER_NAME FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? ORDER BY 1, 2", (&schema,),
-            ).map_err(inspect)?;
-            refusals.extend(triggers.into_iter()
-                .filter(|(table, _)| dumped.contains(&if fold { table.to_lowercase() } else { table.clone() }))
-                .map(|(table, name)| ("target_triggers", Some(table.clone()), format!("table {table} has the trigger {name}, which the swap cannot carry over"))));
+            let dumped = manifest.tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
+            let triggers = crate::mysql_programs::target_trigger_names(conn, &schema)?;
+            let programs = if skip_triggers { Vec::new() } else { crate::mysql_programs::selected_triggers(&manifest.stored_programs, &dumped) };
+            let retained_triggers = triggers.iter().filter(|(table,_)|!dumped.iter().any(|name|if fold {name.eq_ignore_ascii_case(table)} else {name==table})).cloned().collect::<Vec<_>>();
+            for conflict in crate::mysql_programs::trigger_name_conflicts(&retained_triggers, &programs, fold) {
+                refusals.push(("trigger_name_conflict", Some(conflict), "덤프의 트리거 이름이 그대로 둘 테이블의 트리거 이름과 같습니다. 이름을 바꾼 뒤 다시 시도하세요.".into()));
+            }
+            if triggers.iter().any(|(table,_)|dumped.iter().any(|name|if fold { name.eq_ignore_ascii_case(table) } else { name==table })) {
+                refusals.extend(target_trigger_refusals(conn,&schema)?);
+            }
+            match saved_target_programs(conn,original,manifest) {
+                Ok(programs) => refusals.extend(target_function_refusals(conn,&programs)?),
+                Err(error) => refusals.push(("target_program_unsavable",None,error)),
+            }
             let present: Vec<String> = conn.exec("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (&schema,)).map_err(inspect)?;
             let foreign_keys: Vec<ForeignKeyLink> = conn.exec(
                 "SELECT DISTINCT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE \
@@ -771,12 +874,16 @@ fn count(adapter: &mut LiveAdapter, sql: &str) -> Result<u64, String> {
 fn verify_candidate(
     endpoint: &Endpoint,
     manifest: &DumpManifest,
+    programs_deferred: bool,
     input_path: &Path,
     timezone: Option<&str>,
     progress: &mut dyn FnMut(&str, usize, usize),
 ) -> Result<Value, String> {
     let inspection = inspect_live(endpoint)?;
     let mut unsupported = inspection.unsupported_objects;
+    if programs_deferred && endpoint.engine == "mysql" && unsupported.iter().any(|object| ["trigger:", "routine:", "event:"].iter().any(|kind| object.starts_with(kind))) {
+        return Err("후보 데이터베이스에 예상하지 않은 저장 프로그램이 있습니다.".into());
+    }
     unsupported.sort();
     unsupported.dedup();
     let held = if manifest.source_engine == "mysql" && endpoint.engine == "mysql" {
@@ -1229,6 +1336,12 @@ mod tests {
         assert_eq!(plan.candidate.database, candidate.database);
         assert_eq!(plan.candidate.password, "secret-value");
         assert!(!plan.report.to_string().contains("secret-value"));
+        report["skip_triggers"] = json!(false);
+        assert_eq!(plan_digest(&report), plan.plan_digest);
+        report["skip_triggers"] = json!(true);
+        write_dump_import_report(&dir, &report).unwrap();
+        assert!(load_verified_plan(&path, &original).is_err());
+        report.as_object_mut().unwrap().remove("skip_triggers");
         let mut wrong = original.clone();
         wrong.database = "another_live_database".into();
         assert!(load_verified_plan(&path, &wrong).is_err());

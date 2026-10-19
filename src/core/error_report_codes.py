@@ -12,6 +12,17 @@ from typing import Optional
 
 # Stable codes emitted by migration_core (classified_import_error and friends).
 RUST_CORE_CODES = frozenset({
+    "target_trigger_hidden",
+    "rollback_routine_binlog_unsafe",
+    "rollback_trigger_privilege_missing",
+    "rollback_trigger_binlog_privilege",
+    "target_routine_binlog_unsafe",
+    "copy_routine_binlog_unsafe",
+    "target_trigger_binlog_privilege",
+    "target_program_unsavable",
+    "view_calls_dump_routine",
+    "rollback_triggers_recreated",
+
     "program_create_failed",
     "program_finalize_failed",
     "program_probe_failed",
@@ -35,7 +46,6 @@ RUST_CORE_CODES = frozenset({
     "unsupported_invisible_column",
     "copy_refused",
     "candidate_fk_orphans",
-    "dump_programs_unsupported_in_copy",
     "table_definition_unrestorable",
     "routine_binlog_unsafe",
 

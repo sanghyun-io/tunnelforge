@@ -45,6 +45,25 @@ fn tokens(sql: &str, no_escape: bool) -> Result<Vec<Token>, String> {
     Ok(out)
 }
 
+pub(crate) fn view_calls_function(sql: &str, name: &str, sql_mode: Option<&str>) -> Result<bool,String> {
+    let no_escape = sql_mode.is_some_and(|mode|mode.split(',').any(|mode|mode.trim().eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES")));
+    let ts = tokens(sql,no_escape)?;
+    for i in 0..ts.len().saturating_sub(1) {
+        if !matches!(ts[i].quote,0 | b'`') || !ts[i].text.eq_ignore_ascii_case(name) || !keyword(&ts[i+1],"(") { continue }
+        let start = if i>=2 && keyword(&ts[i-1],".") {i-2} else {i};
+        if start>0 && (keyword(&ts[start-1],"VIEW") || keyword(&ts[start-1],"AS") || keyword(&ts[start-1],")")) { continue }
+        let mut depth=0; let mut closing=None;
+        for (j,t) in ts.iter().enumerate().skip(i+1) {
+            if keyword(t,"(") {depth+=1;}
+            if keyword(t,")") {depth-=1; if depth==0 {closing=Some(j);break}}
+        }
+        let j=closing.ok_or("view definition has an unclosed argument or column list")?;
+        if ts.get(j+1).is_some_and(|t|keyword(t,"AS")) && ts.get(j+2).is_some_and(|t|keyword(t,"(")) {continue}
+        return Ok(true)
+    }
+    Ok(false)
+}
+
 fn keyword(t: &Token, word: &str) -> bool { t.quote == 0 && t.text.eq_ignore_ascii_case(word) }
 
 /// Only backtick object identifiers from SHOW CREATE are accepted. DEFINER is never replayed.
@@ -206,12 +225,12 @@ fn event_status(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Resul
         .map_err(|e|e.to_string())?.ok_or_else(||"program_event_dropped: event is missing".into())
 }
 
-fn event_state(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Result<(String,bool),String> {
+pub(crate) fn event_state(conn: &mut mysql::PooledConn, schema: &str, name: &str) -> Result<(String,bool),String> {
     conn.exec_first("SELECT STATUS, COALESCE(ON_COMPLETION='PRESERVE' AND LAST_EXECUTED IS NOT NULL AND ((EVENT_TYPE='ONE TIME' AND EXECUTE_AT<=CURRENT_TIMESTAMP) OR (EVENT_TYPE='RECURRING' AND ENDS<=CURRENT_TIMESTAMP)),FALSE) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=? AND EVENT_NAME=?",(schema,name))
         .map_err(|e|e.to_string())?.ok_or_else(||"program_event_dropped: event is missing".into())
 }
 
-fn event_state_matches(actual: &str, completed: bool, expected: &str) -> bool {
+pub(crate) fn event_state_matches(actual: &str, completed: bool, expected: &str) -> bool {
     actual==expected || (expected=="ENABLED" && actual=="DISABLED" && completed)
         || (matches!(actual,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED") && matches!(expected,"SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED"))
 }
@@ -291,8 +310,50 @@ pub(crate) fn probe_routines(conn: &mut mysql::PooledConn, programs: &[Normalize
     Ok(())
 }
 
+/// Compare saved metadata without executing a program or changing its owner.
+pub(crate) fn schema_program_matches(actual: &NormalizedStoredProgram, expected: &NormalizedStoredProgram) -> bool {
+    actual.kind == expected.kind && actual.name.eq_ignore_ascii_case(&expected.name)
+        && actual.definer == expected.definer && actual.sql_mode == expected.sql_mode
+        && actual.character_set_client == expected.character_set_client && actual.collation_connection == expected.collation_connection
+        && actual.time_zone == expected.time_zone && actual.status == expected.status
+        && schema_program_sql(actual, &expected.name, None).ok().zip(schema_program_sql(expected, &expected.name, None).ok()).is_some_and(|(a,b)|a==b)
+}
+
+/// A missing one-shot event is complete only when its recorded absolute schedule has passed.
+pub(crate) fn recorded_event_completed(conn: &mut mysql::PooledConn, p: &NormalizedStoredProgram) -> Result<bool,String> {
+    let result = (|| -> Result<bool,String> {
+    if p.kind != "EVENT" { return Ok(false) }
+    let (ts,_) = suffix_start(p,None)?;
+    let header = &ts[..ts.iter().position(|t|keyword(t,"DO")).ok_or("event body missing")?];
+    let at = header.windows(3).find(|w|keyword(&w[0],"SCHEDULE") && keyword(&w[1],"AT") && w[2].quote==b'\'');
+    let expires = header.windows(4).any(|w|keyword(&w[0],"ON") && keyword(&w[1],"COMPLETION") && keyword(&w[2],"NOT") && keyword(&w[3],"PRESERVE"));
+    let Some(at) = at.filter(|_|expires) else { return Ok(false) };
+    set_program_context(conn,p)?;
+    conn.exec_first::<bool,_,_>("SELECT CAST(? AS DATETIME) <= CURRENT_TIMESTAMP",(&at[2].text,)).map_err(|e|e.to_string()).map(|v|v.unwrap_or(false))
+    })();
+    let reset = reset_program_context(conn);
+    match (result,reset) { (Err(err),_) => Err(err), (Ok(_),Err(err)) => Err(err), (Ok(completed),Ok(())) => Ok(completed) }
+
+}
+
 /// Replay the target definition, then verify state and definer after any corrective ALTER.
-fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: &NormalizedStoredProgram, failure: &mut Value) -> Result<(),String> {
+pub(crate) fn restore_schema_program(conn: &mut mysql::PooledConn, schema: &str, previous: &NormalizedStoredProgram, failure: &mut Value) -> Result<(),String> {
+    if let Ok(actual) = read_schema_program(conn,schema,&previous.kind,&previous.name) {
+        if schema_program_matches(&actual,previous) {
+            failure["previous_definer_preserved"] = json!(true);
+            failure["previous_unchanged"] = json!(true);
+            return Ok(())
+        }
+    }
+    if previous.kind == "FUNCTION" {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
+        let mut skipped = BTreeSet::new(); let mut warnings = Vec::new();
+        let probe = probe_routines(conn,std::slice::from_ref(previous),&format!("tf_probe_restore_{}_{nonce}",std::process::id()),&mut skipped,&mut warnings);
+        failure["restore_warnings"] = json!(warnings);
+        probe?;
+        if !skipped.is_empty() { failure["restore_warnings"] = json!(warnings); return Err("previous function fails binary log checks".into()) }
+    }
+    if recorded_event_completed(conn,previous)? { return Err("previous event would expire immediately if recreated".into()) }
     set_program_context(conn,previous)?;
     conn.query_drop(format!("DROP {} IF EXISTS {}",previous.kind,quote_ident("mysql",&previous.name))).map_err(|e|e.to_string())?;
     let current:Option<String>=conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?;
@@ -396,6 +457,25 @@ pub(crate) fn replace_schema_program(conn: &mut mysql::PooledConn, schema: &str,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn view_calls_respect_escaping_and_definition_context() {
+        for sql in ["SELECT 'it\\'s' AS label", "SELECT 'it\\'s', 'call f(1)', 'don\\'t'", "CREATE VIEW `f` (`a`) AS SELECT 1", "WITH f(m) AS (SELECT 1) SELECT m FROM f", "SELECT * FROM (SELECT 1) AS f(m)"] {
+            assert_eq!(view_calls_function(sql,"f",None),Ok(false),"{sql}");
+        }
+        for sql in ["SELECT f(x) AS y", "SELECT `db`.`f`()"] {assert_eq!(view_calls_function(sql,"f",None),Ok(true),"{sql}");}
+        assert_eq!(view_calls_function("SELECT 'a\\' AS x, f(1)","f",Some("NO_BACKSLASH_ESCAPES")),Ok(true));
+    }
+
+    #[test]
+    fn view_function_calls_ignore_literals_comments_and_other_names() {
+        for sql in ["SELECT f()", "SELECT `f` ()", "SELECT `db`.`f` /* call */ ()", "SELECT db.F()"] {
+            assert!(super::view_calls_function(sql,"f",None).unwrap(),"{sql}");
+        }
+        for sql in ["SELECT 'f()'", "SELECT 1 /* f() */", "SELECT ff()", "SELECT 1 -- f()\n"] {
+            assert!(!super::view_calls_function(sql,"f",None).unwrap(),"{sql}");
+        }
+    }
+
     use super::*;
     fn program(kind: &str, definition: &str) -> NormalizedStoredProgram {
         serde_json::from_value(json!({"kind":kind,"name":"p","definition":definition,"sql_mode":"","character_set_client":"utf8mb4","collation_connection":"utf8mb4_bin","time_zone":"+00:00","status":"ENABLED"})).unwrap()

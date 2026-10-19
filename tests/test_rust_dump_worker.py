@@ -159,7 +159,7 @@ def test_import_preview_worker_forwards_import_options_and_emits_the_plan(monkey
     worker.run()
 
     assert captured["args"] == ("C:/tmp/dump", "app", 4, "SET SESSION time_zone = '+09:00'")
-    assert captured["kwargs"] == {"use_source_timezone": False, "skip_triggers": False}
+    assert captured["kwargs"] == {"use_source_timezone": False, "skip_triggers": False, "import_mode": "replace"}
     assert emitted == [(True, "", plan)]
 
 

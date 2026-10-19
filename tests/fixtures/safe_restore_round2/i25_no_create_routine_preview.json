@@ -1,0 +1,28 @@
+{
+  "blockers": [
+    {
+      "code": "program_privilege_missing",
+      "detail": "CREATE ROUTINE privilege is required",
+      "table": null
+    }
+  ],
+  "copy_blockers": [
+    {
+      "code": "program_privilege_missing",
+      "detail": "CREATE ROUTINE is required on the verification copy",
+      "table": "tf_restore_*"
+    },
+    {
+      "code": "program_privilege_missing",
+      "detail": "루틴을 만들 권한이 없습니다.",
+      "table": null
+    }
+  ],
+  "direct_blockers": [
+    {
+      "code": "program_privilege_missing",
+      "detail": "CREATE ROUTINE privilege is required",
+      "table": null
+    }
+  ]
+}

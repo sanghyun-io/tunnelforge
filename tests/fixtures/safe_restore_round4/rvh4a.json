@@ -1,0 +1,7 @@
+{
+  "status": "cutover_unknown",
+  "success": false,
+  "original_unchanged": null,
+  "message": "Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery.",
+  "error": "safe_promotion: atomic rename: IoError { server disconnected }"
+}

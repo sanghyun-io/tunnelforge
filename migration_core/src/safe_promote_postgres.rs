@@ -578,6 +578,10 @@ pub(crate) fn promote(
             }
         }
     }
+    if state["status"] == "cutover_unknown" {
+        state["error"] = state["message"].clone();
+        state["message"] = json!(crate::safe_promotion::CUTOVER_UNKNOWN_MESSAGE);
+    }
     if state["status"] == "promoted" {
         // Retention evidence for TF-STATUS-119: lets a later cleanup prove the
         // backup tables were not modified after this cutover.
@@ -1113,6 +1117,7 @@ pub(crate) fn inspect_displaced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("../tests/support/safe_promote_postgres_round5.rs");
 
     fn endpoint() -> Option<Endpoint> {
         Some(Endpoint {

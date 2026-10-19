@@ -81,13 +81,14 @@ fn warning_names(code: &str, names: Vec<String>) -> Value {
     let mut item=warning(code,names.join(", ")); item["names"]=json!(names); item
 }
 
-fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
+pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let input_dir = request.payload.get("input_dir").and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty()).ok_or("dump.import_preview requires input_dir")?;
     let manifest = read_dump_manifest(Path::new(input_dir))?;
     let engine = endpoint.engine.as_str();
     let selected: BTreeSet<String> = string_list(request.payload.get("tables")).into_iter().collect();
     let strict = request.payload.get("strict_manifest").and_then(Value::as_bool).unwrap_or(true);
+    let safe_mode = request.payload.get("mode").or_else(||request.payload.get("import_mode")).and_then(Value::as_str)==Some("safe");
     let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
     let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict, &endpoint_schema(endpoint), skip_triggers)?;
     // A timezone the import would refuse is a bad request, not a property of the target.
@@ -123,6 +124,11 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let exists = super::safe_restore::target_namespace_exists(&mut admin, endpoint)?;
     let can_create = if exists { None } else { can_create_namespace(&mut admin, endpoint)? };
     if let LiveAdapter::MySql(conn) = &mut admin {
+        if exists {
+            copy_blockers.extend(super::safe_restore::copy_program_refusals(conn,&manifest,skip_triggers,true)?.into_iter().map(|(code,table,detail)|issue(code,table.as_deref(),detail)));
+        }
+        copy_blockers.extend(super::safe_restore::program_copy_refusals(conn, endpoint, &manifest, skip_triggers)?
+            .into_iter().map(|(code, table, detail)| issue(code, table.as_deref(), detail)));
         if !programs.is_empty() {
             let (log_bin, trusted): (bool, bool) = conn.query_first("SELECT @@log_bin, @@log_bin_trust_function_creators")
                 .map_err(|err| format!("trigger binlog inspection failed: {err}"))?.ok_or("trigger binlog variables unreadable")?;
@@ -142,7 +148,7 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
             }
             let super_grant=mysql_grants_allow(conn,"SUPER",None);
             let blocked=programs.iter().filter(|p|p.kind=="FUNCTION" && function_binlog_preview_blocked(p,log_bin,trusted,super_grant)).map(|p|p.name.clone()).collect::<Vec<_>>();
-            if !blocked.is_empty() { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
+            if !blocked.is_empty() && !safe_mode { warnings.push(warning_names("routine_binlog_unsafe",blocked)); }
             let events=programs.iter().filter(|p|p.kind=="EVENT").map(|p|p.name.clone()).collect::<Vec<_>>();
             if !events.is_empty() && mysql_grants_allow(conn,"EVENT",Some(&endpoint.database)).is_none() {
                 warnings.push(warning_names("event_privilege_unproven",events));
@@ -159,7 +165,7 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     // A cross-engine dump is already refused as a whole.
     if exists && manifest.source_engine == engine {
         // Only verify-in-copy needs these checks, so a failed one does not fail the preview.
-        match super::safe_restore::target_copy_refusals(&mut admin, endpoint, &manifest) {
+        match super::safe_restore::target_copy_refusals(&mut admin, endpoint, &manifest, skip_triggers) {
             Ok(refusals) => copy_blockers.extend(refusals.into_iter().map(|(code, table, detail)| issue(code, table.as_deref(), detail))),
             Err(error) => copy_blockers.push(issue("copy_checks_unavailable", None, error)),
         }
@@ -200,14 +206,26 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
     let target_views = target.views.iter().map(|(name, _)| key(name)).collect::<BTreeSet<_>>();
     let (views_replace, views_create): (Vec<String>, Vec<String>) = dump_views.into_iter().partition(|name| target_views.contains(&key(name)));
     let replaced_views = views_replace.iter().map(|name| key(name)).collect::<BTreeSet<_>>();
-    for conflict in trigger_name_conflicts(&target.triggers, &programs, fold) {
+    let direct_conflicts = trigger_name_conflicts(&target.triggers,&programs,fold);
+    let conflict_triggers = target.triggers.iter().filter(|(table,_)|!safe_mode || !dumped.contains(&key(table))).cloned().collect::<Vec<_>>();
+    for conflict in trigger_name_conflicts(&conflict_triggers, &programs, fold) {
         blockers.push(issue("trigger_name_conflict", Some(&conflict), &conflict));
     }
 
+    let mut programs_kept = Vec::new();
     let mut program_replace = Vec::new(); let mut program_create = Vec::new(); let mut program_may_not_replace = Vec::new(); let mut events_enabled = new_events_enabled;
     if let Some(LiveAdapter::MySql(conn)) = &mut adapter {
         let target_programs = target_schema_programs(conn,&schema)?;
+        programs_kept = target_programs.iter().filter(|(kind,name,_,_)| !programs.iter().any(|p| p.kind==*kind && p.name.eq_ignore_ascii_case(name)))
+            .map(|(kind,name,_,_)| format!("{}:{name}", if kind=="EVENT" {"event"} else {"routine"})).collect();
         let current: String = conn.query_first("SELECT CURRENT_USER()").map_err(|e|e.to_string())?.unwrap_or_default();
+        if safe_mode && !preserves_foreign_definer(conn) {
+            let affected = target.tables.iter().filter(|(name,_)|dumped.contains(&key(name))).map(|(name,_)|name.clone()).collect();
+            let definitions = crate::safe_promote_mysql::capture_affected_programs(conn,&schema,&affected,&[]).unwrap_or_default();
+            for p in definitions.iter().filter(|p|p.kind=="TRIGGER" && p.definer.as_deref()!=Some(&current)) {
+                warnings.push(warning_names("program_restore_definer_may_change",vec![format!("TRIGGER {} ({} -> {current})",p.name,p.definer.as_deref().unwrap_or_default())]));
+            }
+        }
         for p in &programs {
             if p.kind=="TRIGGER" { program_create.push(program_id(p)); continue }
             let previous = target_programs.iter().find(|(k,n,_,_)| k==&p.kind && n.eq_ignore_ascii_case(&p.name));
@@ -299,6 +317,8 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         }
     }
 
+    let mut direct_blockers = blockers.iter().filter(|item|item["code"]!="trigger_name_conflict").cloned().collect::<Vec<_>>();
+    direct_blockers.extend(direct_conflicts.iter().map(|name|issue("trigger_name_conflict",Some(name),name)));
     Ok(json!({
         "event": "result", "request_id": request.request_id, "command": "dump.import_preview",
         "success": true, "dry_run": true,
@@ -306,9 +326,9 @@ fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, String> {
         "replace": replace, "create": create, "untouched": untouched,
         "kept_children": kept_children, "external_parents": external_parents,
         "views": {"replace": views_replace, "create": views_create, "may_not_replace": may_not_replace, "may_break": may_break},
-        "triggers_dropped": triggers_dropped, "blockers": blockers, "warnings": warnings,
+        "triggers_dropped": triggers_dropped, "direct_blockers":direct_blockers, "blockers": blockers, "warnings": warnings,
         "programs": {"create":program_create,"replace":program_replace,"may_not_replace":program_may_not_replace},
-        "events_enabled":events_enabled,
+        "events_enabled":events_enabled, "programs_kept":programs_kept,
         "programs_skipped_cross_engine": skipped_cross_engine, "programs_skipped_partial": skipped_partial,
         "programs_skipped_toggle": skipped_toggle,
         "strict_export": manifest.strict_export, "snapshot_policy": manifest.snapshot_policy,

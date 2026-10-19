@@ -27,8 +27,8 @@ from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component
 from src.core.production_guard import ProductionGuard
 from src.exporters.rust_dump_exporter import (
-    DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure,
-    dump_original_namespace, restore_target_connection_info, describe_program_warnings, describe_core_code, display_program_name,
+    DEFAULT_DUMP_THREADS, build_rust_dump_config, check_rust_dump, describe_copy_blockers, describe_core_failure, describe_incomplete_promotion, describe_specific_promotion_failure,
+    dump_original_namespace, restore_target_connection_info, describe_program_results, describe_program_warnings, describe_core_code, display_program_name,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.dialogs.import_plan_dialog import ImportPlanDialog, describe_plan, names_preview as _names_preview
@@ -1016,8 +1016,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         path = self.input_dir.text().strip()
         manifest = self._read_manifest(path) if path else {}
         has_triggers = not path or any(isinstance(p, dict) and p.get("kind") == "TRIGGER" for p in manifest.get("stored_programs") or [])
-        allowed = (getattr(self, "_ui_enabled", True) and has_triggers and build_rust_dump_config(self.connector).engine == "mysql"
-                   and not (self.chk_verify_copy.isChecked() and self._verify_allowed))
+        allowed = getattr(self, "_ui_enabled", True) and has_triggers and build_rust_dump_config(self.connector).engine == "mysql"
         self.chk_skip_triggers.setEnabled(allowed)
         if not allowed:
             self.chk_skip_triggers.setChecked(False)
@@ -1351,7 +1350,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_import.setText("⏳ 대상 확인 중…")
         self._previewing = True
         # Kept apart from self.worker, which the import replaces while this thread may still be ending.
-        self._preview_worker = RustDumpWorker("import_preview", self.restore_config, **self._worker_options(request))
+        self._preview_worker = RustDumpWorker("import_preview", self.restore_config, import_mode=request["import_mode"], **self._worker_options(request))
         self.worker = self._preview_worker
         self.worker.preview_finished.connect(self._on_preview_finished)
         self.worker.start()
@@ -1715,7 +1714,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         try:
             event = json.loads(line)
             if isinstance(event, dict):
-                sanitized_event = _sanitized_rust_event(event)
+                sanitized_event = _sanitized_rust_event({key: value for key, value in event.items() if key != "plan"})
                 self.import_audit = getattr(self, "import_audit", {})
                 known = (self.import_audit.get("report_path"), self.import_audit.get("candidate_created"))
                 _capture_import_audit(self.import_audit, sanitized_event)
@@ -2098,9 +2097,9 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_save_log.setEnabled(True)
         if action == "confirm":
             self._show_report_link()
-            sanitized = _sanitized_rust_event(result)
-            self.import_audit["promotion_result"] = {key: sanitized.get(key) for key in (
-                "status", "success", "original_unchanged", "cutover_pending", "backup_namespace", "report_path", "phase", "message")}
+            self.import_audit["promotion_result"] = {key: sanitize_local_diagnostic_data({key: result.get(key)}).get(key) for key in (
+                "status", "success", "original_unchanged", "cutover_pending", "backup_namespace", "report_path", "phase", "message", "missing_programs", "pending_program", "programs_failed", "programs_imported", "program_warnings", "program_verification_error")}
+
         if action == "plan":
             if self._close_after_cancel:
                 pass
@@ -2135,6 +2134,28 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 sanitize_local_diagnostic(self.import_audit["backup_namespace"])))
             self.progress_bar.setValue(100)
             self._add_log(self.label_status.text())
+            for line in describe_plan(result, True)["warnings"]:
+                self._log_visible(line)
+            for line in describe_program_warnings(result.get("program_warnings")):
+                self._log_visible(line)
+        elif action == "confirm" and result.get("status") in ("promoted_incomplete", "failed_original_triggers_missing"):
+            self.import_success = False
+            self.import_end_time = datetime.now()
+            status = result["status"]
+            self.import_audit.update(restore_status=status, original_unchanged=False,
+                                     cutover_pending=False if status == "promoted_incomplete" else None)
+            self.import_audit["missing_programs"] = result.get("missing_programs") or []
+            sentence = describe_incomplete_promotion(status)
+            self.label_status.setText(translate_text(sentence))
+            names = ", ".join(display_program_name(item) for item in result.get("missing_programs") or [])
+            program_lines, details = describe_program_results(result)
+            if not names:
+                names = ", ".join(str(item.get("name") or "") for item in result.get("programs_failed") or [] if isinstance(item, dict))
+            for line in program_lines:
+                self._log_visible(line)
+            for detail in details:
+                self._log_visible(detail)
+            self._show_failure(translate_text("저장 프로그램 복원이 끝나지 않았습니다"), "\n".join([translate_text(sentence), names] + program_lines), "\n".join([sanitize_local_diagnostic(message)] + details))
         elif action == "confirm":
             self.import_success = False
             self.import_end_time = datetime.now()
@@ -2143,7 +2164,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_audit["original_unchanged"] = True if known_unchanged else None
             self.import_audit["cutover_pending"] = True if known_unchanged else None
             self._log_visible(message or "Promotion result could not be verified")
-            cause = describe_core_failure(message)
+            cause = describe_specific_promotion_failure(result, message)
             if self._cancel_requested:
                 self.label_status.setText(translate_text(
                     "⏹ 교체 중지됨 · 원본은 그대로입니다" if known_unchanged
@@ -2155,7 +2176,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             if not known_unchanged:  # stopped or not: what the swap did is unknown, so it is never only a status line
                 self._show_failure(translate_text("교체 결과를 확인하지 못했습니다"), "\n\n".join(filter(None, [
                     translate_text("교체가 끝났는지 확인하지 못했습니다. 원본·백업·복사본 상태를 Import 보고서와 DB에서 확인하세요."),
-                    cause])), message)
+                    cause or result.get("message")])), "\n\n".join(filter(None, [message, str(result.get("error") or "")])))
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 

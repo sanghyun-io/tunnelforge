@@ -152,14 +152,21 @@ fn routine_and_event_source_qualifiers_refuse_before_changes_and_partial_import_
 }
 
 #[test]
-fn schema_programs_skip_on_postgres_and_safe_refuses_before_copy() {
-    let (Some(s),Some(mut pg))=(Sandbox::new(),endpoint("postgresql")) else {return}; let mut db=conn(&s.endpoint); table(&mut db);
+fn schema_programs_skip_on_postgres_and_safe_defers_until_cutover() {
+    let (Some(mut s),Some(mut pg))=(Sandbox::new(),endpoint("postgresql")) else {return}; let mut db=conn(&s.endpoint); table(&mut db);
     db.query_drop("CREATE PROCEDURE p() SELECT 1; CREATE EVENT e ON SCHEDULE EVERY 1 DAY DISABLE DO SET @a=1").unwrap(); s.dump();
     let schema=s.endpoint.database.clone(); pg.schema=Some(schema.clone());
     let mut admin=LiveAdapter::connect(&pg).unwrap(); admin.execute_sql(&format!("CREATE SCHEMA \"{schema}\"")).unwrap();
     let preview=success(events("dump.import_preview",s.payload(&pg))); assert_eq!(preview["programs_skipped_cross_engine"].as_array().unwrap().len(),2);
     let imported=success(events("dump.import",s.payload(&pg))); assert_eq!(imported["programs_skipped_cross_engine"].as_array().unwrap().len(),2);
-    let mut payload=s.payload(&s.endpoint); payload["mode"]=json!("safe"); let refused=outcome(events("dump.import",payload)); assert_eq!(refused["status"],"failed_original_untouched"); assert_eq!(refused["copy_blockers"][0]["code"],"dump_programs_unsupported_in_copy");
+    let mut payload=s.payload(&s.endpoint); payload["mode"]=json!("safe");
+    let restored=success(events("dump.import",payload)); assert_eq!(restored["status"],"ready_for_switch","{restored}");
+    let candidate=restored["candidate_target"]["database"].as_str().unwrap().to_string();
+    let mut target=s.endpoint.clone(); target.database=candidate.clone();
+    let mut copy=conn(&target);
+    assert_eq!(copy.query_first::<u64,_>("SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE()").unwrap(),Some(0));
+    assert_eq!(copy.query_first::<u64,_>("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE()").unwrap(),Some(0));
+    s.databases.push(candidate);
     admin.execute_sql(&format!("DROP SCHEMA \"{schema}\" CASCADE")).unwrap();
 }
 
@@ -546,46 +553,66 @@ fn long_enum_and_set_definitions_export_and_import_with_values_intact() {
     assert!(types(&mut fresh).iter().all(|t|t.len()>512));
 }
 
-fn wait_for_preserved_completion(db:&mut mysql::PooledConn) {
+fn preserved_event_state(db: &mut mysql::PooledConn, one_shot: bool) -> (String,bool,u64) {
+    let mut state = (String::new(),false,0);
     for _ in 0..100 {
-        let done:Option<bool>=db.query_first("SELECT STATUS='DISABLED' AND LAST_EXECUTED IS NOT NULL FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
-        let rows:Option<u64>=db.query_first("SELECT COUNT(*) FROM audit").unwrap();
-        if done==Some(true) && rows==Some(1) { return }
+        state=db.query_first("SELECT STATUS,LAST_EXECUTED IS NOT NULL,(SELECT COUNT(*) FROM audit) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap().unwrap();
+        if state==("DISABLED".into(),true,1) {return state}
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    panic!("preserved event did not complete exactly once");
+    assert!(!one_shot && state==("ENABLED".into(),false,0),"unexpected preserved event state: {state:?}");
+    state
 }
 
 #[test]
 fn due_preserved_events_complete_once_without_failed_import_or_replacement_rollback() {
     for schedule in ["AT '2000-01-01 00:00:00'", "EVERY 1 DAY STARTS '2000-01-01 00:00:00' ENDS '2000-01-02 00:00:00'"] {
         let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint);
+        let one_shot=schedule.starts_with("AT ");
         db.query_drop("CREATE TABLE audit(id INT)").unwrap();
-        db.query_drop(format!("CREATE EVENT e ON SCHEDULE {schedule} ON COMPLETION PRESERVE DISABLE DO INSERT INTO audit VALUES(1)")).unwrap();
-        db.query_drop("ALTER EVENT e ENABLE").unwrap(); assert_eq!(status(&mut db,"e"),"ENABLED"); s.dump();
-        for existing in [false,true] { for complete_before_read in [false,true] {
-            db.query_drop("SET GLOBAL event_scheduler=OFF").unwrap();
-            let target=s.other(true);
-            if existing { conn(&target).query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY STARTS '2099-01-01' ENABLE DO SET @old=1").unwrap(); }
-            let preview=success(events("dump.import_preview",s.payload(&target)));
-            assert!(preview["events_enabled"].as_array().unwrap().contains(&json!("e")),"{preview}");
-            db.query_drop("SET GLOBAL event_scheduler=ON").unwrap();
-            let mut output=Vec::new(); let mut injected=false;
-            handle_request_streaming(Request{command:"dump.import".into(),request_id:None,payload:s.payload(&target)},|e| {
-                if complete_before_read && e["event"]=="program_created" && e["kind"]=="EVENT" {
-                    let mut fresh=conn(&target); fresh.query_drop("ALTER EVENT e ENABLE").unwrap();
-                    wait_for_preserved_completion(&mut fresh); injected=true;
-                }
-                output.push(e);
-            });
-            let v=success(output); assert_eq!(injected,complete_before_read);
-            assert!(v["programs_failed"].as_array().unwrap().is_empty(),"{v}");
-            let mut fresh=conn(&target); wait_for_preserved_completion(&mut fresh);
-            let body:Option<String>=fresh.query_first("SELECT EVENT_DEFINITION FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
-            assert!(body.unwrap().contains("INSERT INTO audit"),"old definition was restored");
-            let imported=v["programs_imported"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT").unwrap();
-            if complete_before_read { assert_eq!(imported["status"],"DISABLED"); assert_eq!(imported["enabled"],false); }
-        }}
+        db.query_drop(format!("CREATE EVENT e ON SCHEDULE {schedule} ON COMPLETION PRESERVE ENABLE DO INSERT INTO audit VALUES(1)")).unwrap();
+        db.query_drop("ALTER EVENT e ENABLE").unwrap();
+        s.dump();
+        // An unrelated enabled event can change whether an already-ended recurring
+        // event executes. Check each target's actual state, without a native oracle.
+        for other_enabled in [false,true] {
+            if other_enabled {db.query_drop("CREATE EVENT future_job ON SCHEDULE AT '2099-01-01' ENABLE DO SET @future=1").unwrap();}
+            for existing in [false,true] { for complete_before_read in [false,true] {
+                db.query_drop("SET GLOBAL event_scheduler=OFF").unwrap();
+                let target=s.other(true);
+                if existing { conn(&target).query_drop("CREATE EVENT e ON SCHEDULE EVERY 1 DAY STARTS '2099-01-01' ENABLE DO SET @old=1").unwrap(); }
+                let preview=success(events("dump.import_preview",s.payload(&target)));
+                assert!(preview["events_enabled"].as_array().unwrap().contains(&json!("e")),"{preview}");
+                db.query_drop("SET GLOBAL event_scheduler=ON").unwrap();
+                let mut output=Vec::new(); let mut observed_before_read=None;
+                handle_request_streaming(Request{command:"dump.import".into(),request_id:None,payload:s.payload(&target)},|e| {
+                    if complete_before_read && e["event"]=="program_created" && e["kind"]=="EVENT" {
+                        let mut fresh=conn(&target); fresh.query_drop("ALTER EVENT e ENABLE").unwrap();
+                        observed_before_read=Some(preserved_event_state(&mut fresh,one_shot));
+                    }
+                    output.push(e);
+                });
+                let v=success(output);
+                assert_eq!(observed_before_read.is_some(),complete_before_read);
+                assert!(v["programs_failed"].as_array().unwrap().is_empty(),"{v}");
+                let mut fresh=conn(&target);
+                let observed=preserved_event_state(&mut fresh,one_shot);
+                eprintln!("schedule={schedule}, other_enabled={other_enabled}, existing={existing}, before_read={complete_before_read}: {observed:?}");
+                let body:Option<String>=fresh.query_first("SELECT EVENT_DEFINITION FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
+                assert!(body.unwrap().contains("INSERT INTO audit"),"old definition was restored");
+                let imported=v["programs_imported"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT").unwrap();
+                assert_eq!(imported["enabled"],imported["status"]=="ENABLED");
+                if let Some(before)=observed_before_read {assert_eq!(imported["status"],before.0);}
+                else {assert!(imported["status"]==observed.0 || (imported["status"]=="ENABLED" && observed.1));}
+                let inspection_dir=s.output.join(format!("inspect_{}",target.database));
+                success(events("dump.run",json!({"source":target,"output_dir":inspection_dir,"data_format":"jsonl","compression":"none","threads":1,"mysql_snapshot_mode":"single_connection"})));
+                let inspected:Value=serde_json::from_slice(&std::fs::read(inspection_dir.join("_tunnelforge_dump.json")).unwrap()).unwrap();
+                let event=inspected["stored_programs"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT" && p["name"]=="e").unwrap();
+                assert_eq!(event["status"],observed.0);
+                fresh.query_drop("DROP EVENT e").unwrap();
+            }}
+            if other_enabled {db.query_drop("DROP EVENT future_job").unwrap();}
+        }
     }
 }
 

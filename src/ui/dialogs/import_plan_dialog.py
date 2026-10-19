@@ -72,11 +72,36 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
     """
     # A blocker the application cannot read still blocks (fail closed).
     raw_blockers = preview.get("blockers") if isinstance(preview.get("blockers"), list) else []
-    blockers = describe_copy_blockers([item if isinstance(item, dict) else {} for item in raw_blockers],
-                                      unknown=_UNKNOWN_BLOCKER)
-    copy_stops = describe_copy_blockers(_dicts(preview.get("copy_blockers")), unknown=_UNKNOWN_COPY_STOP) if verify else []
-    if copy_stops:
-        blockers += copy_stops + [translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다.")]
+    def blocker_key(item):
+        return item.get("code"), str(item.get("table") or item.get("name") or "")
+
+    direct_blockers = _dicts(preview.get("direct_blockers")) if "direct_blockers" in preview else _dicts(raw_blockers)
+    seen = set()
+    direct_codes = {item.get("code") for item in _dicts(raw_blockers)}
+    direct = []
+    for item in raw_blockers:
+        item = item if isinstance(item, dict) else {}
+        if blocker_key(item) not in seen:
+            direct.append(item)
+            seen.add(blocker_key(item))
+    blockers = describe_copy_blockers(direct, unknown=_UNKNOWN_BLOCKER)
+    copy_only = []
+    for item in _dicts(preview.get("copy_blockers")) if verify else []:
+        key = blocker_key(item)
+        if item.get("table") in ("tf_restore_*", "original triggers") and (
+            item.get("code") in direct_codes or ("trigger_privilege_missing" in direct_codes and str(item.get("detail") or "").startswith("TRIGGER "))
+        ):
+            continue
+        if key not in seen:
+            copy_only.append(item)
+            seen.add(key)
+    blockers += describe_copy_blockers(copy_only, unknown=_UNKNOWN_COPY_STOP, omit_verify_hint=bool(direct_blockers))
+    if copy_only and not direct_blockers and not any(item.get("code") in (
+        "copy_routine_binlog_unsafe", "target_routine_binlog_unsafe", "view_calls_dump_routine", "trigger_privilege_missing", "trigger_binlog_privilege", "trigger_name_conflict"
+    ) for item in copy_only):
+        blockers.append(translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."))
+    if any(item.get("code") in ("trigger_privilege_missing", "trigger_name_conflict") for item in raw_blockers + copy_only if isinstance(item, dict)):
+        blockers.append(translate_text("트리거를 제외하려면 '트리거 없이 테이블만 가져오기'를 켜세요."))
 
     data_warnings, notes = [], []
     if verify and preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:
@@ -137,6 +162,18 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
             if names:
                 data_warnings.append("- " + describe_core_code(code) + " " + sanitize_local_diagnostic(names_preview(names)))
 
+    programs = preview.get("programs") if isinstance(preview.get("programs"), dict) else {}
+    for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 루틴·이벤트: {}")):
+        ids = _strings(programs.get(key))
+        triggers = [item for item in ids if item.startswith("trigger:")]
+        if triggers:
+            notes.append(_line("만들 트리거: {}", [display_program_name(item) for item in triggers]))
+        names = [display_program_name(item) for item in ids if item not in triggers]
+        if names:
+            notes.append(_line(sentence, names))
+    kept = [display_program_name(item) for item in _strings(preview.get("programs_kept"))]
+    if kept:
+        notes.append(_line("그대로 둘 루틴·이벤트: {}", kept))
     details = []
     for code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
         if _strings(preview.get(code)):

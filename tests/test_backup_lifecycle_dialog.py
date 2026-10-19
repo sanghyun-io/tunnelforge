@@ -260,3 +260,27 @@ def test_status_cells_are_translated_and_list_summary_survives_follow_up_request
     finally:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
         dialog.close()
+
+
+def test_program_failure_statuses_have_plain_korean_labels():
+    from src.ui.dialogs.backup_lifecycle_dialog import JOURNAL_LABELS, VERDICT_LABELS, status_label
+    for status in ("promoted_incomplete", "failed_original_triggers_missing"):
+        assert status not in status_label(JOURNAL_LABELS, status)
+        assert status not in status_label(VERDICT_LABELS, status)
+    assert "저장 프로그램" in status_label(JOURNAL_LABELS, "rollback_incomplete")
+
+
+def test_partial_rollback_uses_warning_and_names_remaining_programs(monkeypatch):
+    dialog = _dialog()
+    warning = MagicMock()
+    information = MagicMock()
+    monkeypatch.setattr(QMessageBox,"warning",warning)
+    monkeypatch.setattr(QMessageBox,"information",information)
+    dialog.refresh = MagicMock()
+    try:
+        dialog._on_rolled_back(True,"partial",{"status":"rollback_incomplete","missing_programs":["routine:f"],"pending_program":{"kind":"EVENT","name":"tick"}})
+        warning.assert_called_once()
+        information.assert_not_called()
+        assert "루틴 f" in warning.call_args.args[2] and "이벤트 tick" in warning.call_args.args[2]
+    finally:
+        dialog.close()

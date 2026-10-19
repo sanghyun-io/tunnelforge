@@ -305,8 +305,10 @@ the dump is read (`partial_table_filter`); `legacy_bit_unverifiable` and
 | --- | --- |
 | `copy_create_privilege_missing` | MySQL: the grants do not show that the account can create `tf_restore_*`, `tf_backup_*` and `tf_promote_*` databases (unreadable grants count as missing); PostgreSQL: it has no CREATE on the database. |
 | `metadata_visibility_unproven` | MySQL: no direct global SELECT, SHOW VIEW and PROCESS grants (roles and partial revokes count as unproven). |
-| `target_routines`, `target_events` | The target namespace has stored routines (PostgreSQL: functions) or MySQL events; the swap does not move them and cannot prove they still work afterwards. |
-| `target_triggers` | MySQL: a dump table has a trigger in the target; PostgreSQL: any table in the schema has one. |
+| `target_routines` | PostgreSQL: the target schema has functions; the swap cannot prove they still work afterwards. |
+| `target_triggers` | PostgreSQL: a table in the target schema has a trigger. |
+| `trigger_name_conflict` | MySQL: a dump trigger conflicts with a trigger on a table that the safe switch keeps. Moving a trigger between replaced tables is supported. |
+| `view_calls_dump_routine` | MySQL: a dump view calls a dump function. Existing-target copy verification creates functions after the switch, so it refuses this case before making a copy. Direct import remains available. |
 | `linked_target_only` | A table or view outside the dump is linked to a dump table or view: an FK in either direction (from the target catalog or the dump's own FK definitions) or a view reading one, in this or another schema. On PostgreSQL, a dump view whose current definition reads a table outside the dump in the same schema does not count: the swap replaces that view in place and leaves the table alone. |
 | `external_parent_missing` | A dump table's own FK names a parent that is neither in the dump nor in the target. |
 | `saved_view_alias` | The linked object is an old view definition an earlier MySQL swap kept (`tf_p_<nonce>_oldv<i>`); clean it up first (`target: "view_aliases"` below). |
@@ -628,7 +630,7 @@ that appears complete. PostgreSQL ALWAYS identities and custom/shared sequence
 semantics are also refused. Ordinary identity restoration uses `MAX(id)+1`, not
 the source's unused/deleted allocation gaps.
 
-### MySQL triggers (format 7, replace mode)
+### MySQL triggers (format 7, replace and verify-in-copy modes)
 
 The manifest's `stored_programs` holds each exported table's triggers. For a
 TRIGGER, `definition` is the exact `information_schema.TRIGGERS.ACTION_STATEMENT`
@@ -672,12 +674,48 @@ Advanced **트리거 없이 테이블만 가져오기** is off by default and ne
 It sends `skip_triggers=true` to preview and import, skips only the dump triggers,
 and reports every omitted trigger separately from restoration failures. Existing
 triggers on replaced target tables are also removed. This toggle is disabled for
-PostgreSQL targets and verify-in-copy mode. Cross-engine imports and table-subset imports
-also report every skipped trigger. All three cases require seeing the plan even
-when no target table is overwritten. Verify-in-copy (including scheduled
-rehearsals) refuses a dump containing stored programs before making a copy with
-`dump_programs_unsupported_in_copy`, including when skip_triggers is set. Existing
-format 1-6 dumps without stored programs follow their previous paths.
+PostgreSQL targets. It also works with verify-in-copy. Cross-engine imports and
+table-subset imports report every skipped trigger. All three cases require seeing
+the plan even when no target table is overwritten. Existing format 1-6 dumps
+without stored programs follow their previous paths.
+
+### MySQL stored programs in verify-in-copy and restore rehearsals
+
+MySQL verify-in-copy accepts dumps and targets containing triggers, routines and
+events. Before making a copy it checks the required TRIGGER, CREATE ROUTINE,
+ALTER ROUTINE and EVENT grants, the trigger binary-log rule (1419), trigger-name
+collisions with tables outside the dump, and explicit references to a differently
+named source database. The trigger-skip toggle removes the dump triggers from
+these checks and lists each omitted trigger. PostgreSQL refusals are unchanged.
+
+The candidate imports tables, data and views. Trigger and routine creation is
+probed using owned temporary names, then the probes are dropped. Events are not
+probed or created in the candidate; no event can run there. A rehearsal verifies
+this copy and cleans up only its own candidate, without promoting anything.
+
+Promotion rechecks the recorded program inventory under table WRITE locks. The
+journal saves the original trigger definitions before detaching them
+(`triggers_detached`). One RENAME replaces the tables. Dump triggers are attached
+in ACTION_ORDER and checked in information_schema (`triggers_attached`), after all
+table writes have finished and before UNLOCK. Then same-named routines and events
+are replaced, recovering the previous definition on failure (`programs_replaced`).
+Tables outside the dump, their triggers, and routines/events absent from the dump
+are preserved. Same-named events keep the target ENABLE/DISABLE state; new events
+follow the source. Dump DEFINER clauses are removed and routine SQL SECURITY is
+preserved. The plan names disappearing target triggers, replaced/kept/created
+programs, events that can run immediately and changes of execution account.
+
+A failure before RENAME restores and verifies the original triggers before
+reporting `failed_original_unchanged`. If restoration cannot be verified it reports
+`failed_original_triggers_missing`, retaining the definitions. A committed table
+replacement with missing programs reports `promoted_incomplete`, never `promoted`.
+Live reconciliation checks both table identities and program definitions after an
+interruption. Old journals without program fields retain their previous digest
+and behavior. Guided recovery drops the promoted triggers, reverses RENAME,
+restores original triggers and routines/events, and removes programs newly created
+by the dump. It still refuses changed data or programs and promotions involving
+views. Partial program recovery reports `rollback_incomplete` and retains its
+journal and all owned namespaces.
 
 ### MySQL routines and events (format 7, full replace import)
 
@@ -751,13 +789,14 @@ A past one-shot event MySQL immediately removes (1588) is a CREATE failure:
 it is never reported as imported, the result is partial, and the saved target
 definition is recovered when available. Replace is
 not atomic; previous-definition recovery can itself fail and is reported.
-Verify-in-copy and scheduled rehearsals still refuse all stored programs before
-creating a copy. Legacy format 1-6 and trigger-only format 7 paths stay supported.
+Verify-in-copy defers stored-program creation until promotion, and scheduled
+rehearsals probe without leaving programs in the candidate, as described above.
+Legacy format 1-6 and trigger-only format 7 paths stay supported.
 
 ### Object support table (Export)
 
 Only the scope below is officially supported. MySQL triggers are preserved in
-format 7, including full-export routines and events in MySQL replace mode. Live-verified on MySQL 8.0.46 / 8.4.11 and
+format 7, including full-export routines and events in MySQL replace and verify-in-copy modes. Live-verified on MySQL 8.0.46 / 8.4.11 and
 PostgreSQL 13.23 / 18.4 (`live_mysql_programs`, `live_export_contract`,
 `unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds`): the
 preserved core, triggers, routines, events, materialized views, MEMORY tables,
@@ -773,8 +812,8 @@ claimed.
 | INVISIBLE columns | Preserved with explicit read/load/INSERT column lists (format 6) | Non-MySQL targets: refused before DROP on import/migration |
 | Generated columns | Proven MySQL expressions preserved (format 6); replace and safe restore recalculate values | Non-MySQL targets: refused before DROP on import/migration; PostgreSQL export remains refused |
 | Unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
-| Triggers on an exported table | Preserved after body verification (format 7, replace mode) | Refused before export; waivable |
-| Routines (functions/procedures), events | Preserved in full format 7 exports and full MySQL replace imports after header/context validation; failed capture is refused with a reason and is waivable | Refused before full export; waivable (no events) |
+| Triggers on an exported table | Preserved after body verification (format 7, replace and verify-in-copy modes) | Refused before export; waivable |
+| Routines (functions/procedures), events | Preserved in full format 7 exports and full MySQL replace or verify-in-copy imports after header/context validation; failed capture is refused with a reason and is waivable | Refused before full export; waivable (no events) |
 | Materialized views | n/a | Refused before full export; waivable |
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
 

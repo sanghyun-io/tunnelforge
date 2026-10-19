@@ -1,0 +1,15 @@
+{
+  "status": "promoted_incomplete",
+  "success": false,
+  "original_unchanged": false,
+  "message": "Tables were promoted, but stored programs are missing. Check the report before recovery.",
+  "error": "program_create_failed: MySqlError { ERROR 1359 (HY000): Trigger already exists }",
+  "missing_programs": [
+    "event:e",
+    "event:new_e",
+    "routine:f",
+    "routine:new_p",
+    "routine:p",
+    "trigger:parent:guard"
+  ]
+}

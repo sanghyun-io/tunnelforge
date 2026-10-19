@@ -635,6 +635,17 @@ def _is_operation_scoped_import_error(message: str) -> bool:
 # One sentence per code the Rust core emits: the leading `code:` of an error, an error
 # event's error_code, and the code of a dump.import_preview blocker or warning.
 CORE_CODE_SENTENCES = {
+    "target_trigger_hidden": "교체할 테이블에 지금 계정으로는 보이지 않는 트리거가 있어 교체하지 않았습니다. 원본은 그대로입니다. TRIGGER 권한이 있는 계정으로 다시 교체하세요.",
+    "rollback_routine_binlog_unsafe": "원래 함수를 지금 서버 설정으로는 다시 만들 수 없어 복구를 시작하지 않았습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 복구하세요.",
+    "rollback_trigger_privilege_missing": "원래 트리거를 다시 만들 TRIGGER 권한이 없어 복구를 시작하지 않았습니다. TRIGGER 권한이 있는 계정으로 복구하세요.",
+    "rollback_trigger_binlog_privilege": "원래 트리거를 다시 만들려면 log_bin_trust_function_creators=1 설정이나 SUPER 권한이 필요해 복구를 시작하지 않았습니다.",
+    "target_routine_binlog_unsafe": "대상에 같은 이름의 함수가 있는데, 지금 서버 설정으로는 교체가 실패했을 때 그 함수를 원래대로 다시 만들 수 없어 복사 전에 멈췄습니다. 그 함수에 DETERMINISTIC 같은 선언을 추가하거나 log_bin_trust_function_creators=1로 바꾼 뒤 다시 시도하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수는 바꾸지 않고 가져옵니다.",
+    "copy_routine_binlog_unsafe": "지금 서버 설정과 계정 권한으로는 이 함수를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요. '먼저 복사본에서 검증하고 교체'를 끄면 이 함수만 건너뛰고 가져옵니다.",
+    "target_trigger_binlog_privilege": "교체할 테이블에 이미 트리거가 있어, 교체하는 동안 그 트리거를 지웠다가 다시 만들어야 합니다. 지금 서버 설정과 계정 권한으로는 트리거를 만들 수 없어 복사 전에 멈췄습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 가져오세요.",
+    "target_program_unsavable": "교체 중에 저장했다가 되돌려야 하는 대상 프로그램을 저장할 수 없어 복사 전에 멈췄습니다.",
+    "view_calls_dump_routine": "덤프의 뷰가 덤프의 함수를 부릅니다. 복사본 검증에서는 함수를 교체한 뒤에 만들기 때문에 이 뷰를 미리 확인할 수 없어 복사 전에 멈췄습니다. '먼저 복사본에서 검증하고 교체'를 끄고 가져오세요.",
+    "rollback_triggers_recreated": "복구 중 트리거를 다시 만들었습니다. 트리거의 생성 기록이 달라졌을 수 있습니다.",
+
     "program_restore_definer_changed": "이전 정의를 복구하면서 정의자가 가져오는 계정으로 바뀌었습니다. 권한과 소유 계정을 확인하세요.",
     "program_restore_definer_may_change": "다른 계정의 정의자를 지정할 권한이 없어 교체 실패 후 복구하면 정의자가 가져오는 계정으로 바뀔 수 있습니다.",
     "program_restore_unavailable": "대상의 이전 정의를 안전하게 복구할 수 있는지 확인하지 못해 이 객체는 교체하지 않았습니다. 보고서에서 세션 설정과 권한을 확인하세요.",
@@ -648,7 +659,7 @@ CORE_CODE_SENTENCES = {
     "routine_binlog_unsafe": "함수를 바이너리 로그 설정 때문에 만들지 못하면 건너뛰며, 대상의 같은 이름 함수는 유지합니다. log_bin_trust_function_creators 설정과 함수의 DETERMINISTIC·SQL 접근 선언을 확인하세요.",
     "program_probe_cleanup_failed": "확인용 루틴을 지우지 못해 시작하지 않았습니다. 보고서의 남은 객체 이름과 ALTER ROUTINE 권한을 확인하세요.",
     "program_probe_cleanup_unproven": "확인용 루틴을 지우려면 ALTER ROUTINE 권한이 필요합니다.",
-    "program_privilege_missing": "루틴·이벤트를 만들 권한이 없습니다. CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.",
+    "program_privilege_missing": "저장 프로그램을 만들거나 되돌릴 권한이 없습니다. TRIGGER·CREATE ROUTINE·ALTER ROUTINE·EVENT 권한을 확인하세요.",
     "program_replace_privilege_unproven": "다른 계정이 만든 저장 프로그램은 교체하지 못할 수 있습니다.",
     "program_event_system_timezone": "이 이벤트의 SYSTEM 시간대는 대상 서버의 시스템 시간대로 해석됩니다.",
 
@@ -663,7 +674,6 @@ CORE_CODE_SENTENCES = {
     "trigger_privilege_missing": "이 계정에 트리거를 만들 TRIGGER 권한이 없습니다.",
     "program_probe_failed": "저장 프로그램을 만들 수 없어 시작하지 않았습니다. 대상 테이블은 바뀌지 않았습니다.",
     "program_source_schema_reference": "저장 프로그램 본문이 원본 DB 이름을 참조합니다. 같은 이름 DB로 가져오거나 정의에서 DB 이름을 빼세요.",
-    "dump_programs_unsupported_in_copy": "트리거·루틴·이벤트가 담긴 덤프는 아직 복사본에서 검증할 수 없습니다.",
     "programs_skipped_cross_engine": "다른 DB 종류로 가져오므로 덤프의 트리거·루틴·이벤트를 만들지 않습니다.",
     "programs_skipped_partial": "선택한 테이블에 딸린 객체만 가져오므로 나머지 객체는 만들지 않습니다.",
     "programs_skipped_toggle": "'트리거 없이 테이블만 가져오기'를 켜서 덤프의 트리거를 만들지 않습니다.",
@@ -697,7 +707,6 @@ CORE_CODE_SENTENCES = {
     "copy_create_privilege_missing": "이 계정에 복사본과 백업을 둘 DB(PostgreSQL은 스키마)를 만들 권한이 없거나, 권한 목록으로 확인할 수 없습니다.",
     "metadata_visibility_unproven": "이 계정에 서버 전체를 조회하는 권한(SELECT, SHOW VIEW, PROCESS)이 없거나 확인할 수 없어, 대상에 이어진 것을 모두 확인할 수 없습니다.",
     "target_routines": "대상에 저장 프로시저나 함수가 있어, 교체 뒤에도 제대로 동작하는지 확인할 수 없습니다.",
-    "target_events": "대상에 예약 이벤트가 있어, 교체 뒤에도 제대로 동작하는지 확인할 수 없습니다.",
     "target_triggers": "대상 테이블에 트리거가 있어 교체할 수 없습니다.",
     "linked_target_only": "덤프에 없는 테이블이나 뷰가 외래 키나 뷰로 덤프 테이블과 이어져 있어, 그대로 둔 채 교체할 수 없습니다.",
     "saved_view_alias": "이전 교체에서 남긴 옛 뷰가 있습니다. 작업 목록에서 이전 Import 기록의 '복원 백업 관리'에서 먼저 정리하세요.",
@@ -788,6 +797,30 @@ def describe_program_warnings(items: object) -> List[str]:
     return lines
 
 
+def describe_program_results(result: dict) -> Tuple[List[str], List[str]]:
+    """Shared user sentences and sanitized details for failed or restored programs."""
+    from src.core.error_report_sanitizer import sanitize_local_diagnostic
+
+    lines, details, warnings = [], [], list(result.get("program_warnings") or [])
+    for failure in result.get("programs_failed") or []:
+        if not isinstance(failure, dict):
+            continue
+        name = sanitize_local_diagnostic(str(failure.get("name") or ""))
+        line = describe_core_code(failure.get("code") or "program_create_failed", name) or describe_core_code("program_create_failed", name)
+        if "previous_restored" in failure:
+            line += " " + translate_text("이전 정의 복구 성공" if failure["previous_restored"] else "이전 정의 복구 실패")
+        lines.append(line)
+        for key in ("error", "restore_error"):
+            if failure.get(key):
+                details.append(f"{name}: " + sanitize_local_diagnostic(str(failure[key])))
+        warnings.extend(failure.get("warnings") or [])
+        warnings.extend(failure.get("restore_warnings") or [])
+    if result.get("program_verification_error"):
+        details.append(sanitize_local_diagnostic(str(result["program_verification_error"])))
+    lines.extend(sanitize_local_diagnostic(line) for line in describe_program_warnings(warnings))
+    return list(dict.fromkeys(lines)), list(dict.fromkeys(details))
+
+
 # How the core's manifest warnings begin (adapters.rs WARNING_*) and the code Import gives
 # them (import.rs manifest_warning_code).
 _MANIFEST_WARNING_CODES = (
@@ -855,6 +888,42 @@ def describe_core_failure(message: object) -> Optional[str]:
     return " ".join(sentences) or None
 
 
+_INCOMPLETE_PROMOTION_SENTENCES = {
+    "promoted_incomplete": "테이블은 교체했지만 저장 프로그램이 빠져 있습니다. 백업을 보존하고 복구하세요.",
+    "failed_original_triggers_missing": "테이블은 교체하지 않았지만 원래 트리거를 되살리지 못했습니다. 보고서에 저장된 정의로 복구하세요.",
+}
+
+
+def describe_incomplete_promotion(status: object) -> str:
+    return translate_text(_INCOMPLETE_PROMOTION_SENTENCES.get(str(status or ""), ""))
+
+
+def describe_specific_promotion_failure(result: dict, message: object = "") -> Optional[str]:
+    """Keep generic promotion wrappers behind the recorded outcome's guidance."""
+    code = str(result.get("error_code") or "").lower()
+    if code != "safe_promotion" and (sentence := describe_core_code(code)):
+        return sentence
+    for value in (message, result.get("error")):
+        text = re.sub(r"^\s*safe_promotion:\s*", "", str(value or ""))
+        if any(match.group(1).lower()=="safe_promotion" for match in _CORE_CODE_TOKEN.finditer(text)):
+            continue
+        if sentence := describe_core_failure(text):
+            return sentence
+    return None
+
+
+_IMPORT_TOGGLE_NAMES = ("먼저 복사본에서 검증하고 교체", "트리거 없이 테이블만 가져오기")
+
+
+def without_import_toggle_hints(sentence: str) -> str:
+    # A toggle-dependent prefix can qualify an otherwise useful base sentence.
+    for name in _IMPORT_TOGGLE_NAMES:
+        sentence = sentence.replace(f"'{name}'를 켜서 ", "")
+    names = (*_IMPORT_TOGGLE_NAMES, *(translate_text(name) for name in _IMPORT_TOGGLE_NAMES))
+    return " ".join(part for part in re.split(r"(?<=[.!?])\s+", sentence)
+                    if not any(name in part for name in names))
+
+
 IMPORT_PREVIEW_CAPABILITY = "dump.import_preview"
 _UNKNOWN_TARGET_MESSAGE = "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요."
 _MISSING_MANIFEST_MESSAGE = "TunnelForge Rust dump manifest를 찾을 수 없습니다."
@@ -863,7 +932,7 @@ _UNKNOWN_COPY_BLOCKER = "복사본에서 검증할 수 없는 다른 이유가 �
 _UNVERIFIED_COPY_MESSAGE = "복사본 검증 결과를 확인할 수 없습니다. 원본과 복사본의 상태를 Import 보고서에서 확인하세요."
 
 
-def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKER) -> List[str]:
+def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKER, omit_verify_hint: bool = False) -> List[str]:
     """One line per copy_blockers code (why verify-in-copy stopped), naming the tables or views it concerns.
 
     Preview ``blockers`` share the shape; ``unknown`` words a code without a sentence."""
@@ -871,11 +940,17 @@ def describe_copy_blockers(blockers: object, unknown: str = _UNKNOWN_COPY_BLOCKE
     for item in blockers if isinstance(blockers, list) else []:
         if isinstance(item, dict):
             names = grouped.setdefault(str(item.get("code") or "").lower(), [])
-            if item.get("table") and str(item["table"]) not in names:
-                names.append(str(item["table"]))
+            if item.get("table"):
+                name = {"original triggers": translate_text("원래 트리거"), "tf_restore_*": translate_text("검증용 복사본")}.get(str(item["table"]), str(item["table"]))
+                if name not in names:
+                    names.append(name)
+
     lines = []
     for code, names in grouped.items():
-        sentence = translate_text(CORE_CODE_SENTENCES.get(code) or unknown)
+        source = CORE_CODE_SENTENCES.get(code) or unknown
+        if omit_verify_hint:
+            source = without_import_toggle_hints(source)
+        sentence = translate_text(source)
         shown = ", ".join(names[:10]) + (f" … (+{len(names) - 10})" if len(names) > 10 else "")
         lines.append(f"- {sentence}" + (f" ({shown})" if names else ""))
     return lines
@@ -914,6 +989,7 @@ class RustDumpImporter(_RustDumpClientBase):
         timezone_sql: Optional[str] = None,
         use_source_timezone: bool = True,
         skip_triggers: bool = False,
+        import_mode: str = "replace",
     ) -> Tuple[bool, str, dict]:
         """What a replace import would do, read from the target without changing it.
 
@@ -933,6 +1009,7 @@ class RustDumpImporter(_RustDumpClientBase):
             )
             if payload is None:
                 return False, _UNKNOWN_TARGET_MESSAGE, {}
+            payload["mode"] = import_mode
             if skip_triggers:
                 payload["skip_triggers"] = True
             if IMPORT_PREVIEW_CAPABILITY not in (self.facade.hello().get("capabilities") or []):
@@ -1068,7 +1145,7 @@ class RustDumpImporter(_RustDumpClientBase):
 
             if import_mode == "safe":
                 candidate = restore_target_connection_info(result.get("candidate_target"))
-                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "candidate_created", "restore_id", "report_path", "plan_digest")}
+                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "candidate_created", "restore_id", "report_path", "plan_digest", "triggers_dropped", "programs", "programs_kept", "events_enabled", "programs_skipped_toggle")}
                 state.update(event="safe_restore_ready", candidate_target=candidate,
                              original_target=restore_target_connection_info(result.get("original_target")))
                 if raw_output_callback:
@@ -1079,11 +1156,8 @@ class RustDumpImporter(_RustDumpClientBase):
                     reason = str((result.get("message") if result.get("report_write_failed") else result.get("error"))
                                  or result.get("message") or "")
                     self.last_error_code = classify_error_code(result.get("error_code"), reason)
-                    stops = describe_copy_blockers(result.get("copy_blockers"))
+                    stops = describe_copy_blockers(result.get("copy_blockers"), omit_verify_hint=verify_only)
                     if stops:
-                        # Rehearsals have no interactive verify toggle.
-                        if not verify_only and any(item.get("code") == "dump_programs_unsupported_in_copy" for item in result.get("copy_blockers") or [] if isinstance(item, dict)):
-                            stops.append(translate_text("'먼저 복사본에서 검증하고 교체'를 끄면 진행할 수 있습니다."))
                         return False, "\n".join([describe_core_code("copy_refused"), *stops]), import_results
                     return False, "\n".join([reason, *(str(item) for item in result.get("blockers") or [])]), import_results
                 new_target = result.get("status") == "completed_new_target" and result.get("namespace_existed") is False and result.get("namespace_created") is True
@@ -1104,45 +1178,52 @@ class RustDumpImporter(_RustDumpClientBase):
                 message = translate_text("테이블 데이터는 가져왔지만 일부 객체를 복원하지 못했습니다.") + f" ({len(tables_to_import)}개 테이블, {rows:,} rows)"
             if import_mode == "safe":
                 candidate_name = candidate.get("schema") if self.config.engine == "postgresql" else candidate.get("database")
-                message = f"복사본 {candidate_name}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다."
+                message = translate_text("복사본 {}에 넣고 검증했습니다. 원본은 그대로이고 교체를 기다립니다.").format(candidate_name)
                 if new_target:
-                    message = f"새 대상 {candidate_name}을 만들어 넣고 검증했습니다."
+                    message = translate_text("새 대상 {}을 만들어 넣고 검증했습니다.").format(candidate_name)
+                for key, sentence in (("programs_kept", "그대로 둘 루틴·이벤트: {}"),):
+                    if result.get(key):
+                        message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in result[key]))
+                programs = result.get("programs") or {}
+                for key, sentence in (("replace", "교체할 루틴·이벤트: {}"), ("create", "만들 루틴·이벤트: {}")):
+                    ids = programs.get(key) or []
+                    triggers = [item for item in ids if str(item).startswith("trigger:")]
+                    if triggers:
+                        message += "\n" + translate_text("만들 트리거: {}").format(", ".join(display_program_name(item) for item in triggers))
+                    ids = [item for item in ids if item not in triggers]
+                    if ids:
+                        message += "\n" + translate_text(sentence).format(", ".join(display_program_name(item) for item in ids))
                 if result.get("status") == "ready_for_review":
-                    message += " 교체 전에 따로 확인할 것이 있습니다."
+                    message += "\n" + translate_text("교체 전에 따로 확인할 것이 있습니다.")
                     for blocker in result.get("blockers") or []:
                         message += f"\n{blocker}"
             if views_imported:
-                message += f", View {len(views_imported)}개"
+                message += ("\n" if import_mode == "safe" else ", ") + f"View {len(views_imported)}개"
             for kinds, label in [(("TRIGGER",), "트리거"), (("PROCEDURE", "FUNCTION"), "루틴"), (("EVENT",), "이벤트")]:
                 count = sum(item.get("kind", "TRIGGER") in kinds for item in result.get("programs_imported") or [] if isinstance(item, dict))
                 if count:
-                    message += ", " + translate_text({"트리거":"트리거 {}개","루틴":"루틴 {}개","이벤트":"이벤트 {}개"}[label]).format(count)
+                    message += ("\n" if import_mode == "safe" else ", ") + translate_text({"트리거":"트리거 {}개","루틴":"루틴 {}개","이벤트":"이벤트 {}개"}[label]).format(count)
             programs_failed = result.get("programs_failed") or []
             if programs_failed:
                 self.last_error_code = classify_error_code(programs_failed[0].get("code") or "program_create_failed", "")
-            for failure in programs_failed:
-                name = str(failure.get("name", ""))
-                line = describe_core_code(failure.get("code") or "program_create_failed", name)
-                if "previous_restored" in failure:
-                    line += " " + translate_text("이전 정의 복구 성공" if failure["previous_restored"] else "이전 정의 복구 실패")
+            program_lines, _ = describe_program_results(result)
+            for line in program_lines:
                 message += "\n" + line
+                if progress_callback:
+                    progress_callback(line)
             for key in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle"):
                 if result.get(key):
                     skipped_line = describe_core_code(key) + " " + ", ".join(display_program_name(item) for item in result[key])
                     message += "\n" + skipped_line
                     if progress_callback:
                         progress_callback(skipped_line)
-            for warning_line in describe_program_warnings(result.get("program_warnings")):
-                message += "\n" + warning_line
-                if progress_callback:
-                    progress_callback(warning_line)
             if views_failed:
                 failed_names = ", ".join(
                     str(item.get("name", "")) for item in views_failed if isinstance(item, dict)
                 )
-                message += f" (View {len(views_failed)}개 생성 실패: {failed_names})"
+                message += ("\n" if import_mode == "safe" else " ") + f"(View {len(views_failed)}개 생성 실패: {failed_names})"
             if views_skipped:
-                message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
+                message += ("\n" if import_mode == "safe" else " ") + f"(크로스 엔진 View {len(views_skipped)}개 건너뜀)"
             if import_mode != "safe" and result.get("namespace_created") is True:
                 if self.config.engine == "postgresql":
                     # Without a configured database the schema lands in the `postgres` database.
