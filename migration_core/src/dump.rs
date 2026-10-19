@@ -1300,7 +1300,8 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         let tables: Vec<&str> = schema.tables.iter().map(|table| table.name.as_str()).collect();
         export_warnings.extend(mysql_visibility_warning(&endpoint, &tables, full_export));
     } else if endpoint.engine=="postgresql" {
-        let comments = unheld.iter().filter(|id|schema.tables.iter().any(|table|id.starts_with(&format!("comment:{}:",table.name)))).collect::<Vec<_>>();
+        let comments = inspection.object_reasons.iter().filter(|(id,code)|*code=="comments_not_exported" && schema.tables.iter().any(|table|id.starts_with(&format!("comment:{}:",table.name))))
+            .map(|(id,_)|id).collect::<Vec<_>>();
         if !comments.is_empty() {
             let mut names = comments.iter().take(20).map(|id|id.as_str()).collect::<Vec<_>>().join(", ");
             if comments.len()>20 { names.push_str(&format!(", … (+{})", comments.len()-20)); }

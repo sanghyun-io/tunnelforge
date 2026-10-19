@@ -922,7 +922,7 @@ fn inspect_postgresql_unsupported_objects(
     for row in client.query(
         "SELECT t.relname,COALESCE(a.attname,'TABLE') FROM pg_description d JOIN pg_class t ON t.oid=d.objoid JOIN pg_namespace n ON n.oid=t.relnamespace LEFT JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.objsubid WHERE d.classoid='pg_class'::regclass AND n.nspname=$1 AND t.relkind IN ('r','p') AND (d.objsubid=0 OR (a.attnum>0 AND NOT a.attisdropped)) ORDER BY t.relname,d.objsubid", &[&schema_name],
     ).map_err(|err| format!("postgresql comment inspect error: {err}"))? {
-        objects.push(format!("comment:{}:{}",row.get::<_,String>(0),row.get::<_,String>(1)));
+        reasons.insert(format!("comment:{}:{}",row.get::<_,String>(0),row.get::<_,String>(1)),"comments_not_exported".into());
     }
     for id in &objects {
         let code = match id.split(':').next().unwrap_or("") {
@@ -934,7 +934,7 @@ fn inspect_postgresql_unsupported_objects(
         reasons.entry(id.clone()).or_insert_with(||code.into());
     }
     objects.sort(); objects.dedup();
-    debug_assert!(reasons.values().all(|code|POSTGRES_REFUSAL_REASONS.contains(&code.as_str())));
+    debug_assert!(reasons.values().all(|code|POSTGRES_REFUSAL_REASONS.contains(&code.as_str()) || POSTGRES_WARNING_REASONS.contains(&code.as_str())));
     Ok(objects)
 }
 

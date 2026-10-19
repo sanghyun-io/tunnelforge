@@ -11,7 +11,7 @@ fn pg_generated_columns_verify_in_copy_promotes() {
     let Some(s)=pg_objects::Sandbox::new() else { return };
     pg_objects::db(&s.source).batch_execute("CREATE TABLE sample(id int PRIMARY KEY,g int GENERATED ALWAYS AS(id+1) STORED, v int GENERATED ALWAYS AS(id+3) VIRTUAL); INSERT INTO sample(id) VALUES(1)").unwrap();
     s.dump();
-    pg_objects::db(&s.target).batch_execute("CREATE TABLE sample(id int PRIMARY KEY,g int GENERATED ALWAYS AS(id+1) STORED, v int GENERATED ALWAYS AS(id+3) VIRTUAL); INSERT INTO sample(id) VALUES(91)").unwrap();
+    pg_objects::db(&s.target).batch_execute("CREATE TABLE sample(id int PRIMARY KEY,g int GENERATED ALWAYS AS(id+1) STORED, v int GENERATED ALWAYS AS(id+3) VIRTUAL); INSERT INTO sample(id) VALUES(91); COMMENT ON COLUMN sample.id IS 'target metadata'").unwrap();
     let prepared=pg_objects::run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"safe"}));
     assert_eq!(prepared["ready_for_switch"],true,"{prepared:#}");
     let planned=pg_objects::run("dump.promote",json!({"endpoint":s.target,"action":"plan","report_path":prepared["report_path"],"restore_id":prepared["restore_id"]}));

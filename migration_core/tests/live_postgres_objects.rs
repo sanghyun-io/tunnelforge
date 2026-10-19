@@ -67,6 +67,9 @@ fn postgres_security_rules_inheritance_and_comments_are_reported() {
         source.batch_execute("DROP TABLE sample,child CASCADE").unwrap();
     }
     source.batch_execute("CREATE TABLE sample(id int); COMMENT ON TABLE sample IS 'table'; COMMENT ON COLUMN sample.id IS 'column'").unwrap();
+    let inspected=migration_core::inspect_live(&s.source).unwrap();
+    assert!(inspected.unsupported_objects.iter().all(|id|!id.starts_with("comment:")));
+    assert_eq!(inspected.object_reasons["comment:sample:id"],"comments_not_exported");
     let exported=s.dump();
     let warnings=exported["manifest_warnings"].as_array().unwrap();
     assert_eq!(warnings.len(),1);
