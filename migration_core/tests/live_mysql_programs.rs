@@ -560,7 +560,9 @@ fn wait_for_preserved_completion(db:&mut mysql::PooledConn) {
         if done==Some(true) && rows==Some(1) { return }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    panic!("preserved event did not complete exactly once");
+    let event:Option<(String,Option<String>)>=db.query_first("SELECT STATUS, CAST(LAST_EXECUTED AS CHAR) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
+    let rows:Option<u64>=db.query_first("SELECT COUNT(*) FROM audit").unwrap();
+    panic!("preserved event did not complete exactly once: event={event:?}, audit_rows={rows:?}");
 }
 
 #[test]
@@ -569,7 +571,28 @@ fn due_preserved_events_complete_once_without_failed_import_or_replacement_rollb
         let Some(mut s)=Sandbox::new() else {return}; let mut db=conn(&s.endpoint);
         db.query_drop("CREATE TABLE audit(id INT)").unwrap();
         db.query_drop(format!("CREATE EVENT e ON SCHEDULE {schedule} ON COMPLETION PRESERVE DISABLE DO INSERT INTO audit VALUES(1)")).unwrap();
-        db.query_drop("ALTER EVENT e ENABLE").unwrap(); assert_eq!(status(&mut db,"e"),"ENABLED"); s.dump();
+        db.query_drop("SET GLOBAL event_scheduler=ON").unwrap();
+        db.query_drop("ALTER EVENT e ENABLE").unwrap();
+        // Establish the native result first: an already-ended recurring schedule
+        // need not execute at all, whereas a due one-shot event executes once.
+        let mut native_completed=false;
+        for _ in 0..100 {
+            let done:Option<bool>=db.query_first("SELECT STATUS='DISABLED' AND LAST_EXECUTED IS NOT NULL FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
+            let rows:Option<u64>=db.query_first("SELECT COUNT(*) FROM audit").unwrap();
+            if done==Some(true) && rows==Some(1) {native_completed=true;break}
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let native_status=status(&mut db,"e");
+        let native_rows:Option<u64>=db.query_first("SELECT COUNT(*) FROM audit").unwrap();
+        assert!(native_rows==Some(0) || native_rows==Some(1));
+        if schedule.starts_with("AT ") {assert!(native_completed,"native one-shot event did not complete");}
+        eprintln!("native preserved schedule={schedule}: status={native_status}, rows={native_rows:?}");
+        // Freeze source metadata/data while exporting so a source execution cannot
+        // be imported as an audit row and then counted as a target execution.
+        db.query_drop("SET GLOBAL event_scheduler=OFF").unwrap();
+        db.query_drop("ALTER EVENT e ENABLE").unwrap();
+        db.query_drop("DELETE FROM audit").unwrap();
+        s.dump();
         for existing in [false,true] { for complete_before_read in [false,true] {
             db.query_drop("SET GLOBAL event_scheduler=OFF").unwrap();
             let target=s.other(true);
@@ -579,19 +602,25 @@ fn due_preserved_events_complete_once_without_failed_import_or_replacement_rollb
             db.query_drop("SET GLOBAL event_scheduler=ON").unwrap();
             let mut output=Vec::new(); let mut injected=false;
             handle_request_streaming(Request{command:"dump.import".into(),request_id:None,payload:s.payload(&target)},|e| {
-                if complete_before_read && e["event"]=="program_created" && e["kind"]=="EVENT" {
+                if complete_before_read && native_completed && e["event"]=="program_created" && e["kind"]=="EVENT" {
                     let mut fresh=conn(&target); fresh.query_drop("ALTER EVENT e ENABLE").unwrap();
                     wait_for_preserved_completion(&mut fresh); injected=true;
                 }
                 output.push(e);
             });
-            let v=success(output); assert_eq!(injected,complete_before_read);
+            let v=success(output); assert_eq!(injected,complete_before_read && native_completed);
             assert!(v["programs_failed"].as_array().unwrap().is_empty(),"{v}");
-            let mut fresh=conn(&target); wait_for_preserved_completion(&mut fresh);
+            let mut fresh=conn(&target);
+            if native_completed {wait_for_preserved_completion(&mut fresh)}
+            else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert_eq!(status(&mut fresh,"e"),native_status);
+                assert_eq!(fresh.query_first::<u64,_>("SELECT COUNT(*) FROM audit").unwrap(),native_rows);
+            }
             let body:Option<String>=fresh.query_first("SELECT EVENT_DEFINITION FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() AND EVENT_NAME='e'").unwrap();
             assert!(body.unwrap().contains("INSERT INTO audit"),"old definition was restored");
             let imported=v["programs_imported"].as_array().unwrap().iter().find(|p|p["kind"]=="EVENT").unwrap();
-            if complete_before_read { assert_eq!(imported["status"],"DISABLED"); assert_eq!(imported["enabled"],false); }
+            if complete_before_read && native_completed { assert_eq!(imported["status"],"DISABLED"); assert_eq!(imported["enabled"],false); }
         }}
     }
 }
