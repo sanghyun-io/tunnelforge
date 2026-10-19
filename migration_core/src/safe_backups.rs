@@ -48,13 +48,9 @@ impl Entry {
         dirs.iter().filter_map(|dir| read_json(&dump_import_report_path(dir).ok()?)).collect()
     }
 
-    fn rolled_back(&self, credentials: &Endpoint) -> Result<Option<Value>,String> {
-        let Some(record) = self.rollbacks().pop().filter(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete"))) else {return Ok(None)};
-        let restored = match self.stored.as_ref().map(|s|&s.engine_plan) {
-            Some(EnginePlan::MySql(plan)) => crate::safe_promote_mysql::inspect_rollback(credentials,plan,&record)?.is_some_and(|missing|missing.is_empty()),
-            _ => record["status"]=="rolled_back",
-        };
-        Ok(if restored {Some(record)} else {None})
+    fn rolled_back(&self, backup: Option<&Value>) -> Option<Value> {
+        self.rollbacks().pop().filter(|record| record["status"]=="rolled_back"
+            || (record["status"]=="rollback_incomplete" && backup.is_some_and(|b|b["verdict"]=="rolled_back")))
     }
 
     fn new_table_ids(&self) -> Option<Value> {
@@ -190,19 +186,22 @@ fn inspect_backup(entry: &Entry, credentials: &Endpoint, deep: bool) -> Result<O
                 || entry.journal_status()=="failed_original_unchanged" || entry.rollbacks().last().is_some_and(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete")));
             let mut backup = crate::safe_promote_mysql::inspect_backup_recorded(&endpoint,plan,deep,fingerprint.as_ref(),completed,entry.journal_status()=="failed_original_unchanged")?;
             if let Some(record) = entry.rollbacks().last().filter(|r|matches!(r["status"].as_str(),Some("rolled_back" | "rollback_incomplete"))) {
-                match crate::safe_promote_mysql::inspect_rollback(&endpoint,plan,record) {
-                    Ok(Some(missing)) => {
-                        backup["verdict"] = json!(if missing.is_empty() {"rolled_back"} else {"rollback_incomplete"});
-                        backup["missing_programs"] = json!(missing);
+                backup["verdict"] = record["status"].clone();
+                backup["missing_programs"] = record["missing_programs"].clone();
+                backup["pending_program"] = record["pending_program"].clone();
+                if record["status"]=="rollback_incomplete" {
+                    use crate::safe_promote_mysql::RollbackInspection;
+                    match crate::safe_promote_mysql::inspect_rollback(&endpoint,plan,record) {
+                        Ok(RollbackInspection::Programs(missing)) => {
+                            backup["verdict"] = json!(if missing.is_empty() {"rolled_back"} else {"rollback_incomplete"});
+                            backup["missing_programs"] = json!(missing);
+                        }
+                        Ok(RollbackInspection::ProgramsNotVisible) => backup["note"] = json!(crate::safe_promote_mysql::ROLLBACK_VISIBILITY_NOTE),
+                        Ok(RollbackInspection::OriginalIdsChanged) => {},
+                        Err(err) => backup["program_verification_error"] = json!(err),
                     }
-                    Err(err) => {
-                        backup["verdict"] = record["status"].clone();
-                        backup["missing_programs"] = record["missing_programs"].clone();
-                        backup["program_verification_error"] = json!(err);
-                    }
-                    Ok(None) => {}
                 }
-                backup["pending_program"] = if backup["verdict"]=="rolled_back" {Value::Null} else {record["pending_program"].clone()};
+                if backup["verdict"]=="rolled_back" {backup["pending_program"]=Value::Null;}
             }
             Ok(Some(backup))
         },
@@ -304,7 +303,7 @@ fn entry_json(entry: &Entry, credentials: &Endpoint) -> Result<Value, String> {
     if !rollbacks.is_empty() {
         out["rollbacks"] = json!(rollbacks.iter().map(|r| json!({"status": r["status"], "displaced_backup": r["displaced_backup"], "missing_programs":r["missing_programs"],"pending_program":r["pending_program"],"program_warnings":r["program_warnings"]})).collect::<Vec<_>>());
     }
-    if let Some(record) = entry.rolled_back(credentials)? {
+    if let Some(record) = entry.rolled_back(out.get("backup")) {
         if let Some(displaced) = inspect_displaced(entry, credentials, &record, false)? {
             out["displaced"] = displaced;
         }
@@ -342,7 +341,7 @@ fn list(request: &Request, credentials: &Endpoint) -> Result<Value, String> {
         }
     }
     // Namespaces that follow the backup naming but have no journal in input_dirs.
-    let known: std::collections::BTreeSet<String> = items.iter().filter_map(|i| i["backup"]["namespace"].as_str().map(str::to_string)).collect();
+    let known: std::collections::BTreeSet<String> = items.iter().flat_map(|i|[&i["backup"]["namespace"],&i["displaced"]["namespace"]]).filter_map(|n|n.as_str().map(str::to_string)).collect();
     let named = if credentials.engine == "mysql" {
         crate::safe_promote_mysql::backup_named_namespaces(credentials)?
     } else {
@@ -385,10 +384,14 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
     let mut blockers: Vec<String> = Vec::new();
     let (namespace, tables, notes): (String, Vec<Value>, Vec<String>);
     let mut engine_endpoint = credentials.clone();
+    let backup = if matches!(target,"backup" | "displaced") {inspect_backup(entry,credentials,target=="backup")?} else {None};
+    if let Some(error) = backup.as_ref().and_then(|b|b["program_verification_error"].as_str()) {blockers.push(error.to_string());}
+    if let Some(note) = backup.as_ref().and_then(|b|b["note"].as_str()).filter(|_|backup.as_ref().is_some_and(|b|b["verdict"]=="rollback_incomplete")) {blockers.push(note.to_string());}
+    let recovered = entry.rolled_back(backup.as_ref());
     match target {
-        "backup" if entry.rolled_back(credentials)?.is_some() => {
+        "backup" if recovered.is_some() => {
             // After a recovery the promotion backup namespace is an empty shell.
-            let backup = inspect_backup(entry, credentials, false)?.ok_or("this restore has no promotion journal on this server")?;
+            let backup = backup.as_ref().ok_or("this restore has no promotion journal on this server")?;
             namespace = backup["namespace"].as_str().unwrap_or("").to_string();
             let (exists, table_count, view_count) = counts(credentials, &Value::Null, &namespace)?;
             if !exists {
@@ -447,21 +450,27 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
             notes = vec!["Old view definitions the promotion kept under these names in the original database; the active views are not touched.".into()];
         }
         "displaced" => {
-            let record = entry.rolled_back(credentials)?.ok_or("no completed recovery is recorded for this restore")?;
-            let displaced = inspect_displaced(entry, credentials, &record, true)?.ok_or("this restore has no promotion journal")?;
-            blockers.extend(displaced["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
-            if displaced["ownership"] != "proven" || displaced["unchanged"] != true {
-                blockers.push("the recovery backup is not proven owned and unchanged".into());
+            if let Some(record) = recovered {
+                let displaced = inspect_displaced(entry, credentials, &record, true)?.ok_or("this restore has no promotion journal")?;
+                blockers.extend(displaced["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+                if displaced["ownership"] != "proven" || displaced["unchanged"] != true {
+                    blockers.push("the recovery backup is not proven owned and unchanged".into());
+                }
+                namespace = displaced["namespace"].as_str().unwrap_or("").to_string();
+                tables = displaced["tables"].as_array().cloned().unwrap_or_default();
+            } else {
+                let record = entry.rollbacks().pop().filter(|r|r["status"]=="rollback_incomplete").ok_or("no completed recovery is recorded for this restore")?;
+                namespace = record["displaced_backup"].as_str().ok_or("recovery backup namespace missing")?.to_string();
+                blockers.push("the recorded recovery is still incomplete; retain the recovery backup until its programs are verified".into());
+                tables = vec![];
             }
-            namespace = displaced["namespace"].as_str().unwrap_or("").to_string();
             if !namespace.starts_with("tf_backup_rb_") {
                 blockers.push("namespace does not follow the owned recovery backup naming".into());
             }
-            tables = displaced["tables"].as_array().cloned().unwrap_or_default();
             notes = vec!["This namespace holds the tables that were active before the recovery.".into()];
         }
         "backup" => {
-            let backup = inspect_backup(entry, credentials, true)?.ok_or("this restore has no promotion journal on this server")?;
+            let backup = backup.as_ref().ok_or("this restore has no promotion journal on this server")?;
             blockers.extend(backup["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
             let verdict = backup["verdict"].as_str().unwrap_or("undeterminable");
             if !matches!(verdict, "promoted") {

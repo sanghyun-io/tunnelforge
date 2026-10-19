@@ -674,7 +674,7 @@ fn verdict(fx: &Fixture) -> Value {
 
 #[test]
 #[ignore = "requires disposable TF_MYSQL_HOST"]
-fn rv204_unrelated_routine_created_after_promotion_blocks_backup_cleanup() {
+fn rv204_unrelated_routine_created_after_promotion_keeps_cleanup_and_rollback_allowed() {
     let base = endpoints().into_iter().find(|e| e.engine == "mysql").unwrap();
     let mut fx = drift_fixture(&base, &[], &["CREATE PROCEDURE app_proc() SELECT 1"]);
     let before = verdict(&fx);
@@ -702,7 +702,7 @@ fn rv204_unrelated_routine_created_after_promotion_blocks_backup_cleanup() {
 
 #[test]
 #[ignore = "requires disposable TF_MYSQL_HOST"]
-fn rv204_dumped_not_preserve_event_firing_after_promotion_flips_verdict() {
+fn rv204_dumped_not_preserve_event_firing_after_promotion_keeps_promoted_verdict() {
     let base = endpoints().into_iter().find(|e| e.engine == "mysql").unwrap();
     let fx = drift_fixture(&base, &["CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 40 SECOND ON COMPLETION NOT PRESERVE ENABLE DO SET @tf_rv=1"], &[]);
     let before = verdict(&fx);

@@ -8,8 +8,8 @@ fn rvg_save(name: &str, value: &Value) {
 }
 
 /// [0] rollback: RENAME rejected (1050), SELECT 1 succeeds, the connection is then lost inside the
-/// locked recover_triggers (killed while it waits for the backup lock). recovered_locked=true blocks
-/// the fresh-connection recovery.
+/// locked recover_triggers (killed while it waits for the backup lock). A fresh connection must
+/// restore the start triggers and leave the recovery retryable.
 #[test]
 fn safe_promote_rvg0_rollback_lost_connection_in_locked_recovery() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -81,7 +81,7 @@ fn safe_promote_rvg0_rollback_lost_connection_in_locked_recovery() {
 }
 
 /// [0] promote: RENAME rejected (1050), SELECT 1 succeeds, connection killed at the start of the
-/// locked recovery. recovered_locked=true skips the fresh-connection recovery.
+/// locked recovery. A fresh connection must still restore the original triggers.
 #[test]
 fn safe_promote_rvg0_promote_lost_connection_in_locked_recovery() {
     let _guard = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

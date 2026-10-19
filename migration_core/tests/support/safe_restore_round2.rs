@@ -396,3 +396,5 @@ fn rvf_i_show_create_view_escaping_is_independent_of_no_backslash_mode() {
 }
 
 include!("safe_restore_round3.rs");
+
+include!("safe_restore_round4.rs");

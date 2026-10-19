@@ -2540,12 +2540,42 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
     Ok(state)
 }
 
-pub(crate) fn inspect_rollback(endpoint: &Endpoint, plan: &PromotionPlan, record: &Value) -> Result<Option<Vec<String>>,String> {
+pub(crate) const ROLLBACK_VISIBILITY_NOTE: &str = "This account cannot see all stored programs, so the recovery result was not re-checked. The recorded state is kept.";
+
+pub(crate) enum RollbackInspection {
+    OriginalIdsChanged,
+    ProgramsNotVisible,
+    Programs(Vec<String>),
+}
+
+fn rollback_program_kinds(plan: &PromotionPlan, record: &Value) -> BTreeSet<String> {
+    let mut kinds = BTreeSet::new();
+    let mut add = |kind: &str| {kinds.insert(match kind.to_ascii_uppercase().as_str() {
+        "FUNCTION" | "PROCEDURE" | "ROUTINE" => "ROUTINE".to_string(),
+        _ => kind.to_ascii_uppercase(),
+    });};
+    for p in plan.original_programs.iter().chain(&plan.promoted_programs) {add(&p.kind);}
+    for id in record["missing_programs"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        add(id.strip_prefix("unexpected:").unwrap_or(id).split(':').next().unwrap_or(""));
+    }
+    if let Some(kind) = record["pending_program"]["kind"].as_str() {add(kind);}
+    kinds
+}
+
+pub(crate) fn inspect_rollback(endpoint: &Endpoint, plan: &PromotionPlan, record: &Value) -> Result<RollbackInspection,String> {
     let mut conn = lifecycle_connect(endpoint,plan)?;
-    if !plan.original_tables.iter().all(|(name,t)|optional_table_id(&mut conn,&plan.original_database,name).ok().flatten()==Some(t.table_id)) { return Ok(None) }
-    if record["status"]=="rolled_back" { return Ok(Some(Vec::new())) }
+    for (name,table) in &plan.original_tables {
+        if optional_table_id(&mut conn,&plan.original_database,name)? != Some(table.table_id) {return Ok(RollbackInspection::OriginalIdsChanged)}
+    }
+    use crate::import::import_preview::mysql_grants_allow;
+    let visible = rollback_program_kinds(plan,record).iter().all(|kind|match kind.as_str() {
+        "EVENT" | "TRIGGER" => mysql_grants_allow(&mut conn,kind,Some(&plan.original_database))==Some(true),
+        "ROUTINE" => mysql_grants_allow(&mut conn,"SHOW_ROUTINE",None)==Some(true) || mysql_grants_allow(&mut conn,"SELECT",None)==Some(true),
+        _ => false,
+    });
+    if !visible {return Ok(RollbackInspection::ProgramsNotVisible)}
     let effective = with_program_warnings(plan,record["program_warnings"].as_array().map(Vec::as_slice).unwrap_or_default());
-    restored_program_differences(&mut conn,&effective).map(Some)
+    restored_program_differences(&mut conn,&effective).map(RollbackInspection::Programs)
 }
 
 /// Content digest a promoted table must still have: the verified candidate digest, or
@@ -2726,6 +2756,7 @@ mod tests {
     static LIVE_LOCK: Mutex<()> = Mutex::new(());
     include!("../tests/support/safe_promote_round2.rs");
     include!("../tests/support/safe_promote_round3.rs");
+    include!("../tests/support/safe_promote_round4.rs");
 
     #[test]
     fn safe_promote_rollback_lock_failure_leaves_active_triggers_untouched() {
