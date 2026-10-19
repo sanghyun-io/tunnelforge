@@ -534,7 +534,7 @@ fn safe_promote_rvf_list_keeps_other_entries_after_inspection_error() {
     let p=plan(&original,&candidate,"list_good",&programs).unwrap();
     let result=promote(&original,&candidate,&p,&p.digest,&dir).unwrap();
     let input=rvf_journal(&dir,"list_good",&original,&candidate,&p,&result);
-    let mut bad=p.clone(); bad.restore_id="list_bad".into(); bad.server_uuid="wrong-server".into();
+    let mut bad=p.clone(); bad.restore_id="list_bad".into(); bad.port=original.port+1;
     rvf_journal(&dir,"list_bad",&original,&candidate,&bad,&result);
     let listed=rvf_backups(&input,"list_good",&original,"list",json!({}));
     assert_eq!(listed["event"],"result","{listed:#}");

@@ -375,9 +375,10 @@ def test_core_lifecycle_outcomes_all_have_status_and_verdict_labels():
     root=Path(__file__).resolve().parents[1]/"migration_core"/"src"
     outcomes=set()
     for name in ["safe_promote_mysql.rs","safe_promote_postgres.rs"]:
-        source=(root/name).read_text(encoding="utf-8").split("#[cfg(test)]")[0]
+        source=re.split(r"#\[cfg\(test\)\]\s*mod tests",(root/name).read_text(encoding="utf-8"),maxsplit=1)[0]
         outcomes.update(re.findall(r'"((?:failed_|rollback_|cutover_)[a-z_]+|preparing|promoted(?:_incomplete)?|rolled_back)"\s*(?:\.into\(\)|\.to_string\(\))',source))
         outcomes.update(re.findall(r'\["status"\]\s*=\s*json!\("([a-z_]+)"\)',source))
+        outcomes.update(re.findall(r'"status"\s*:\s*"([a-z_]+)"',source))
     assert {"rolled_back","failed_triggers_recreated","rollback_incomplete","cutover_unknown"} <= outcomes
     assert outcomes <= JOURNAL_LABELS.keys()
     source=(root/"safe_backups.rs").read_text(encoding="utf-8")

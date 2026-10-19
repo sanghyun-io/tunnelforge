@@ -133,6 +133,19 @@ fn rvf_i_c10_target_function_binlog_rule_found_only_after_switch() {
     assert!(codes(&pre["copy_blockers"]).iter().any(|c|c.starts_with("target_routine_binlog_unsafe")));
     let direct=import(&original,&output,json!({"mode":"replace"}));
     assert_eq!(direct["status"],"partial","{direct:#}");
+    db.execute_sql("DROP FUNCTION f").unwrap();
+    db.execute_sql("CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 1").unwrap();
+    let ready=import(&original,&output,json!({}));
+    assert_eq!(ready["status"],"ready_for_switch","{ready:#}");
+    db.execute_sql("DROP FUNCTION f").unwrap();
+    admin.execute_sql("SET GLOBAL log_bin_trust_function_creators=1").unwrap();
+    db.execute_sql("CREATE FUNCTION f() RETURNS INT RETURN 1").unwrap();
+    admin.execute_sql("SET GLOBAL log_bin_trust_function_creators=0").unwrap();
+    let blocked=promote(&original,&ready,json!({"action":"plan"}));
+    assert_eq!(blocked["can_promote"],false,"{blocked:#}");
+    assert!(blocked["copy_blockers"].to_string().contains("target_routine_binlog_unsafe"));
+    drop_db(&mut admin,candidate_of(&ready).as_deref().unwrap());
+
     let done=Value::Null;
     let value = first_value(&original, "SELECT value FROM parents WHERE id=1");
     let f = first_value(&original, "SELECT CAST(f() AS CHAR) AS n");
@@ -162,9 +175,9 @@ fn rvf_i_c11_promote_plan_requires_candidate_program_grants() {
         format!("CREATE USER '{op}'@'%' IDENTIFIED BY 'tf_local_test'"),
         format!("GRANT SELECT, SHOW VIEW, PROCESS ON *.* TO '{op}'@'%'"),
         format!("GRANT ALL ON `{name}`.* TO '{op}'@'%'"),
-        format!("GRANT CREATE, DROP, ALTER, INSERT, SELECT ON `tf\\_restore\\_%`.* TO '{op}'@'%'"),
-        format!("GRANT CREATE, DROP, ALTER, INSERT, SELECT ON `tf\\_backup\\_%`.* TO '{op}'@'%'"),
-        format!("GRANT CREATE, DROP, ALTER, INSERT, SELECT ON `tf\\_promote\\_%`.* TO '{op}'@'%'"),
+        format!("GRANT CREATE, DROP, ALTER, INSERT, SELECT, LOCK TABLES ON `tf\\_restore\\_%`.* TO '{op}'@'%'"),
+        format!("GRANT CREATE, DROP, ALTER, INSERT, SELECT, LOCK TABLES ON `tf\\_backup\\_%`.* TO '{op}'@'%'"),
+        format!("GRANT CREATE, DROP, ALTER, INSERT, SELECT, LOCK TABLES ON `tf\\_promote\\_%`.* TO '{op}'@'%'"),
     ] { admin.execute_sql(&sql).unwrap(); }
     let op_ep = Endpoint { user: op.clone(), ..original.clone() };
     let op_plan = promote(&op_ep, &restored, json!({"action":"plan"}));

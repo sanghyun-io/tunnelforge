@@ -199,6 +199,8 @@ class BackupLifecycleDialog(QDialog):
                 self.table.setItem(row, column, item)
         lines = []
         for entry in self.entries:
+            if entry.get("inspection_error"):
+                lines.append(f"[{entry.get('restore_id')}] {entry['inspection_error']}")
             note = (entry.get("backup") or {}).get("saved_view_alias_note")
             if note:
                 lines.append(f"[{entry.get('restore_id')}] {note}")

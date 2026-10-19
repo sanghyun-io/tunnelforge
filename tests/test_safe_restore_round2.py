@@ -140,3 +140,11 @@ def test_direct_blockers_suppress_even_embedded_verify_off_advice(code,language)
         lines=describe_plan({"blockers":[],"direct_blockers":[{"code":"trigger_name_conflict","table":"p.guard"}],"copy_blockers":[{"code":code,"table":"v"}]},True)["blockers"]
         assert not any("끄" in line or "Turning off" in line or "Turn off" in line for line in lines)
     finally:i18n.set_language("ko")
+
+def test_backup_list_shows_per_entry_inspection_error():
+    dialog=_dialog()
+    try:
+        dialog._on_list(True,"",{"backups":[{"restore_id":"bad","inspection_error":"journal endpoint mismatch","backup":{"verdict":"undeterminable"}},{"restore_id":"good","backup":{"verdict":"promoted"}}]})
+        assert dialog.table.rowCount()==2
+        assert "journal endpoint mismatch" in dialog.notes.toPlainText()
+    finally:dialog.close()
