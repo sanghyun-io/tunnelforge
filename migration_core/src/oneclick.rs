@@ -1686,6 +1686,7 @@ mod tests {
     fn oneclick_issues_classify_deprecated_engine_marker_as_auto_fixable() {
         let inspection = InspectionResult {
             object_reasons: BTreeMap::new(),
+            object_tables: BTreeMap::new(),
             schema: NormalizedSchema {
                 tables: vec![NormalizedTable {
                     name: "legacy_table".to_string(),
@@ -1720,6 +1721,7 @@ mod tests {
     fn oneclick_live_inspection_does_not_synthesize_int_display_width_skip() {
         let inspection = InspectionResult {
             object_reasons: BTreeMap::new(),
+            object_tables: BTreeMap::new(),
             schema: NormalizedSchema {
                 tables: vec![NormalizedTable {
                     name: "orders".to_string(),

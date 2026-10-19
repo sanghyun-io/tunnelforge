@@ -639,7 +639,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.phase = "dump_import_post_load".into();
             journal.checkpoint()?;
             complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
-            if manifest.source_engine=="postgresql" && target_engine=="postgresql" && table.columns.iter().any(|column|column.generated.as_ref().is_some_and(|g|g.stored)) {
+            if journal.safe_context.is_none() && manifest.source_engine=="postgresql" && target_engine=="postgresql" && table.columns.iter().any(|column|column.generated.as_ref().is_some_and(|g|g.stored)) {
                 journal.program_warnings.push(json!({"code":"generated_values_recomputed","name":table.name}));
             }
             let table_programs = programs.iter().filter(|p| !journal.safe_context.as_ref().is_some_and(|context| context["cutover_pending"] == true)
@@ -828,11 +828,53 @@ fn verify_pg_generated_probe(client: &mut postgres::Client, schema: &str, table:
         if *unsupported_dependency {
             return Err(classified_import_error("program_name_resolution_changed","generated expression binds to an object outside pg_catalog or the probe table; target tables were not changed",Some(&column.name)));
         }
-        if generated.stored!=expected.stored || safe_restore::canonical_sql(&generated.expression)!=safe_restore::canonical_sql(&expected.expression) {
+        if generated.stored!=expected.stored || canonical_pg_expression(&generated.expression)!=canonical_pg_expression(&expected.expression) {
             return Err(classified_import_error("generated_expression_changed","server stored a different generated expression; target tables were not changed",Some(&column.name)));
         }
     }
     Ok(())
+}
+
+/// Compare PG deparsing across versions without rewriting any string contents.
+/// A newer server may quote a formerly ordinary lower-case column name (e.g. json).
+pub(super) fn canonical_pg_expression(value: &str) -> String {
+    let b=value.as_bytes(); let mut i=0; let mut out=String::new();
+    while i<b.len() {
+        if b[i]==b'\'' || b[i]==b'"' {
+            let start=i; let quote=b[i];
+            let escaped=quote==b'\'' && i>0 && matches!(b[i-1],b'e'|b'E')
+                && (i<2 || !(b[i-2].is_ascii_alphanumeric() || matches!(b[i-2],b'_'|b'$')));
+            i+=1;
+            while i<b.len() {
+                if escaped && b[i]==b'\\' { i=(i+2).min(b.len()); }
+                else if b[i]==quote { i+=1; if b.get(i)==Some(&quote) {i+=1} else {break} }
+                else { i+=1; }
+            }
+            let token=&value[start..i];
+            if quote==b'"' && token.ends_with('"') && token.len()>1 {
+                let name=token[1..token.len()-1].replace("\"\"","\"");
+                let mut chars=name.bytes();
+                if chars.next().is_some_and(|c|c.is_ascii_lowercase() || c==b'_')
+                    && chars.all(|c|c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c,b'_'|b'$')) {
+                    out.push_str(&name); continue;
+                }
+            }
+            out.push_str(token);
+        } else if b[i]==b'$' {
+            let end=value[i+1..].find('$').map(|end|i+end+2);
+            if let Some(end)=end {
+                let delimiter=&value[i..end];
+                if let Some(close)=value[end..].find(delimiter) {
+                    out.push_str(&value[i..end+close+delimiter.len()]); i=end+close+delimiter.len(); continue;
+                }
+            }
+            out.push('$');i+=1;
+        } else {
+            let ch=value[i..].chars().next().unwrap();i+=ch.len_utf8();
+            if !ch.is_whitespace() { out.extend(ch.to_lowercase()); }
+        }
+    }
+    out
 }
 
 fn trigger_probe_error(err: &str, name: Option<&str>) -> String {
@@ -3182,5 +3224,19 @@ mod tests {
                 "expected NOT transient: {msg}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pg_expression_comparison_fix_tests {
+    use super::*;
+    #[test]
+    fn lower_case_identifiers_compare_across_server_quoting() {
+        assert_eq!(canonical_pg_expression(r#"("json" ->> 'name'::text)"#),canonical_pg_expression("(json ->> 'name'::text)"));
+        assert_eq!(canonical_pg_expression(r#""a_1$""#),canonical_pg_expression("a_1$"));
+        assert_ne!(canonical_pg_expression(r#""Json""#),canonical_pg_expression("json"));
+        assert_ne!(canonical_pg_expression(r#"'"json"'"#),canonical_pg_expression("'json'"));
+        assert_ne!(canonical_pg_expression("$$ABC def$$"),canonical_pg_expression("$$abc def$$"));
+        assert_ne!(canonical_pg_expression(r"E'a\'B'"),canonical_pg_expression(r"E'a\'b'"));
     }
 }

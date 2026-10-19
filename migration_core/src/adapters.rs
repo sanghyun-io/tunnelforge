@@ -418,6 +418,8 @@ pub struct InspectionResult {
     pub unsupported_objects: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub object_reasons: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object_tables: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -567,6 +569,30 @@ pub enum LiveAdapter {
 }
 
 impl LiveAdapter {
+    /// Data-copy sources must fail rather than silently read an RLS-filtered subset.
+    /// Ordinary editor connections deliberately keep the server's normal RLS behavior.
+    pub fn connect_source(endpoint: &Endpoint) -> Result<Self, String> {
+        let mut adapter=Self::connect(endpoint)?;
+        adapter.source_read_mode()?;
+        Ok(adapter)
+    }
+
+    pub(crate) fn source_read_mode(&mut self) -> Result<(),String> {
+        if let Self::PostgreSql(client)=self {
+            client.batch_execute("SET row_security=off").map_err(|err|format_postgres_error("postgresql source setup error",&err))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn probe_source_rows(&mut self, schema: &NormalizedSchema) -> Result<(),String> {
+        if let Self::PostgreSql(client)=self {
+            for table in &schema.tables {
+                client.query(&format!("SELECT * FROM {} LIMIT 0",quote_ident("postgresql",&table.name)),&[])
+                    .map_err(|err|postgres_source_read_error("postgresql source probe error",&table.name,&err))?;
+            }
+        }
+        Ok(())
+    }
     /// PostgreSQL's extended protocol refuses statement chains even if metadata validation errs.
     pub(crate) fn execute_single(&mut self, sql: &str) -> Result<(), String> {
         match self {
@@ -614,7 +640,7 @@ impl LiveAdapter {
                 }).collect()).unwrap_or_default())
             }
             Self::PostgreSql(client) => {
-                let rows = client.query(sql, &[]).map_err(|err| format_postgres_error("postgresql query error", &err))?;
+                let rows = client.query(sql, &[]).map_err(|err| postgres_source_read_error("postgresql query error", "", &err))?;
                 Ok(rows.first().map(|row| (0..row.len()).map(|index| row.get::<_, Option<String>>(index)).collect()).unwrap_or_default())
             }
         }
@@ -646,7 +672,7 @@ impl MigrationAdapter for LiveAdapter {
                     {
                         Ok(0)
                     } else {
-                        Err(format_postgres_error("postgresql count error", &err))
+                        Err(postgres_source_read_error("postgresql count error", table, &err))
                     }
                 }),
         }
@@ -710,7 +736,7 @@ impl MigrationAdapter for LiveAdapter {
                 let sql = select_chunk_text_sql("postgresql", table, &key_columns);
                 let rows = client
                     .query(&sql, &[&(limit as i64), &(offset as i64)])
-                    .map_err(|err| format_postgres_error("postgresql select chunk error", &err))?;
+                    .map_err(|err| postgres_source_read_error("postgresql select chunk error", &table.name, &err))?;
                 Ok(rows
                     .into_iter()
                     .map(|row| postgres_row_to_json(&columns, &row))
@@ -765,7 +791,7 @@ impl MigrationAdapter for LiveAdapter {
                     limit,
                 );
                 let rows = client.query(&sql, &[]).map_err(|err| {
-                    format_postgres_error("postgresql keyset select chunk error", &err)
+                    postgres_source_read_error("postgresql keyset select chunk error", &table.name, &err)
                 })?;
                 Ok(rows
                     .into_iter()
@@ -790,7 +816,7 @@ impl MigrationAdapter for LiveAdapter {
                 Ok(rows.into_iter().map(|row| mysql_row_to_json(&columns, row)).collect())
             }
             Self::PostgreSql(client) => {
-                let rows = client.query(&sql, &[]).map_err(|err| format_postgres_error("postgresql key lookup error", &err))?;
+                let rows = client.query(&sql, &[]).map_err(|err| postgres_source_read_error("postgresql key lookup error", &table.name, &err))?;
                 Ok(rows.into_iter().map(|row| postgres_row_to_json(&columns, &row)).collect())
             }
         }

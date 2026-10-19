@@ -101,7 +101,7 @@ pub(crate) fn is_safe_pg_expression(expression: &str) -> bool {
             byte if byte.is_ascii_alphabetic() || byte==b'_' => {
                 let start=i; i+=1;
                 while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i],b'_'|b'$') || bytes[i]>=128) { i+=1; }
-                if matches!(expression[start..i].to_ascii_uppercase().as_str(), "SELECT"|"INSERT"|"UPDATE"|"DELETE"|"DROP"|"ALTER"|"CREATE"|"CONSTRAINT"|"COMMENT"|"REFERENCES"|"UNION"|"RETURNING"|"INTO"|"OUTFILE"|"DUMPFILE") { return false; }
+                if matches!(expression[start..i].to_ascii_uppercase().as_str(), "SELECT"|"CREATE"|"CONSTRAINT"|"REFERENCES"|"UNION"|"RETURNING"|"INTO") { return false; }
             }
             _ => i+=1,
         }
@@ -875,6 +875,14 @@ pub(crate) fn format_postgres_error(context: &str, err: &postgres::Error) -> Str
         }
     }
     parts.join("; ")
+}
+
+pub(crate) fn postgres_source_read_error(context: &str, table: &str, err: &postgres::Error) -> String {
+    let detail=format_postgres_error(context,err);
+    if err.code()==Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        && err.as_db_error().is_some_and(|error|error.message().contains("row-level security")) {
+        format!("row_security_blocks_read: {table}: {detail}")
+    } else { detail }
 }
 
 pub fn copy_rows_csv_sql(target_engine: &str, table: &NormalizedTable) -> String {
@@ -4171,5 +4179,19 @@ mod postgres_fidelity_tests {
         let table:NormalizedTable=serde_json::from_value(json!({"name":"t","columns":[{"name":"a","type":"integer"},{"name":"g","type":"integer","generated":{"expression":"a+1","stored":true}},{"name":"b","type":"text"},{"name":"h","type":"text","generated":{"expression":"b","stored":false}}]})).unwrap();
         assert_eq!(copy_rows_csv_sql("postgresql",&table),r#"COPY "t" ("a", "b") FROM STDIN WITH (FORMAT csv, NULL '\N')"#);
         assert_eq!(copy_csv_line_for_table("postgresql",&table,&json!({"a":1,"g":2,"b":"kept","h":"omitted"})),"\"1\",\"kept\"\n");
+    }
+}
+
+#[cfg(test)]
+mod postgres_keyword_fix_tests {
+    use super::*;
+    #[test]
+    fn pg_unreserved_identifiers_are_not_statement_tokens() {
+        for name in ["comment","update","delete","insert","drop","alter","outfile","dumpfile"] {
+            assert!(is_safe_pg_expression(&format!("length({name})")),"{name}");
+        }
+        for expression in ["SELECT 1","a; SELECT 1","a -- c","a /* c */","a,b","(a"] {
+            assert!(!is_safe_pg_expression(expression),"{expression}");
+        }
     }
 }

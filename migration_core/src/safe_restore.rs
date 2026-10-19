@@ -329,7 +329,8 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             .iter()
             .filter(|object| !object.to_ascii_lowercase().starts_with("view:") && !held.contains(*object))
             .filter(|object| original.engine != "mysql" || !["trigger:", "routine:", "event:"].iter().any(|kind| object.starts_with(kind)))
-            .filter(|object| object.split(':').nth(1).is_none_or(|table| !target_only.iter().any(|name| name == table)))
+            .filter(|object| original_inspection.object_tables.get(*object).map(String::as_str)
+                .or_else(||object.split(':').nth(1)).is_none_or(|table| !target_only.iter().any(|name| name == table)))
             .cloned()
             .collect::<Vec<_>>();
         let mut blockers = Vec::new();
@@ -1165,7 +1166,7 @@ fn verify_schema(
                 return Err(mismatch(&format!("column {} definition", source.name)));
             }
             let generation = |column: &NormalizedColumn| column.generated.as_ref()
-                .map(|generated| (canonical_sql(&generated.expression), generated.stored));
+                .map(|generated| (if engine=="postgresql" {super::canonical_pg_expression(&generated.expression)} else {canonical_sql(&generated.expression)}, generated.stored));
             if generation(source) != generation(column) {
                 return Err(mismatch(&format!("column {} generated expression/storage", source.name)));
             }

@@ -5,6 +5,27 @@ use support::*;
 use serde_json::json;
 
 #[test]
+fn pg13_json_identifier_imports_into_pg18_replace_and_safe() {
+    let Some(old)=endpoint("TF_POSTGRES13") else {return};
+    let Some(new)=endpoint("TF_POSTGRES") else {return};
+    let source=Sandbox::on(old);let target=Sandbox::on(new);
+    db(&source.source).batch_execute("CREATE TABLE doc(id int PRIMARY KEY,json jsonb,name text GENERATED ALWAYS AS(json->>'name') STORED); INSERT INTO doc(id,json) VALUES(1,'{\"name\":\"source\"}')").unwrap();
+    assert_eq!(source.dump()["format_version"],6);
+    assert!(!source.manifest()["schema"]["tables"][0]["columns"][2]["generated"]["expression"].as_str().unwrap().contains("\"json\""));
+    db(&target.target).batch_execute("CREATE TABLE doc(id int PRIMARY KEY,json jsonb,name text GENERATED ALWAYS AS(json->>'name') STORED); INSERT INTO doc(id,json) VALUES(91,'{\"name\":\"old\"}')").unwrap();
+    run("dump.import",json!({"target":target.target,"input_dir":source.dir,"mode":"replace"}));
+    assert_eq!(db(&target.target).query_one("SELECT name FROM doc",&[]).unwrap().get::<_,String>(0),"source");
+    let safe=run("dump.import",json!({"target":target.target,"input_dir":source.dir,"mode":"safe"}));
+    assert_eq!(safe["ready_for_switch"],true,"{safe:#}");
+    assert!(!safe["program_warnings"].to_string().contains("generated_values_recomputed"));
+    let candidate=safe["clone_database"].as_str().unwrap();
+    let mut admin=db(&target.target);
+    let name:String=admin.query_one(&format!("SELECT name FROM \"{candidate}\".doc"),&[]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA \"{candidate}\" CASCADE")).unwrap();
+    assert_eq!(name,"source");
+}
+
+#[test]
 fn pg_virtual_into_old_target_refused() {
     let Some(base)=endpoint("TF_POSTGRES13") else { return };
     let s=Sandbox::on(base);

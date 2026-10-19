@@ -73,7 +73,7 @@ fn postgres_security_rules_inheritance_and_comments_are_reported() {
     let exported=s.dump();
     let warnings=exported["manifest_warnings"].as_array().unwrap();
     assert_eq!(warnings.len(),1);
-    assert!(warnings[0].as_str().unwrap().contains("comments_not_exported: comment:sample:TABLE, comment:sample:id"));
+    assert!(warnings[0].as_str().unwrap().contains("comments_not_exported: comment:sample, comment:sample:id"));
     run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"replace"}));
     assert!(db(&s.target).query_one("SELECT obj_description('sample'::regclass,'pg_class'),col_description('sample'::regclass,1)",&[]).unwrap().get::<_,Option<String>>(0).is_none());
     source.batch_execute("CREATE TABLE many_comments(id int)").unwrap();
@@ -177,3 +177,6 @@ fn pg_copy_rejects_generated_in_column_list() {
     let err=match source.copy_in("COPY sample(id,g) FROM STDIN") { Err(err)=>err, Ok(_)=>panic!("COPY accepted a generated column") };
     assert!(err.as_db_error().unwrap().message().contains("generated column"));
 }
+
+#[path="support/postgres_fidelity_fix.rs"]
+mod fix_round1;

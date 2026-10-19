@@ -540,16 +540,19 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
     match dump_run_with_refusal(request, |event| emit(event), &mut refusal) {
         Ok(result) => emit(result),
         Err(err) => {
+            let rls=err.starts_with("row_security_blocks_read:");
             let mut event = json!({
                 "event": "error",
                 "request_id": request.request_id,
                 "message": err
             });
+            if rls { event["error_code"]=json!("row_security_blocks_read"); }
             if let Some(refusal) = refusal {
                 event["error_code"] = json!("unsupported_objects");
                 event["reasons"] = json!(refusal.reasons);
                 event["objects"] = json!(refusal.objects);
                 event["bypassable"] = json!(refusal.bypassable);
+                if !refusal.object_tables.is_empty() { event["object_tables"]=json!(refusal.object_tables); }
             }
             emit(event)
         }
@@ -561,6 +564,7 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
 pub(crate) struct DumpRefusal {
     pub(crate) objects: Vec<String>,
     pub(crate) reasons: BTreeMap<String, String>,
+    pub(crate) object_tables: BTreeMap<String,String>,
     /// True when only omittable objects (triggers, routines, events, ...) are
     /// involved, so "table data only (incomplete)" may proceed. Lossy table
     /// definitions are never bypassable.
@@ -1041,19 +1045,28 @@ fn dump_ddl_refusal(schema: &NormalizedSchema, engine: &str) -> Option<DumpRefus
         .map(|table| format!("table_definition:{}:DDL", table.name)).collect::<Vec<_>>();
     if objects.is_empty() { return None }
     let reasons = objects.iter().map(|id| (id.clone(), "table_definition_unrestorable".into())).collect();
-    Some(DumpRefusal { objects, reasons, bypassable: false })
+    Some(DumpRefusal { object_tables: if engine=="postgresql" {schema.tables.iter().filter(|table|objects.contains(&format!("table_definition:{}:DDL",table.name))).map(|table|(format!("table_definition:{}:DDL",table.name),table.name.clone())).collect()} else {BTreeMap::new()}, objects, reasons, bypassable: false })
 }
 
 fn scoped_unrepresentable(objects: &[String], schema: &NormalizedSchema) -> Vec<String> {
+    scoped_unrepresentable_with_tables(objects,schema,&BTreeMap::new())
+}
+
+fn scoped_unrepresentable_with_tables(objects: &[String], schema: &NormalizedSchema, tables: &BTreeMap<String,String>) -> Vec<String> {
     objects.iter().filter(|object| {
-        LOSSY_SCHEMA_KINDS.iter().any(|kind| schema.tables.iter().any(|table| object.starts_with(&format!("{kind}:{}:", table.name))))
+        if let Some(table)=tables.get(*object) {
+            let kind=object.split(':').next().unwrap_or("");
+            return LOSSY_SCHEMA_KINDS.contains(&kind) && schema.tables.iter().any(|selected| &selected.name==table);
+        }
+        LOSSY_SCHEMA_KINDS.iter().filter(|kind|**kind!="table_inheritance").any(|kind| schema.tables.iter().any(|table| object.starts_with(&format!("{kind}:{}:", table.name))))
             || schema.tables.iter().any(|table| **object==format!("table_inheritance:{}",table.name))
     }).cloned().collect()
 }
 
 fn inspected_scope_refusal(objects: &[String], schema: &NormalizedSchema, full_export: bool, allow_incomplete: bool,
-    reasons: &BTreeMap<String,String>) -> Option<DumpRefusal> {
-    let mut refusal=dump_scope_refusal(objects,schema,full_export,allow_incomplete)?;
+    reasons: &BTreeMap<String,String>, tables: &BTreeMap<String,String>) -> Option<DumpRefusal> {
+    let mut refusal=dump_scope_refusal_with_tables(objects,schema,full_export,allow_incomplete,tables)?;
+    refusal.object_tables.extend(refusal.objects.iter().filter_map(|id|tables.get(id).map(|table|(id.clone(),table.clone()))));
     refusal.reasons.extend(refusal.objects.iter().filter_map(|id|reasons.get(id).map(|code|(id.clone(),code.clone()))));
     Some(refusal)
 }
@@ -1062,8 +1075,15 @@ fn inspected_scope_refusal(objects: &[String], schema: &NormalizedSchema, full_e
 /// non-transactional tables belong to a table; routines, events and
 /// materialized views are schema-level and only in scope for a full export.
 fn scoped_omitted_objects(objects: &[String], schema: &NormalizedSchema, full_export: bool) -> Vec<String> {
+    scoped_omitted_objects_with_tables(objects,schema,full_export,&BTreeMap::new())
+}
+
+fn scoped_omitted_objects_with_tables(objects: &[String], schema: &NormalizedSchema, full_export: bool, tables: &BTreeMap<String,String>) -> Vec<String> {
     let selected = |name: &str| schema.tables.iter().any(|table| table.name == name);
     objects.iter().filter(|object| {
+        if let Some(table)=tables.get(*object) {
+            return matches!(object.split(':').next(),Some("trigger"|"policy"|"rule"|"deprecated_engine"|"non_transactional_table")) && selected(table);
+        }
         let mut parts = object.splitn(3, ':');
         match (parts.next(), parts.next()) {
             (Some("policy"), _) => schema.tables.iter().any(|table|**object==format!("policy:{}",table.name)),
@@ -1083,16 +1103,20 @@ fn dump_scope_refusal(
     full_export: bool,
     allow_incomplete: bool,
 ) -> Option<DumpRefusal> {
-    let mut listed = scoped_unrepresentable(objects, schema);
+    dump_scope_refusal_with_tables(objects,schema,full_export,allow_incomplete,&BTreeMap::new())
+}
+
+fn dump_scope_refusal_with_tables(objects: &[String], schema: &NormalizedSchema, full_export: bool, allow_incomplete: bool, tables: &BTreeMap<String,String>) -> Option<DumpRefusal> {
+    let mut listed = scoped_unrepresentable_with_tables(objects, schema, tables);
     let bypassable = listed.is_empty();
     if bypassable && allow_incomplete {
         return None;
     }
-    listed.extend(scoped_omitted_objects(objects, schema, full_export));
+    listed.extend(scoped_omitted_objects_with_tables(objects, schema, full_export,tables));
     if listed.is_empty() {
         None
     } else {
-        Some(DumpRefusal { objects: listed, reasons: BTreeMap::new(), bypassable })
+        Some(DumpRefusal { objects: listed, reasons: BTreeMap::new(), object_tables:BTreeMap::new(), bypassable })
     }
 }
 
@@ -1267,7 +1291,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     if endpoint.engine == "mysql" {
         scope_objects.extend(mysql_non_transactional_objects(&endpoint, &schema)?);
     }
-    if let Some(mut refusal) = inspected_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete, &inspection.object_reasons) {
+    if let Some(mut refusal) = inspected_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete, &inspection.object_reasons, &inspection.object_tables) {
         if endpoint.engine == "mysql" {
             refusal.reasons = refusal.objects.iter().filter(|id| id.starts_with("generated_column:"))
                 .map(|id| (id.clone(), "generated_column_unproven".to_string())).collect();
@@ -1294,7 +1318,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         }
     }
     // Only objects inside the export scope make this dump incomplete (C5).
-    let mut export_warnings: Vec<String> = scoped_omitted_objects(&unheld, &schema, full_export)
+    let mut export_warnings: Vec<String> = scoped_omitted_objects_with_tables(&unheld, &schema, full_export, &inspection.object_tables)
         .into_iter()
         .map(|object| format!("{WARNING_OBJECT_NOT_EXPORTED} {object}"))
         .collect();
@@ -1302,7 +1326,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         let tables: Vec<&str> = schema.tables.iter().map(|table| table.name.as_str()).collect();
         export_warnings.extend(mysql_visibility_warning(&endpoint, &tables, full_export));
     } else if endpoint.engine=="postgresql" {
-        let comments = inspection.object_reasons.iter().filter(|(id,code)|*code=="comments_not_exported" && schema.tables.iter().any(|table|id.starts_with(&format!("comment:{}:",table.name))))
+        let comments = inspection.object_reasons.iter().filter(|(id,code)|*code=="comments_not_exported" && inspection.object_tables.get(*id).is_some_and(|owner|schema.tables.iter().any(|table|&table.name==owner)))
             .map(|(id,_)|id).collect::<Vec<_>>();
         if !comments.is_empty() {
             let mut names = comments.iter().take(20).map(|id|id.as_str()).collect::<Vec<_>>().join(", ");
@@ -1311,7 +1335,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             export_warnings.push(format!("{WARNING_COMMENTS_NOT_EXPORTED} {names}"));
         }
     }
-    prepare_dump_output_dir(output_path, options.overwrite)?;
+    if endpoint.engine!="postgresql" {prepare_dump_output_dir(output_path, options.overwrite)?;}
 
     // The resolved method drives the worker count, the phase events, the manifest
     // policy and the result, so `auto` is never recorded.
@@ -1347,7 +1371,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
     let effective_threads = mysql_snapshot.as_ref().map_or(1, |snapshot| snapshot.workers.len());
 
     let mut postgres_snapshot = if endpoint.engine == "postgresql" {
-        let mut adapter = LiveAdapter::connect(&endpoint)?;
+        let mut adapter = LiveAdapter::connect_source(&endpoint)?;
         adapter.execute_sql("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
         adapter.execute_sql("SET LOCAL TIME ZONE 'UTC'")?;
         adapter.execute_sql("SET LOCAL DateStyle = 'ISO, YMD'")?;
@@ -1363,10 +1387,12 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
         if dependency_ordered_schema(&locked_schema) != schema {
             return Err("postgresql schema changed before snapshot locks were acquired; retry export".into());
         }
+        adapter.probe_source_rows(&schema)?;
         Some(adapter)
     } else {
         None
     };
+    if endpoint.engine=="postgresql" {prepare_dump_output_dir(output_path, options.overwrite)?;}
     if let Some(snapshot) = mysql_snapshot.as_mut() {
         // consistent snapshot은 InnoDB MVCC 기반이라 MEMORY/MyISAM 등 비트랜잭션 테이블은
         // 스냅샷 일관성을 보장할 수 없다. 전체 export를 막는 대신 해당 테이블만 제외하고
@@ -1454,7 +1480,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
             if let Some(adapter) = postgres_snapshot.as_mut() {
                 dump_tables_sequential(adapter, &ctx, &export_tables, |event| emit(event))?
             } else {
-                let mut adapter = LiveAdapter::connect(&endpoint)?;
+                let mut adapter = LiveAdapter::connect_source(&endpoint)?;
                 dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
             }
         }
@@ -2206,7 +2232,7 @@ fn spawn_dump_table_worker(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
-            let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
+            let mut adapter = LiveAdapter::connect_source(&ctx.endpoint)?;
             dump_one_table(
                 &mut adapter,
                 &ctx,
@@ -2614,7 +2640,8 @@ mod tests {
         let schema = schema();
         let table = &schema.tables[0].name;
         for kind in LOSSY_SCHEMA_KINDS {
-            let selected = dump_scope_refusal(&[format!("{kind}:{table}:example")], &schema, true, true).unwrap();
+            let id=if kind=="table_inheritance" {format!("{kind}:{table}")} else {format!("{kind}:{table}:example")};
+            let selected = dump_scope_refusal(&[id], &schema, true, true).unwrap();
             assert!(!selected.bypassable, "{kind} must not be waived by allow_incomplete");
             assert!(dump_scope_refusal(&[format!("{kind}:unselected_table:example")], &schema, true, false).is_none());
         }
@@ -3486,9 +3513,10 @@ mod postgres_refusal_tests {
         let inspection=InspectionResult {
             schema:crate::adapters::test_support::schema(),
             unsupported_objects:vec!["unsupported_default:users:id".into()],
+            object_tables:BTreeMap::new(),
             object_reasons:BTreeMap::from([("unsupported_default:users:id".into(),"identity_always_unsupported".into())]),
         };
-        let refused=inspected_scope_refusal(&inspection.unsupported_objects,&inspection.schema,true,false,&inspection.object_reasons).unwrap();
+        let refused=inspected_scope_refusal(&inspection.unsupported_objects,&inspection.schema,true,false,&inspection.object_reasons,&inspection.object_tables).unwrap();
         assert!(!refused.bypassable);
         assert_eq!(refused.reasons,inspection.object_reasons);
     }

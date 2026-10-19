@@ -148,6 +148,7 @@ pub(crate) fn inspect(request: &Request) -> Vec<Value> {
                 "unsupported_objects": result.unsupported_objects
                 });
                 if !result.object_reasons.is_empty() { event["object_reasons"]=json!(result.object_reasons); }
+                if !result.object_tables.is_empty() { event["object_tables"]=json!(result.object_tables); }
                 events.push(event);
             },
             Err(err) => events.push(error_event(request, err)),
@@ -230,6 +231,7 @@ pub(crate) fn target_check_name_problems(adapter: &mut LiveAdapter, target_schem
 /// 담당한다. DB 연결/쿼리는 tunnelforge-core 소유 그대로 유지한다.
 trait InspectAdapter {
     fn object_reasons(&self) -> BTreeMap<String, String> { BTreeMap::new() }
+    fn object_tables(&self) -> BTreeMap<String, String> { BTreeMap::new() }
     fn enrich_table(&mut self, _schema: &str, _table: &mut NormalizedTable) -> Result<(), String> { Ok(()) }
     fn table_names(&mut self, schema: &str) -> Result<Vec<(String, Option<String>)>, String>;
     fn columns(&mut self, schema: &str, table: &str) -> Result<Vec<NormalizedColumn>, String>;
@@ -279,6 +281,7 @@ fn inspect_generic<A: InspectAdapter>(
         schema: NormalizedSchema { tables },
         unsupported_objects,
         object_reasons: adapter.object_reasons(),
+        object_tables: adapter.object_tables(),
     })
 }
 
@@ -609,10 +612,12 @@ fn inspect_mysql_deprecated_engines_sql() -> &'static str {
 struct PostgresInspectAdapter {
     client: postgres::Client,
     object_reasons: BTreeMap<String, String>,
+    object_tables: BTreeMap<String, String>,
 }
 
 impl InspectAdapter for PostgresInspectAdapter {
     fn object_reasons(&self) -> BTreeMap<String, String> { self.object_reasons.clone() }
+    fn object_tables(&self) -> BTreeMap<String, String> { self.object_tables.clone() }
     fn table_names(&mut self, schema: &str) -> Result<Vec<(String, Option<String>)>, String> {
         let rows = self
             .client
@@ -737,7 +742,7 @@ impl InspectAdapter for PostgresInspectAdapter {
     }
 
     fn unsupported_objects(&mut self, schema: &str) -> Result<Vec<String>, String> {
-        inspect_postgresql_unsupported_objects(&mut self.client, schema, &mut self.object_reasons)
+        inspect_postgresql_unsupported_objects(&mut self.client, schema, &mut self.object_reasons, &mut self.object_tables)
     }
 }
 
@@ -747,7 +752,7 @@ fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
         .map_err(|err| format!("postgresql connection error: {err}"))?;
     client.batch_execute("SET DateStyle = 'ISO, YMD'; SET TIME ZONE 'UTC'")
         .map_err(|err| format!("postgresql metadata session setup error: {err}"))?;
-    let mut adapter = PostgresInspectAdapter { client, object_reasons: BTreeMap::new() };
+    let mut adapter = PostgresInspectAdapter { client, object_reasons: BTreeMap::new(), object_tables: BTreeMap::new() };
     inspect_generic(&mut adapter, &schema_name)
 }
 
@@ -756,7 +761,7 @@ pub(crate) const POSTGRES_REFUSAL_REASONS: &[&str] = &[
     "identity_always_unsupported", "sequence_options_unsupported", "default_expression_unsupported",
     "check_constraint_unsupported", "custom_type_unsupported", "index_shape_unsupported",
     "cross_schema_fk_unsupported", "materialized_view_unsupported", "postgres_trigger_unsupported",
-    "postgres_routine_unsupported", "row_security_unsupported", "rule_unsupported",
+    "postgres_routine_unsupported", "row_security_unsupported", "row_security_blocks_read", "rule_unsupported",
     "table_inheritance_unsupported", "generated_expression_unsafe", "generated_dependency_unsupported",
 ];
 pub(crate) const POSTGRES_WARNING_REASONS: &[&str] = &["comments_not_exported"];
@@ -781,6 +786,8 @@ pub(crate) fn postgres_generated_columns(client: &mut postgres::Client, schema: 
                (d.refclassid='pg_proc'::regclass AND EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE p.oid=d.refobjid AND n.nspname='pg_catalog')) OR \
                (d.refclassid='pg_operator'::regclass AND EXISTS(SELECT 1 FROM pg_operator o JOIN pg_namespace n ON n.oid=o.oprnamespace WHERE o.oid=d.refobjid AND n.nspname='pg_catalog')) OR \
                (d.refclassid='pg_type'::regclass AND EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE t.oid=d.refobjid AND n.nspname='pg_catalog')) OR \
+               (d.refclassid='pg_ts_config'::regclass AND EXISTS(SELECT 1 FROM pg_ts_config c JOIN pg_namespace n ON n.oid=c.cfgnamespace WHERE c.oid=d.refobjid AND n.nspname='pg_catalog')) OR \
+               (d.refclassid='pg_ts_dict'::regclass AND EXISTS(SELECT 1 FROM pg_ts_dict c JOIN pg_namespace n ON n.oid=c.dictnamespace WHERE c.oid=d.refobjid AND n.nspname='pg_catalog')) OR \
                (d.refclassid='pg_collation'::regclass AND EXISTS(SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=d.refobjid AND n.nspname='pg_catalog')))) \
              FROM pg_attribute a JOIN pg_class t ON t.oid=a.attrelid JOIN pg_namespace n ON n.oid=t.relnamespace \
              JOIN pg_attrdef ad ON ad.adrelid=t.oid AND ad.adnum=a.attnum \
@@ -794,10 +801,16 @@ pub(crate) fn postgres_generated_columns(client: &mut postgres::Client, schema: 
     inspect().map_err(|err| format!("postgresql generated column inspect error: {err}"))
 }
 
+// ponytail: distinct (table, object) pairs producing the same colon-delimited ID are out of scope.
+fn pg_table_object(objects: &mut Vec<String>, tables: &mut BTreeMap<String,String>, id: String, table: &str) {
+    tables.insert(id.clone(),table.into()); objects.push(id);
+}
+
 fn inspect_postgresql_unsupported_objects(
     client: &mut postgres::Client,
     schema_name: &str,
     reasons: &mut BTreeMap<String, String>,
+    tables: &mut BTreeMap<String, String>,
 ) -> Result<Vec<String>, String> {
     let mut objects = Vec::new();
     let views = client
@@ -819,7 +832,9 @@ fn inspect_postgresql_unsupported_objects(
         )
         .map_err(|err| format!("postgresql trigger inspect error: {err}"))?;
     objects.extend(triggers.into_iter().map(|row| {
-        format!("trigger:{}:{}", row.get::<_, String>(0), row.get::<_, String>(1))
+        let table:String=row.get(0);
+        let id=format!("trigger:{table}:{}",row.get::<_,String>(1));
+        tables.insert(id.clone(),table); id
     }));
 
     let matviews = client
@@ -859,13 +874,13 @@ fn inspect_postgresql_unsupported_objects(
         let expression_unsupported = default_value.as_deref().is_some_and(|value| identity != "YES" && !value.starts_with("nextval(") && !supported_postgresql_default(value));
         if let Some(code) = postgres_default_reason(identity_generation.as_deref()==Some("ALWAYS"), false, expression_unsupported) {
             reasons.insert(format!("unsupported_default:{table}:{column}"),code.into());
-            objects.push(format!("unsupported_default:{table}:{column}"));
+            pg_table_object(&mut objects,tables,format!("unsupported_default:{table}:{column}"),&table);
         }
-        if !generated.is_empty() { objects.push(format!("generated_column:{table}:{column}")); }
+        if !generated.is_empty() { pg_table_object(&mut objects,tables,format!("generated_column:{table}:{column}"),&table); }
         if namespace != "pg_catalog" || matches!(kind.as_str(), "d" | "e" | "c")
             || element_namespace.as_deref().is_some_and(|namespace| namespace != "pg_catalog")
             || element_kind.as_deref().is_some_and(|kind| matches!(kind, "d" | "e" | "c")) {
-            objects.push(format!("custom_type:{table}:{column}"));
+            pg_table_object(&mut objects,tables,format!("custom_type:{table}:{column}"),&table);
         }
     }
     for row in client.query(
@@ -881,26 +896,29 @@ fn inspect_postgresql_unsupported_objects(
             let id = format!("unsupported_default:{table}:{column}");
             let code = postgres_default_reason(reasons.get(&id).is_some_and(|code| code=="identity_always_unsupported"),true,false).unwrap();
             reasons.insert(id.clone(),code.into());
-            objects.push(id);
+            pg_table_object(&mut objects,tables,id,&table);
         }
     }
     for row in client.query(
         "SELECT t.relname,c.conname FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=$1 AND c.contype='c'",
         &[&schema_name],
     ).map_err(|err| format!("postgresql check inspect error: {err}"))? {
-        objects.push(format!("check_constraint:{}:{}", row.get::<_,String>(0), row.get::<_,String>(1)));
+        let table:String=row.get(0);
+        pg_table_object(&mut objects,tables,format!("check_constraint:{table}:{}",row.get::<_,String>(1)),&table);
     }
     for row in client.query(
         "SELECT t.relname,i.relname FROM pg_index ix JOIN pg_class t ON t.oid=ix.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class i ON i.oid=ix.indexrelid JOIN pg_am am ON am.oid=i.relam WHERE n.nspname=$1 AND (ix.indexprs IS NOT NULL OR ix.indpred IS NOT NULL OR am.amname<>'btree' OR NOT (0=ALL(ix.indoption)) OR COALESCE((to_jsonb(ix)->>'indnkeyatts')::int,ix.indnatts)<>ix.indnatts)",
         &[&schema_name],
     ).map_err(|err| format!("postgresql advanced index inspect error: {err}"))? {
-        objects.push(format!("unsupported_index:{}:{}", row.get::<_,String>(0), row.get::<_,String>(1)));
+        let table:String=row.get(0);
+        pg_table_object(&mut objects,tables,format!("unsupported_index:{table}:{}",row.get::<_,String>(1)),&table);
     }
     for row in client.query(
         "SELECT child.relname,c.conname FROM pg_constraint c JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace n ON n.oid=child.relnamespace JOIN pg_class parent ON parent.oid=c.confrelid WHERE n.nspname=$1 AND c.contype='f' AND parent.relnamespace<>child.relnamespace",
         &[&schema_name],
     ).map_err(|err| format!("postgresql cross-schema FK inspect error: {err}"))? {
-        objects.push(format!("cross_schema_fk:{}:{}", row.get::<_,String>(0), row.get::<_,String>(1)));
+        let table:String=row.get(0);
+        pg_table_object(&mut objects,tables,format!("cross_schema_fk:{table}:{}",row.get::<_,String>(1)),&table);
     }
 
     for row in client.query(
@@ -910,19 +928,23 @@ fn inspect_postgresql_unsupported_objects(
         &[&schema_name],
     ).map_err(|err| format!("postgresql table security inspect error: {err}"))? {
         let table:String=row.get(0);
-        if row.get::<_,bool>(1) { let id=format!("policy:{table}"); reasons.insert(id.clone(),"row_security_unsupported".into()); objects.push(id); }
-        if row.get::<_,bool>(2) { let id=format!("table_inheritance:{table}"); reasons.insert(id.clone(),"table_inheritance_unsupported".into()); objects.push(id); }
+        if row.get::<_,bool>(1) { let id=format!("policy:{table}"); reasons.insert(id.clone(),"row_security_unsupported".into()); pg_table_object(&mut objects,tables,id,&table); }
+        if row.get::<_,bool>(2) { let id=format!("table_inheritance:{table}"); reasons.insert(id.clone(),"table_inheritance_unsupported".into()); pg_table_object(&mut objects,tables,id,&table); }
     }
     for row in client.query(
         "SELECT t.relname,r.rulename FROM pg_rewrite r JOIN pg_class t ON t.oid=r.ev_class JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=$1 AND t.relkind IN ('r','p') AND r.rulename<>'_RETURN' ORDER BY t.relname,r.rulename", &[&schema_name],
     ).map_err(|err| format!("postgresql rule inspect error: {err}"))? {
-        let id=format!("rule:{}:{}",row.get::<_,String>(0),row.get::<_,String>(1));
-        reasons.insert(id.clone(),"rule_unsupported".into()); objects.push(id);
+        let table:String=row.get(0);
+        let id=format!("rule:{table}:{}",row.get::<_,String>(1));
+        reasons.insert(id.clone(),"rule_unsupported".into()); pg_table_object(&mut objects,tables,id,&table);
     }
     for row in client.query(
-        "SELECT t.relname,COALESCE(a.attname,'TABLE') FROM pg_description d JOIN pg_class t ON t.oid=d.objoid JOIN pg_namespace n ON n.oid=t.relnamespace LEFT JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.objsubid WHERE d.classoid='pg_class'::regclass AND n.nspname=$1 AND t.relkind IN ('r','p') AND (d.objsubid=0 OR (a.attnum>0 AND NOT a.attisdropped)) ORDER BY t.relname,d.objsubid", &[&schema_name],
+        "SELECT t.relname,a.attname::text FROM pg_description d JOIN pg_class t ON t.oid=d.objoid JOIN pg_namespace n ON n.oid=t.relnamespace LEFT JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.objsubid WHERE d.classoid='pg_class'::regclass AND n.nspname=$1 AND t.relkind IN ('r','p') AND (d.objsubid=0 OR (a.attnum>0 AND NOT a.attisdropped)) ORDER BY t.relname,d.objsubid", &[&schema_name],
     ).map_err(|err| format!("postgresql comment inspect error: {err}"))? {
-        reasons.insert(format!("comment:{}:{}",row.get::<_,String>(0),row.get::<_,String>(1)),"comments_not_exported".into());
+        let table:String=row.get(0); let column:Option<String>=row.get(1);
+        let id=column.map_or_else(||format!("comment:{table}"),|column|format!("comment:{table}:{column}"));
+        tables.insert(id.clone(),table);
+        reasons.insert(id,"comments_not_exported".into());
     }
     for id in &objects {
         let code = match id.split(':').next().unwrap_or("") {
