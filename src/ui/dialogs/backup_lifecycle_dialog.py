@@ -50,7 +50,7 @@ VERDICT_LABELS = {
 
 def status_label(labels: dict, code) -> str:
     code = str(code or "-")
-    return labels.get(code, code)
+    return translate_text(labels.get(code, code))
 
 
 def _rows_text(tables: list) -> str:

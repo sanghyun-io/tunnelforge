@@ -382,6 +382,8 @@ def test_core_lifecycle_outcomes_all_have_status_and_verdict_labels():
     assert {"rolled_back","failed_triggers_recreated","rollback_incomplete","cutover_unknown"} <= outcomes
     assert outcomes <= JOURNAL_LABELS.keys()
     source=(root/"safe_backups.rs").read_text(encoding="utf-8")
+    journal=source[source.index("    fn journal_status("):source.index("    /// Recovery journals")]
+    assert set(re.findall(r'"([a-z_]+)"',journal)) - {"status"} <= JOURNAL_LABELS.keys()
     reconcile=source[source.index("fn reconcile("):source.index("fn cleanup_plan(")]
     conclusions=set(re.findall(r'=>\s*\("([a-z_]+)"',reconcile))
     assert {"rolled_back","rollback_incomplete","not_promoted"}<=conclusions

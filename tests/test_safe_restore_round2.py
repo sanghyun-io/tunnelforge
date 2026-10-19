@@ -148,3 +148,17 @@ def test_backup_list_shows_per_entry_inspection_error():
         assert dialog.table.rowCount()==2
         assert "journal endpoint mismatch" in dialog.notes.toPlainText()
     finally:dialog.close()
+
+def test_warning_uses_the_translated_status_label(monkeypatch):
+    from src.core import i18n
+    warning=MagicMock()
+    monkeypatch.setattr(QMessageBox,"warning",warning)
+    i18n.set_language("en")
+    dialog=_dialog()
+    try:
+        dialog._on_rolled_back(True,"",{"status":"failed_triggers_recreated","message":"Review warnings before retrying.","error":"rename rejected"})
+        text=warning.call_args.args[2]
+        assert "Failed (no change, triggers recreated)" in text
+        assert "Review warnings before retrying." in text and "rename rejected" in text
+    finally:
+        dialog.close();i18n.set_language("ko")
