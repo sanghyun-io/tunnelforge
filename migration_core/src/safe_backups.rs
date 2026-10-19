@@ -570,7 +570,7 @@ fn rollback_context<'a>(entries: &'a [Entry], request: &Request, credentials: &E
     if !matches!(verdict.as_str(), "promoted" | "promoted_incomplete") {
         blockers.push(format!("promotion outcome is not confirmed (journal {status}, live objects {verdict}); reconcile first"));
     }
-    if entry.rollbacks().iter().any(|r| r["status"] != "failed_no_change") {
+    if entry.rollbacks().iter().any(|r| !matches!(r["status"].as_str(), Some("failed_no_change" | "failed_triggers_recreated"))) {
         blockers.push("a recovery of this restore was already attempted; inspect its journal (rollback-*) before another attempt".into());
     }
     Ok((entry, displaced_name(entry)?, blockers))
@@ -621,7 +621,7 @@ fn rollback_apply(request: &Request, credentials: &Endpoint) -> Result<Value, St
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // Only a proven no-change attempt may be retried; its journal is kept aside.
             let previous = read_json(&dump_import_report_path(&journal_dir)?).ok_or("previous recovery journal is unreadable")?;
-            if previous["status"] != "failed_no_change" {
+            if !matches!(previous["status"].as_str(), Some("failed_no_change" | "failed_triggers_recreated")) {
                 return Err("a previous recovery attempt is not proven to have changed nothing".into());
             }
             fs::rename(&journal_dir, plan_dir.join(format!("failed-{displaced}-{}", std::process::id()))).map_err(|e| e.to_string())?;
