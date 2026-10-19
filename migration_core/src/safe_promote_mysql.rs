@@ -2415,7 +2415,13 @@ fn rollback_apply_with_hook(mut_endpoint: &Endpoint, plan: &PromotionPlan, finge
                 }
             }
         }
-        state["pending_program"] = Value::Null;
+        if let Some(failure) = state["programs_failed"].as_array().and_then(|items|items.first()).cloned() {
+            state["pending_program"] = json!({"kind":failure["kind"],"name":failure["name"]});
+            let error = failure["restore_error"].as_str().or_else(||failure["error"].as_str()).unwrap_or("stored program recovery failed");
+            state["error"] = json!(redact_endpoint_secret(error,endpoint));
+        } else {
+            state["pending_program"] = Value::Null;
+        }
         state["phase"] = json!("programs_restored");
         write_dump_import_report(journal_dir, &state)?;
         Ok(())

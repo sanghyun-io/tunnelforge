@@ -281,6 +281,6 @@ def test_partial_rollback_uses_warning_and_names_remaining_programs(monkeypatch)
         dialog._on_rolled_back(True,"partial",{"status":"rollback_incomplete","missing_programs":["routine:f"],"pending_program":{"kind":"EVENT","name":"tick"}})
         warning.assert_called_once()
         information.assert_not_called()
-        assert "routine:f" in warning.call_args.args[2] and "tick" in warning.call_args.args[2]
+        assert "루틴 f" in warning.call_args.args[2] and "이벤트 tick" in warning.call_args.args[2]
     finally:
         dialog.close()

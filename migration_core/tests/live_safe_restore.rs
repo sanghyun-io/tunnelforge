@@ -1284,6 +1284,8 @@ fn rv10_rollback_incomplete_is_reported_and_reconciled() {
     assert!(!recovered["message"].as_str().unwrap().contains("outcome is unknown"), "rollback_incomplete message: {}", recovered["message"]);
     assert_eq!(reconciled["conclusion"], "rollback_incomplete", "{reconciled:#}");
     assert!(recovered["missing_programs"].to_string().contains("routine:f"));
+    assert_eq!(recovered["pending_program"]["name"],"f");
+    assert!(recovered["error"].as_str().unwrap().contains("1205"),"{recovered:#}");
     assert_eq!(new_e,"absent","later programs are still restored after a failure");
     assert!(p_now.as_str().unwrap().contains("original"));
     assert!(reconciled["evidence"].get("missing_programs").is_some(), "{reconciled:#}");
