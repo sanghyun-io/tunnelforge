@@ -100,6 +100,17 @@ jobs:
         options: >-
           --health-cmd="pg_isready -U postgres -d tf_test"
           --health-interval=10s --health-timeout=5s --health-retries=12
+      postgres13:
+        image: postgres:13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: tf_local_test
+          POSTGRES_DB: tf_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d tf_test"
+          --health-interval=10s --health-timeout=5s --health-retries=12
     env:
       TF_LIVE_REQUIRED: "1"
       TF_MYSQL_HOST: 127.0.0.1
@@ -113,6 +124,11 @@ jobs:
       TF_POSTGRES_USER: postgres
       TF_POSTGRES_PASSWORD: tf_local_test
       TF_POSTGRES_DATABASE: tf_test
+      TF_POSTGRES13_HOST: 127.0.0.1
+      TF_POSTGRES13_PORT: "5433"
+      TF_POSTGRES13_USER: postgres
+      TF_POSTGRES13_PASSWORD: tf_local_test
+      TF_POSTGRES13_DATABASE: tf_test
 
     steps:
       - name: Checkout PR
@@ -137,6 +153,7 @@ jobs:
             --test live_mysql_spatial \
             --test live_mysql_objects \
             --test live_generated_columns \
+            --test live_postgres_objects \
             --test live_mysql_triggers \
             --test live_mysql_programs \
             --test live_cross_engine_types \
@@ -156,6 +173,9 @@ jobs:
             -- --include-ignored --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib safe_promote_ -- --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib import::safe_restore_digest:: -- --include-ignored --test-threads=1
+
+      - name: Run PostgreSQL version-boundary regressions
+        run: cargo test --manifest-path migration_core/Cargo.toml --test live_postgres13 -- --include-ignored --test-threads=1
 
       # MySQL 8.0 behaves differently (e.g. late AUTO_INCREMENT statistics, no
       # restrict_fk_on_non_standard_key), and production servers still run it.

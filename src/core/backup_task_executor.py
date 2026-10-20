@@ -163,6 +163,14 @@ class BackupTaskExecutor:
                     logger.warning("백업 연결 정리 실패", exc_info=True)
 
     def _fail(self, schedule: ScheduleConfig, job_id, error_msg: str, output_subdir: str) -> Tuple[bool, str]:
+        from src.exporters.rust_dump_exporter import describe_core_failure
+        from src.core.error_report_sanitizer import sanitize_local_diagnostic
+        from src.core.i18n import translate_text
+        raw_detail = error_msg
+        sentence = describe_core_failure(error_msg) if "row_security_blocks_read:" in error_msg else None
+        if sentence:
+            logger.info("Backup source read refused: %s", raw_detail)
+            error_msg = sentence
         logger.error(error_msg)
         if output_subdir and os.path.isdir(output_subdir):
             try:
@@ -173,8 +181,10 @@ class BackupTaskExecutor:
                     shutil.rmtree(output_subdir, ignore_errors=True)
             except OSError:
                 logger.warning("실패한 백업 마커 갱신 실패", exc_info=True)
-        self.log_writer.log_execution(schedule, False, error_msg)
-        job_finish(job_id, STATUS_FAILED, error=error_msg)
+        logged = error_msg + " " + translate_text("상세: {}").format(raw_detail) if sentence else error_msg
+        self.log_writer.log_execution(schedule, False, logged)
+        job_finish(job_id, STATUS_FAILED, error=error_msg,
+                   **({"details": {"core_error": sanitize_local_diagnostic(raw_detail)}} if sentence else {}))
         return False, error_msg
 
     def _apply_retention(self, schedule: ScheduleConfig):

@@ -56,6 +56,10 @@ fn validate_import_metadata(
     if !untranslatable.is_empty() {
         let code = if untranslatable.iter().any(|(_, reason)| reason.starts_with("program_source_schema_reference:")) {
             "program_source_schema_reference"
+        } else if untranslatable.iter().any(|(_,reason)|reason.starts_with("unsupported_generated_column:")) {
+            "unsupported_generated_column"
+        } else if untranslatable.iter().any(|(_,reason)|reason.starts_with("unsupported_invisible_column:")) {
+            "unsupported_invisible_column"
         } else { "export_invalid" };
         let table_count=untranslatable.iter().map(|(table,_)|table).collect::<BTreeSet<_>>().len();
         let reasons = untranslatable.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>();
@@ -224,6 +228,8 @@ fn manifest_warning_code(warning: &str) -> &'static str {
         "omitted_object"
     } else if warning.starts_with(WARNING_VISIBILITY_UNPROVEN) {
         "visibility_unproven"
+    } else if warning.starts_with(WARNING_COMMENTS_NOT_EXPORTED) {
+        "comments_not_exported"
     } else {
         "source_dump_warning"
     }
@@ -418,6 +424,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     let metadata_schema = journal.safe_context.as_ref().and_then(|context| context["original_target"]["schema"].as_str())
         .map(str::to_string).unwrap_or_else(|| endpoint_schema(&endpoint));
     let table_ddls = validate_import_metadata(&manifest, &selected, &endpoint.engine, &metadata_schema, skip_triggers)?;
+    validate_pg_generated_target(&endpoint, &manifest, &selected)?;
     let tables: Vec<DumpTableManifest> = manifest
         .tables
         .iter()
@@ -632,6 +639,9 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.phase = "dump_import_post_load".into();
             journal.checkpoint()?;
             complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
+            if journal.safe_context.is_none() && manifest.source_engine=="postgresql" && target_engine=="postgresql" && table.columns.iter().any(|column|column.generated.as_ref().is_some_and(|g|g.stored)) {
+                journal.program_warnings.push(json!({"code":"generated_values_recomputed","name":table.name}));
+            }
             let table_programs = programs.iter().filter(|p| !journal.safe_context.as_ref().is_some_and(|context| context["cutover_pending"] == true)
                 && p.table.as_deref() == Some(table.name.as_str())).collect::<Vec<_>>();
             if !table_programs.is_empty() {
@@ -769,13 +779,20 @@ fn probe_import_ddl(
         .map_err(|err| format!("cannot allocate DDL probe name: {err}"))?.as_nanos();
     let prefix = format!("tf_probe_{}_{nonce}", std::process::id());
     let engine = adapter.engine();
+    let mut generated_probe = if engine=="postgresql" && schema.tables.iter().any(|table|table.columns.iter().any(|column|column.generated.is_some())) {
+        Some(LiveAdapter::connect(endpoint)?)
+    } else { None };
     let mut program_conn = if programs.is_empty() { None } else { Some(import_trigger_connection(endpoint)
         .map_err(|err| trigger_probe_error(&err, None))?) };
     journal.pending_probes.insert(prefix.clone()); journal.checkpoint()?;
     let result=run_owned_ddl_probe(schema, source_engine, engine, surviving, &prefix,
         |table| { journal.current_table = Some(table.to_string()); journal.checkpoint() },
-        |sql| adapter.execute_sql(sql),
+        |sql| adapter.execute_single(sql),
         |table, probe| {
+            if let Some(LiveAdapter::PostgreSql(client)) = generated_probe.as_mut() {
+                let definition = schema.tables.iter().find(|definition|definition.name==table).unwrap();
+                verify_pg_generated_probe(client, &endpoint_schema(endpoint), definition, probe)?;
+            }
             if let Some(conn) = program_conn.as_mut() {
                 for (index, p) in programs.iter().enumerate().filter(|(_, p)| p.table.as_deref() == Some(table)) {
                     create_trigger(conn, p, &format!("{prefix}_t{index}"), probe)
@@ -787,6 +804,77 @@ fn probe_import_ddl(
     if !result.as_ref().is_err_and(|e|e.contains("cleanup_failed")) { journal.pending_probes.remove(&prefix); }
     journal.checkpoint()?;
     result
+}
+
+pub(super) fn validate_pg_generated_target(endpoint: &Endpoint, manifest: &DumpManifest, selected: &BTreeSet<String>) -> Result<(),String> {
+    if endpoint.engine!="postgresql" || manifest.source_engine!="postgresql" || !manifest.schema.tables.iter()
+        .filter(|table|selected.is_empty() || selected.contains(&table.name))
+        .any(|table|table.columns.iter().any(|column|column.generated.as_ref().is_some_and(|generated|!generated.stored))) { return Ok(()) }
+    let mut client=connect_postgres(endpoint).map_err(|err|format!("postgresql connection error: {err}"))?;
+    let version:String=client.query_one("SHOW server_version_num", &[]).map_err(|err|err.to_string())?.get(0);
+    if version.parse::<u32>().unwrap_or(0)<180000 {
+        return Err(classified_import_error("generated_virtual_unsupported_on_target", "VIRTUAL generated columns require PostgreSQL 18 or newer; target tables were not changed",None));
+    }
+    Ok(())
+}
+
+fn verify_pg_generated_probe(client: &mut postgres::Client, schema: &str, table: &NormalizedTable, probe: &str) -> Result<(),String> {
+    let actual=crate::schema::postgres_generated_columns(client,schema,probe)?;
+    for column in table.columns.iter().filter(|column|column.generated.is_some()) {
+        let expected=column.generated.as_ref().unwrap();
+        let Some((_, generated, unsupported_dependency))=actual.iter().find(|(name,_,_)|name==&column.name) else {
+            return Err(classified_import_error("generated_expression_changed","probe did not retain the generated column",Some(&column.name)));
+        };
+        if *unsupported_dependency {
+            return Err(classified_import_error("program_name_resolution_changed","generated expression binds to an object outside pg_catalog or the probe table; target tables were not changed",Some(&column.name)));
+        }
+        if generated.stored!=expected.stored || canonical_pg_expression(&generated.expression)!=canonical_pg_expression(&expected.expression) {
+            return Err(classified_import_error("generated_expression_changed","server stored a different generated expression; target tables were not changed",Some(&column.name)));
+        }
+    }
+    Ok(())
+}
+
+/// Compare PG deparsing across versions without rewriting any string contents.
+/// A newer server may quote a formerly ordinary lower-case column name (e.g. json).
+pub(super) fn canonical_pg_expression(value: &str) -> String {
+    let b=value.as_bytes(); let mut i=0; let mut out=String::new();
+    while i<b.len() {
+        if b[i]==b'\'' || b[i]==b'"' {
+            let start=i; let quote=b[i];
+            let escaped=quote==b'\'' && i>0 && matches!(b[i-1],b'e'|b'E')
+                && (i<2 || !(b[i-2].is_ascii_alphanumeric() || matches!(b[i-2],b'_'|b'$')));
+            i+=1;
+            while i<b.len() {
+                if escaped && b[i]==b'\\' { i=(i+2).min(b.len()); }
+                else if b[i]==quote { i+=1; if b.get(i)==Some(&quote) {i+=1} else {break} }
+                else { i+=1; }
+            }
+            let token=&value[start..i];
+            if quote==b'"' && token.ends_with('"') && token.len()>1 {
+                let name=token[1..token.len()-1].replace("\"\"","\"");
+                let mut chars=name.bytes();
+                if chars.next().is_some_and(|c|c.is_ascii_lowercase() || c==b'_')
+                    && chars.all(|c|c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c,b'_'|b'$')) {
+                    out.push_str(&name); continue;
+                }
+            }
+            out.push_str(token);
+        } else if b[i]==b'$' {
+            let end=value[i+1..].find('$').map(|end|i+end+2);
+            if let Some(end)=end {
+                let delimiter=&value[i..end];
+                if let Some(close)=value[end..].find(delimiter) {
+                    out.push_str(&value[i..end+close+delimiter.len()]); i=end+close+delimiter.len(); continue;
+                }
+            }
+            out.push('$');i+=1;
+        } else {
+            let ch=value[i..].chars().next().unwrap();i+=ch.len_utf8();
+            if !ch.is_whitespace() { out.extend(ch.to_lowercase()); }
+        }
+    }
+    out
 }
 
 fn trigger_probe_error(err: &str, name: Option<&str>) -> String {
@@ -3136,5 +3224,19 @@ mod tests {
                 "expected NOT transient: {msg}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pg_expression_comparison_fix_tests {
+    use super::*;
+    #[test]
+    fn lower_case_identifiers_compare_across_server_quoting() {
+        assert_eq!(canonical_pg_expression(r#"("json" ->> 'name'::text)"#),canonical_pg_expression("(json ->> 'name'::text)"));
+        assert_eq!(canonical_pg_expression(r#""a_1$""#),canonical_pg_expression("a_1$"));
+        assert_ne!(canonical_pg_expression(r#""Json""#),canonical_pg_expression("json"));
+        assert_ne!(canonical_pg_expression(r#"'"json"'"#),canonical_pg_expression("'json'"));
+        assert_ne!(canonical_pg_expression("$$ABC def$$"),canonical_pg_expression("$$abc def$$"));
+        assert_ne!(canonical_pg_expression(r"E'a\'B'"),canonical_pg_expression(r"E'a\'b'"));
     }
 }

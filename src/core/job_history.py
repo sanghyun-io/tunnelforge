@@ -134,7 +134,7 @@ def _clean_details(details: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if isinstance(value, bool) or isinstance(value, int):
             cleaned[key] = value
         elif isinstance(value, str):
-            cleaned[key] = scrub_text(value, MAX_FIELD_CHARS)
+            cleaned[key] = scrub_text(value, MAX_ERROR_CHARS if key == "core_error" else MAX_FIELD_CHARS)
     return cleaned
 
 

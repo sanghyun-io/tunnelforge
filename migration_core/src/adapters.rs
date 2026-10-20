@@ -126,7 +126,7 @@ pub struct NormalizedColumn {
 
 /// A proven MySQL generated column. `expression` is decoded SQL without the
 /// enclosing AS (...) parentheses (parentheses belonging to the expression stay).
-/// `stored`: true = STORED, false = VIRTUAL; supported only MySQL -> MySQL.
+/// `stored`: true = STORED, false = VIRTUAL; restored only within the same engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedGenerated {
     pub expression: String,
@@ -416,6 +416,10 @@ pub(crate) enum ImportChunkEvent {
 pub struct InspectionResult {
     pub schema: NormalizedSchema,
     pub unsupported_objects: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object_reasons: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object_tables: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -564,7 +568,104 @@ pub enum LiveAdapter {
     PostgreSql(postgres::Client),
 }
 
+/// Source reads pin a pooler backend only for the read, and never change its session defaults.
+pub struct SourceReadAdapter(pub(crate) LiveAdapter, pub(crate) String);
+
+impl SourceReadAdapter {
+    pub fn into_inner(self) -> LiveAdapter { self.0 }
+
+    pub(crate) fn probe_source_rows(&mut self, schema: &NormalizedSchema) -> Result<(),String> {
+        self.0.source_read(&self.1,|adapter|adapter.probe_source_rows(schema))
+    }
+
+    fn read<T>(&mut self, table: &str, context: &str,
+        postgres: impl FnOnce(&mut postgres::Client)->Result<T,postgres::Error>,
+        other: impl FnOnce(&mut LiveAdapter)->Result<T,String>) -> Result<T,String> {
+        self.0.source_read(&self.1,|adapter|match adapter {
+            LiveAdapter::PostgreSql(client) => postgres(client).map_err(|err|postgres_source_read_error(context,table,&err)),
+            adapter => other(adapter),
+        })
+    }
+
+    pub(crate) fn query_text_row(&mut self, table: &str, sql: &str) -> Result<Vec<Option<String>>,String> {
+        self.read(table,"postgresql query error",|client|client.query(sql,&[])
+            .map(|rows|rows.first().map(|row|(0..row.len()).map(|index|row.get(index)).collect()).unwrap_or_default()),
+            |adapter|adapter.query_text_row(sql))
+    }
+}
+
+impl MigrationAdapter for SourceReadAdapter {
+    fn row_count(&mut self, table: &str) -> Result<usize,String> {
+        self.read(table,"postgresql count error",|client|match client.query_one(&count_sql("postgresql",table),&[]) {
+            Ok(row) => Ok(row.get::<_,i64>(0) as usize),
+            Err(err) if err.code()==Some(&SqlState::UNDEFINED_TABLE) => Ok(0),
+            Err(err) => Err(err),
+        },|adapter|adapter.row_count(table))
+    }
+    fn read_rows(&mut self, table: &NormalizedTable, offset: usize, limit: usize) -> Result<Vec<Value>,String> {
+        self.read(&table.name,"postgresql select chunk error",|client|{
+            let columns=column_names(table);
+            let sql=select_chunk_text_sql("postgresql",table,&cursor_key_columns(table));
+            client.query(&sql,&[&(limit as i64),&(offset as i64)])
+                .map(|rows|rows.iter().map(|row|postgres_row_to_json(&columns,row)).collect())},
+            |adapter|adapter.read_rows(table,offset,limit))
+    }
+    fn read_rows_after_key(&mut self, table: &NormalizedTable, keys: &[String], last: Option<&str>, limit: usize) -> Result<Vec<Value>,String> {
+        if keys.is_empty() {return self.read_rows(table,last.and_then(|key|key.parse().ok()).unwrap_or(0),limit);}
+        self.read(&table.name,"postgresql keyset select chunk error",|client|{
+            let columns=column_names(table);
+            let values=last.and_then(decode_key_token);
+            let sql=select_chunk_text_after_key_sql("postgresql",table,keys,values.as_deref(),limit);
+            client.query(&sql,&[]).map(|rows|rows.iter().map(|row|postgres_row_to_json(&columns,row)).collect())},
+            |adapter|adapter.read_rows_after_key(table,keys,last,limit))
+    }
+    fn read_rows_by_keys(&mut self, table: &NormalizedTable, keys: &[String], values: &[Vec<String>]) -> Result<Vec<Value>,String> {
+        self.read(&table.name,"postgresql key lookup error",|client|{
+            let columns=column_names(table);
+            let sql=select_chunk_text_by_keys_sql("postgresql",table,keys,values);
+            client.query(&sql,&[]).map(|rows|rows.iter().map(|row|postgres_row_to_json(&columns,row)).collect())},
+            |adapter|adapter.read_rows_by_keys(table,keys,values))
+    }
+    fn create_table(&mut self, table: &NormalizedTable, ddl: &str) -> Result<(),String> { self.0.create_table(table,ddl) }
+    fn insert_rows(&mut self, table: &NormalizedTable, rows: Vec<Value>) -> Result<(),String> { self.0.insert_rows(table,rows) }
+    fn execute_sql(&mut self, sql: &str) -> Result<(),String> { self.0.execute_sql(sql) }
+}
+
 impl LiveAdapter {
+    /// Data-copy sources must fail rather than silently read an RLS-filtered subset.
+    /// Ordinary editor connections deliberately keep the server's normal RLS behavior.
+    pub fn connect_source(endpoint: &Endpoint) -> Result<SourceReadAdapter, String> {
+        Self::connect(endpoint).map(|adapter|SourceReadAdapter(adapter,endpoint_schema(endpoint)))
+    }
+
+    pub(crate) fn source_read<T>(&mut self, schema: &str, read: impl FnOnce(&mut Self)->Result<T,String>) -> Result<T,String> {
+        if !matches!(self,Self::PostgreSql(_)) { return read(self); }
+        self.execute_sql(&format!("BEGIN READ ONLY; SET LOCAL row_security = off; SET LOCAL search_path TO {}",quote_ident("postgresql",schema)))?;
+        let result=read(self);
+        match result {
+            Ok(value) => { self.execute_sql("COMMIT")?; Ok(value) },
+            Err(error) => { let _=self.execute_sql("ROLLBACK"); Err(error) },
+        }
+    }
+
+    pub(crate) fn probe_source_rows(&mut self, schema: &NormalizedSchema) -> Result<(),String> {
+        if let Self::PostgreSql(client)=self {
+            for table in &schema.tables {
+                client.query(&format!("SELECT * FROM {} LIMIT 0",quote_ident("postgresql",&table.name)),&[])
+                    .map_err(|err|postgres_source_read_error("postgresql source probe error",&table.name,&err))?;
+            }
+        }
+        Ok(())
+    }
+    /// PostgreSQL's extended protocol refuses statement chains even if metadata validation errs.
+    pub(crate) fn execute_single(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Self::MySql(conn) => conn.query_drop(sql).map_err(|err| format!("mysql SQL execution error: {err}")),
+            Self::PostgreSql(client) => client.execute(sql, &[]).map(|_| ())
+                .map_err(|err| format_postgres_error("postgresql SQL execution error", &err)),
+        }
+    }
+
     pub fn connect(endpoint: &Endpoint) -> Result<Self, String> {
         match endpoint.engine.as_str() {
             "mysql" => Ok(Self::MySql(mysql_conn(endpoint)?)),
@@ -574,7 +675,7 @@ impl LiveAdapter {
                 let schema = endpoint_schema(endpoint);
                 client
                     .batch_execute(&format!(
-                        "SET search_path TO {}",
+                        "SET standard_conforming_strings=on; SET search_path TO {}",
                         quote_ident("postgresql", &schema)
                     ))
                     .map_err(|err| format!("postgresql schema selection error: {err}"))?;
@@ -623,7 +724,8 @@ impl MigrationAdapter for LiveAdapter {
                         Err(format!("mysql count error: {err}"))
                     }
                 }),
-            Self::PostgreSql(client) => client
+            Self::PostgreSql(client) => {
+                client
                 .query_one(&count_sql("postgresql", table), &[])
                 .map(|row| {
                     let count: i64 = row.get(0);
@@ -637,7 +739,8 @@ impl MigrationAdapter for LiveAdapter {
                     } else {
                         Err(format_postgres_error("postgresql count error", &err))
                     }
-                }),
+                })
+            },
         }
     }
 
@@ -824,7 +927,7 @@ impl LiveAdapter {
                 .query_drop(ddl)
                 .map_err(|err| format!("mysql create table error: {err}")),
             Self::PostgreSql(client) => client
-                .batch_execute(ddl)
+                .execute(ddl, &[]).map(|_| ())
                 .map_err(|err| format_postgres_error("postgresql create table error", &err)),
         }
     }
@@ -996,6 +1099,7 @@ fn default_snapshot_policy() -> String {
 pub(crate) const WARNING_UNSYNCHRONIZED_SNAPSHOTS: &str = "Workers used independent snapshots";
 pub(crate) const WARNING_VIEWS_OUTSIDE_SNAPSHOT: &str = "View definitions were collected outside the table data snapshot";
 pub(crate) const WARNING_OBJECT_NOT_EXPORTED: &str = "Object not exported:";
+pub(crate) const WARNING_COMMENTS_NOT_EXPORTED: &str = "comments_not_exported:";
 pub(crate) const WARNING_NON_TRANSACTIONAL_EXCLUDED: &str = "Non-transactional tables excluded from export:";
 pub(crate) const WARNING_VISIBILITY_UNPROVEN: &str = "The export account's privileges do not prove it sees every object, so some may be missing:";
 

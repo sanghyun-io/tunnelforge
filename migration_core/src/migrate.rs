@@ -209,7 +209,7 @@ fn direction_guide(payload: &Value, source: &Endpoint, target: &Endpoint) -> Val
             issues.extend(source_value_issues(&check_payload));
             let row_limit = guide_row_limit(payload);
             let mut table_guides = Vec::new();
-            match LiveAdapter::connect(source) {
+            match LiveAdapter::connect_source(source) {
                 Ok(mut source_adapter) => {
                     table_guides = build_table_guides(
                         &schema,
@@ -443,7 +443,7 @@ fn plan_table_summaries(request: &Request, schema: &NormalizedSchema) -> Vec<Val
     }
     if let Some(source_value) = request.payload.get("source") {
         if let Ok(source_endpoint) = endpoint_from_value(source_value) {
-            if let Ok(mut source) = LiveAdapter::connect(&source_endpoint) {
+            if let Ok(mut source) = LiveAdapter::connect_source(&source_endpoint) {
                 for table in &schema.tables {
                     if let Ok(rows) = source.row_count(&table.name) {
                         rows_by_table.insert(table.name.clone(), rows);
@@ -538,10 +538,13 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             }
         }
         match (
-            connect_migration_endpoint(&source_endpoint),
+            connect_migration_source(&source_endpoint),
             connect_migration_endpoint(&target_endpoint),
         ) {
             (Ok(mut source), Ok(mut target)) => {
+                if let Err(err)=source.probe_source_rows(&schema) {
+                    emit(json!({"event":"error","request_id":request.request_id,"message":err})); return;
+                }
                 if let Err(err) = prepare_target_schema(&mut target, &target_endpoint) {
                     emit(
                         json!({"event": "error", "request_id": request.request_id, "message": err}),
@@ -690,7 +693,7 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
         let options = parse_options(&request.payload);
         let schema = without_mysql_spatial_names(schema, &source_endpoint.engine, &target_endpoint.engine);
         match (
-            connect_migration_endpoint(&source_endpoint),
+            connect_migration_source(&source_endpoint),
             connect_migration_endpoint(&target_endpoint),
         ) {
             (Ok(mut source), Ok(mut target)) => {
@@ -1089,7 +1092,7 @@ pub(crate) fn source_value_issues(payload: &Value) -> Vec<MigrationIssue> {
     if scans.is_empty() {
         return Vec::new();
     }
-    let mut source = match connect_migration_endpoint(&endpoint) {
+    let mut source = match connect_migration_source(&endpoint) {
         Ok(source) => source,
         Err(message) => return vec![MigrationIssue {
             issue_type: None, severity: "error".to_string(), location: "source".to_string(), message,
@@ -1102,7 +1105,7 @@ pub(crate) fn source_value_issues(payload: &Value) -> Vec<MigrationIssue> {
         // ponytail: one full scan per table with temporal columns; sample or index if preflight gets slow.
         let sums = checks.iter().map(|(_, condition)| format!("CAST(SUM(CASE WHEN {condition} THEN 1 ELSE 0 END) AS {text_cast})")).collect::<Vec<_>>();
         let sql = format!("SELECT {} FROM {}", sums.join(", "), quote_ident(&source_engine, &table.name));
-        let counts = match source.query_text_row(&sql) {
+        let counts = match source.query_text_row(&table.name,&sql) {
             Ok(counts) => counts,
             Err(err) => {
                 issues.push(MigrationIssue {
@@ -1356,6 +1359,10 @@ enum TableCopyControl {
 /// PostgreSQL timestamptz text carries that zone's offset into MySQL DATETIME. MySQL sessions are
 /// strict like dump.import, so a value the target column cannot hold (NaN, a key longer than the
 /// mapped VARCHAR) fails instead of being zeroed or truncated.
+fn connect_migration_source(endpoint: &Endpoint) -> Result<SourceReadAdapter,String> {
+    Ok(SourceReadAdapter(connect_migration_endpoint(endpoint)?,endpoint_schema(endpoint)))
+}
+
 fn connect_migration_endpoint(endpoint: &Endpoint) -> Result<LiveAdapter, String> {
     let mut adapter = LiveAdapter::connect(endpoint)?;
     if endpoint.engine == "mysql" {

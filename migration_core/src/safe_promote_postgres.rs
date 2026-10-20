@@ -67,9 +67,10 @@ fn objects(db: &mut impl GenericClient, schemas: &[String]) -> Result<Vec<Value>
       'options',c.reloptions,'rls',c.relrowsecurity,'partition',c.relispartition,
       'comment',obj_description(c.oid,'pg_class'),'persistence',c.relpersistence::text,
       'definition',CASE WHEN c.relkind='v' THEN pg_get_viewdef(c.oid,false) ELSE NULL END,
-      'columns',(SELECT jsonb_agg(jsonb_build_object('name',a.attname,'type',a.atttypid::bigint,
+      'columns',(SELECT jsonb_agg((jsonb_build_object('name',a.attname,'type',a.atttypid::bigint,
         'mod',a.atttypmod,'null',a.attnotnull,'acl',a.attacl::text,'identity',a.attidentity::text,
-        'default',pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum) FROM pg_attribute a
+        'default',pg_get_expr(d.adbin,d.adrelid)) || CASE WHEN COALESCE(to_jsonb(a)->>'attgenerated','')<>''
+          THEN jsonb_build_object('generated',to_jsonb(a)->>'attgenerated') ELSE '{}'::jsonb END) ORDER BY a.attnum) FROM pg_attribute a
         LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
         WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),
       'constraints',(SELECT jsonb_agg(jsonb_build_object('name',k.conname,'def',pg_get_constraintdef(k.oid,false),
@@ -1117,6 +1118,7 @@ pub(crate) fn inspect_displaced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("../tests/support/safe_promote_postgres_fidelity.rs");
     include!("../tests/support/safe_promote_postgres_round5.rs");
 
     fn endpoint() -> Option<Endpoint> {

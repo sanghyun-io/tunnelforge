@@ -2,6 +2,8 @@
 import copy
 import html
 import json
+from src.exporters.rust_dump_exporter import describe_core_failure
+from src.core.i18n import VerbatimText
 from typing import Any, Dict, List, Optional, cast
 
 from PyQt6.QtCore import QTimer, Qt
@@ -639,7 +641,15 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_verify_status.setText("검증 완료" if bool(payload.get("success")) else "검증 완료: 불일치 확인 필요")
         self.lbl_verify_mismatch.setText(f"Mismatch: {mismatch_count:,}개")
         self._append_verify_log("검증 완료")
-        self.txt_verify_result.setPlainText(translate_text(self._verification_result_text(payload)))
+        text = translate_text(self._verification_result_text(payload))
+        for mismatch in payload.get("mismatches") or []:
+            if not isinstance(mismatch, dict):
+                continue
+            raw = str(mismatch.get("message") or "")
+            sentence = describe_core_failure(raw) if "row_security_blocks_read:" in raw else None
+            if sentence:
+                text += f"\n\n{sentence}\n" + translate_text("상세: {}").format(raw)
+        self.txt_verify_result.setPlainText(text)
 
     def _mark_verify_result_stale(self):
         self.verify_activity_bar.hide()
@@ -744,7 +754,10 @@ class CrossEngineMigrationDialog(QDialog):
             table.setItem(row, 0, kind_item)
             for column, key in enumerate(("location", "message", "suggestion"), start=1):
                 text = str(issue.get(key) or "-")
-                item = QTableWidgetItem(text)
+                sentence = (describe_core_failure(issue.get("message"))
+                            if "row_security_blocks_read:" in str(issue.get("message")) else None)
+                shown = sentence if sentence and key == "message" else "-" if sentence and key == "suggestion" else text
+                item = QTableWidgetItem(shown)
                 item.setToolTip(text)
                 table.setItem(row, column, item)
         table.resizeColumnsToContents()
@@ -1217,7 +1230,10 @@ class CrossEngineMigrationDialog(QDialog):
             self._mark_verify_result_stale()
         if finished_command == "migrate" and not success:
             self._step_completed["execute"] = False
-            if not self.lbl_migration_result.isVisible():
+            raw = str(payload.get("error") or payload.get("message") or "") if isinstance(payload, dict) else ""
+            if "row_security_blocks_read:" in raw and describe_core_failure(raw):
+                self._update_migration_result_summary(payload)
+            elif not self.lbl_migration_result.isVisible():
                 self.lbl_migration_result.setText("DB 변경 실패: Rust Core가 상세 실패 원인을 반환하지 않았습니다.")
                 self.lbl_migration_result.show()
                 self.btn_cleanup_failed.show()
@@ -1392,13 +1408,17 @@ class CrossEngineMigrationDialog(QDialog):
             self._append_verify_log(f"[phase:{phase}] {message}")
 
     def _on_issue(self, issue):
-        line = f"[{issue.severity}] {issue.location}: {issue.message}"
+        sentence = describe_core_failure(issue.message) if "row_security_blocks_read:" in issue.message else None
+        line = f"[{issue.severity}] {issue.location}: {sentence or issue.message}"
         self._append_log(line)
         if self._current_command == "preflight":
             self._append_safety_log(line)
 
     def _on_worker_failed(self, message: str):
-        line = f"[error] {message}"
+        sentence = describe_core_failure(message) if "row_security_blocks_read:" in message else None
+        line = f"[error] {sentence or message}"
+        if sentence:
+            self._append_log(VerbatimText(f"[detail] {message}"))
         self._append_log(line)
         if self._current_command == "preflight":
             self._append_safety_log(line)
@@ -1473,6 +1493,12 @@ class CrossEngineMigrationDialog(QDialog):
         error_code = str(payload.get("code") or first_issue.get("code") or "").strip()
         detail = str(payload.get("detail") or first_issue.get("detail") or "").strip()
         context = str(payload.get("context") or first_issue.get("context") or "").strip()
+        rls_sentence = describe_core_failure(message) if "row_security_blocks_read:" in message else None
+        rls_detail = ""
+        if rls_sentence:
+            rls_detail = "\n".join(part for part in (detail, message) if part)
+            detail = ""
+            message = rls_sentence
         raw_state = payload.get("state")
         state: Dict[str, Any] = cast(Dict[str, Any], raw_state) if isinstance(raw_state, dict) else {}
         raw_tables = state.get("tables")
@@ -1499,14 +1525,19 @@ class CrossEngineMigrationDialog(QDialog):
             lines.append(f"상세: {detail}")
         if context:
             lines.append(f"위치: {context}")
-        if suggestion:
+        if rls_sentence:
+            pass  # The refusal sentence already gives the appropriate next action.
+        elif suggestion:
             lines.append(f"다음 행동: {suggestion}")
         else:
             lines.append("다음 행동: Target 정리 후 전환 가능 여부 점검부터 다시 실행하세요.")
-        self.lbl_migration_result.setText("\n".join(lines))
+        rendered = "\n".join(lines)
+        if rls_sentence:
+            rendered = VerbatimText(translate_text(rendered) + "\n" + translate_text("상세: {}").format(rls_detail))
+        self.lbl_migration_result.setText(rendered)
         self.lbl_migration_result.show()
-        self.btn_cleanup_failed.show()
-        self._append_log("\n".join(lines))
+        self.btn_cleanup_failed.setVisible(not bool(rls_sentence))
+        self._append_log(rendered)
 
     def _lock_execution_due_to_input_change(self):
         for step_id in self._step_completed:

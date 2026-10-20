@@ -258,8 +258,16 @@ def finish_migration_job(job_id: Optional[str], success: bool, payload: Any, rep
     try:
         status = migration_status(success, payload)
         error = ""
+        details = {}
         if status == STATUS_FAILED and isinstance(payload, dict):
             error = str(payload.get("error") or payload.get("message") or "")
-        job_finish(job_id, status, error=error, report_path=report_path)
+            if "row_security_blocks_read:" in error:
+                from src.exporters.rust_dump_exporter import describe_core_failure
+                from src.core.error_report_sanitizer import sanitize_local_diagnostic
+                if sentence := describe_core_failure(error):
+                    details["core_error"] = sanitize_local_diagnostic(error)
+                    error = sentence
+        job_finish(job_id, status, error=error, report_path=report_path,
+                   **({"details": details} if details else {}))
     except Exception:
         pass

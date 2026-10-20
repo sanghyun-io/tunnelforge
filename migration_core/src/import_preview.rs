@@ -91,6 +91,10 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
     let safe_mode = request.payload.get("mode").or_else(||request.payload.get("import_mode")).and_then(Value::as_str)==Some("safe");
     let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
     let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict, &endpoint_schema(endpoint), skip_triggers)?;
+    if let Err(err)=super::validate_pg_generated_target(endpoint,&manifest,&selected) {
+        if err.starts_with("generated_virtual_unsupported_on_target:") { blockers.push(issue("generated_virtual_unsupported_on_target",None,err)); }
+        else { return Err(err) }
+    }
     // A timezone the import would refuse is a bad request, not a property of the target.
     super::import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), engine)?;
     let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();

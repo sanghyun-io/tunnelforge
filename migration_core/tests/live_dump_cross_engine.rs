@@ -2,6 +2,27 @@
 //! supported portable scalar values across engines. Requires disposable DBs.
 use migration_core::{handle_request, Endpoint, LiveAdapter, MigrationAdapter, Request};
 use serde_json::{json, Value};
+#[path="support/postgres_objects.rs"]
+mod pg_objects;
+
+#[test]
+fn pg_generated_dump_into_mysql_refused_before_change() {
+    let Some(s)=pg_objects::Sandbox::new() else { return };
+    let Some(mysql)=endpoint("TF_MYSQL","mysql",3306) else { return };
+    pg_objects::db(&s.source).batch_execute("CREATE TABLE sample(id int,g int GENERATED ALWAYS AS(id+1) STORED)").unwrap();
+    s.dump();
+    let name=format!("tf205_{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let target=Endpoint {database:name.clone(),..mysql.clone()};
+    let mut admin=LiveAdapter::connect(&mysql).unwrap();
+    admin.execute_sql(&format!("CREATE DATABASE {name}")).unwrap();
+    let mut target_db=LiveAdapter::connect(&target).unwrap();
+    target_db.execute_sql("CREATE TABLE sample(id int); INSERT INTO sample VALUES(91)").unwrap();
+    let refused=pg_objects::response("dump.import",json!({"target":target,"input_dir":s.dir,"mode":"replace"}));
+    let untouched=call("query.execute",json!({"connection":target,"sql":"SELECT id FROM sample"}));
+    admin.execute_sql(&format!("DROP DATABASE {name}")).unwrap();
+    assert!(refused.to_string().contains("unsupported_generated_column:"),"{refused:#}");
+    assert_eq!(untouched["rows"],json!([{"id":"91"}]));
+}
 
 fn call(command: &str, payload: Value) -> Value {
     let events = handle_request(Request { command: command.into(), request_id: None, payload });

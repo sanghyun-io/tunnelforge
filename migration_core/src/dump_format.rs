@@ -2474,3 +2474,15 @@ mod tests {
         assert!(schema.tables[0].columns[0].primary_key);
     }
 }
+
+#[cfg(test)]
+mod postgres_legacy_format_tests {
+    use super::*;
+    #[test]
+    fn pg_v3_manifest_without_generated_columns_is_byte_identical() {
+        let old=r#"{"format":"tunnelforge-dump","format_version":3,"data_format":"jsonl","compression":"none","source_engine":"postgresql","source_schema":"app","source_timezone":"UTC","database":"db","schema":{"tables":[{"name":"t","columns":[{"name":"id","type":"integer","default":null,"default_is_expression":false,"nullable":false,"primary_key":true,"unique":false}],"indexes":[],"foreign_keys":[]}]},"snapshot_policy":"connection_consistent","strict_export":true,"manifest_warnings":[],"chunk_size":1000,"created_unix_seconds":1760000000,"tables":[{"name":"t","path":"0001_t","rows":0,"chunks":0}]}"#;
+        let manifest:DumpManifest=serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&manifest).unwrap(),old);
+        assert_eq!(manifest.format_version,3);
+    }
+}

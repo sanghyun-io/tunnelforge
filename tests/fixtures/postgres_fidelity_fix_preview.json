@@ -1,0 +1,19 @@
+{
+  "event": "result",
+  "success": true,
+  "dry_run": true,
+  "replace": [
+    "orders"
+  ],
+  "create": [],
+  "warnings": [
+    {
+      "code": "comments_not_exported",
+      "detail": "source dump: comments_not_exported: comment:orders:TABLE, comment:orders:id"
+    },
+    {
+      "code": "not_strict",
+      "detail": "source dump is not marked strict; its recorded fidelity and consistency limitations remain after import"
+    }
+  ]
+}

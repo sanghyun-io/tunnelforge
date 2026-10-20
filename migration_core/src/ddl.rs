@@ -60,6 +60,55 @@ pub(crate) fn is_safe_check_expression(expression: &str) -> bool {
     depth==0
 }
 
+/// PostgreSQL standard strings do not consume backslash escapes; E strings do.
+/// Dollar strings and quoted identifiers must also stay inside their own boundary.
+pub(crate) fn is_safe_pg_expression(expression: &str) -> bool {
+    let bytes=expression.as_bytes(); let mut i=0; let mut depth=0_u32;
+    if expression.trim().is_empty() || bytes.contains(&0) { return false; }
+    while i<bytes.len() {
+        let escape_string=matches!(bytes[i],b'e'|b'E') && bytes.get(i+1)==Some(&b'\'');
+        match bytes[i] {
+            b'\'' | b'"' | b'e' | b'E' if escape_string || matches!(bytes[i],b'\''|b'"') => {
+                if escape_string { i+=1; }
+                let quote=bytes[i]; i+=1; let mut closed=false;
+                while i<bytes.len() {
+                    if escape_string && bytes[i]==b'\\' { i+=2; }
+                    else if bytes[i]==quote {
+                        i+=1;
+                        if bytes.get(i)==Some(&quote) { i+=1; } else { closed=true; break; }
+                    } else { i+=1; }
+                }
+                if !closed { return false; }
+            }
+            b'$' => {
+                let start=i; i+=1;
+                if bytes.get(i)!=Some(&b'$') {
+                    if !bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic() || *b==b'_') { return false; }
+                    while bytes.get(i).is_some_and(|b| b.is_ascii_alphanumeric() || *b==b'_') { i+=1; }
+                }
+                if bytes.get(i)!=Some(&b'$') { return false; }
+                i+=1;
+                let delimiter=&expression[start..i];
+                let Some(end)=expression[i..].find(delimiter) else { return false; };
+                i+=end+delimiter.len();
+            }
+            b'(' => { depth+=1; i+=1; }
+            b')' => { if depth==0 { return false; } depth-=1; i+=1; }
+            b';' | b'`' => return false,
+            b'-' if bytes.get(i+1)==Some(&b'-') => return false,
+            b'/' if bytes.get(i+1)==Some(&b'*') => return false,
+            b',' if depth==0 => return false,
+            byte if byte.is_ascii_alphabetic() || byte==b'_' => {
+                let start=i; i+=1;
+                while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i],b'_'|b'$') || bytes[i]>=128) { i+=1; }
+                if matches!(expression[start..i].to_ascii_uppercase().as_str(), "SELECT"|"CREATE"|"CONSTRAINT"|"REFERENCES"|"UNION"|"INTO") { return false; }
+            }
+            _ => i+=1,
+        }
+    }
+    depth==0
+}
+
 pub(crate) fn read_engine(payload: &Value, key: &str) -> String {
     payload
         .get(key)
@@ -124,8 +173,8 @@ pub(crate) fn validate_target_foreign_key_actions(table: &NormalizedTable, targe
 
 pub(crate) fn mysql_column_direction_refusals<'a>(table: &'a NormalizedTable, source: &str, target: &str) -> Vec<(&'a NormalizedColumn, &'static str, String)> {
     table.columns.iter().filter_map(|column| {
-        if column.generated.is_some() && (source != "mysql" || target != "mysql") {
-            Some((column, "unsupported_generated_column", format!("cannot translate {source} generated column {}.{} to {target}; generated columns require MySQL -> MySQL", table.name, column.name)))
+        if column.generated.is_some() && source != target {
+            Some((column, "unsupported_generated_column", format!("cannot translate {source} generated column {}.{} to {target}; generated columns require the same source and target engine", table.name, column.name)))
         } else if column.invisible && (source != "mysql" || target != "mysql") {
             Some((column, "unsupported_invisible_column", format!("cannot preserve INVISIBLE column {}.{} from {source} on {target}; invisible columns require MySQL -> MySQL", table.name, column.name)))
         } else { None }
@@ -828,10 +877,20 @@ pub(crate) fn format_postgres_error(context: &str, err: &postgres::Error) -> Str
     parts.join("; ")
 }
 
+fn postgres_read_is_rls(sqlstate: Option<&str>, routine: Option<&str>) -> bool {
+    sqlstate==Some("42501") && routine==Some("check_enable_rls")
+}
+
+pub(crate) fn postgres_source_read_error(context: &str, table: &str, err: &postgres::Error) -> String {
+    let detail=format_postgres_error(context,err);
+    if postgres_read_is_rls(err.code().map(|code|code.code()),err.as_db_error().and_then(|error|error.routine())) {
+        format!("row_security_blocks_read: {table}: {detail}")
+    } else { detail }
+}
+
 pub fn copy_rows_csv_sql(target_engine: &str, table: &NormalizedTable) -> String {
-    let columns = column_names(table)
-        .iter()
-        .map(|column| quote_ident(target_engine, column))
+    let columns = table.columns.iter().filter(|column|column.generated.is_none())
+        .map(|column| quote_ident(target_engine, &column.name))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -849,6 +908,7 @@ pub fn copy_csv_line_for_table(
     let fields = table
         .columns
         .iter()
+        .filter(|column|column.generated.is_none())
         .map(|column| match row {
             Value::Object(object) => copy_csv_field_for_column(
                 target_engine,
@@ -1363,7 +1423,7 @@ fn column_ddl_lines(
         }
         let generated = column.generated.as_ref();
         if let Some(generated) = generated {
-            if !is_safe_check_expression(&generated.expression) { return None; }
+            if !(if source=="postgresql" { is_safe_pg_expression(&generated.expression) } else { is_safe_check_expression(&generated.expression) }) { return None; }
         }
         // MySQL places SRID after GENERATED ... STORED [NOT NULL], not in its type.
         let (mapped_type, srid_sql) = if generated.is_some() && is_mysql_spatial_type(&mapped_type) {
@@ -4090,5 +4150,69 @@ mod binary_keyset_tests {
         let flag = table(vec![column("k", "tinyint(1)")]);
         assert!(select_chunk_text_by_keys_sql("postgresql", &flag, &["k".to_string()], &[vec!["2".to_string()]]).contains("= TRUE"));
         assert!(select_chunk_text_by_keys_sql("mysql", &flag, &["k".to_string()], &[]).ends_with("WHERE 1 = 0"));
+    }
+}
+
+#[cfg(test)]
+mod postgres_fidelity_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn pg_expression_scanner() {
+        for expression in [r"'a\'", r"E'a\';b'", r"$$a;b$$", r"$tag$a;b$tag$", r#""odd""name" + 1"#, "j #>> '{a}'", "j @> '{}'", "@ a", "array_length(arr, 1)"] {
+            assert!(is_safe_pg_expression(expression),"{expression}");
+        }
+        for expression in [r"'\'), x int); DROP TABLE keep_me; CREATE TABLE z (q text GENERATED ALWAYS AS ('", "a,b", "a -- comment", "a /*comment*/", "$tag$open", "(a", "a)", "SELECT 1", "a\0b", "'open"] {
+            assert!(!is_safe_pg_expression(expression),"{expression}");
+        }
+    }
+    #[test]
+    fn pg_generated_renders_same_engine_only() {
+        let mut table:NormalizedTable=serde_json::from_value(json!({"name":"t","columns":[{"name":"a","type":"integer"},{"name":"g","type":"integer","generated":{"expression":"(a + 1)","stored":true}}]})).unwrap();
+        for stored in [true,false] {
+            table.columns[1].generated.as_mut().unwrap().stored=stored;
+            let ddl=generate_table_ddl(&table,"postgresql","postgresql").unwrap();
+            assert!(ddl.contains(if stored {"GENERATED ALWAYS AS ((a + 1)) STORED"} else {"GENERATED ALWAYS AS ((a + 1)) VIRTUAL"}));
+            assert_eq!(mysql_column_direction_refusals(&table,"postgresql","mysql")[0].1,"unsupported_generated_column");
+            assert!(generate_table_ddl(&table,"postgresql","mysql").is_none());
+        }
+    }
+    #[test]
+    fn copy_sql_and_line_skip_generated_columns() {
+        let table:NormalizedTable=serde_json::from_value(json!({"name":"t","columns":[{"name":"a","type":"integer"},{"name":"g","type":"integer","generated":{"expression":"a+1","stored":true}},{"name":"b","type":"text"},{"name":"h","type":"text","generated":{"expression":"b","stored":false}}]})).unwrap();
+        assert_eq!(copy_rows_csv_sql("postgresql",&table),r#"COPY "t" ("a", "b") FROM STDIN WITH (FORMAT csv, NULL '\N')"#);
+        assert_eq!(copy_csv_line_for_table("postgresql",&table,&json!({"a":1,"g":2,"b":"kept","h":"omitted"})),"\"1\",\"kept\"\n");
+    }
+}
+
+#[cfg(test)]
+mod postgres_keyword_fix_tests {
+    use super::*;
+    #[test]
+    fn rls_classification_uses_sqlstate_and_server_routine_only() {
+        assert!(postgres_read_is_rls(Some("42501"),Some("check_enable_rls")));
+        assert!(!postgres_read_is_rls(Some("42501"),Some("aclcheck_error")));
+        assert!(!postgres_read_is_rls(Some("42501"),None));
+        assert!(!postgres_read_is_rls(Some("42P01"),Some("check_enable_rls")));
+        assert!(!postgres_read_is_rls(None,Some("check_enable_rls")));
+    }
+    #[test]
+    fn pg_sql_json_returning_is_part_of_an_expression() {
+        for expression in ["JSON_VALUE(j, '$.name' RETURNING text)",
+            "JSON_QUERY(j, '$.tags' RETURNING jsonb WITHOUT WRAPPER KEEP QUOTES)"] {
+            assert!(is_safe_pg_expression(expression));
+        }
+        for expression in ["JSON_VALUE(j,'$.name'); DELETE FROM t RETURNING id", "JSON_QUERY(j,'$.a') -- x", "j, JSON_VALUE(j,'$.a')"] {
+            assert!(!is_safe_pg_expression(expression));
+        }
+    }
+    #[test]
+    fn pg_unreserved_identifiers_are_not_statement_tokens() {
+        for name in ["comment","update","delete","insert","drop","alter","outfile","dumpfile"] {
+            assert!(is_safe_pg_expression(&format!("length({name})")),"{name}");
+        }
+        for expression in ["SELECT 1","a; SELECT 1","a -- c","a /* c */","a,b","(a"] {
+            assert!(!is_safe_pg_expression(expression),"{expression}");
+        }
     }
 }

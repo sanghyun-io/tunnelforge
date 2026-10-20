@@ -1,0 +1,13 @@
+[
+  {
+    "event": "phase",
+    "message": "migration started",
+    "phase": "migrate",
+    "request_id": null
+  },
+  {
+    "event": "error",
+    "message": "row_security_blocks_read: orders: postgresql source probe error: db error; code=42501; message=query would be affected by row-level security policy for table \"orders\"",
+    "request_id": null
+  }
+]

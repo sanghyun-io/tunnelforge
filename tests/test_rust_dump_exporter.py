@@ -1966,15 +1966,19 @@ def test_every_refusal_kind_the_core_reports_has_a_sentence():
 
     source = (Path(__file__).resolve().parents[1] / "migration_core" / "src" / "dump.rs").read_text(encoding="utf-8")
     lossy = re.search(r"LOSSY_SCHEMA_KINDS: \[&str; \d+\] = \[([^\]]*)\]", source).group(1)
-    omitted = re.search(r"fn scoped_omitted_objects\b.*?\n\}", source, re.DOTALL).group(0)
+    omitted = re.search(r"fn scoped_omitted_objects_with_tables\b.*?\n\}", source, re.DOTALL).group(0)
     assert set(re.findall(r'"([a-z_]+)"', lossy)) == LOSSY_REFUSAL_KINDS, "the dialog splits a refusal by the core's own list"
     kinds = set(re.findall(r'"([a-z_]+)"', lossy)) | set(re.findall(r'"([a-z_]+)"', omitted))
     assert {"generated_column", "cross_schema_fk", "trigger", "non_transactional_table", "routine", "event"} <= kinds
 
     for kind in sorted(kinds):
-        line = describe_export_refusal([f"{kind}:orders:x"])[0]
+        object_id = f"{kind}:orders" if kind in ("policy", "table_inheritance") else f"{kind}:orders:x"
+        line = describe_export_refusal([object_id])[0]
         assert "이 객체는 담을 수 없습니다" not in line, kind
-        assert "x" in line and ":" in line, kind
+        if kind in ("policy", "rule", "table_inheritance"):
+            assert "orders" in line, kind
+        else:
+            assert "x" in line and ":" in line, kind
     i18n.set_language("en")
     try:
         lines = describe_export_refusal([f"{kind}:orders:x" for kind in sorted(kinds)] + ["future_kind:orders:x"])

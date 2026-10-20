@@ -321,7 +321,7 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             .collect::<Vec<_>>();
         // Target-only tables and views linked to the dump stopped the run above; the swap leaves
         // the rest, and whatever belongs to them, where they are.
-        let held = if manifest.source_engine == "mysql" && original.engine == "mysql" {
+        let held = if manifest.source_engine == original.engine {
             crate::dump_format::held_object_ids(&manifest.schema, &manifest.stored_programs)
         } else { BTreeSet::new() };
         let unrepresented = original_inspection
@@ -329,7 +329,8 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             .iter()
             .filter(|object| !object.to_ascii_lowercase().starts_with("view:") && !held.contains(*object))
             .filter(|object| original.engine != "mysql" || !["trigger:", "routine:", "event:"].iter().any(|kind| object.starts_with(kind)))
-            .filter(|object| object.split(':').nth(1).is_none_or(|table| !target_only.iter().any(|name| name == table)))
+            .filter(|object| original_inspection.object_tables.get(*object).map(String::as_str)
+                .or_else(||object.split(':').nth(1)).is_none_or(|table| !target_only.iter().any(|name| name == table)))
             .cloned()
             .collect::<Vec<_>>();
         let mut blockers = Vec::new();
@@ -886,7 +887,7 @@ fn verify_candidate(
     }
     unsupported.sort();
     unsupported.dedup();
-    let held = if manifest.source_engine == "mysql" && endpoint.engine == "mysql" {
+    let held = if manifest.source_engine == endpoint.engine {
         crate::dump_format::held_object_ids(&manifest.schema, &manifest.stored_programs)
     } else { BTreeSet::new() };
     let rejected = unsupported
@@ -1060,7 +1061,7 @@ fn verify_candidate(
     )
 }
 
-fn canonical_sql(value: &str) -> String {
+pub(super) fn canonical_sql(value: &str) -> String {
     let mut result = String::new();
     let mut quote = None;
     for ch in value.chars() {
@@ -1165,7 +1166,7 @@ fn verify_schema(
                 return Err(mismatch(&format!("column {} definition", source.name)));
             }
             let generation = |column: &NormalizedColumn| column.generated.as_ref()
-                .map(|generated| (canonical_sql(&generated.expression), generated.stored));
+                .map(|generated| (if engine=="postgresql" {super::canonical_pg_expression(&generated.expression)} else {canonical_sql(&generated.expression)}, generated.stored));
             if generation(source) != generation(column) {
                 return Err(mismatch(&format!("column {} generated expression/storage", source.name)));
             }

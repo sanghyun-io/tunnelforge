@@ -3,6 +3,29 @@ use migration_core::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[path="support/postgres_objects.rs"]
+mod pg_objects;
+
+#[test]
+fn pg_generated_columns_verify_in_copy_promotes() {
+    let Some(s)=pg_objects::Sandbox::new() else { return };
+    pg_objects::db(&s.source).batch_execute("CREATE TABLE sample(id int PRIMARY KEY,g int GENERATED ALWAYS AS(id+1) STORED, v int GENERATED ALWAYS AS(id+3) VIRTUAL); INSERT INTO sample(id) VALUES(1)").unwrap();
+    s.dump();
+    pg_objects::db(&s.target).batch_execute("CREATE TABLE sample(id int PRIMARY KEY,g int GENERATED ALWAYS AS(id+1) STORED, v int GENERATED ALWAYS AS(id+3) VIRTUAL); INSERT INTO sample(id) VALUES(91); COMMENT ON COLUMN sample.id IS 'target metadata'").unwrap();
+    let prepared=pg_objects::run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"safe"}));
+    assert_eq!(prepared["ready_for_switch"],true,"{prepared:#}");
+    let planned=pg_objects::run("dump.promote",json!({"endpoint":s.target,"action":"plan","report_path":prepared["report_path"],"restore_id":prepared["restore_id"]}));
+    let done=pg_objects::run("dump.promote",json!({"endpoint":s.target,"action":"confirm","report_path":prepared["report_path"],"restore_id":prepared["restore_id"],"plan_digest":planned["plan_digest"],"overwrite_confirmed":true}));
+    let mut target=pg_objects::db(&s.target);
+    assert_eq!(target.query_one("SELECT g,v FROM sample WHERE id=1",&[]).unwrap().get::<_,i32>(0),2);
+    target.batch_execute("UPDATE sample SET id=5").unwrap();
+    assert_eq!(target.query_one("SELECT g,v FROM sample",&[]).unwrap().get::<_,i32>(0),6);
+    for key in ["backup_namespace","clone_database"] {
+        if let Some(name)=done[key].as_str() {
+            pg_objects::db(&s.source).batch_execute(&format!("DROP SCHEMA IF EXISTS \"{name}\" CASCADE")).unwrap();
+        }
+    }
+}
 
 fn run(command: &str, payload: Value) -> Vec<Value> {
     handle_request(Request {
