@@ -877,20 +877,13 @@ pub(crate) fn format_postgres_error(context: &str, err: &postgres::Error) -> Str
     parts.join("; ")
 }
 
-pub(crate) fn postgres_table_has_rls(client: &mut postgres::Client, table: &str) -> Result<bool,String> {
-    // Read before the data statement: a permission error may abort its transaction.
-    client.query_opt("SELECT c.relrowsecurity OR c.relforcerowsecurity OR EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid=c.oid) FROM pg_class c WHERE c.oid=to_regclass($1)", &[&quote_ident("postgresql",table)])
-        .map(|row|row.is_some_and(|row|row.get(0)))
-        .map_err(|err|format_postgres_error("postgresql source security inspect error",&err))
+fn postgres_read_is_rls(sqlstate: Option<&str>, routine: Option<&str>) -> bool {
+    sqlstate==Some("42501") && routine==Some("check_enable_rls")
 }
 
-fn postgres_read_is_rls(sqlstate: Option<&str>, rls: bool) -> bool {
-    sqlstate==Some("42501") && rls
-}
-
-pub(crate) fn postgres_source_read_error(context: &str, table: &str, rls: bool, err: &postgres::Error) -> String {
+pub(crate) fn postgres_source_read_error(context: &str, table: &str, err: &postgres::Error) -> String {
     let detail=format_postgres_error(context,err);
-    if postgres_read_is_rls(err.code().map(|code|code.code()),rls) {
+    if postgres_read_is_rls(err.code().map(|code|code.code()),err.as_db_error().and_then(|error|error.routine())) {
         format!("row_security_blocks_read: {table}: {detail}")
     } else { detail }
 }
@@ -4196,11 +4189,12 @@ mod postgres_fidelity_tests {
 mod postgres_keyword_fix_tests {
     use super::*;
     #[test]
-    fn rls_classification_uses_sqlstate_and_catalog_flags_only() {
-        assert!(postgres_read_is_rls(Some("42501"),true));
-        assert!(!postgres_read_is_rls(Some("42501"),false));
-        assert!(!postgres_read_is_rls(Some("42P01"),true));
-        assert!(!postgres_read_is_rls(None,true));
+    fn rls_classification_uses_sqlstate_and_server_routine_only() {
+        assert!(postgres_read_is_rls(Some("42501"),Some("check_enable_rls")));
+        assert!(!postgres_read_is_rls(Some("42501"),Some("aclcheck_error")));
+        assert!(!postgres_read_is_rls(Some("42501"),None));
+        assert!(!postgres_read_is_rls(Some("42P01"),Some("check_enable_rls")));
+        assert!(!postgres_read_is_rls(None,Some("check_enable_rls")));
     }
     #[test]
     fn pg_sql_json_returning_is_part_of_an_expression() {

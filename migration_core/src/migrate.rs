@@ -1360,7 +1360,7 @@ enum TableCopyControl {
 /// strict like dump.import, so a value the target column cannot hold (NaN, a key longer than the
 /// mapped VARCHAR) fails instead of being zeroed or truncated.
 fn connect_migration_source(endpoint: &Endpoint) -> Result<SourceReadAdapter,String> {
-    Ok(SourceReadAdapter(connect_migration_endpoint(endpoint)?))
+    Ok(SourceReadAdapter(connect_migration_endpoint(endpoint)?,endpoint_schema(endpoint)))
 }
 
 fn connect_migration_endpoint(endpoint: &Endpoint) -> Result<LiveAdapter, String> {

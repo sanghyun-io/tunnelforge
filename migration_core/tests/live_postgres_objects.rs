@@ -183,3 +183,6 @@ mod fix_round1;
 
 #[path="support/postgres_fidelity_fix2.rs"]
 mod fix_round2;
+
+#[path="support/postgres_fidelity_fix3.rs"]
+mod fix_round3;

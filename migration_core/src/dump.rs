@@ -1372,11 +1372,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
 
     let mut postgres_snapshot = if endpoint.engine == "postgresql" {
         let mut adapter = LiveAdapter::connect(&endpoint)?;
-        adapter.execute_sql("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
-        adapter.execute_sql("SET LOCAL row_security = off")?;
-        adapter.execute_sql("SET LOCAL TIME ZONE 'UTC'")?;
-        adapter.execute_sql("SET LOCAL DateStyle = 'ISO, YMD'")?;
-        adapter.execute_sql("SET LOCAL lock_timeout = '2s'")?;
+        adapter.execute_sql(&format!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL row_security = off; SET LOCAL search_path TO {}; SET LOCAL TIME ZONE 'UTC'; SET LOCAL DateStyle = 'ISO, YMD'; SET LOCAL lock_timeout = '2s'",quote_ident("postgresql",&endpoint_schema(&endpoint))))?;
         let tables = schema.tables.iter()
             .map(|table| quote_ident("postgresql", &table.name))
             .collect::<Vec<_>>().join(", ");
@@ -1482,7 +1478,7 @@ fn dump_run_with_refusal<F: FnMut(Value)>(
                 dump_tables_sequential(adapter, &ctx, &export_tables, |event| emit(event))?
             } else {
                 let mut adapter = LiveAdapter::connect(&endpoint)?;
-                adapter.source_read(|adapter|dump_tables_sequential(adapter, &ctx, &export_tables, |event| emit(event)))?
+                adapter.source_read(&endpoint_schema(&endpoint),|adapter|dump_tables_sequential(adapter, &ctx, &export_tables, |event| emit(event)))?
             }
         }
     };
@@ -2234,7 +2230,7 @@ fn spawn_dump_table_worker(
     thread::spawn(move || {
         let result = (|| {
             let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
-            adapter.source_read(|adapter|dump_one_table(
+            adapter.source_read(&endpoint_schema(&ctx.endpoint),|adapter|dump_one_table(
                 adapter,
                 &ctx,
                 &table,

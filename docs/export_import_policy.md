@@ -906,9 +906,11 @@ RLS flags, forced RLS, or any policy produce `policy:<table>`; a table rule
 produces `rule:<table>:<rule>`. The existing advanced setting
 "담을 수 없는 객체는 빼고 내보내기" explicitly allows their omission. The export
 then records persistent not-exported warnings. PostgreSQL source-copy and comparison
-reads use `SET LOCAL row_security = off` inside their read transaction (the dump
-uses its snapshot transaction). The setting never changes session defaults or
-leaks into other transactions through a pooler. An account whose rows would be filtered stops with
+reads (export and migrate/verify source) pin `row_security=off` and the selected
+`search_path` inside their transaction (export uses its snapshot transaction).
+Import/migrate target writes and other features are not supported behind a
+transaction-mode pooler; use session pooling or a direct connection instead.
+An account whose rows would be filtered stops with
 `row_security_blocks_read` instead of writing a partial data set. Superusers and
 BYPASSRLS accounts can read all rows; ordinary editor queries keep normal RLS
 behavior. Policies/rules must be
