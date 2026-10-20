@@ -13,7 +13,8 @@ use crate::*;
 /// 바이트 목표 기반 추정보다 실측에 가깝다고 보고 학습값을 신뢰한다.
 const LEARNED_PROFILE_LARGE_ROW_BYTES: u64 = 4_096;
 
-pub(crate) const MAX_SUPPORTED_DUMP_FORMAT_VERSION: u32 = 7;
+/// 8 = PostgreSQL key rules (NULLS NOT DISTINCT, EXCLUDE, DEFERRABLE) on indexes and foreign keys.
+pub(crate) const MAX_SUPPORTED_DUMP_FORMAT_VERSION: u32 = 8;
 
 pub(crate) fn supported_manifest_version(manifest: &DumpManifest) -> bool {
     manifest.format == "tunnelforge-dump"
@@ -24,7 +25,8 @@ pub(crate) fn supported_manifest_version(manifest: &DumpManifest) -> bool {
 pub(crate) fn held_object_ids(schema: &NormalizedSchema, programs: &[NormalizedStoredProgram]) -> BTreeSet<String> {
     let mut held: BTreeSet<String> = schema.tables.iter().flat_map(|table| table.columns.iter()
         .filter(|column| column.generated.is_some())
-        .map(|column| format!("generated_column:{}:{}", table.name, column.name))).collect();
+        .map(|column| format!("generated_column:{}:{}", table.name, column.name))
+        .chain(table.key_rule_names().into_iter().map(|name| format!("key_rule:{}:{name}", table.name)))).collect();
     held.extend(programs.iter().filter(|p| if p.kind == "TRIGGER" {
         crate::mysql_programs::validate_trigger(p).is_ok() && schema.tables.iter().any(|t| Some(&t.name) == p.table.as_ref())
     } else { crate::mysql_schema_programs::schema_program_sql(p,&p.name,None).is_ok() }).map(crate::mysql_programs::program_id));
@@ -1769,6 +1771,7 @@ mod tests {
                         referenced_columns: vec!["code".to_string()],
                         on_delete: None,
                         on_update: None,
+                        deferrable: None,
                     }],
                     table_collation: None,
                     auto_increment: None,
@@ -1837,6 +1840,7 @@ mod tests {
                         referenced_columns: vec!["code".to_string()],
                         on_delete: None,
                         on_update: None,
+                        deferrable: None,
                     }],
                     table_collation: None,
                     auto_increment: None,

@@ -57,7 +57,7 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     }
     match super::import_table_ddls(manifest, selected, engine, target_schema, skip_triggers) {
         Ok((_, untranslatable)) => blockers.extend(untranslatable.into_iter()
-            .map(|(table, reason)| issue(if reason.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else if reason.starts_with("unsupported_generated_column:") {"unsupported_generated_column"} else if reason.starts_with("unsupported_invisible_column:") {"unsupported_invisible_column"} else { "untranslatable_table" }, Some(table.as_str()), reason))),
+            .map(|(table, reason)| issue(if reason.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else if reason.starts_with("unsupported_generated_column:") {"unsupported_generated_column"} else if reason.starts_with("unsupported_invisible_column:") {"unsupported_invisible_column"} else if reason.starts_with("unsupported_constraint_behavior:") {"unsupported_constraint_behavior"} else { "untranslatable_table" }, Some(table.as_str()), reason))),
         Err(err) => blockers.push(issue(if err.starts_with("program_source_schema_reference:") { "program_source_schema_reference" } else { "dump_invalid" }, None, err)),
     }
     let tables = manifest.tables.iter()
@@ -77,6 +77,11 @@ fn dump_findings(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &
     Ok(DumpFindings { tables: dependency_ordered_dump_tables(&manifest.schema, tables), blockers, warnings, copy_blockers })
 }
 
+fn import_schema_deferrals(manifest: &DumpManifest, selected: &BTreeSet<String>, engine: &str) -> Vec<String> {
+    manifest.schema.tables.iter().filter(|table| selected.is_empty() || selected.contains(&table.name))
+        .flat_map(|table| crate::ddl::deferral_not_kept(table, engine)).collect()
+}
+
 fn warning_names(code: &str, names: Vec<String>) -> Value {
     let mut item=warning(code,names.join(", ")); item["names"]=json!(names); item
 }
@@ -91,10 +96,14 @@ pub(crate) fn preview(request: &Request, endpoint: &Endpoint) -> Result<Value, S
     let safe_mode = request.payload.get("mode").or_else(||request.payload.get("import_mode")).and_then(Value::as_str)==Some("safe");
     let skip_triggers = request.payload.get("skip_triggers").and_then(Value::as_bool).unwrap_or(false);
     let DumpFindings { tables, mut blockers, mut warnings, mut copy_blockers } = dump_findings(&manifest, &selected, engine, strict, &endpoint_schema(endpoint), skip_triggers)?;
-    if let Err(err)=super::validate_pg_generated_target(endpoint,&manifest,&selected) {
-        if err.starts_with("generated_virtual_unsupported_on_target:") { blockers.push(issue("generated_virtual_unsupported_on_target",None,err)); }
-        else { return Err(err) }
+    if let Err(err)=super::validate_pg_target_version(endpoint,&manifest,&selected) {
+        match super::PG_VERSION_CODES.iter().find(|code| err.starts_with(&format!("{code}:"))) {
+            Some(code) => blockers.push(issue(code,None,err)),
+            None => return Err(err),
+        }
     }
+    let deferred = import_schema_deferrals(&manifest, &selected, engine);
+    if !deferred.is_empty() { warnings.push(warning_names("constraint_deferral_not_kept", deferred)); }
     // A timezone the import would refuse is a bad request, not a property of the target.
     super::import_timezone_sql(&request.payload, manifest.source_timezone.as_deref(), engine)?;
     let names = tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
@@ -633,6 +642,18 @@ mod tests {
         let found = dump_findings(&m,&BTreeSet::new(),"mysql",true,"copy",false).unwrap();
         assert_eq!(codes(&found.blockers),["program_source_schema_reference","program_source_schema_reference","untranslatable_table"]);
         assert_eq!(found.blockers[0]["table"],"users.guard1"); assert_eq!(found.blockers[1]["table"],"users.guard2");
+    }
+
+    #[test]
+    fn postgres_key_rules_refuse_on_mysql_and_need_postgresql_15() {
+        let mut table = users();
+        table.indexes = vec![serde_json::from_value(json!({"name":"u","columns":["name"],"unique":true,"nulls_not_distinct":true})).unwrap()];
+        let m = manifest("postgresql", 8, vec![table.clone()]);
+        let found = findings(&m, &[], "mysql", true);
+        assert!(found.blockers.iter().any(|b| b["code"] == "unsupported_constraint_behavior" && b["table"] == "users"), "{:?}", found.blockers);
+        assert!(!findings(&m, &[], "postgresql", true).blockers.iter().any(|b| b["code"] == "unsupported_constraint_behavior"));
+        // The PostgreSQL 15 requirement holds whatever source engine the manifest claims.
+        assert_eq!(super::super::pg_target_requirement(&manifest("mysql", 8, vec![table]), &BTreeSet::new()).map(|r| r.0), Some(150000));
     }
 
     #[test]

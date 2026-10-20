@@ -509,7 +509,8 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             return;
         }
         // Reject before target schema creation or cleanup, even when preflight was bypassed.
-        let column_refusals = mysql_column_migration_issues(&schema, &source_endpoint.engine, &target_endpoint.engine, &unsupported_objects(&request.payload));
+        let column_refusals = mysql_column_migration_issues(&schema, &source_endpoint.engine, &target_endpoint.engine, &unsupported_objects(&request.payload))
+            .into_iter().filter(|issue| issue.blocking).collect::<Vec<_>>();
         if !column_refusals.is_empty() {
             let messages = column_refusals.iter().map(|issue| issue.message.as_str()).collect::<Vec<_>>();
             emit(json!({"event":"error","request_id":request.request_id,"message":messages.join("; ")}));
@@ -907,7 +908,34 @@ fn mysql_column_migration_issues(schema: &NormalizedSchema, source: &str, target
             }
         }
     }
-    issues.into_values().collect()
+    // Key rules get their own map, so a rule and a column with the same name both stay.
+    let mut rules = BTreeMap::new();
+    let rule = |table: &str, name: &str, kind: &str, blocking: bool, message: String| MigrationIssue {
+        issue_type: Some(kind.into()), severity: if blocking { "error" } else { "warning" }.into(), location: format!("{table}.{name}"), message,
+        suggestion: if blocking { "Exclude this table or remove the rule in the source before migrating." }
+            else { "The target checks this key immediately; review transactions that relied on deferring it." }.into(),
+        blocking, table_name: Some(table.into()), column_name: None,
+    };
+    if target != "postgresql" {
+        for table in &schema.tables {
+            for (name, reason) in key_rule_direction_refusals(table, target) {
+                rules.insert((table.name.clone(), name.to_string()), rule(&table.name, name, "unsupported_constraint_behavior", true, reason));
+            }
+            let deferred = table.indexes.iter().filter(|index| index.deferrable.is_some()).map(|index| &index.name)
+                .chain(table.foreign_keys.iter().filter(|fk| fk.deferrable.is_some()).map(|fk| &fk.name));
+            for name in deferred {
+                rules.entry((table.name.clone(), name.clone())).or_insert_with(|| rule(&table.name, name, "constraint_deferral_not_kept", false,
+                    format!("{target} checks PostgreSQL DEFERRABLE key {}.{name} immediately", table.name)));
+            }
+        }
+        // Ids the schema does not explain (a deferrable primary key, an EXCLUDE the dump cannot keep,
+        // or an edited schema) block: their rules would silently change on the target.
+        for (table, name) in unsupported.iter().filter_map(|object| object.strip_prefix("key_rule:").and_then(|rest| rest.split_once(':'))) {
+            rules.entry((table.into(), name.into())).or_insert_with(|| rule(table, name, "unsupported_constraint_behavior", true,
+                format!("cannot keep PostgreSQL key rule {table}.{name} on {target}")));
+        }
+    }
+    issues.into_values().chain(rules.into_values()).collect()
 }
 
 pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
@@ -999,7 +1027,7 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
 
     issues.extend(mysql_column_migration_issues(&parse_schema(&payload["schema"]).unwrap_or_default(), &source, &target, &unsupported_objects(payload)));
     for object_name in unsupported_objects(payload) {
-        if object_name.starts_with("generated_column:") { continue; }
+        if object_name.starts_with("generated_column:") || object_name.starts_with("key_rule:") { continue; }
         issues.push(MigrationIssue {
             issue_type: None,
             severity: "warning".to_string(),
@@ -2042,6 +2070,23 @@ mod tests {
         let mut events=Vec::new();
         migrate_streaming(&request,|event|events.push(event));
         assert!(events.iter().any(|event|event["event"]=="error" && event["message"].as_str().unwrap_or_default().contains("cannot translate generated column")),"{events:?}");
+    }
+
+    #[test]
+    fn postgres_key_rules_block_or_warn_on_mysql_targets() {
+        let mut schema=crate::adapters::test_support::schema();
+        schema.tables[0].indexes=vec![serde_json::from_value(serde_json::json!({"name":"u","columns":["name"],"unique":true,"nulls_not_distinct":true})).unwrap()];
+        let mut deferred=crate::adapters::test_support::fk("f","parent");
+        deferred.deferrable=Some(Deferral::Deferred);
+        schema.tables[0].foreign_keys=vec![deferred];
+        let ids=["key_rule:users:u","key_rule:users:f","key_rule:users:users_pkey"].map(String::from);
+        let issues=mysql_column_migration_issues(&schema,"postgresql","mysql",&ids);
+        let at=|location:&str| issues.iter().find(|issue|issue.location==location).unwrap_or_else(||panic!("{issues:?}")).clone();
+        assert!(at("users.u").blocking);
+        assert!(!at("users.f").blocking);
+        assert_eq!(at("users.f").issue_type.as_deref(),Some("constraint_deferral_not_kept"));
+        assert!(at("users.users_pkey").blocking,"a rule the schema does not explain blocks");
+        assert!(mysql_column_migration_issues(&schema,"mysql","postgresql",&[]).is_empty());
     }
 
     

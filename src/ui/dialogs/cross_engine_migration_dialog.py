@@ -68,6 +68,8 @@ _ISSUE_TYPE_LABELS = {
     "unsupported_fk_action": "FK 동작 미지원",
     "unsupported_generated_column": "계산 열 미지원",
     "unsupported_invisible_column": "숨김 열 미지원",
+    "unsupported_constraint_behavior": "키 규칙 미지원",
+    "constraint_deferral_not_kept": "키 검사 시점 바뀜",
 }
 
 _WIZARD_STYLESHEET = """

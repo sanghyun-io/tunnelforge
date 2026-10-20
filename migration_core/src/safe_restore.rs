@@ -239,6 +239,13 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
             }
             return Err(error);
         }
+        // Before any copy schema exists: the server version alone decides it.
+        if let Err(error) = super::validate_pg_target_version(&original, &manifest, &BTreeSet::new()) {
+            if let Some(code) = super::PG_VERSION_CODES.iter().find(|code| error.starts_with(&format!("{code}:"))) {
+                return Err(copy_stop(&mut state, &[(*code, None, error.clone())]));
+            }
+            return Err(error);
+        }
         let timezone = super::import_timezone_sql(
             &request.payload,
             manifest.source_timezone.as_deref(),
@@ -1161,7 +1168,8 @@ fn verify_schema(
                 || source.nullable != column.nullable
                 || source.primary_key != column.primary_key
                 || source.invisible != column.invisible
-                || source.unique && !column.unique
+                // PostgreSQL UNIQUE constraints come back as unique indexes, checked in the index loop.
+                || engine != "postgresql" && source.unique && !column.unique
             {
                 return Err(mismatch(&format!("column {} definition", source.name)));
             }
@@ -1207,6 +1215,7 @@ fn verify_schema(
             if index.columns != restored.columns
                 || index.unique != restored.unique
                 || index.visible.is_some() && index.visible != restored.visible
+                || (index.nulls_not_distinct, index.exclusion, index.deferrable) != (restored.nulls_not_distinct, restored.exclusion, restored.deferrable)
             {
                 return Err(mismatch(&format!("index {} definition", index.name)));
             }
@@ -1232,6 +1241,7 @@ fn verify_schema(
                 || fk.referenced_columns != restored.referenced_columns
                 || action(&fk.on_delete, engine) != action(&restored.on_delete, engine)
                 || action(&fk.on_update, engine) != action(&restored.on_update, engine)
+                || fk.deferrable != restored.deferrable
             {
                 return Err(mismatch(&format!("FK {} definition", fk.name)));
             }
@@ -1282,6 +1292,26 @@ mod tests {
         assert!(verify_schema(&expected,&actual,"mysql").is_ok());
         actual.tables[0].columns[0].invisible=false;
         assert!(verify_schema(&expected,&actual,"mysql").unwrap_err().contains("column x definition"));
+    }
+
+    #[test]
+    fn verify_schema_compares_postgres_key_rules_and_reads_unique_constraints_from_indexes() {
+        let expected: NormalizedSchema=serde_json::from_value(json!({"tables":[{"name":"t",
+            "columns":[{"name":"x","type":"int","unique":true}],
+            "indexes":[{"name":"t_x_key","columns":["x"],"unique":true,"nulls_not_distinct":true,"deferrable":"INITIALLY DEFERRED"}],
+            "foreign_keys":[{"name":"f","columns":["x"],"referenced_table":"p","referenced_columns":["id"],"deferrable":"INITIALLY IMMEDIATE"}]}]})).unwrap();
+        let mut actual=expected.clone();
+        assert!(verify_schema(&expected,&actual,"postgresql").is_ok());
+        // A UNIQUE constraint comes back as a unique index; the index loop checks it.
+        actual.tables[0].columns[0].unique=false;
+        assert!(verify_schema(&expected,&actual,"postgresql").is_ok());
+        assert!(verify_schema(&expected,&actual,"mysql").unwrap_err().contains("column x definition"));
+        actual.tables[0].indexes[0].nulls_not_distinct=false;
+        assert!(verify_schema(&expected,&actual,"postgresql").unwrap_err().contains("index t_x_key definition"));
+        actual=expected.clone(); actual.tables[0].indexes[0].deferrable=None;
+        assert!(verify_schema(&expected,&actual,"postgresql").unwrap_err().contains("index t_x_key definition"));
+        actual=expected.clone(); actual.tables[0].foreign_keys[0].deferrable=None;
+        assert!(verify_schema(&expected,&actual,"postgresql").unwrap_err().contains("FK f definition"));
     }
 
     #[test]

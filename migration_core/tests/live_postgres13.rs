@@ -43,6 +43,49 @@ fn pg_virtual_into_old_target_refused() {
 }
 
 #[test]
+fn pg_nulls_not_distinct_into_old_target_refused() {
+    let Some(base)=endpoint("TF_POSTGRES13") else { return };
+    let s=Sandbox::on(base);
+    db(&s.source).batch_execute("CREATE TABLE a(id int PRIMARY KEY, v int); CREATE UNIQUE INDEX a_v ON a(v); CREATE TABLE b(id int PRIMARY KEY); INSERT INTO a VALUES(1,1); INSERT INTO b VALUES(1)").unwrap();
+    s.dump(); s.sentinel();
+    // PostgreSQL 13 cannot make the rule, so the dump is edited the way a PG15+ source would write it.
+    let mut manifest=s.manifest(); manifest["format_version"]=json!(8);
+    let a=manifest["schema"]["tables"].as_array_mut().unwrap().iter_mut().find(|t|t["name"]=="a").unwrap();
+    a["indexes"][0]["nulls_not_distinct"]=json!(true);
+    s.write_manifest(&manifest);
+    let refused=response("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"replace"}));
+    assert!(refused.to_string().contains("nulls_not_distinct_unsupported_on_target:"),"{refused:#}");
+    s.assert_untouched();
+    for mode in ["replace","safe"] {
+        let preview=run("dump.import_preview",json!({"target":s.target,"input_dir":s.dir,"mode":mode}));
+        assert!(preview["blockers"].as_array().unwrap().iter().any(|b|b["code"]=="nulls_not_distinct_unsupported_on_target"),"{preview:#}");
+    }
+    let copies="SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'tf_restore_%'";
+    let before:i64=db(&s.target).query_one(copies,&[]).unwrap().get(0);
+    let safe=response("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"safe"}));
+    assert_eq!(safe["error_code"],"copy_refused","{safe:#}");
+    assert!(safe.to_string().contains("nulls_not_distinct_unsupported_on_target"),"{safe:#}");
+    assert_eq!(db(&s.target).query_one(copies,&[]).unwrap().get::<_,i64>(0),before,"no copy schema may be created");
+    run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"replace","tables":["b"]}));
+}
+
+#[test]
+fn pg13_key_rules_round_trip() {
+    let Some(base)=endpoint("TF_POSTGRES13") else { return };
+    let s=Sandbox::on(base);
+    let definitions="SELECT conname::text, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid WHERE t.relnamespace=current_schema()::regnamespace AND (c.contype IN ('f','x') OR c.condeferrable) ORDER BY 1";
+    let mut source=db(&s.source);
+    source.batch_execute("CREATE TABLE p(id int PRIMARY KEY, d int, b int, CONSTRAINT dk UNIQUE(d) DEFERRABLE, CONSTRAINT ex EXCLUDE USING btree (b WITH =)); \
+        CREATE TABLE c(id int PRIMARY KEY, pid int, CONSTRAINT c_parent FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO p VALUES(1,1,1); INSERT INTO c VALUES(1,1)").unwrap();
+    assert_eq!(s.dump()["format_version"],8);
+    run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"replace"}));
+    let read=|client:&mut postgres::Client| client.query(definitions,&[]).unwrap().into_iter().map(|row|(row.get::<_,String>(0),row.get::<_,String>(1))).collect::<Vec<_>>();
+    let expected=read(&mut source);
+    assert_eq!(expected.len(),3,"{expected:?}");
+    assert_eq!(read(&mut db(&s.target)),expected);
+}
+
+#[test]
 fn pg13_stored_generated_columns_round_trip() {
     let Some(base)=endpoint("TF_POSTGRES13") else { return };
     let s=Sandbox::on(base);

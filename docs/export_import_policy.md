@@ -146,7 +146,8 @@ replace import creates it.
 `blockers` (`{code, table, detail}`) are what the import refuses before its first
 DROP: `dump_invalid`, `untranslatable_table`, `spatial_unsupported`,
 `temporal_unsupported`, `no_tables`, `unsupported_generated_column`,
-`unsupported_invisible_column`, `trigger_name_conflict`, `trigger_binlog_privilege`,
+`unsupported_invisible_column`, `unsupported_constraint_behavior`,
+`nulls_not_distinct_unsupported_on_target`, `trigger_name_conflict`, `trigger_binlog_privilege`,
 `trigger_privilege_missing`, `program_privilege_missing`,
 `program_source_schema_reference`, the PostgreSQL
 dependents above (`drop_privilege_missing`, `dependent_view`,
@@ -804,8 +805,10 @@ default refusal, opt-in and a strict export/import round trip. The lossy-definit
 rows (unproven generated columns, CHECK, defaults, advanced indexes, cross-schema FKs)
 come from the existing inspection and its earlier fixtures. The new PostgreSQL
 RLS, rules, inheritance/partitioning, and comment-warning rows were live-tested
-only on 18.4. The dedicated PG13 binary tests STORED capture, VIRTUAL refusal and
-PG13-to-PG18 generated-column imports. Other versions are not claimed.
+only on 18.4. The dedicated PG13 binary tests STORED capture, VIRTUAL refusal,
+PG13-to-PG18 generated-column imports, DEFERRABLE/EXCLUDE round trips and the
+NULLS NOT DISTINCT refusal on an old target; the other key-rule rows ran on 18.4.
+Other versions are not claimed.
 
 | Object | MySQL | PostgreSQL |
 | --- | --- | --- |
@@ -821,6 +824,8 @@ PG13-to-PG18 generated-column imports. Other versions are not claimed.
 | Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
 | Row-level security flags/policies and table rules | n/a | Refused with `row_security_unsupported` / `rule_unsupported`; explicitly waivable, then listed as not exported |
 | Inheritance/partitioning, including either side of a relationship | n/a | Refused with `table_inheritance_unsupported`; never waivable, including partial exports |
+| NULLS NOT DISTINCT unique keys, DEFERRABLE UNIQUE/FK constraints, btree EXCLUDE comparing plain columns with `=` | n/a | Preserved (format 8); NULLS NOT DISTINCT needs a PostgreSQL 15+ target. MySQL targets: NULLS NOT DISTINCT and EXCLUDE refused before any change, a deferral is created as an immediately checked key with a `constraint_deferral_not_kept` warning |
+| DEFERRABLE primary keys, any other EXCLUDE constraint | n/a | Refused with `deferrable_primary_key_unsupported` / `exclusion_constraint_unsupported`; never waivable |
 
 INVISIBLE columns (MySQL 8.0.23+) retain their visibility through format 6,
 including invisible generated columns. Reads and loads name these columns
@@ -841,7 +846,7 @@ Imports/migrations across engines refuse generated columns before DROP
 Data chunks retain generated values. Import skips those fields in LOAD DATA and
 INSERT, so MySQL recalculates them. Format 6 readers preserve the expression,
 VIRTUAL/STORED kind, indexes and supported FKs. Dumps without generated/invisible
-columns or stored programs retain the previous format versions. Formats 1-7 are readable: format 6 marks generated/invisible columns and format 7 stored programs. Older applications refuse unsupported 6/7 dumps before changing the target.
+columns or stored programs retain the previous format versions. Formats 1-8 are readable: format 6 marks generated/invisible columns, format 7 stored programs and format 8 PostgreSQL key rules. Older applications refuse unsupported 6/7/8 dumps before changing the target.
 
 Before creating a MySQL or PostgreSQL dump directory, Export also checks that every table it
 will export can generate same-engine import DDL. Failure refuses even an
@@ -894,6 +899,39 @@ dumps through promotion. The promotion inventory records generated kind only for
 columns that have it, retaining the legacy inventory/digest shape otherwise.
 Stored programs remain refused/skipped according to the existing engine rules.
 
+### PostgreSQL key rules (format 8)
+
+Inspection reads primary and unique keys from `pg_constraint` and the trigger
+inventory from `pg_trigger`. `information_schema.table_constraints` and
+`information_schema.triggers` hide both from a role that has only SELECT, so an
+export by a read-only account used to lose the primary key and leave triggers out
+without a refusal.
+
+NULLS NOT DISTINCT on unique indexes and UNIQUE constraints, DEFERRABLE
+[INITIALLY DEFERRED] on UNIQUE constraints and foreign keys, and EXCLUDE
+constraints that use a plain btree index comparing columns only with
+`pg_catalog.=` are kept. Every such rule is listed as `key_rule:<table>:<name>`
+and held only when the dump carries it, so a rule the dump cannot keep is refused,
+never dropped: a DEFERRABLE primary key (`deferrable_primary_key_unsupported`) and
+any other EXCLUDE, such as gist or `&&` (`exclusion_constraint_unsupported`).
+Neither can be waived. The import builds the constraints from fixed keywords and
+quoted names (`ALTER TABLE ... ADD CONSTRAINT ... UNIQUE ... DEFERRABLE`,
+`EXCLUDE USING btree (... WITH OPERATOR(pg_catalog.=))`); plain and NULLS NOT
+DISTINCT UNIQUE constraints still come back as unique indexes, as before. A
+manifest whose rule cannot exist on its index (for example DEFERRABLE on a
+non-unique index) is refused as `export_invalid` before any change.
+
+A dump with key rules uses format 8; every other dump keeps its format and
+manifest bytes. NULLS NOT DISTINCT needs a PostgreSQL 15+ target: an older target
+stops before DDL with `nulls_not_distinct_unsupported_on_target` (replace,
+preview, and verify-in-copy before any copy schema exists). MySQL targets refuse
+NULLS NOT DISTINCT and EXCLUDE before any change (`unsupported_constraint_behavior`,
+also in migrate preflight). A DEFERRABLE key, Django's default for foreign keys,
+is created as an ordinary immediately checked key on MySQL, and the import and
+migrate preflight report it as `constraint_deferral_not_kept`. Verify-in-copy
+compares the rules, and a PostgreSQL UNIQUE constraint that returns as a unique
+index no longer fails the column check.
+
 Every remaining detected PostgreSQL export refusal has a per-object reason in
 `InspectionResult.object_reasons` and the export's `reasons` map, with Korean and
 English sentences. Unsupported defaults select one reason in this order:
@@ -941,8 +979,10 @@ refusal instead of silently producing an incomplete backup. Import behavior is
 unchanged. Objects this inspection does not detect are not reported: MySQL partitioning;
 PostgreSQL extensions, rules on views, column collation, UNLOGGED persistence,
 replica identity and storage parameters, ownership and ACLs, foreign tables,
-event triggers, view/index/constraint/sequence comments, NULLS NOT DISTINCT unique indexes, DEFERRABLE
-constraints, and EXCLUDE constraints. These losses remain outside this fix.
+event triggers, view/index/constraint/sequence comments, foreign key MATCH FULL /
+NOT VALID / NOT ENFORCED / ON DELETE SET NULL (columns), constraint names of
+primary keys, and UNIQUE constraints restored as unique indexes. These losses
+remain outside this fix.
 
 MySQL lists triggers, routines, events, tables and columns only to accounts
 allowed to see them, so a narrow account would get a dump that looks complete
@@ -996,7 +1036,7 @@ log. The trigger toggle is locked during preview/run and disabled for a selected
 dump without triggers. Stable stored-program failure codes are privacy-allowlisted.
 
 Compatibility: full MySQL dumps preserve proven generated/invisible columns and
-stored programs in formats 6/7. This release reads formats 1-7; older applications
+stored programs in formats 6/7. This release reads formats 1-8; older applications
 refuse unsupported formats before changing the target. Table-subset imports name
 omitted views and programs, which can require confirmation for old and PostgreSQL
 dumps as well, without changing their table data or DDL behavior.
