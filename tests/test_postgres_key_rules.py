@@ -2,6 +2,7 @@
 import pytest
 
 from src.core import i18n
+from src.core.cross_engine_migration import excluded_objects, format_schema_summary
 from src.exporters.rust_dump_exporter import (
     LOSSY_REFUSAL_KINDS, describe_core_code, describe_export_refusal, describe_program_warnings,
 )
@@ -43,3 +44,14 @@ def test_deferral_warning_lists_the_keys_in_the_plan_and_the_result(language):
     result = describe_program_warnings([{"code": "constraint_deferral_not_kept", "name": "c.c_parent"}])
     assert result == [describe_core_code("constraint_deferral_not_kept", "c.c_parent")]
     assert "c.c_parent" in result[0]
+    # DEFERRABLE INITIALLY IMMEDIATE keys are checked right away too: the sentence says "could postpone".
+    assert ("미룰 수 있던" if language == "ko" else "could postpone") in result[0]
+
+
+def test_deferral_only_keys_are_not_counted_as_left_out_of_a_migration():
+    schema = {"tables": [{"name": "c", "columns": [],
+                          "indexes": [{"name": "u", "deferrable": "INITIALLY DEFERRED", "nulls_not_distinct": True}],
+                          "foreign_keys": [{"name": "c_parent", "deferrable": "INITIALLY DEFERRED"}]}]}
+    ids = ["key_rule:c:c_parent", "key_rule:c:u", "key_rule:r:no_overlap", "trigger:c:t"]
+    assert excluded_objects(schema, ids) == ["key_rule:c:u", "key_rule:r:no_overlap", "trigger:c:t"]
+    assert format_schema_summary(schema, ids).endswith("지원 제외 3개")

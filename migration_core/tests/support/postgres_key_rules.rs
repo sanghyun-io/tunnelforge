@@ -130,6 +130,92 @@ fn pg_plain_keys_keep_format_3_and_tampered_rules_refused() {
 }
 
 #[test]
+fn pg_old_dumps_in_safe_restore() {
+    let Some(s)=Sandbox::new() else {return};
+    let ddl="CREATE TABLE p(id int PRIMARY KEY); CREATE TABLE c(id int PRIMARY KEY, pid int, CONSTRAINT c_parent FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED); \
+        CREATE TABLE q(id int PRIMARY KEY, code text UNIQUE); INSERT INTO p VALUES(1); INSERT INTO c VALUES(1,1); INSERT INTO q VALUES(1,'a')";
+    db(&s.source).batch_execute(ddl).unwrap();
+    db(&s.target).batch_execute(ddl).unwrap();
+    assert_eq!(s.dump()["format_version"],8);
+    // A dump from before format 8 carries no deferral: the live rule would be weakened, so review.
+    let mut manifest=s.manifest();
+    manifest["format_version"]=json!(3);
+    for table in manifest["schema"]["tables"].as_array_mut().unwrap() {
+        for fk in table["foreign_keys"].as_array_mut().unwrap() { fk.as_object_mut().unwrap().remove("deferrable"); }
+    }
+    s.write_manifest(&manifest);
+    let mut target=db(&s.target);
+    let safe=run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"safe"}));
+    if let Some(candidate)=safe["candidate_target"]["schema"].as_str() { target.batch_execute(&format!("DROP SCHEMA \"{candidate}\" CASCADE")).unwrap(); }
+    assert_eq!(safe["status"],"ready_for_review","{safe:#}");
+    assert_eq!(safe["unrepresented_original_objects"],json!(["key_rule:c:c_parent"]),"{safe:#}");
+    // A plain format-3 dump of a table with a UNIQUE constraint verifies (it returns as a unique index).
+    std::fs::remove_dir_all(&s.dir).unwrap();
+    let plain=run("dump.run",json!({"source":s.source,"output_dir":s.dir,"tables":["q"],"data_format":"jsonl","compression":"none"}));
+    assert_eq!(plain["format_version"],3);
+    let safe=run("dump.import",json!({"target":s.target,"input_dir":s.dir,"mode":"safe"}));
+    if let Some(candidate)=safe["candidate_target"]["schema"].as_str() { target.batch_execute(&format!("DROP SCHEMA \"{candidate}\" CASCADE")).unwrap(); }
+    assert_eq!(safe["ready_for_switch"],true,"{safe:#}");
+}
+
+#[test]
+fn pg_nulls_not_distinct_primary_key_is_not_a_deferrable_one() {
+    // PostgreSQL 15 lets ADD PRIMARY KEY USING INDEX take a NULLS NOT DISTINCT index; 16+ refuses it,
+    // so the catalog state such a database keeps is set directly (postgres is a superuser in CI).
+    let Some(s)=Sandbox::new() else {return};
+    let mut source=db(&s.source);
+    source.batch_execute("CREATE TABLE t(id int, CONSTRAINT t_pk PRIMARY KEY(id)); INSERT INTO t VALUES(1); \
+        UPDATE pg_index SET indnullsnotdistinct=true WHERE indexrelid='t_pk'::regclass").unwrap();
+    let exported=s.dump();
+    assert_eq!(exported["format_version"],3,"{exported:#}");
+}
+
+#[test]
+fn pg_key_rules_in_cross_engine_migrate() {
+    let Some(s)=Sandbox::new() else {return};
+    let host=std::env::var("TF_MYSQL_HOST").expect("MySQL is required for the cross-engine migrate regression");
+    let base=Endpoint {engine:"mysql".into(),host,port:3306,user:"root".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:None,tls:Default::default()};
+    let name=s.source.schema.clone().unwrap();
+    let mut root=LiveAdapter::connect(&base).unwrap();
+    for database in [name.clone(),format!("{name}_2")] { root.execute_sql(&format!("CREATE DATABASE {database}")).unwrap(); }
+    let target=Endpoint {database:name.clone(),..base.clone()};
+    let second=Endpoint {database:format!("{name}_2"),..base};
+    let mut source=db(&s.source);
+    source.batch_execute("CREATE TABLE p(id int PRIMARY KEY); CREATE TABLE c(id int PRIMARY KEY, pid int, CONSTRAINT c_parent FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED); \
+        INSERT INTO p VALUES(1); INSERT INTO c VALUES(1,1)").unwrap();
+    let payload=|target:&Endpoint| {
+        let inspected=run("inspect",json!({"source":s.source}));
+        json!({"source_engine":"postgresql","target_engine":"mysql","source":s.source,"target":target,
+            "schema":inspected["schema"],"unsupported_objects":inspected["unsupported_objects"]})
+    };
+    let blocking=|payload:&serde_json::Value| migration_core::preflight_issues(payload).into_iter().filter(|issue|issue.blocking).map(|issue|issue.location).collect::<Vec<_>>();
+    // Django's DEFERRABLE foreign keys migrate (owner decision); the preflight only warns.
+    let django=payload(&target);
+    assert!(blocking(&django).is_empty(),"{:?}",blocking(&django));
+    let migrated=response("migrate",django);
+    let mut mysql=LiveAdapter::connect(&target).unwrap();
+    let LiveAdapter::MySql(conn)=&mut mysql else {unreachable!()};
+    let fks:Option<i64>=conn.exec_first("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND CONSTRAINT_NAME='c_parent'",(name.as_str(),)).unwrap();
+    // A gist EXCLUDE blocks before the target changes, and leaving its table out lets the rest go.
+    source.batch_execute("CREATE TABLE r(id int PRIMARY KEY, span int4range, CONSTRAINT no_overlap EXCLUDE USING gist (span WITH &&))").unwrap();
+    let excluded=payload(&second);
+    let refused=response("migrate",excluded.clone());
+    let mut later=LiveAdapter::connect(&second).unwrap();
+    let LiveAdapter::MySql(later_conn)=&mut later else {unreachable!()};
+    let created:Option<i64>=later_conn.exec_first("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=?",(format!("{name}_2"),)).unwrap();
+    let mut without_r=excluded.clone();
+    without_r["schema"]["tables"].as_array_mut().unwrap().retain(|table|table["name"]!="r");
+    let partial=blocking(&without_r);
+    for database in [name.clone(),format!("{name}_2")] { root.execute_sql(&format!("DROP DATABASE {database}")).unwrap(); }
+    assert_eq!(migrated["success"],true,"{migrated:#}");
+    assert_eq!(fks,Some(1));
+    assert_eq!(blocking(&excluded),vec!["r.no_overlap".to_string()]);
+    assert!(refused.to_string().contains("cannot keep PostgreSQL key rule r.no_overlap"),"{refused:#}");
+    assert_eq!(created,Some(0),"the refusal must come before the target changes");
+    assert!(partial.is_empty(),"a table left out of the migration must not block it: {partial:?}");
+}
+
+#[test]
 fn pg_key_rules_into_mysql() {
     let Some(s)=Sandbox::new() else {return};
     let host=std::env::var("TF_MYSQL_HOST").expect("MySQL is required for the cross-engine key-rule regression");

@@ -313,6 +313,21 @@ def make_connection_payload(
     ).to_payload()
 
 
+def excluded_objects(schema: Dict, unsupported_objects: List[str]) -> List[str]:
+    """Objects the migration leaves out or refuses. A PostgreSQL DEFERRABLE key the schema carries is
+    migrated (MySQL checks it immediately, with a warning), so it is not counted."""
+    deferral_only = set()
+    tables = schema.get("tables") if isinstance(schema, dict) else None
+    for table in tables if isinstance(tables, list) else []:
+        if not isinstance(table, dict):
+            continue
+        keys = [item for field in ("indexes", "foreign_keys") if isinstance(table.get(field), list) for item in table[field]]
+        for key in keys:
+            if isinstance(key, dict) and key.get("deferrable") and not key.get("nulls_not_distinct") and not key.get("exclusion"):
+                deferral_only.add(f"key_rule:{table.get('name')}:{key.get('name')}")
+    return [str(item) for item in unsupported_objects if str(item) not in deferral_only]
+
+
 def format_schema_summary(schema: Dict, unsupported_objects: List[str]) -> str:
     schema_data: Dict[str, Any] = schema if isinstance(schema, dict) else {}
     raw_tables = schema_data.get("tables")
@@ -332,7 +347,7 @@ def format_schema_summary(schema: Dict, unsupported_objects: List[str]) -> str:
     return (
         f"테이블 {table_count}개, 컬럼 {column_count}개, "
         f"인덱스 {index_count}개, FK {foreign_key_count}개, "
-        f"지원 제외 {len(unsupported_objects)}개"
+        f"지원 제외 {len(excluded_objects(schema_data, unsupported_objects))}개"
     )
 
 

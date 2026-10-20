@@ -623,7 +623,7 @@ const PG_PLAIN_BTREE_INDEX: &str = "(ix.indexprs IS NULL AND ix.indpred IS NULL 
 /// (name, contype or '', deferrable, deferred, NULLS NOT DISTINCT, EXCLUDE keepable) per index and FK of one table.
 fn pg_key_rules_sql() -> String {
     format!("SELECT i.relname::text, COALESCE(c.contype::text,''), COALESCE(c.condeferrable,false), COALESCE(c.condeferred,false), \
-     ix.indisunique AND COALESCE((to_jsonb(ix)->>'indnullsnotdistinct')::boolean,false), \
+     ix.indisunique AND NOT ix.indisprimary AND COALESCE((to_jsonb(ix)->>'indnullsnotdistinct')::boolean,false), \
      {PG_PLAIN_BTREE_INDEX} AND NOT EXISTS(SELECT 1 FROM unnest(c.conexclop) AS x(op) JOIN pg_operator o ON o.oid=x.op JOIN pg_namespace ons ON ons.oid=o.oprnamespace WHERE o.oprname<>'=' OR ons.nspname<>'pg_catalog') \
      FROM pg_index ix JOIN pg_class t ON t.oid=ix.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class i ON i.oid=ix.indexrelid JOIN pg_am am ON am.oid=i.relam \
      LEFT JOIN pg_constraint c ON c.conindid=ix.indexrelid AND c.conrelid=ix.indrelid AND c.contype IN ('p','u','x') \
