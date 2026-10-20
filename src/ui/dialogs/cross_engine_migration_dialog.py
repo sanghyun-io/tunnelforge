@@ -1230,7 +1230,10 @@ class CrossEngineMigrationDialog(QDialog):
             self._mark_verify_result_stale()
         if finished_command == "migrate" and not success:
             self._step_completed["execute"] = False
-            if not self.lbl_migration_result.isVisible():
+            raw = str(payload.get("error") or payload.get("message") or "") if isinstance(payload, dict) else ""
+            if "row_security_blocks_read:" in raw and describe_core_failure(raw):
+                self._update_migration_result_summary(payload)
+            elif not self.lbl_migration_result.isVisible():
                 self.lbl_migration_result.setText("DB 변경 실패: Rust Core가 상세 실패 원인을 반환하지 않았습니다.")
                 self.lbl_migration_result.show()
                 self.btn_cleanup_failed.show()
@@ -1533,7 +1536,7 @@ class CrossEngineMigrationDialog(QDialog):
             rendered = VerbatimText(translate_text(rendered) + "\n" + translate_text("상세: {}").format(rls_detail))
         self.lbl_migration_result.setText(rendered)
         self.lbl_migration_result.show()
-        self.btn_cleanup_failed.show()
+        self.btn_cleanup_failed.setVisible(not bool(rls_sentence))
         self._append_log(rendered)
 
     def _lock_execution_due_to_input_change(self):

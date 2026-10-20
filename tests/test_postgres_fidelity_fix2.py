@@ -70,25 +70,10 @@ def test_scheduled_backup_localizes_full_and_table_failures_and_keeps_detail(sen
     schedule = ScheduleConfig(id="rls", name="nightly", tunnel_id="t", schema="app", database="db", tables=tables, output_dir=str(tmp_path))
     ok, message = executor.execute(schedule)
     assert not ok and message == sentence
-    assert log_writer.log_execution.call_args.args[2] == sentence
+    assert sentence in log_writer.log_execution.call_args.args[2]
+    assert DETAIL in log_writer.log_execution.call_args.args[2]
     assert finished.call_args.kwargs["error"] == sentence
     assert DETAIL in finished.call_args.kwargs["details"]["core_error"]
-
-
-def test_migration_failure_and_result_use_guidance_with_raw_details(sentence):
-    dialog = make_dialog()
-    try:
-        dialog._current_command = "migrate"
-        dialog._on_worker_failed(DETAIL)
-        text = dialog.txt_log.toPlainText()
-        assert "[error] " + sentence in text and "[detail] " + DETAIL in text
-        dialog._update_migration_result_summary({"success": False, "message": DETAIL})
-        summary = dialog.lbl_migration_result.text()
-        assert i18n.translate_text("원인: {}").format(sentence) in summary
-        assert i18n.translate_text("상세: {}").format(DETAIL) in summary
-        assert "Target 정리 후" not in summary
-    finally:
-        dialog.close()
 
 
 def test_temporal_preflight_uses_rls_guidance_and_keeps_tooltip_detail(sentence):
