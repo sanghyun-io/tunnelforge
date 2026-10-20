@@ -150,6 +150,34 @@ pub struct NormalizedIndex {
     /// MySQL SPATIAL key (recreated as `CREATE SPATIAL INDEX`, without the reported prefix).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spatial: bool,
+    /// PostgreSQL 15+ unique key that treats NULLs as equal (dump format 8).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nulls_not_distinct: bool,
+    /// PostgreSQL btree EXCLUDE constraint comparing plain columns with pg_catalog `=` (format 8).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusion: bool,
+    /// PostgreSQL DEFERRABLE UNIQUE or EXCLUDE constraint (format 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferrable: Option<Deferral>,
+}
+
+impl NormalizedIndex {
+    pub fn has_key_rule(&self) -> bool { self.nulls_not_distinct || self.exclusion || self.deferrable.is_some() }
+}
+
+/// When a PostgreSQL DEFERRABLE constraint is checked by default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Deferral {
+    #[serde(rename = "INITIALLY IMMEDIATE")]
+    Immediate,
+    #[serde(rename = "INITIALLY DEFERRED")]
+    Deferred,
+}
+
+impl Deferral {
+    pub fn as_sql(self) -> &'static str {
+        match self { Self::Immediate => "DEFERRABLE INITIALLY IMMEDIATE", Self::Deferred => "DEFERRABLE INITIALLY DEFERRED" }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +218,17 @@ pub struct NormalizedForeignKey {
     pub on_delete: Option<ForeignKeyAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_update: Option<ForeignKeyAction>,
+    /// PostgreSQL DEFERRABLE foreign key (format 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferrable: Option<Deferral>,
+}
+
+impl NormalizedTable {
+    /// Names of the PostgreSQL key rules (NULLS NOT DISTINCT, EXCLUDE, DEFERRABLE) this table carries.
+    pub fn key_rule_names(&self) -> Vec<&str> {
+        self.indexes.iter().filter(|index| index.has_key_rule()).map(|index| index.name.as_str())
+            .chain(self.foreign_keys.iter().filter(|fk| fk.deferrable.is_some()).map(|fk| fk.name.as_str())).collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1194,6 +1233,7 @@ pub(crate) mod test_support {
             referenced_columns: vec!["id".to_string()],
             on_delete: None,
             on_update: None,
+            deferrable: None,
         }
     }
 

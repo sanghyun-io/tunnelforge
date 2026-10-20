@@ -154,6 +154,14 @@ pub(crate) fn validate_target_foreign_key_actions(table: &NormalizedTable, targe
     for check in &table.checks {
         if !is_safe_check_expression(&check.expression) { return Err(format!("unsafe CHECK expression in table {} constraint {}",table.name,check.name)); }
     }
+    // Inspection never produces these shapes; a tampered manifest could otherwise turn a plain
+    // index into a constraint that only fails after the DROP and load.
+    for index in &table.indexes {
+        if (index.nulls_not_distinct && !index.unique) || (index.exclusion && (index.unique || index.columns.is_empty()))
+            || (index.deferrable.is_some() && !(index.unique || index.exclusion)) {
+            return Err(format!("invalid key rule on index {} of table {}", index.name, table.name));
+        }
+    }
     for column in &table.columns {
         if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| !supported_mysql_default_expression(value)) {
             return Err(format!("unsupported expression default for {}.{}",table.name,column.name));
@@ -181,8 +189,26 @@ pub(crate) fn mysql_column_direction_refusals<'a>(table: &'a NormalizedTable, so
     }).collect()
 }
 
+/// PostgreSQL key rules a non-PostgreSQL target cannot keep: `(rule name, reason)`. Deferral alone
+/// is not refused (the owner's call, 2026-10-20): MySQL checks it immediately and the import reports it.
+pub(crate) fn key_rule_direction_refusals<'a>(table: &'a NormalizedTable, target: &str) -> Vec<(&'a str, String)> {
+    if target == "postgresql" { return Vec::new() }
+    table.indexes.iter().filter(|index| index.nulls_not_distinct || index.exclusion).map(|index| (index.name.as_str(), format!(
+        "cannot keep PostgreSQL {} rule {}.{} on {target}; it requires a PostgreSQL target",
+        if index.exclusion { "EXCLUDE" } else { "NULLS NOT DISTINCT" }, table.name, index.name))).collect()
+}
+
+/// Deferrable keys a non-PostgreSQL target creates as immediately checked keys, as `table.name`.
+pub(crate) fn deferral_not_kept(table: &NormalizedTable, target: &str) -> Vec<String> {
+    if target == "postgresql" { return Vec::new() }
+    table.indexes.iter().filter(|index| index.deferrable.is_some() && !index.exclusion).map(|index| &index.name)
+        .chain(table.foreign_keys.iter().filter(|fk| fk.deferrable.is_some()).map(|fk| &fk.name))
+        .map(|name| format!("{}.{name}", table.name)).collect()
+}
+
 pub(crate) fn validate_mysql_column_direction(table: &NormalizedTable, source: &str, target: &str) -> Result<(), String> {
-    let reasons = mysql_column_direction_refusals(table, source, target).into_iter().map(|(_, _, reason)| reason).collect::<Vec<_>>();
+    let reasons = mysql_column_direction_refusals(table, source, target).into_iter().map(|(_, _, reason)| reason)
+        .chain(key_rule_direction_refusals(table, target).into_iter().map(|(_, reason)| reason)).collect::<Vec<_>>();
     if reasons.is_empty() { Ok(()) } else { Err(reasons.join("; ")) }
 }
 
@@ -239,6 +265,26 @@ pub(crate) fn secondary_index_ddl(table: &NormalizedTable, target: &str) -> Vec<
             .collect::<Vec<_>>()
             .join(", ");
         let visibility = if target == "mysql" && index.visible == Some(false) { " INVISIBLE" } else { "" };
+        if target == "postgresql" {
+            // Built only from fixed keywords and quoted names; nothing is copied from catalog text.
+            let deferral = index.deferrable.map(|deferral| format!(" {}", deferral.as_sql())).unwrap_or_default();
+            let nulls = if index.nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" };
+            if index.exclusion {
+                let elements = index.columns.iter().map(|column| format!("{} WITH OPERATOR(pg_catalog.=)", quote_ident(target, column)))
+                    .collect::<Vec<_>>().join(", ");
+                ddl.push(format!("ALTER TABLE {} ADD CONSTRAINT {} EXCLUDE USING btree ({elements}){deferral};",
+                    quote_ident(target, &table.name), quote_ident(target, &index.name)));
+                continue;
+            }
+            if index.deferrable.is_some() {
+                ddl.push(format!("ALTER TABLE {} ADD CONSTRAINT {} UNIQUE{nulls} ({columns}){deferral};",
+                    quote_ident(target, &table.name), quote_ident(target, &index.name)));
+                continue;
+            }
+            ddl.push(format!("CREATE {unique}INDEX {} ON {} ({columns}){nulls};",
+                quote_ident(target, &index.name), quote_ident(target, &table.name)));
+            continue;
+        }
         ddl.push(format!(
             "CREATE {}INDEX {} ON {} ({}){};",
             unique,
@@ -263,6 +309,10 @@ pub(crate) fn foreign_key_ddl(table: &str, fk: &NormalizedForeignKey, target: &s
     }
     if let Some(action) = &fk.on_update {
         actions.push_str(&format!(" ON UPDATE {}", action.as_sql()));
+    }
+    // MySQL checks foreign keys immediately; the deferral is reported, not rendered (import/migrate).
+    if let Some(deferral) = fk.deferrable.filter(|_| target == "postgresql") {
+        actions.push_str(&format!(" {}", deferral.as_sql()));
     }
     Some(format!(
         "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}){};",
@@ -1281,7 +1331,9 @@ pub fn postgresql_column_type(
 
 pub fn inspect_keys_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
-        "SELECT kcu.column_name, tc.constraint_type FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name WHERE tc.table_schema = $1 AND tc.table_name = $2 AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE') ORDER BY tc.constraint_type, kcu.ordinal_position"
+        // pg_constraint, not information_schema.table_constraints: the latter hides every key from a
+        // role that has only SELECT on the table, and the primary key then vanished from the dump.
+        "SELECT a.attname::text, CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' ELSE 'UNIQUE' END FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum WHERE n.nspname = $1 AND t.relname = $2 AND c.contype IN ('p', 'u') ORDER BY 2, c.conname, k.ord"
     } else {
         "SELECT kcu.COLUMN_NAME AS column_name, tc.CONSTRAINT_TYPE AS constraint_type FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.KEY_COLUMN_USAGE kcu ON tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_NAME = kcu.TABLE_NAME WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE') ORDER BY tc.CONSTRAINT_TYPE, kcu.ORDINAL_POSITION"
     }
@@ -1333,7 +1385,7 @@ pub(crate) fn group_indexes(
                 columns: Vec::new(),
                 column_prefixes: Vec::new(),
                 unique,
-                visible: None, spatial: false,
+                visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
             });
         index.unique = index.unique || unique;
         index.columns.push(column);
@@ -1358,6 +1410,7 @@ pub(crate) fn group_foreign_keys(rows: Vec<(String, String, String, String, Stri
                 referenced_columns: Vec::new(),
                 on_delete: Some(on_delete),
                 on_update: Some(on_update),
+                deferrable: None,
             });
         fk.columns.push(column);
         fk.referenced_columns.push(referenced_column);
@@ -2541,7 +2594,7 @@ mod tests {
                         columns: vec!["user_id".to_string()],
                         column_prefixes: vec![None],
                         unique: false,
-                        visible: None, spatial: false,
+                        visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                     }],
                     foreign_keys: vec![NormalizedForeignKey {
                         name: "fk_orders_users".to_string(),
@@ -2550,6 +2603,7 @@ mod tests {
                         referenced_columns: vec!["id".to_string()],
                         on_delete: None,
                         on_update: None,
+                        deferrable: None,
                     }],
                     table_collation: None,
                     auto_increment: None,
@@ -2598,6 +2652,7 @@ mod tests {
                         referenced_columns: vec!["slug".to_string()],
                         on_delete: None,
                         on_update: None,
+                        deferrable: None,
                     }],
                     table_collation: None,
                     auto_increment: None,
@@ -2624,7 +2679,7 @@ mod tests {
                         columns: vec!["slug".to_string()],
                         column_prefixes: vec![None],
                         unique: true,
-                        visible: None, spatial: false,
+                        visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                     }],
                     foreign_keys: Vec::new(),
                     table_collation: None,
@@ -2649,7 +2704,7 @@ mod tests {
         let mut parent = empty_table("parent", vec![fk("parent_cycle", "child")]);
         parent.indexes.push(NormalizedIndex {
             name: "idx_parent".into(), columns: vec!["parent_id".into()], column_prefixes: vec![None],
-            unique: false, visible: None, spatial: false,
+            unique: false, visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
         });
         let child = empty_table("child", vec![fk("child_parent", "parent"), fk("child_self", "child"), fk("child_outside", "users")]);
         let schema = NormalizedSchema { tables: vec![parent.clone(), child.clone()] };
@@ -2691,7 +2746,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None, spatial: false,
+                    visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -2766,6 +2821,7 @@ mod tests {
                         referenced_columns: vec!["id".to_string()],
                         on_delete: None,
                         on_update: None,
+                        deferrable: None,
                     }],
                     table_collation: None,
                     auto_increment: None,
@@ -2821,7 +2877,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None, spatial: false,
+                    visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -2873,7 +2929,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None, spatial: false,
+                    visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -2940,7 +2996,7 @@ mod tests {
                         columns: vec!["audit_category_code".to_string()],
                         column_prefixes: vec![None],
                         unique: false,
-                        visible: None, spatial: false,
+                        visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                     }],
                     foreign_keys: vec![NormalizedForeignKey {
                         name: "df_evaluation_results_ibfk_3".to_string(),
@@ -2949,6 +3005,7 @@ mod tests {
                         referenced_columns: vec!["code".to_string()],
                         on_delete: None,
                         on_update: None,
+                        deferrable: None,
                     }],
                     table_collation: None,
                     auto_increment: None,
@@ -2988,7 +3045,7 @@ mod tests {
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
-                    visible: None, spatial: false,
+                    visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -3802,7 +3859,7 @@ mod tests {
                     columns: vec!["filename".to_string()],
                     column_prefixes: vec![Some(255)],
                     unique: false,
-                    visible: None, spatial: false,
+                    visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
@@ -4060,7 +4117,7 @@ mod binary_keyset_tests {
         // Key columns cannot be TEXT/BLOB in MySQL (ERROR 1170).
         let mut keyed = table(vec![column("code", "text"), column("blob_key", "bytea")]);
         keyed.columns[1].primary_key = false;
-        keyed.indexes.push(NormalizedIndex { name: "uq_blob".into(), columns: vec!["blob_key".into()], column_prefixes: vec![None], unique: true, visible: None, spatial: false });
+        keyed.indexes.push(NormalizedIndex { name: "uq_blob".into(), columns: vec!["blob_key".into()], column_prefixes: vec![None], unique: true, visible: None, spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None });
         let ddl = generate_table_ddl(&keyed, "postgresql", "mysql").unwrap();
         assert!(ddl.contains("`code` VARCHAR(255) NOT NULL"), "{ddl}");
         assert!(ddl.contains("`blob_key` VARBINARY(255)"), "{ddl}");
@@ -4094,7 +4151,7 @@ mod binary_keyset_tests {
         assert!(!is_safe_column_type("point srid") && !is_safe_column_type("point srid x"));
         let ddl = generate_table_ddl(&geo, "mysql", "mysql").unwrap();
         assert!(ddl.contains("`pos` point srid 4326 NOT NULL"), "{ddl}");
-        geo.indexes.push(NormalizedIndex { name: "sp_pos".into(), columns: vec!["pos".into()], column_prefixes: vec![Some(32)], unique: false, visible: None, spatial: true });
+        geo.indexes.push(NormalizedIndex { name: "sp_pos".into(), columns: vec!["pos".into()], column_prefixes: vec![Some(32)], unique: false, visible: None, spatial: true, nulls_not_distinct: false, exclusion: false, deferrable: None });
         let post = generate_post_data_ddl(&NormalizedSchema { tables: vec![geo] }, "mysql");
         assert!(post.iter().any(|sql| sql == "CREATE SPATIAL INDEX `sp_pos` ON `events` (`pos`);"), "{post:?}");
     }
@@ -4214,5 +4271,91 @@ mod postgres_keyword_fix_tests {
         for expression in ["SELECT 1","a; SELECT 1","a -- c","a /* c */","a,b","(a"] {
             assert!(!is_safe_pg_expression(expression),"{expression}");
         }
+    }
+}
+
+#[cfg(test)]
+mod key_rule_tests {
+    use super::*;
+    use crate::adapters::test_support::{fk, schema};
+    use std::collections::BTreeSet;
+
+    fn index(name: &str, unique: bool) -> NormalizedIndex {
+        NormalizedIndex { name: name.into(), columns: vec!["name".into()], column_prefixes: vec![None], unique, visible: None,
+            spatial: false, nulls_not_distinct: false, exclusion: false, deferrable: None }
+    }
+
+    fn table() -> NormalizedTable { schema().tables.remove(0) }
+
+    #[test]
+    fn postgres_key_rules_render_as_constraints_and_plain_indexes_stay_the_same() {
+        let mut t = table();
+        t.indexes = vec![
+            NormalizedIndex { nulls_not_distinct: true, ..index("u", true) },
+            NormalizedIndex { nulls_not_distinct: true, deferrable: Some(Deferral::Deferred), ..index("dk", true) },
+            NormalizedIndex { exclusion: true, deferrable: Some(Deferral::Immediate), ..index("ex", false) },
+            index("plain", false),
+            index("plain_u", true),
+        ];
+        assert_eq!(secondary_index_ddl(&t, "postgresql"), vec![
+            "CREATE UNIQUE INDEX \"u\" ON \"users\" (\"name\") NULLS NOT DISTINCT;",
+            "ALTER TABLE \"users\" ADD CONSTRAINT \"dk\" UNIQUE NULLS NOT DISTINCT (\"name\") DEFERRABLE INITIALLY DEFERRED;",
+            "ALTER TABLE \"users\" ADD CONSTRAINT \"ex\" EXCLUDE USING btree (\"name\" WITH OPERATOR(pg_catalog.=)) DEFERRABLE INITIALLY IMMEDIATE;",
+            "CREATE INDEX \"plain\" ON \"users\" (\"name\");",
+            "CREATE UNIQUE INDEX \"plain_u\" ON \"users\" (\"name\");",
+        ]);
+        let mut deferred = fk("f", "parent");
+        deferred.deferrable = Some(Deferral::Deferred);
+        assert!(foreign_key_ddl("users", &deferred, "postgresql").unwrap().ends_with(") DEFERRABLE INITIALLY DEFERRED;"));
+        let mysql = foreign_key_ddl("users", &deferred, "mysql").unwrap();
+        deferred.deferrable = None;
+        assert_eq!(mysql, foreign_key_ddl("users", &deferred, "mysql").unwrap(), "MySQL text must not change");
+    }
+
+    #[test]
+    fn impossible_key_rules_are_refused() {
+        for bad in [NormalizedIndex { nulls_not_distinct: true, ..index("i", false) },
+                    NormalizedIndex { exclusion: true, ..index("i", true) },
+                    NormalizedIndex { deferrable: Some(Deferral::Deferred), ..index("i", false) }] {
+            let mut t = table();
+            t.indexes = vec![bad];
+            assert!(validate_target_foreign_key_actions(&t, "postgresql").unwrap_err().contains("invalid key rule on index i"));
+        }
+    }
+
+    #[test]
+    fn non_postgres_targets_refuse_rules_but_only_report_deferral() {
+        let mut t = table();
+        t.indexes = vec![NormalizedIndex { nulls_not_distinct: true, ..index("u", true) },
+                         NormalizedIndex { deferrable: Some(Deferral::Immediate), ..index("dk", true) }];
+        let mut deferred = fk("f", "parent");
+        deferred.deferrable = Some(Deferral::Deferred);
+        t.foreign_keys = vec![deferred];
+        assert!(key_rule_direction_refusals(&t, "postgresql").is_empty());
+        assert!(deferral_not_kept(&t, "postgresql").is_empty());
+        assert_eq!(key_rule_direction_refusals(&t, "mysql").iter().map(|(name, _)| *name).collect::<Vec<_>>(), vec!["u"]);
+        assert_eq!(deferral_not_kept(&t, "mysql"), vec!["users.dk", "users.f"]);
+        assert!(generate_table_ddl(&t, "mysql", "mysql").is_none());
+        t.indexes.remove(0);
+        assert!(generate_table_ddl(&t, "mysql", "mysql").is_some(), "deferral alone does not refuse");
+    }
+
+    #[test]
+    fn key_rules_serialize_only_when_set_and_are_held() {
+        let plain = serde_json::to_value(index("p", true)).unwrap();
+        assert!(plain.get("nulls_not_distinct").is_none() && plain.get("exclusion").is_none() && plain.get("deferrable").is_none());
+        let rule = serde_json::to_value(NormalizedIndex { deferrable: Some(Deferral::Deferred), ..index("dk", true) }).unwrap();
+        assert_eq!(rule["deferrable"], "INITIALLY DEFERRED");
+        assert_eq!(serde_json::from_value::<NormalizedIndex>(rule).unwrap().deferrable, Some(Deferral::Deferred));
+        let mut later = serde_json::to_value(index("x", true)).unwrap();
+        later["deferrable"] = "LATER".into();
+        assert!(serde_json::from_value::<NormalizedIndex>(later).is_err());
+        let mut s = schema();
+        let mut deferred = fk("f", "parent");
+        deferred.deferrable = Some(Deferral::Immediate);
+        s.tables[0].indexes = vec![NormalizedIndex { nulls_not_distinct: true, ..index("u", true) }, index("p", false)];
+        s.tables[0].foreign_keys = vec![deferred, fk("plain_f", "parent")];
+        assert_eq!(crate::dump_format::held_object_ids(&s, &[]),
+            BTreeSet::from(["key_rule:users:u".to_string(), "key_rule:users:f".to_string()]));
     }
 }

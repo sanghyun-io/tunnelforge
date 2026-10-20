@@ -36,6 +36,7 @@ from src.core.cross_engine_migration import (
     DatabaseEngine,
     MigrationDirection,
     format_plan_summary,
+    excluded_objects,
     format_schema_summary,
     format_verification_result,
     load_resume_state,
@@ -68,6 +69,8 @@ _ISSUE_TYPE_LABELS = {
     "unsupported_fk_action": "FK 동작 미지원",
     "unsupported_generated_column": "계산 열 미지원",
     "unsupported_invisible_column": "숨김 열 미지원",
+    "unsupported_constraint_behavior": "키 규칙 미지원",
+    "constraint_deferral_not_kept": "키 검사 시점 바뀜",
 }
 
 _WIZARD_STYLESHEET = """
@@ -1112,7 +1115,8 @@ class CrossEngineMigrationDialog(QDialog):
             self.unsupported_objects = [str(item) for item in unsupported_objects]
             if self.unsupported_objects:
                 self._append_log(
-                    translate_text("지원 제외 객체 {}개를 사전 점검 대상으로 저장했습니다.").format(len(self.unsupported_objects))
+                    translate_text("지원 제외 객체 {}개를 사전 점검 대상으로 저장했습니다.").format(
+                        len(excluded_objects(schema, self.unsupported_objects)) if schema is not None else len(self.unsupported_objects))
                 )
             if any(item.startswith("generated_column:") for item in self.unsupported_objects):
                 self._append_log(translate_text("계산 열은 다른 DB 엔진으로 이관할 수 없어 실행을 차단합니다."))

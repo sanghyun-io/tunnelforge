@@ -60,6 +60,8 @@ fn validate_import_metadata(
             "unsupported_generated_column"
         } else if untranslatable.iter().any(|(_,reason)|reason.starts_with("unsupported_invisible_column:")) {
             "unsupported_invisible_column"
+        } else if untranslatable.iter().any(|(_,reason)|reason.starts_with("unsupported_constraint_behavior:")) {
+            "unsupported_constraint_behavior"
         } else { "export_invalid" };
         let table_count=untranslatable.iter().map(|(table,_)|table).collect::<BTreeSet<_>>().len();
         let reasons = untranslatable.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>();
@@ -151,6 +153,11 @@ fn import_table_ddls(
             let direction=mysql_column_direction_refusals(definition,&manifest.source_engine,target_engine);
             if !direction.is_empty() {
                 untranslatable.extend(direction.into_iter().map(|(_,code,reason)|(table.name.clone(),format!("{code}: {reason}"))));
+                continue;
+            }
+            let key_rules = key_rule_direction_refusals(definition, target_engine);
+            if !key_rules.is_empty() {
+                untranslatable.extend(key_rules.into_iter().map(|(_, reason)| (table.name.clone(), format!("unsupported_constraint_behavior: {reason}"))));
                 continue;
             }
             if let Err(reason) = validate_target_foreign_key_actions(definition, target_engine) {
@@ -424,7 +431,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     let metadata_schema = journal.safe_context.as_ref().and_then(|context| context["original_target"]["schema"].as_str())
         .map(str::to_string).unwrap_or_else(|| endpoint_schema(&endpoint));
     let table_ddls = validate_import_metadata(&manifest, &selected, &endpoint.engine, &metadata_schema, skip_triggers)?;
-    validate_pg_generated_target(&endpoint, &manifest, &selected)?;
+    validate_pg_target_version(&endpoint, &manifest, &selected)?;
     let tables: Vec<DumpTableManifest> = manifest
         .tables
         .iter()
@@ -642,6 +649,10 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             if journal.safe_context.is_none() && manifest.source_engine=="postgresql" && target_engine=="postgresql" && table.columns.iter().any(|column|column.generated.as_ref().is_some_and(|g|g.stored)) {
                 journal.program_warnings.push(json!({"code":"generated_values_recomputed","name":table.name}));
             }
+            let deferred = deferral_not_kept(table, target_engine);
+            if !deferred.is_empty() {
+                journal.program_warnings.push(json!({"code":"constraint_deferral_not_kept","name":deferred.join(", ")}));
+            }
             let table_programs = programs.iter().filter(|p| !journal.safe_context.as_ref().is_some_and(|context| context["cutover_pending"] == true)
                 && p.table.as_deref() == Some(table.name.as_str())).collect::<Vec<_>>();
             if !table_programs.is_empty() {
@@ -806,14 +817,26 @@ fn probe_import_ddl(
     result
 }
 
-pub(super) fn validate_pg_generated_target(endpoint: &Endpoint, manifest: &DumpManifest, selected: &BTreeSet<String>) -> Result<(),String> {
-    if endpoint.engine!="postgresql" || manifest.source_engine!="postgresql" || !manifest.schema.tables.iter()
-        .filter(|table|selected.is_empty() || selected.contains(&table.name))
-        .any(|table|table.columns.iter().any(|column|column.generated.as_ref().is_some_and(|generated|!generated.stored))) { return Ok(()) }
+/// The newest PostgreSQL target version the selected tables need: VIRTUAL generated columns need 18,
+/// NULLS NOT DISTINCT keys need 15 (whatever the source engine claims).
+fn pg_target_requirement(manifest: &DumpManifest, selected: &BTreeSet<String>) -> Option<(u32, &'static str, &'static str)> {
+    let tables = || manifest.schema.tables.iter().filter(|table| selected.is_empty() || selected.contains(&table.name));
+    if manifest.source_engine == "postgresql" && tables().any(|table| table.columns.iter().any(|column| column.generated.as_ref().is_some_and(|generated| !generated.stored))) {
+        return Some((180000, "generated_virtual_unsupported_on_target", "VIRTUAL generated columns require PostgreSQL 18 or newer; target tables were not changed"));
+    }
+    tables().any(|table| table.indexes.iter().any(|index| index.nulls_not_distinct))
+        .then_some((150000, "nulls_not_distinct_unsupported_on_target", "NULLS NOT DISTINCT keys require PostgreSQL 15 or newer; target tables were not changed"))
+}
+
+pub(super) const PG_VERSION_CODES: [&str; 2] = ["generated_virtual_unsupported_on_target", "nulls_not_distinct_unsupported_on_target"];
+
+pub(super) fn validate_pg_target_version(endpoint: &Endpoint, manifest: &DumpManifest, selected: &BTreeSet<String>) -> Result<(),String> {
+    if endpoint.engine!="postgresql" { return Ok(()) }
+    let Some((minimum, code, reason)) = pg_target_requirement(manifest, selected) else { return Ok(()) };
     let mut client=connect_postgres(endpoint).map_err(|err|format!("postgresql connection error: {err}"))?;
     let version:String=client.query_one("SHOW server_version_num", &[]).map_err(|err|err.to_string())?.get(0);
-    if version.parse::<u32>().unwrap_or(0)<180000 {
-        return Err(classified_import_error("generated_virtual_unsupported_on_target", "VIRTUAL generated columns require PostgreSQL 18 or newer; target tables were not changed",None));
+    if version.parse::<u32>().unwrap_or(0)<minimum {
+        return Err(classified_import_error(code, reason, None));
     }
     Ok(())
 }
@@ -2923,7 +2946,7 @@ mod tests {
                     manifest.schema.tables[0].foreign_keys.push(NormalizedForeignKey {
                         name: "fk_default".into(), columns: vec!["id".into()],
                         referenced_table: "parent".into(), referenced_columns: vec!["id".into()],
-                        on_delete: Some(ForeignKeyAction::SetDefault), on_update: None,
+                        on_delete: Some(ForeignKeyAction::SetDefault), on_update: None, deferrable: None,
                     });
                     "SET DEFAULT"
                 }

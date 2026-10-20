@@ -139,7 +139,8 @@ def describe_plan(preview: dict, verify: bool, timezone_label: str = "") -> Dict
                 data_warnings.append("- " + translate_text("바로 실행될 수 있는 이벤트 {}개: {}").format(len(names), names_preview(names)))
         elif code in ("programs_skipped_cross_engine", "programs_skipped_partial", "programs_skipped_toggle", "program_definer_replaced",
                       "routine_grants_reset", "program_restore_definer_may_change", "program_session_unavailable",
-                      "program_replace_privilege_unproven", "routine_binlog_unsafe", "program_execution_account", "event_privilege_unproven"):
+                      "program_replace_privilege_unproven", "routine_binlog_unsafe", "program_execution_account", "event_privilege_unproven",
+                      "constraint_deferral_not_kept"):
             data_warnings.append(f"- {sentence} " + sanitize_local_diagnostic(names_preview(_warning_names(preview, code))))
         elif code == "unsynchronized_snapshot":
             if preview.get("snapshot_policy") in _UNSYNCHRONIZED_POLICIES:

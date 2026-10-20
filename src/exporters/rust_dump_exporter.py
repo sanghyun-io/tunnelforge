@@ -120,10 +120,12 @@ _TABLE_REFUSAL_REASONS = {
     "unsupported_index": "인덱스({})는 덤프에 담을 수 없습니다",
     "cross_schema_fk": "외래 키({})가 다른 DB나 스키마의 테이블을 가리켜 덤프에 담을 수 없습니다",
     "table_inheritance": "테이블 {}은 상속이나 파티션으로 다른 테이블과 이어져 있어 아직 덤프에 담을 수 없습니다.",
+    "key_rule": "제약·인덱스 {}의 NULL 처리·검사 시점·배제 규칙을 덤프에 담을 수 없습니다",
 }
 # dump.rs LOSSY_SCHEMA_KINDS: refused without a way to leave them out (bypassable false).
 LOSSY_REFUSAL_KINDS = frozenset({
     "generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk", "table_inheritance",
+    "key_rule",
 })
 _SCHEMA_REFUSAL_REASONS = {
     "routine": "저장 프로시저·함수 {}: 덤프에 담을 수 없습니다",
@@ -673,6 +675,11 @@ CORE_CODE_SENTENCES = {
     "program_name_resolution_changed": "대상 스키마에 이름이 같은 함수나 연산자가 있어, 계산 열이나 트리거가 원본과 다른 객체를 부르게 됩니다. 대상 스키마의 그 객체 이름을 바꾸거나 지운 뒤 다시 가져오세요. 대상 테이블은 바뀌지 않았습니다.",
     "generated_virtual_unsupported_on_target": "대상 PostgreSQL이 18보다 낮아 VIRTUAL 계산 열을 만들 수 없습니다. 대상 테이블은 바뀌지 않았습니다.",
     "generated_values_recomputed": "계산 열 값은 대상 DB에서 다시 계산했습니다. 원본 값과 같은지는 복사본 검증에서 확인할 수 있습니다: {}",
+    "deferrable_primary_key_unsupported": "기본 키 {}는 검사를 커밋 때로 미룰 수 있게(DEFERRABLE) 만들어져 있어 아직 덤프에 담을 수 없습니다.",
+    "exclusion_constraint_unsupported": "배제 제약(EXCLUDE) {}은 btree 인덱스로 열을 같음(=)으로만 비교하는 형태가 아니어서 아직 덤프에 담을 수 없습니다.",
+    "nulls_not_distinct_unsupported_on_target": "대상 PostgreSQL이 15보다 낮아, NULL끼리도 중복으로 보는 UNIQUE(NULLS NOT DISTINCT)를 만들 수 없습니다. PostgreSQL 15 이상인 대상으로 가져오세요. 대상 테이블은 바뀌지 않았습니다.",
+    "unsupported_constraint_behavior": "NULL끼리도 중복으로 보는 UNIQUE(NULLS NOT DISTINCT)나 배제 제약(EXCLUDE) 같은 PostgreSQL 키 규칙은 MySQL에서 같은 규칙으로 만들 수 없습니다. 이 테이블을 빼고 진행하거나, 원본에서 그 설정을 없앤 뒤 다시 시도하세요.",
+    "constraint_deferral_not_kept": "MySQL은 키를 바로 검사하므로, 검사를 커밋 때로 미룰 수 있던 PostgreSQL 키(DEFERRABLE)도 바로 검사하는 키가 됩니다. 한 트랜잭션에서 부모보다 자식 행을 먼저 넣거나 UNIQUE 값을 서로 바꾸는 등, 검사를 커밋 때로 미루는 데 기대던 작업이 있으면 확인하세요: {}",
 
     "target_trigger_hidden": "교체할 테이블에 지금 계정으로는 보이지 않는 트리거가 있어 교체하지 않았습니다. 원본은 그대로입니다. TRIGGER 권한이 있는 계정으로 다시 교체하세요.",
     "rollback_routine_binlog_unsafe": "원래 함수를 지금 서버 설정으로는 다시 만들 수 없어 복구를 시작하지 않았습니다. log_bin_trust_function_creators=1로 바꾸거나 SUPER 권한이 있는 계정으로 복구하세요.",

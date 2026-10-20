@@ -1017,7 +1017,9 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         format: "tunnelforge-dump".to_string(),
         // Older readers ignore namespace, timezone and ON UPDATE metadata. Fail
         // their version gate instead of silently restoring different semantics.
-        format_version: if !stored_programs.is_empty() { 7 } else if schema.tables.iter().any(|table| table.columns.iter().any(|column| column.generated.is_some() || column.invisible)) { 6 } else if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
+        // Version 8: PostgreSQL key rules (NULLS NOT DISTINCT, EXCLUDE, DEFERRABLE). Older readers drop the
+        // fields and would restore weaker keys, so they must refuse the dump instead.
+        format_version: if schema.tables.iter().any(|table| !table.key_rule_names().is_empty()) { 8 } else if !stored_programs.is_empty() { 7 } else if schema.tables.iter().any(|table| table.columns.iter().any(|column| column.generated.is_some() || column.invisible)) { 6 } else if has_spatial_columns { 5 } else if has_bit_columns { 4 } else { 3 },
         data_format: options.data_format.clone(),
         compression: options.compression.clone(),
         source_engine: endpoint.engine.clone(),
@@ -1038,7 +1040,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     Ok((manifest, views_count))
 }
 
-const LOSSY_SCHEMA_KINDS: [&str; 7] = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk", "table_inheritance"];
+const LOSSY_SCHEMA_KINDS: [&str; 8] = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk", "table_inheritance", "key_rule"];
 
 fn dump_ddl_refusal(schema: &NormalizedSchema, engine: &str) -> Option<DumpRefusal> {
     let objects = schema.tables.iter().filter(|table| generate_table_ddl(table, engine, engine).is_none())

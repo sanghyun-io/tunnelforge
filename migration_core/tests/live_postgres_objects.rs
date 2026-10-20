@@ -186,3 +186,6 @@ mod fix_round2;
 
 #[path="support/postgres_fidelity_fix3.rs"]
 mod fix_round3;
+
+#[path="support/postgres_key_rules.rs"]
+mod key_rules;

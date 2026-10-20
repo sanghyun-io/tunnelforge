@@ -33,6 +33,11 @@ RUST_CORE_CODES = frozenset({
     "program_name_resolution_changed",
     "generated_virtual_unsupported_on_target",
     "generated_values_recomputed",
+    "deferrable_primary_key_unsupported",
+    "exclusion_constraint_unsupported",
+    "nulls_not_distinct_unsupported_on_target",
+    "unsupported_constraint_behavior",
+    "constraint_deferral_not_kept",
 
     "target_trigger_hidden",
     "rollback_routine_binlog_unsafe",

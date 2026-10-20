@@ -613,11 +613,54 @@ struct PostgresInspectAdapter {
     client: postgres::Client,
     object_reasons: BTreeMap<String, String>,
     object_tables: BTreeMap<String, String>,
+    /// `key_rule:{table}:{name}` ids, always listed; held only when the table carries the rule.
+    key_rules: Vec<String>,
+}
+
+/// One definition of the index shapes a dump keeps, shared by the advanced-index refusal and EXCLUDE.
+const PG_PLAIN_BTREE_INDEX: &str = "(ix.indexprs IS NULL AND ix.indpred IS NULL AND am.amname='btree' AND 0=ALL(ix.indoption) AND COALESCE((to_jsonb(ix)->>'indnkeyatts')::int,ix.indnatts)=ix.indnatts)";
+
+/// (name, contype or '', deferrable, deferred, NULLS NOT DISTINCT, EXCLUDE keepable) per index and FK of one table.
+fn pg_key_rules_sql() -> String {
+    format!("SELECT i.relname::text, COALESCE(c.contype::text,''), COALESCE(c.condeferrable,false), COALESCE(c.condeferred,false), \
+     ix.indisunique AND NOT ix.indisprimary AND COALESCE((to_jsonb(ix)->>'indnullsnotdistinct')::boolean,false), \
+     {PG_PLAIN_BTREE_INDEX} AND NOT EXISTS(SELECT 1 FROM unnest(c.conexclop) AS x(op) JOIN pg_operator o ON o.oid=x.op JOIN pg_namespace ons ON ons.oid=o.oprnamespace WHERE o.oprname<>'=' OR ons.nspname<>'pg_catalog') \
+     FROM pg_index ix JOIN pg_class t ON t.oid=ix.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class i ON i.oid=ix.indexrelid JOIN pg_am am ON am.oid=i.relam \
+     LEFT JOIN pg_constraint c ON c.conindid=ix.indexrelid AND c.conrelid=ix.indrelid AND c.contype IN ('p','u','x') \
+     WHERE n.nspname=$1 AND t.relname=$2 \
+     UNION ALL SELECT c.conname::text,'f',c.condeferrable,c.condeferred,false,true FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace \
+     WHERE n.nspname=$1 AND t.relname=$2 AND c.contype='f'")
 }
 
 impl InspectAdapter for PostgresInspectAdapter {
     fn object_reasons(&self) -> BTreeMap<String, String> { self.object_reasons.clone() }
     fn object_tables(&self) -> BTreeMap<String, String> { self.object_tables.clone() }
+    fn enrich_table(&mut self, schema: &str, table: &mut NormalizedTable) -> Result<(), String> {
+        let rows = self.client.query(pg_key_rules_sql().as_str(), &[&schema, &table.name])
+            .map_err(|err| format!("postgresql key rule inspect error: {err}"))?;
+        for row in rows {
+            let name: String = row.get(0);
+            let kind: String = row.get(1);
+            let deferral = row.get::<_, bool>(2).then(|| if row.get(3) { Deferral::Deferred } else { Deferral::Immediate });
+            let nulls_not_distinct: bool = row.get(4);
+            if deferral.is_none() && kind != "x" && !nulls_not_distinct { continue }
+            let id = format!("key_rule:{}:{name}", table.name);
+            self.object_tables.insert(id.clone(), table.name.clone());
+            self.key_rules.push(id.clone());
+            match kind.as_str() {
+                "f" => if let Some(fk) = table.foreign_keys.iter_mut().find(|fk| fk.name == name) { fk.deferrable = deferral; },
+                "p" => { self.object_reasons.insert(id, "deferrable_primary_key_unsupported".into()); }
+                "x" if !row.get::<_, bool>(5) => { self.object_reasons.insert(id, "exclusion_constraint_unsupported".into()); }
+                // Not found (an index inspection skipped) stays unheld, so the export refuses it.
+                _ => if let Some(index) = table.indexes.iter_mut().find(|index| index.name == name) {
+                    index.nulls_not_distinct = nulls_not_distinct;
+                    index.exclusion = kind == "x";
+                    index.deferrable = deferral;
+                },
+            }
+        }
+        Ok(())
+    }
     fn table_names(&mut self, schema: &str) -> Result<Vec<(String, Option<String>)>, String> {
         let rows = self
             .client
@@ -742,7 +785,10 @@ impl InspectAdapter for PostgresInspectAdapter {
     }
 
     fn unsupported_objects(&mut self, schema: &str) -> Result<Vec<String>, String> {
-        inspect_postgresql_unsupported_objects(&mut self.client, schema, &mut self.object_reasons, &mut self.object_tables)
+        let mut objects = inspect_postgresql_unsupported_objects(&mut self.client, schema, &mut self.object_reasons, &mut self.object_tables)?;
+        objects.append(&mut self.key_rules);
+        objects.sort(); objects.dedup();
+        Ok(objects)
     }
 }
 
@@ -752,7 +798,7 @@ fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
         .map_err(|err| format!("postgresql connection error: {err}"))?;
     client.batch_execute("SET DateStyle = 'ISO, YMD'; SET TIME ZONE 'UTC'")
         .map_err(|err| format!("postgresql metadata session setup error: {err}"))?;
-    let mut adapter = PostgresInspectAdapter { client, object_reasons: BTreeMap::new(), object_tables: BTreeMap::new() };
+    let mut adapter = PostgresInspectAdapter { client, object_reasons: BTreeMap::new(), object_tables: BTreeMap::new(), key_rules: Vec::new() };
     inspect_generic(&mut adapter, &schema_name)
 }
 
@@ -763,6 +809,7 @@ pub(crate) const POSTGRES_REFUSAL_REASONS: &[&str] = &[
     "cross_schema_fk_unsupported", "materialized_view_unsupported", "postgres_trigger_unsupported",
     "postgres_routine_unsupported", "row_security_unsupported", "row_security_blocks_read", "rule_unsupported",
     "table_inheritance_unsupported", "generated_expression_unsafe", "generated_dependency_unsupported",
+    "deferrable_primary_key_unsupported", "exclusion_constraint_unsupported",
 ];
 pub(crate) const POSTGRES_WARNING_REASONS: &[&str] = &["comments_not_exported"];
 
@@ -827,7 +874,8 @@ fn inspect_postgresql_unsupported_objects(
 
     let triggers = client
         .query(
-            "SELECT DISTINCT event_object_table, trigger_name FROM information_schema.triggers WHERE trigger_schema = $1 ORDER BY trigger_name",
+            // pg_trigger: information_schema.triggers hides triggers from a SELECT-only role.
+            "SELECT DISTINCT t.relname::text, tg.tgname::text FROM pg_trigger tg JOIN pg_class t ON t.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = $1 AND NOT tg.tgisinternal ORDER BY 2",
             &[&schema_name],
         )
         .map_err(|err| format!("postgresql trigger inspect error: {err}"))?;
@@ -906,8 +954,9 @@ fn inspect_postgresql_unsupported_objects(
         let table:String=row.get(0);
         pg_table_object(&mut objects,tables,format!("check_constraint:{table}:{}",row.get::<_,String>(1)),&table);
     }
+    // EXCLUDE constraints are listed once, as key_rule ids (enrich_table).
     for row in client.query(
-        "SELECT t.relname,i.relname FROM pg_index ix JOIN pg_class t ON t.oid=ix.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class i ON i.oid=ix.indexrelid JOIN pg_am am ON am.oid=i.relam WHERE n.nspname=$1 AND (ix.indexprs IS NOT NULL OR ix.indpred IS NOT NULL OR am.amname<>'btree' OR NOT (0=ALL(ix.indoption)) OR COALESCE((to_jsonb(ix)->>'indnkeyatts')::int,ix.indnatts)<>ix.indnatts)",
+        format!("SELECT t.relname,i.relname FROM pg_index ix JOIN pg_class t ON t.oid=ix.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class i ON i.oid=ix.indexrelid JOIN pg_am am ON am.oid=i.relam WHERE n.nspname=$1 AND NOT {PG_PLAIN_BTREE_INDEX} AND NOT EXISTS(SELECT 1 FROM pg_constraint xc WHERE xc.conindid=ix.indexrelid AND xc.contype='x')").as_str(),
         &[&schema_name],
     ).map_err(|err| format!("postgresql advanced index inspect error: {err}"))? {
         let table:String=row.get(0);
