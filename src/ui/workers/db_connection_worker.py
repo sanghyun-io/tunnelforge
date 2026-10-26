@@ -91,6 +91,7 @@ class TunnelStartWorker(CancellableWorker):
         self.success = False
         self.message = ""
         self._was_running = bool(engine.is_running(config.get('id')))
+        self._start_generation = None
         self.finished.connect(self._finish, Qt.ConnectionType.QueuedConnection)
 
     def start(self, *args):
@@ -106,13 +107,19 @@ class TunnelStartWorker(CancellableWorker):
         try:
             kwargs = {} if self.check_port is None else {'check_port': self.check_port}
             self.success, self.message = self.engine.start_tunnel(self.config, **kwargs)
+            get_generation = getattr(self.engine, 'get_thread_start_generation', None)
+            if callable(get_generation):
+                self._start_generation = get_generation()
         except Exception as exc:
             self.success, self.message = False, str(exc)
         finally:
             if self._cancelled and self.success and not self._was_running:
                 # 사용자가 취소했는데 뒤늦게 열린 터널은 남기지 않는다.
                 try:
-                    self.engine.stop_tunnel(self.config.get('id'))
+                    if isinstance(self._start_generation, int):
+                        self.engine.stop_tunnel(self.config.get('id'), expected_generation=self._start_generation)
+                    else:
+                        self.engine.stop_tunnel(self.config.get('id'))
                 except Exception as exc:
                     logger.warning("Cancelled tunnel cleanup failed: %s", exc)
                 self.success, self.message = False, "cancelled"

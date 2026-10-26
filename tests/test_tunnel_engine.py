@@ -233,8 +233,12 @@ class TestTunnelEngine:
         assert not success
         assert 'start failed' in message
         server.stop.assert_called_once()
-        assert not self.engine.active_tunnels
-        assert not self.engine.tunnel_configs
+        if cleanup_fails and not temporary:
+            assert self.engine.active_tunnels[sample_tunnel_config['id']] is server
+            assert self.engine.get_cleanup_error(sample_tunnel_config['id']) == 'cleanup failed'
+        else:
+            assert not self.engine.active_tunnels
+            assert not self.engine.tunnel_configs
 
     def test_restart_stops_dead_forwarder_before_checking_port(self, sample_tunnel_config):
         old_server = MagicMock(is_active=False)

@@ -163,6 +163,8 @@ class TestTunnelMonitor:
         self.mock_engine.active_tunnels = {}
         self.mock_engine.is_running.return_value = False
         self.mock_engine.tunnel_configs = {}
+        self.mock_engine.get_reconnect_context.return_value = (0, {'id': 'tunnel1'})
+        self.mock_engine.get_generation.return_value = 0
 
         self.monitor = TunnelMonitor(
             tunnel_engine=self.mock_engine,
@@ -620,6 +622,7 @@ class TestTunnelMonitor:
         assert seen == [TunnelState.RECONNECTING]
 
         status.error_message = "Connection refused"
+        self.monitor._reconnect_jobs['tunnel1'].scheduled = False
         self.monitor._attempt_reconnect('tunnel1')
         assert seen[-1] == TunnelState.ERROR
         assert "Connection refused" in status.error_message
@@ -633,12 +636,15 @@ class TestTunnelMonitor:
         self.monitor._running = True
         self.monitor._auto_reconnect = True
         self.mock_engine.tunnel_configs = {'tunnel1': {'id': 'tunnel1'}}
-        self.mock_engine.start_tunnel.return_value = (False, "timeout")
+        self.mock_engine.reconnect_tunnel.return_value = (False, "timeout")
+        from src.core.tunnel_monitor import _ReconnectJob
+        job = _ReconnectJob({'id': 'tunnel1'}, 0)
+        self.monitor._reconnect_jobs['tunnel1'] = job
 
         seen = []
         self.monitor.add_callback(lambda tid, st: seen.append(st.state))
-        with patch('time.sleep'), patch.object(self.monitor, '_attempt_reconnect') as retry:
-            self.monitor._reconnect_after_delay('tunnel1', 0, status)
+        with patch.object(self.monitor, '_attempt_reconnect') as retry:
+            self.monitor._reconnect_after_delay('tunnel1', 0, status, job)
 
         retry.assert_called_once_with('tunnel1')
         assert seen == [TunnelState.RECONNECTING]

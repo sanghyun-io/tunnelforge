@@ -5,7 +5,6 @@
 - 자동 재연결
 - 이벤트 히스토리
 """
-import time
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -80,6 +79,14 @@ class TunnelEvent:
     message: str
 
 
+@dataclass
+class _ReconnectJob:
+    config: dict
+    generation: int
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    scheduled: bool = False
+
+
 class TunnelMonitor:
     """터널 상태 모니터"""
 
@@ -101,6 +108,7 @@ class TunnelMonitor:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.RLock()  # RLock: 재진입 가능 (on_tunnel_connected 등 내부 중첩 호출 대응)
+        self._reconnect_jobs = {}
 
         # Health check 책임은 TunnelHealthChecker로 위임 (터널별 연결 캐시 포함)
         self._health_checker = TunnelHealthChecker(tunnel_engine, config_manager, self._lock)
@@ -172,6 +180,10 @@ class TunnelMonitor:
         """모니터링 중지"""
         self._running = False
         self._stop_event.set()
+        with self._lock:
+            for job in self._reconnect_jobs.values():
+                job.cancelled.set()
+            self._reconnect_jobs.clear()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         self._thread = None
@@ -225,7 +237,16 @@ class TunnelMonitor:
 
     def set_auto_reconnect(self, enabled: bool):
         """자동 재연결 설정"""
-        self._auto_reconnect = enabled
+        with self._lock:
+            self._auto_reconnect = enabled
+            if not enabled:
+                for tunnel_id, job in self._reconnect_jobs.items():
+                    job.cancelled.set()
+                    status = self._statuses.get(tunnel_id)
+                    if status and status.state == TunnelState.RECONNECTING:
+                        status.state = TunnelState.DISCONNECTED
+                        self._notify_callbacks(tunnel_id, status)
+                self._reconnect_jobs.clear()
         if self.config_manager:
             self.config_manager.set_app_setting('auto_reconnect', enabled)
         logger.info(f"자동 재연결: {'활성화' if enabled else '비활성화'}")
@@ -377,6 +398,15 @@ class TunnelMonitor:
             if not status:
                 return
 
+            job = self._reconnect_jobs.get(tunnel_id)
+            if job and (job.cancelled.is_set()
+                        or self.tunnel_engine.get_generation(tunnel_id) != job.generation):
+                job.cancelled.set()
+                self._reconnect_jobs.pop(tunnel_id, None)
+                job = None
+            if job and job.scheduled:
+                return
+
             # 최대 재연결 시도 횟수 체크
             if status.reconnect_count >= self._max_reconnect_attempts:
                 status.state = TunnelState.ERROR
@@ -387,7 +417,19 @@ class TunnelMonitor:
                     f"재연결 실패 (시도 {status.reconnect_count}회)"
                 )
                 self._notify_callbacks(tunnel_id, status)
+                self._reconnect_jobs.pop(tunnel_id, None)
                 return
+
+            if job is None:
+                generation, config = self.tunnel_engine.get_reconnect_context(tunnel_id)
+                if not config:
+                    status.state = TunnelState.ERROR
+                    status.error_message = "재연결 실패: 터널 설정을 찾을 수 없음"
+                    self._notify_callbacks(tunnel_id, status)
+                    return
+                job = _ReconnectJob(dict(config), generation)
+                self._reconnect_jobs[tunnel_id] = job
+            job.scheduled = True
 
             # 백오프 딜레이: RECONNECT_BACKOFF_SECONDS 참조 (증가 정책은 모듈 상수 주석 참조)
             delay = RECONNECT_BACKOFF_SECONDS[min(status.reconnect_count, len(RECONNECT_BACKOFF_SECONDS) - 1)]
@@ -404,46 +446,37 @@ class TunnelMonitor:
         # 별도 스레드에서 재연결 시도 (락을 점유하지 않은 상태로 예약)
         threading.Thread(
             target=self._reconnect_after_delay,
-            args=(tunnel_id, delay, status),
+            args=(tunnel_id, delay, status, job),
             daemon=True
         ).start()
 
-    def _reconnect_after_delay(self, tunnel_id, delay, status):
+    def _reconnect_after_delay(self, tunnel_id, delay, status, job):
         """지연 시간 대기 후 재연결 시도 (별도 스레드에서 실행)
 
         _attempt_reconnect가 예약한 백오프 지연을 소비한 뒤 실제 재연결을 수행한다.
         """
-        time.sleep(delay)
-
-        if not self._running:
+        if job.cancelled.wait(delay):
             return
 
-        try:
-            # start_tunnel은 config dict를 요구함. stop_tunnel이 tunnel_configs를
-            # 삭제하므로, 반드시 stop 호출 전에 config를 조회/보관한다.
-            config = self.tunnel_engine.tunnel_configs.get(tunnel_id)
-            if not config:
-                with self._lock:
-                    status.state = TunnelState.ERROR
-                    status.error_message = "재연결 실패: 터널 설정을 찾을 수 없음"
-                    self._add_event(
-                        tunnel_id, "error", status.error_message
-                    )
-                    self._notify_callbacks(tunnel_id, status)
+        with self._lock:
+            if not self._job_is_current(tunnel_id, job):
+                self._discard_reconnect_job(tunnel_id, job)
                 return
 
-            # 끊긴 stale server 객체와 tunnel_configs 엔트리를 정리하여
-            # 포트 충돌 및 객체 누수를 방지한다.
-            self.tunnel_engine.stop_tunnel(tunnel_id)
-
-            # 자동 재연결은 포트 재사용 상황이라 포트 충돌 체크를 건너뛴다.
-            success, msg = self.tunnel_engine.start_tunnel(
-                config, check_port=False
-            )
+        try:
+            # Engine serializes cleanup/start with manual operations and checks
+            # ownership again under its operation lock. Keep I/O outside _lock.
+            result = self.tunnel_engine.reconnect_tunnel(job.config, job.generation, job.cancelled)
 
             should_retry = False
             with self._lock:
+                if result is None or not self._job_is_current(tunnel_id, job):
+                    self._discard_reconnect_job(tunnel_id, job)
+                    return
+                success, msg = result
+                job.scheduled = False
                 if success:
+                    self._reconnect_jobs.pop(tunnel_id, None)
                     status.state = TunnelState.CONNECTED
                     status.connected_at = datetime.now()
                     status.reconnect_count = 0
@@ -455,6 +488,7 @@ class TunnelMonitor:
                     # 재시도가 남아 있으면 RECONNECTING 유지 — ERROR는 최종 실패에만 쓴다
                     if not should_retry:
                         status.state = TunnelState.ERROR
+                        self._reconnect_jobs.pop(tunnel_id, None)
 
                 self._notify_callbacks(tunnel_id, status)
 
@@ -466,8 +500,28 @@ class TunnelMonitor:
         except Exception as e:
             logger.error(f"재연결 오류 ({tunnel_id}): {e}")
             with self._lock:
+                if not self._job_is_current(tunnel_id, job):
+                    self._discard_reconnect_job(tunnel_id, job)
+                    return
+                self._reconnect_jobs.pop(tunnel_id, None)
                 status.state = TunnelState.ERROR
                 status.error_message = str(e)
+                self._notify_callbacks(tunnel_id, status)
+
+    def _job_is_current(self, tunnel_id, job):
+        return (
+            self._running and self._auto_reconnect
+            and not job.cancelled.is_set()
+            and self._reconnect_jobs.get(tunnel_id) is job
+            and self.tunnel_engine.get_generation(tunnel_id) == job.generation
+        )
+
+    def _discard_reconnect_job(self, tunnel_id, job):
+        if self._reconnect_jobs.get(tunnel_id) is job:
+            self._reconnect_jobs.pop(tunnel_id, None)
+            status = self._statuses.get(tunnel_id)
+            if status and status.state == TunnelState.RECONNECTING:
+                status.state = TunnelState.DISCONNECTED
                 self._notify_callbacks(tunnel_id, status)
 
     def _add_event(self, tunnel_id: str, event_type: str, message: str):
