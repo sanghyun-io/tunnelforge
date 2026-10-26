@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-10-13
+Last reviewed: 2026-10-26
 
 Current shipping version: `v2.23.0` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
 
@@ -852,6 +852,10 @@ Commands run locally:
 | `pytest tests\test_current_status_docs.py::test_current_status_records_macos_final_validation_tooling_recheck -q` | RED then PASS |
 
 ## Verification Log
+
+2026-10-26 TF-STATUS-214 implementation: focused recovery/engine/monitor/trust/unattended/live-SSH/main-window/wizard suite -> 158 passed, 2 warnings. Real local Paramiko SSH server tests passed normal operation, one dropped tunnel, and three simultaneously dropped tunnels; recovered on the same local ports and forwarded bytes again. Deterministic tests cover configuration lifetime through five attempts, manual stop/start superseding recovery, late completion cleanup, saved-port TLS unregister and cleanup failure ownership. Initial full-suite run found four UI test-double interface gaps, now corrected and passing in the focused gate; final full-suite run and protected release gates pending.
+
+2026-10-23 TF-STATUS-214 investigation: `.\.venv\Scripts\python -m pytest tests/test_tunnel_recovery_investigation.py tests/test_tunnel_engine.py tests/test_tunnel_monitor.py -q -rx` -> 77 passed, 3 strict xfailed, 2 warnings. `--runxfail -q --tb=short` on the investigation file -> 3 expected failures at the desired recovery contracts: dead-forwarder stop returns False before library cleanup, second retry performs no SSH start after config deletion, old retry stops a healthy replacement. Actual sshtunnel property and bound local listener used for the first case; no external SSH/DB accessed. Relevant engine/monitor/health/worker/progress/main-window files have no diff from v2.21.0 release merge `33152f1b53823fdada578e6e24f2e7bfb9743712`. Production behavior remains unfixed; see `docs/tunnel_recovery_investigation_2026-10-23.md`.
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
@@ -2923,6 +2927,7 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-214 | High | fixed_pending_full_verify | Tunnel recovery after SSH loss | User reports v2.21.0 tunnels disconnected with Start shown but restart blocked. Fixed dead-transport cleanup before port lookup failure, retry config lifetime, and stale automatic/manual operation ownership with per-tunnel serialization and generation checks. Failed cleanup keeps the object tracked and offers Retry cleanup; automatic recovery never asks trust/passphrase questions. 158 focused tests and actual local one/three-tunnel SSH-loss recovery passed. Initial field outage trigger remains unconfirmed. | Complete final full-suite and protected patch-release gates, validate downloaded assets and updater. See docs/tunnel_recovery_investigation_2026-10-23.md |
 | TF-STATUS-213 | Low | open | A dumped index name can collide with a target-only table's index | PostgreSQL index names are schema-wide; a dump index whose name an index of a table outside the import already uses fails after the DROP (`post_load_validation_failed`). Found by the TF-209 design review. | Add a relkind 'i' preflight next to `refuse_non_table_name_collisions` |
 | TF-STATUS-212 | Low | open | PostgreSQL FK and key details still change on restore | MATCH FULL, NOT VALID (with orphan rows the post-load ADD FOREIGN KEY fails after the DROP), PG18 NOT ENFORCED, PG15 ON DELETE SET NULL (columns), primary key names and key column order, and UNIQUE constraints restored as unique indexes (ON CONFLICT ON CONSTRAINT and the pg_constraint row are lost). Found by the TF-209 design review. | Render NOT VALID / NOT ENFORCED and constraint-form UNIQUE; refuse MATCH FULL and SET NULL (columns) under `key_rule` until kept |
 | TF-STATUS-211 | Medium | open | PostgreSQL table attributes not inspected | Column/index collation (a nondeterministic collation changes what counts as a duplicate), UNLOGGED, replica identity and storage parameters, ownership and ACLs, foreign tables, event triggers, view/index/constraint/sequence comments, rules on views, and routine inventory still read from information_schema.routines (hidden when EXECUTE is revoked from PUBLIC). Listed in `docs/export_import_policy.md`. | Paused by the owner (2026-10-20); start with collation when resumed |
@@ -3139,6 +3144,8 @@ Next action:
 
 ## Recommended Execution Order
 
+2026-10-26 priority: TF-STATUS-214 local fixes and real isolated SSH-loss verification pass. Complete final full-suite checks and the protected patch release authorized by the owner. PostgreSQL roadmap items paused by the owner remain paused.
+
 Current state (2026-10-02): the PM agenda after v2.11.1 is shipped -> (1) per-table
 replace import and stricter surviving-FK preflight (139, v2.11.2), (2) allowlisted error
 codes in automatic reports (140, v2.11.3), (3) TLS/query-control/read-only live tests in
@@ -3301,6 +3308,10 @@ The historical release-preservation checklist follows.
    complete and user/benchmark evidence justifies them.
 
 ## Session Log
+
+2026-10-26: Owner authorized fixing all three recovery defects conservatively and releasing together. Added dead-transport force cleanup with cached ports, retained failed-cleanup ownership, retry-owned configuration, per-tunnel operation locks/generations, cancellable backoff, stale UI worker cancellation protection, no interactive prompts during automatic recovery, and an explicit cleanup retry UI. Focused 158 passed, including local one/three-tunnel real SSH-loss recovery. Final full suite and protected publication in progress.
+
+2026-10-23: Investigated the user's v2.21.0 all-tunnels-disconnected/restart-blocked report by drilling from UI state through engine cleanup and retry lifetime. Confirmed real sshtunnel dead-transport property failure before stop; reproduced lost retry settings and old retry stopping a healthy replacement. Added TF-STATUS-214, a detailed investigation report and 3 strict-xfail recovery contracts. Focused existing tests: 77 passed; explicit reproduction: 3 expected failures; current-status docs tests: 76 passed; git diff --check passed. No production code changes, field-log diagnosis or release claimed.
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |

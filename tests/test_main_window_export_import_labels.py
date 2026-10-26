@@ -2,6 +2,7 @@ import inspect
 import os
 import sys
 from pathlib import Path
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -228,6 +229,9 @@ class _DummyTunnelTree:
 
 
 class _DummyHeartbeatEngine:
+    def get_cleanup_error(self, tunnel_id):
+        return None
+
     def is_running(self, tunnel_id):
         return tunnel_id == "t1"
 
@@ -361,6 +365,28 @@ def test_running_tunnel_ignores_stale_monitor_error():
     TunnelManagerUI._update_tunnel_status_ui(dummy, "t1")
 
     assert dummy.tunnel_tree.health == (None, "")
+
+
+def test_cleanup_failure_is_visible_even_with_an_active_transport():
+    status = TunnelStatus(tunnel_id="t1", state=TunnelState.CONNECTED)
+    dummy = _health_window(status)
+    dummy.engine.get_cleanup_error = lambda tid: "listener still owned"
+    assert TunnelManagerUI._apply_tunnel_status(dummy, 't1', True) == 'error'
+    assert '정리 재시도' in dummy.tunnel_tree.health[1]
+
+
+def test_failed_stop_keeps_login_path_and_reports_failure(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: warnings.append(args[1:]))
+    dummy = SimpleNamespace(
+        engine=SimpleNamespace(get_connection_info=lambda tid: ('127.0.0.1', 3307),
+                               stop_tunnel=lambda tid: False),
+        _remove_login_path=lambda *args: pytest.fail('must retain login path on failed stop'),
+        statusBar=lambda: _Recorder(),
+        refresh_table=lambda: None,
+    )
+    TunnelManagerUI.stop_tunnel(dummy, {'id': 't1', 'name': 'test'})
+    assert warnings and warnings[0][0] == '연결 정리 실패'
 
 
 def test_row_manage_buttons_have_no_delete_button():

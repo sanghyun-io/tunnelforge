@@ -19,6 +19,12 @@ class TunnelEngine:
     def __init__(self, known_hosts=None):
         self.active_tunnels = {}  # { tunnel_id: server_object or None(직접 연결) }
         self.tunnel_configs = {}  # { tunnel_id: config } - 연결 정보 저장용
+        self._registry_lock = threading.RLock()
+        self._operation_locks = {}
+        self._generations = {}
+        self._desired_running = {}
+        self._bound_ports = {}
+        self._cleanup_errors = {}
         # SSH 신원 확인 (TF-STATUS-110). known_hosts: get_known_host/save_known_host 제공 객체
         # (None이면 ConfigManager를 지연 생성). confirmer가 없으면 처음 보는 호스트 키는 거부한다.
         self._known_hosts = known_hosts
@@ -28,6 +34,64 @@ class TunnelEngine:
         self._temp_endpoints = {}        # id(temp_server) -> (host, port)
         # 무인(예약) 실행 스레드에서는 사용자에게 묻지 않는다: 스레드별 플래그 (UI 스레드의 대화형 흐름과 분리)
         self._unattended = threading.local()
+        self._automatic = threading.local()
+        self._start_request = threading.local()
+
+    def _operation_lock(self, tunnel_id):
+        with self._registry_lock:
+            return self._operation_locks.setdefault(tunnel_id, threading.RLock())
+
+    def _new_generation(self, tunnel_id, desired_running):
+        # Invalidate queued recovery before waiting for an in-progress operation.
+        with self._registry_lock:
+            generation = self._generations.get(tunnel_id, 0) + 1
+            self._generations[tunnel_id] = generation
+            self._desired_running[tunnel_id] = desired_running
+            return generation
+
+    def get_generation(self, tunnel_id):
+        with self._registry_lock:
+            return self._generations.get(tunnel_id, 0)
+
+    def get_thread_start_generation(self):
+        """Ownership token for cancellation cleanup by the calling worker."""
+        return getattr(self._start_request, 'generation', None)
+
+    def get_reconnect_context(self, tunnel_id):
+        with self._registry_lock:
+            config = self.tunnel_configs.get(tunnel_id)
+            if not self._desired_running.get(tunnel_id, True):
+                config = None
+            config = dict(config) if config else None
+            if config and not config.get('local_port') and tunnel_id in self._bound_ports:
+                config['local_port'] = self._bound_ports[tunnel_id]
+            return self._generations.get(tunnel_id, 0), config
+
+    def get_cleanup_error(self, tunnel_id):
+        with self._registry_lock:
+            return self._cleanup_errors.get(tunnel_id)
+
+    def reconnect_tunnel(self, config, generation, cancelled=None):
+        """Return None for obsolete recovery; never stop a healthy replacement."""
+        tunnel_id = config['id']
+        with self._operation_lock(tunnel_id):
+            if (self.get_generation(tunnel_id) != generation
+                    or (cancelled is not None and cancelled.is_set())):
+                return None
+            if self.is_running(tunnel_id):
+                return True, "이미 연결 중입니다."
+            self._automatic.active = True
+            try:
+                result = self._start_tunnel_locked(config, check_port=True)
+            finally:
+                self._automatic.active = False
+            if (self.get_generation(tunnel_id) != generation
+                    or (cancelled is not None and cancelled.is_set())):
+                # A manual stop/start arrived while SSH was connecting. This
+                # operation still owns the lock, so only its own result is closed.
+                self._stop_tunnel_locked(tunnel_id)
+                return None
+            return result
 
     @property
     def known_hosts(self):
@@ -55,7 +119,8 @@ class TunnelEngine:
         """Bastion 호스트 키를 TOFU 정책으로 검증하고 신뢰된 키를 반환한다."""
         return ssh_trust.verify_host_key(
             config['bastion_host'], int(config['bastion_port']),
-            self.known_hosts, None if self._is_unattended() else self.host_key_confirmer,
+            self.known_hosts,
+            None if self._is_unattended() or getattr(self._automatic, 'active', False) else self.host_key_confirmer,
         )
 
     def probe_bastion_fingerprint(self, host, port):
@@ -139,7 +204,8 @@ class TunnelEngine:
         self._passphrases.pop(cache_id, None)
         retry = cached is not None
         for _ in range(3):
-            provider = None if self._is_unattended() else self.passphrase_provider
+            provider = (None if self._is_unattended() or getattr(self._automatic, 'active', False)
+                        else self.passphrase_provider)
             passphrase = provider(key_path, retry) if provider else None
             if passphrase is None:
                 raise ssh_trust.SshPassphraseRequired(key_path)
@@ -197,21 +263,38 @@ class TunnelEngine:
             (success, message) 튜플
         """
         tunnel_id = config['id']
+        generation = self._new_generation(tunnel_id, True)
+        self._start_request.generation = generation
+        with self._operation_lock(tunnel_id):
+            if generation != self.get_generation(tunnel_id):
+                return False, "더 최근의 연결 요청으로 취소되었습니다."
+            was_running = self.is_running(tunnel_id)
+            result = self._start_tunnel_locked(config, check_port)
+            if generation != self.get_generation(tunnel_id):
+                if not was_running:
+                    self._stop_tunnel_locked(tunnel_id)
+                return False, "더 최근의 연결 요청으로 취소되었습니다."
+            return result
+
+    def _start_tunnel_locked(self, config, check_port=True):
+        tunnel_id = config['id']
 
         # 이미 실행 중인지 확인
         if tunnel_id in self.active_tunnels:
-            if config.get('connection_mode') == 'direct':
+            if self.active_tunnels[tunnel_id] is None:
                 return True, "이미 연결 중입니다."
-            elif self.active_tunnels[tunnel_id] and self.active_tunnels[tunnel_id].is_active:
+            elif self.is_running(tunnel_id):
                 return True, "이미 실행 중입니다."
-            if not self.stop_tunnel(tunnel_id):
+            if not self._stop_tunnel_locked(tunnel_id):
                 return False, "기존 터널을 종료하지 못했습니다. 다시 시도해주세요."
 
         # 직접 연결 모드
         if config.get('connection_mode') == 'direct':
-            self.active_tunnels[tunnel_id] = None  # 터널 객체 없음 (직접 연결)
-            self.tunnel_configs[tunnel_id] = config
             self._register_db_tls(config, config['remote_host'], config['remote_port'])
+            with self._registry_lock:
+                self.active_tunnels[tunnel_id] = None
+                self.tunnel_configs[tunnel_id] = dict(config)
+                self._cleanup_errors.pop(tunnel_id, None)
             logger.info(f"직접 연결 모드: {config['name']} -> {config['remote_host']}:{config['remote_port']}")
             return True, f"직접 연결: {config['remote_host']}:{config['remote_port']}"
 
@@ -258,14 +341,27 @@ class TunnelEngine:
             connection_logs.append("터널 연결 시작...")
             logger.debug("터널 연결 시작...")
             server.start()
-            self.active_tunnels[tunnel_id] = server
-            self.tunnel_configs[tunnel_id] = config
-            self._register_db_tls(config, DEFAULT_LOCAL_HOST, server.local_bind_port)
+            port = server.local_bind_port
+            self._register_db_tls(config, DEFAULT_LOCAL_HOST, port)
+            with self._registry_lock:
+                self.active_tunnels[tunnel_id] = server
+                self.tunnel_configs[tunnel_id] = dict(config)
+                self._bound_ports[tunnel_id] = port
+                self._cleanup_errors.pop(tunnel_id, None)
             logger.info(f"터널 연결 성공! (Local {config['local_port']} -> Remote {config['remote_host']})")
             return True, "연결 성공"
 
         except Exception as e:
-            self.close_temp_tunnel(server)
+            if server is not None:
+                try:
+                    server.stop(force=True)
+                except Exception as cleanup_error:
+                    # A partially started listener must not become an orphan.
+                    with self._registry_lock:
+                        self.active_tunnels[tunnel_id] = server
+                        self.tunnel_configs[tunnel_id] = dict(config)
+                        self._cleanup_errors[tunnel_id] = str(cleanup_error) or type(cleanup_error).__name__
+                    logger.warning("실패한 터널 정리 중 오류: %s", cleanup_error)
             error_msg = self._describe_ssh_error(e)
             error_type = type(e).__name__
 
@@ -279,32 +375,56 @@ class TunnelEngine:
             logger.error(full_error)
             return False, full_error
 
-    def stop_tunnel(self, tunnel_id):
+    def stop_tunnel(self, tunnel_id, expected_generation=None):
         """터널 종료"""
+        with self._registry_lock:
+            if expected_generation is not None and self.get_generation(tunnel_id) != expected_generation:
+                return False
+            generation = self._new_generation(tunnel_id, False)
+        with self._operation_lock(tunnel_id):
+            if generation != self.get_generation(tunnel_id):
+                return False
+            return self._stop_tunnel_locked(tunnel_id)
+
+    def _stop_tunnel_locked(self, tunnel_id):
         if tunnel_id in self.active_tunnels:
             try:
                 server = self.active_tunnels[tunnel_id]
                 config = self.tunnel_configs.get(tunnel_id)
                 if server is not None:  # SSH 터널인 경우만 stop 호출
-                    port = getattr(server, 'local_bind_port', None)
-                    server.stop()
+                    port = self._bound_ports.get(tunnel_id)
+                    if port is None:
+                        # Compatibility with an object registered before a full
+                        # start. A dead transport makes this property raise.
+                        try:
+                            port = server.local_bind_port
+                        except Exception:
+                            port = config.get('local_port') if config else None
+                    server.stop(force=True)
                     if port:
                         unregister_endpoint_tls(DEFAULT_LOCAL_HOST, port, tunnel_id)
                 elif config:
                     unregister_endpoint_tls(config['remote_host'], config['remote_port'], tunnel_id)
-                del self.active_tunnels[tunnel_id]
-                if tunnel_id in self.tunnel_configs:
-                    del self.tunnel_configs[tunnel_id]
+                with self._registry_lock:
+                    del self.active_tunnels[tunnel_id]
+                    self.tunnel_configs.pop(tunnel_id, None)
+                    self._bound_ports.pop(tunnel_id, None)
+                    self._cleanup_errors.pop(tunnel_id, None)
                 logger.info(f"터널 종료됨: {tunnel_id}")
                 return True
             except Exception as e:
+                with self._registry_lock:
+                    self._cleanup_errors[tunnel_id] = str(e) or type(e).__name__
                 logger.warning(f"터널 종료 중 오류: {e}")
         return False
 
     def is_running(self, tunnel_id):
         """터널/연결이 활성화 상태인지 확인"""
-        if tunnel_id in self.active_tunnels:
-            server = self.active_tunnels[tunnel_id]
+        with self._registry_lock:
+            present = tunnel_id in self.active_tunnels
+            server = self.active_tunnels.get(tunnel_id)
+            cleanup_failed = tunnel_id in self._cleanup_errors
+        if present and not cleanup_failed:
             if server is None:  # 직접 연결 모드
                 return True
             return server.is_active
@@ -312,17 +432,22 @@ class TunnelEngine:
 
     def get_connection_info(self, tunnel_id):
         """실제 연결할 호스트/포트 반환"""
-        if tunnel_id not in self.tunnel_configs:
+        with self._registry_lock:
+            config = self.tunnel_configs.get(tunnel_id)
+            server = self.active_tunnels.get(tunnel_id)
+            port = self._bound_ports.get(tunnel_id)
+            cleanup_failed = tunnel_id in self._cleanup_errors
+        if not config or cleanup_failed:
             return None, None
-
-        config = self.tunnel_configs[tunnel_id]
         if config.get('connection_mode') == 'direct':
             return config['remote_host'], int(config['remote_port'])
         else:
-            server = self.active_tunnels.get(tunnel_id)
             if server is None or not server.is_active:
                 return None, None
-            return DEFAULT_LOCAL_HOST, server.local_bind_port
+            try:
+                return DEFAULT_LOCAL_HOST, port or server.local_bind_port
+            except Exception:
+                return None, None
 
     def create_temp_tunnel(self, config):
         """
@@ -453,10 +578,15 @@ class TunnelEngine:
     def get_active_tunnels(self):
         """활성화된 터널/연결 목록 반환 (DB Export용)"""
         result = []
-        for tunnel_id, server in self.active_tunnels.items():
-            if tunnel_id in self.tunnel_configs and self.is_running(tunnel_id):
-                config = self.tunnel_configs[tunnel_id]
+        with self._registry_lock:
+            active_ids = list(self.active_tunnels)
+        for tunnel_id in active_ids:
+            with self._registry_lock:
+                config = self.tunnel_configs.get(tunnel_id)
+            if config and self.is_running(tunnel_id):
                 host, port = self.get_connection_info(tunnel_id)
+                if host is None or port is None:
+                    continue
                 result.append({
                     'id': tunnel_id,
                     'tunnel_id': tunnel_id,  # DB 연결 다이얼로그에서 자격 증명 조회용

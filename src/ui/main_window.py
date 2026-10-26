@@ -384,6 +384,11 @@ class TunnelManagerUI(QMainWindow):
 
     def _build_power_button(self, tunnel: dict, is_active: bool) -> QPushButton:
         """터널 활성 상태에 맞는 전원 버튼을 생성한다."""
+        if self.engine.get_cleanup_error(tunnel['id']):
+            button = QPushButton(tr("정리 재시도"))
+            button.setStyleSheet(ButtonStyles.DANGER)
+            button.clicked.connect(lambda checked, t=tunnel: self.stop_tunnel(t))
+            return button
         btn_power = QPushButton(tr("common.stop") if is_active else tr("common.start"))
         if is_active:
             btn_power.setStyleSheet(ButtonStyles.DANGER)
@@ -839,7 +844,11 @@ class TunnelManagerUI(QMainWindow):
         tid = tunnel_config['id']
         # engine stop 전에 실제 활성 포트 저장 (stop 후엔 engine에서 조회 불가)
         _, active_port = self.engine.get_connection_info(tid)
-        self.engine.stop_tunnel(tid)
+        if not self.engine.stop_tunnel(tid):
+            self.statusBar().showMessage(f"연결 정리 실패: {tunnel_config['name']}")
+            QMessageBox.warning(self, "연결 정리 실패", "기존 연결을 정리하지 못했습니다. 정리 재시도 후 다시 시작해주세요.")
+            self.refresh_table()
+            return
         self._remove_login_path(tunnel_config, active_port)
         self.statusBar().showMessage(f"연결 종료: {tunnel_config['name']}")
         self.refresh_table()
@@ -1226,7 +1235,11 @@ class TunnelManagerUI(QMainWindow):
         """엔진 실행 여부 + 모니터 상태(재연결 중/실패)를 행 상태 아이콘에 반영한다."""
         health, tooltip = None, ""
         monitor = getattr(self, 'tunnel_monitor', None)
-        if not is_active and monitor:
+        if self.engine.get_cleanup_error(tunnel_id):
+            health = "error"
+            is_active = False
+            tooltip = tr("기존 연결 정리 실패. 정리 재시도 후 다시 시작해주세요.")
+        elif not is_active and monitor:
             status = monitor.get_status(tunnel_id)
             if status.state == TunnelState.RECONNECTING:
                 health = "reconnecting"

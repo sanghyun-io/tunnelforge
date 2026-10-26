@@ -55,6 +55,18 @@ def test_unknown_host_key_is_never_auto_accepted_even_when_a_confirmer_would_say
     forwarder.assert_not_called()
 
 
+def test_automatic_recovery_never_opens_a_host_key_prompt(config, host_key):
+    config['local_port'] = 0
+    engine = TunnelEngine(known_hosts=MemoryStore())
+    engine.host_key_confirmer = MagicMock(return_value=True)
+    with patch.object(ssh_trust, 'probe_host_key', return_value=host_key), \
+            patch.object(engine, '_load_private_key', return_value=object()):
+        success, message = engine.reconnect_tunnel(config, 0)
+    assert not success and 'ssh_host_key_unknown' in message
+    engine.host_key_confirmer.assert_not_called()
+    assert not engine._automatic.active
+
+
 def test_interactive_start_still_asks_after_an_unattended_attempt(config, host_key):
     store = MemoryStore()
     engine = TunnelEngine(known_hosts=store)
