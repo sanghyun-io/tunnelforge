@@ -310,6 +310,7 @@ def test_postgresql_header_labels_selector_as_schema(monkeypatch):
     )
     try:
         assert dialog.db_selector_label.text() == "📂 Schema:"
+        assert dialog.database_label.text() == "DB: tf_target"
     finally:
         close_dialog(dialog)
 
@@ -395,6 +396,8 @@ def test_refresh_databases_uses_configured_engine(monkeypatch):
             "public",
         )
         assert dialog.db_combo.findText("public") >= 0
+        assert "1개 스키마 발견" in dialog.message_text.toPlainText()
+        assert "데이터베이스 발견" not in dialog.message_text.toPlainText()
         assert connector.disconnected is True
     finally:
         close_dialog(dialog)
