@@ -14,6 +14,7 @@ from PyQt6.QtGui import QColor, QDrag
 from src.ui.styles import ButtonStyles
 from src.core.i18n import tr
 from src.core.connection_trust import insecure_connection_warning
+from src.core.db_core_service import normalize_db_engine
 
 
 class TunnelTreeWidget(QTreeWidget):
@@ -93,7 +94,7 @@ class TunnelTreeWidget(QTreeWidget):
     def apply_language(self):
         self.setHeaderLabels([
             tr("main.status"), tr("main.name"), tr("main.local_port"), tr("main.target_host"),
-            tr("main.default_schema"), tr("main.power"), tr("main.manage")
+            tr("main.database_schema"), tr("main.power"), tr("main.manage")
         ])
         self._empty_label.setText(tr("tree.empty_hint"))
 
@@ -283,8 +284,14 @@ class TunnelTreeWidget(QTreeWidget):
             item.setText(3, f"⚠ {remote_host}:{remote_port}")
             item.setToolTip(3, tls_warning)
 
-        # 기본 스키마
-        item.setText(4, tunnel.get('default_schema', '-') or '-')
+        if normalize_db_engine(tunnel.get('db_engine'), tunnel.get('remote_port')) == 'postgresql':
+            database = tunnel.get('default_database') or 'postgres'
+            schema = tunnel.get('default_schema') or 'public'
+            item.setText(4, f"{database} / {schema}")
+            item.setToolTip(4, f"DB: {database}\nSchema: {schema}")
+        else:
+            item.setText(4, tunnel.get('default_database') or tunnel.get('default_schema') or '-')
+            item.setToolTip(4, f"DB: {item.text(4)}")
 
         # 드래그 가능
         item.setFlags(

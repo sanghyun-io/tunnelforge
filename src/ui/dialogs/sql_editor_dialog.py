@@ -354,6 +354,11 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
 
         conn_bar.addWidget(QLabel(f"🔗 {mode_label}: {host_info}"))
         conn_bar.addWidget(QLabel(f"👤 {db_user or '(미설정)'}"))
+        if self._db_engine() == "postgresql":
+            database, _ = self._database_and_schema_for_selection()
+            self.database_label = QLabel(f"DB: {database}")
+            self.database_label.setTextFormat(Qt.TextFormat.PlainText)
+            conn_bar.addWidget(self.database_label)
         selector_text = "📂 Schema:" if self._db_engine() == "postgresql" else "📂 DB:"
         self.db_selector_label = QLabel(selector_text)
         conn_bar.addWidget(self.db_selector_label)
@@ -364,7 +369,9 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         conn_bar.addWidget(self.db_combo)
 
         btn_refresh_db = QPushButton("🔄")
-        btn_refresh_db.setToolTip("데이터베이스 목록 새로고침")
+        btn_refresh_db.setToolTip(
+            "스키마 목록 새로고침" if self._db_engine() == "postgresql" else "데이터베이스 목록 새로고침"
+        )
         btn_refresh_db.setMaximumWidth(40)
         btn_refresh_db.clicked.connect(self.refresh_databases)
         conn_bar.addWidget(btn_refresh_db)
@@ -860,14 +867,17 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         temp_server = None
 
         try:
-            self.message_text.append("📋 데이터베이스 목록 조회 중...")
+            db_engine = self._db_engine()
+            if db_engine == 'postgresql':
+                self.message_text.append("📋 스키마 목록 조회 중...")
+            else:
+                self.message_text.append("📋 데이터베이스 목록 조회 중...")
             QApplication.processEvents()
 
             host, port, temp_server, error = self._resolve_db_target(allow_temp_tunnel=True)
             if error:
                 self.message_text.append(f"❌ {error}")
                 return
-            db_engine = self._db_engine()
             connect_database, connect_schema = self._database_and_schema_for_selection(
                 self.config.get('default_schema') if db_engine == 'postgresql' else None
             )
@@ -887,7 +897,10 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
 
                     self.db_combo.clear()
                     self.db_combo.addItems(schemas)
-                    self.message_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
+                    if db_engine == 'postgresql':
+                        self.message_text.append(f"✅ {len(schemas)}개 스키마 발견")
+                    else:
+                        self.message_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
 
                     # 기본 스키마 자동 선택
                     default_schema = self.config.get('default_schema')
