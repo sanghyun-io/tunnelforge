@@ -1,0 +1,962 @@
+[
+  {
+    "lens": "import-semantics",
+    "summary": "Import 모드 의미 점검(읽기 전용, bb3c53b 기준). 사용자 규칙 1~3을 끝까지 지키는 모드는 replace/recreate(MySQL)뿐이고, 두 모드는 코드상 완전히 같다. 다만 이 두 모드도 '실패 피해는 그 테이블 하나'라는 기준은 지키지 못한다. 보조 인덱스·FK(PostgreSQL은 UNIQUE·시퀀스까지)를 전체 루프가 끝난 뒤 한 번에 만들기 때문에, 중간에 실패하면 이미 교체된 모든 테이블이 인덱스·FK 없이 남는다. 대상 테이블의 트리거도 경고 없이 사라진다. 기본값 '안전 복원'은 기존 대상을 절대 바꾸지 않고 tf_restore_<id> 새 DB에만 복원하므로 규칙 1·2를 적용하지 않는다. 덮어쓰기(= safe + promote)는 실제 운영 환경에서 거의 성립하지 않는다. DB 단위 권한 계정이거나, 루틴/이벤트가 하나라도 있거나, PostgreSQL에 GRANT가 있거나, 덤프에 FK 고아 행이 있으면 막힌다. 교체가 되더라도 FK·뷰로 엮인 '덤프에 없는' 테이블을 SHOW CREATE TABLE로 다시 만들어 바꿔치기하므로 규칙 3을 어긴다. merge는 규칙 1을 의도적으로 따르지 않는다. 그에 더해 새로 만든 테이블에 보조 인덱스·FK가 빠지고, PostgreSQL 시퀀스를 다시 맞추지 않으며, MySQL에서 이미 있는 뷰 때문에 실패로 보고되는 버그가 있다. UI는 모드 5개 중 2개가 'mysqldump처럼'이라고 표시하고, 실행 전에 어떤 테이블이 삭제되는지(부분 Export에서 FK로 자동 포함된 부모 테이블 포함) 보여주지 않는다.",
+    "matrix": "| 모드 (core) | (a) 덤프에 있고 대상에도 있는 테이블 | (b) 덤프에만 있는 테이블 | (c) 대상에만 있는 테이블 | (d) 대상의 뷰/트리거/루틴/이벤트 | (e) 대상 전용 테이블과 덤프 테이블 간 FK | (f) AUTO_INCREMENT·charset·인덱스·CHECK·주석 | 부분 덤프 / 일부 객체가 빠진 덤프 |\n|---|---|---|---|---|---|---|---|\n| 안전 복원 (safe) | rule_gap: 대상은 그대로 두고 새 DB tf_restore_<id>에 복원 (safe_restore.rs:330-341). 대상 이름 namespace가 없을 때만 그 이름으로 생성 (ok) | rule_gap: 후보 DB에만 생성 | ok: 변경 없음. 다만 'absent from this dump' 차단 사유가 생겨 ready_for_review로 감 (303-305) | 대상 변경 없음. 후보에는 덤프의 뷰만 들어감. 대상에만 있는 뷰·대상의 루틴/이벤트는 검토 차단 사유가 됨 (306-317) | 대상 변경 없음. incoming_foreign_keys로 보고만 함 (299-301). FK 고아 행이 있는 덤프는 복원 자체가 실패 (609-637) | 후보는 replace와 같은 DDL(내부 mode=replace, 369) 후 검증 | 부분 덤프도 받음(scope 필드 없음). 그러면 나머지 대상 테이블이 전부 '대상 전용'이 되어 review로 감. CREATE DATABASE 권한이 없으면 실패 (497-505) |\n| 덮어쓰기 (UI 전용, safe + dump.promote) | 깨끗한 경우에만 ok: 원자적 RENAME으로 교체하고 이전 테이블은 tf_backup_*에 보관. 대신 전역 SELECT/SHOW VIEW/PROCESS 권한 필요 (promote_mysql 89-128), PostgreSQL은 소유자 일치·ACL 없음 필요 (promote_pg 187-202) | ok: RENAME으로 대상에 들어감 | rule_gap: FK/뷰로 연결 안 된 테이블은 유지(ok). 연결된 테이블은 SHOW CREATE TABLE로 clone DB에 재생성 → 행 복사 → 원본은 백업으로 RENAME (659-691, 1307-1319, 1416-1456, 1127-1140; TF-STATUS-173). PostgreSQL은 진짜로 유지 | MySQL은 DB에 루틴/이벤트가 하나라도 있으면 막힘 (896-911). 영향 테이블에 트리거가 있으면 막힘 (300-310). 영향받는 뷰는 재생성되고, 원본 DB에 tf_p_*_oldv* 별칭이 남음. PostgreSQL은 스키마 안 어디든 루틴/트리거/룰이 있으면 막힘 (promote_pg 204-222) | MySQL: 대상 전용 자식 행이 덤프에 없는 부모를 참조하면 막힘 (validate_fks 1089-1124). PostgreSQL: 들어오는 FK는 새 부모로 다시 연결하고, 덤프 테이블 → 대상 전용 부모 FK는 막힘 (promote_pg 265-270) | 덤프 테이블은 후보의 구조 그대로. 재생성되는 대상 전용 테이블은 손실이 생길 수 있는 SHOW CREATE TABLE 텍스트 기반, AUTO_INCREMENT는 복사 (1441-1450) | 부분 덤프 → 대상 전용 테이블이 생기므로 자동 교체 불가 (_take_auto_overwrite 1915-1925) → 검토 대화상자. 빠진 루틴/이벤트가 대상에 그대로 있으면 MySQL 교체 차단 |\n| 데이터 추가 (merge) | rule_gap: 구조는 그대로 두고 행만 덧붙임. FK 검사 ON. 중복 키가 나면 중단 | bug: CREATE TABLE만 하고 post-load 생략 → 보조 인덱스·FK 없음(PostgreSQL은 UNIQUE·주석·시퀀스 리셋도 없음) (import.rs:427-431, 875-892) | ok: 손대지 않음 | 대상 전용 객체는 유지(ok). bug: MySQL에서 덤프의 뷰가 대상에 이미 있으면 CREATE VIEW 실패 → partial(실패) 보고 (1036-1042). PostgreSQL은 CREATE OR REPLACE | ok: 기존 FK가 들어오는 행을 강제함 | 기존 테이블: 대상 정의 유지. bug: PostgreSQL 시퀀스를 다시 맞추지 않아 이후 INSERT에서 키 충돌 (ddl.rs:263-273은 merge에서 호출 안 됨) | 규칙상 ok. 부분 덤프에는 뷰가 없음 |\n| 고급: 전체 교체 (replace) | MySQL ok: 테이블마다 DROP→CREATE→적재 (import.rs:419-431). PostgreSQL rule_gap: 덤프에 포함된 뷰라도 의존 뷰가 하나라도 있거나 대상 전용 FK 자식이 있으면 전체 거부 (683-707) | ok: 없으면 DROP 건너뛰고 생성 (609-611) | ok: 손대지 않음 | 덤프의 뷰는 DROP 후 CREATE하며 SQL SECURITY INVOKER로 바뀌고 DEFINER가 빠짐. 대상 전용 뷰·루틴·이벤트는 유지. rule_gap: 교체된 테이블의 트리거는 아무 경고 없이 삭제됨 | MySQL ok: FK_CHECKS=0이라 살아남는 자식 FK가 유지되고, 호환되지 않으면 사전 점검에서 거부 (560-594). 고아 행은 조용히 남음 (mysqldump와 같음). 같은 import 대상 안 자식 FK는 먼저 떼고 post-load에서 다시 만듦 | MySQL에서 AUTO_INCREMENT=, COLLATE=, 컬럼 단위 charset, 주석, CHECK, PK/UNIQUE는 CREATE에서 처리. 보조 인덱스·FK는 post-load. 인덱스 주석·ROW_FORMAT·테이블 옵션은 빠짐. rule_gap: 실패하면 이미 교체된 모든 테이블에 보조 인덱스·FK가 없음 | 부분 덤프: FK로 자동 포함된 부모 테이블도 삭제·재적재되며 사용자에게 보이지 않음. 덤프에서 빠진 트리거는 대상에서 사라짐 |\n| 고급: 완전 재생성 (recreate) | replace와 동일 (모든 분기가 matches!(replace\\|recreate)) | 동일 | 동일 | 동일 | 동일 | 동일 | 동일 |",
+    "findings": [
+      {
+        "title": "replace/recreate: a mid-run failure leaves every already-replaced table without secondary indexes and FKs",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "migration_core import replace path + Import failure dialog",
+        "rule_item": "baseline",
+        "evidence": "import.rs:399-476 creates each table with generate_table_ddl only (ddl.rs:1271-1303: PK/UNIQUE/CHECK on MySQL, PK only on PG). Secondary indexes, all FKs, PG UNIQUE, PG comments and PG sequence resets run once in apply_post_load_ddl after the loop (import.rs:492-515, ddl.rs:157, 263-303). The failure dialog _replace_failure_details (db_import_dialog.py:95-114) and the mode text (675-679) only mention the in-progress table and the unreached tables.",
+        "scenario": "A 50-table dump fails on table 30. Tables 1-29 keep the new data but have no secondary indexes or FKs (on PG also no UNIQUE, and the sequences sit at 1, so the next INSERT hits a duplicate key). The dialog says only table 30 was lost and 31-50 kept their data. mysqldump creates indexes inside each CREATE TABLE, so its damage stays in one table."
+      },
+      {
+        "title": "Default '안전 복원' never applies rules 1/2 to an existing target",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "safe restore (default mode)",
+        "rule_item": "1",
+        "evidence": "safe_restore.rs:330-341 restores into tf_restore_<id> whenever the namespace exists. Status is ready_for_switch/review and the original is unchanged (420-427). UI default radio_safe.setChecked(True) (db_import_dialog.py:646-648).",
+        "scenario": "The user imports into the existing `app` DB with the default mode. The result is a full copy in `tf_restore_...`, `app` is unchanged, and a review dialog opens. Only the '고급' replace mode overwrites tables the way the user's rule expects."
+      },
+      {
+        "title": "Overwrite/safe cannot run for common real targets (privileges, routines/events, grants)",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "safe restore + promotion",
+        "rule_item": "1",
+        "evidence": "Candidate needs CREATE DATABASE (safe_restore.rs:497-505). MySQL promotion needs direct global SELECT/SHOW VIEW/PROCESS (safe_promote_mysql.rs:89-128). Any routine or event in the original DB blocks it (896-911). Triggers on affected tables block it (300-310). PG blocks on any ACL, foreign owner, routine, trigger or rule anywhere in the schema (safe_promote_postgres.rs:187-222). The UI has no hint that points to replace (no matches in src/).",
+        "scenario": "Today's database-scoped local account picks 덮어쓰기 and fails at CREATE DATABASE tf_restore_*. A DB with one stored procedure restores and verifies the whole candidate, then gets 'blocked', and the user is left with an extra DB."
+      },
+      {
+        "title": "Safe/overwrite reject dumps whose source has orphan FK rows; replace accepts them",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "safe restore verification",
+        "rule_item": "1",
+        "evidence": "verify_candidate fails on any orphan row per declared FK (safe_restore.rs:609-637), and live_safe_restore.rs:53,110-126 treats this as a 'defect'. Yet ddl.rs:275-282 says prod sources really contain orphans and replace deliberately creates FKs with checks=0, as mysqldump does.",
+        "scenario": "A prod dump has is_read_comment rows that point to deleted users. Safe and overwrite load the whole candidate, then fail with 'orphan rows', leaving tf_restore_* behind. The same dump restores fine with replace."
+      },
+      {
+        "title": "Overwrite rebuilds and swaps target-only tables that are FK/view-connected to dump tables",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "safe_promote_mysql",
+        "rule_item": "3",
+        "evidence": "The plan closure pulls in every original table linked by FK or view (safe_promote_mysql.rs:659-691). Those tables are recreated from SHOW CREATE TABLE text in the tf_promote_ clone (1307-1319), their rows are copied under WRITE locks (1416-1456), then the originals are RENAMEd into tf_backup_ and the clones into the original name (1127-1140). This is TF-STATUS-173 (lossy CHECK and literal text). validate_fks also refuses when target-only child rows point to parents missing from the dump (1089-1124).",
+        "scenario": "A partial dump of `users` restored with 덮어쓰기 replaces every table with an FK to users with a rebuilt copy, and the originals move to tf_backup_*. If any child row references a user who is not in the dump, the whole swap is refused."
+      },
+      {
+        "title": "Review dialog labels rebuilt tables as '유지'",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "db_import_dialog promotion review",
+        "rule_item": "3",
+        "evidence": "summary target_only_tables_preserved = original_tables minus candidate tables (safe_promote_mysql.rs:859), and original_tables is exactly the FK/view closure that gets cloned and swapped. The UI labels it '기존 대상에만 있는 테이블 (유지)' (db_import_dialog.py:132).",
+        "scenario": "The user reads 'kept' and confirms, but those tables are rebuilt from SHOW CREATE TABLE and their originals end up in the backup namespace."
+      },
+      {
+        "title": "merge creates missing tables without secondary indexes/FKs (PG: also no UNIQUE/comments)",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "migration_core import merge",
+        "rule_item": "2",
+        "evidence": "merge uses create_table(table, ddl) from generate_table_ddl (import.rs:427-431, ddl.rs:1271-1303). should_apply_post_load_ddl is false for merge (ddl.rs:255-257) and finalize skips it with the message 'existing objects must already match' (import.rs:875-892), which is wrong for tables merge just created.",
+        "scenario": "A merge dump contains a new table `orders`. On MySQL it is created with only PK/UNIQUE (no customer_id index, no FK); on PG it gets only the PK. The import reports success."
+      },
+      {
+        "title": "PG merge never resets serial/identity sequences",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "migration_core import merge (PostgreSQL)",
+        "rule_item": "1",
+        "evidence": "generate_sequence_reset_ddl (setval MAX+1) is called only from apply_post_load_ddl (ddl.rs:263-273), and merge never calls that (import.rs:875). COPY with explicit ids does not advance the sequence.",
+        "scenario": "Rows with ids up to 500 are merged into a PG table whose sequence is at 100. The app's next INSERT fails with a duplicate key on ids 101..500."
+      },
+      {
+        "title": "MySQL merge reports failure when the target already has the dump's views",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "import_views",
+        "rule_item": "n/a",
+        "evidence": "Views are dropped only for replace/recreate (import.rs:1036-1042). MySQL definitions come from SHOW CREATE VIEW as plain CREATE VIEW (schema.rs:792-800). The 'already exists' error lands in views_failed, so status is 'partial' and success is false (import.rs:915-916; rust_dump_exporter.py:685).",
+        "scenario": "Merging a full dump into a DB that has the same views appends all rows, then shows 'Import 실패'. The policy forbids re-running merge (duplicates), so the user cannot tell whether to retry."
+      },
+      {
+        "title": "PG replace refuses when views depend on dump tables, even views contained in the dump; target-only FK children also refuse",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "validate_postgres_drop_dependencies",
+        "rule_item": "1",
+        "evidence": "Any view on a dump table refuses the import with no exclusion for manifest views (import.rs:687-694). Any target-only FK child also refuses (695-707). The live test live_import_policy.rs:643-661 confirms that a full dump including v_protected cannot be replaced over its own schema.",
+        "scenario": "Re-importing a full PG dump into its own schema (which still has the dump's views) fails with target_dependency_preflight_failed. The same flow on MySQL works."
+      },
+      {
+        "title": "replace/recreate silently destroy target triggers on replaced tables",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "migration_core import replace",
+        "rule_item": "1",
+        "evidence": "DROP TABLE runs in replace_target_table (import.rs:627-629) with no trigger preflight (no TRIGGERS query in import.rs/dump_format.rs). Dumps never carry triggers (dump.rs:821-830), and import only echoes the source warning 'Object not exported: trigger' (import.rs:107-109).",
+        "scenario": "Target `orders` has an audit trigger. After replace the trigger is gone, and nothing says the target lost it. mysqldump's default dump would have recreated it."
+      },
+      {
+        "title": "No table list before destructive confirmation; FK-auto-added parents of partial dumps invisible",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "db_import_dialog / partial export metadata",
+        "rule_item": "3",
+        "evidence": "The replace confirmation says '선택한 기존 테이블' but the import has no table selection and shows no names or count (db_import_dialog.py:1217-1225). The production guard shows only folder and mode (1178-1181). added_fk_tables is written to _export_metadata.json (rust_dump_exporter.py:457,483) but never read on import, and the manifest has no scope field (adapters.rs:242-266).",
+        "scenario": "A partial export of `comments` auto-added `users`. Replace then drops and reloads the target `users`, and the user never sees that table named before confirming."
+      },
+      {
+        "title": "Five modes with overlapping claims; recreate is a pure duplicate; merge has no confirm",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "Import mode group",
+        "rule_item": "n/a",
+        "evidence": "Both overwrite (db_import_dialog.py:656) and replace (674-677) say 'mysqldump처럼'. recreate takes the same branches as replace everywhere (import.rs:379,419,1038,1114; ddl.rs:255). Safe already auto-opens the review with a '기존 이름으로 교체' button (1739-1740), so overwrite differs only by skipping that dialog in the clean case. merge is not marked advanced and gets no confirm dialog (1217-1234) even though it appends non-atomically.",
+        "scenario": "The user can't tell which mode matches the 3-rule behaviour. The only rule-compliant one is hidden under '고급' with a scary warning, while merge (non-atomic, not retryable) is one click away."
+      },
+      {
+        "title": "Overwrite/safe leave extra namespaces and alias views behind",
+        "kind": "ux",
+        "severity": "low",
+        "area": "safe restore / promotion",
+        "rule_item": "n/a",
+        "evidence": "promote_with_hook creates tf_backup_ and tf_promote_ databases (safe_promote_mysql.rs:1297-1300) and never drops them or the candidate on success (1537-1539). Saved old views are renamed to tf_p_*_oldv* inside the original DB (1141-1147). Cleanup is manual only, through restore.backups (safe_backups.rs:561).",
+        "scenario": "After one successful 덮어쓰기 the server has tf_restore_*, tf_promote_* and tf_backup_*, and the production DB has extra tf_p_*_oldv* views. mysqldump would leave nothing."
+      },
+      {
+        "title": "Safe restore message says partial filters unsupported but partial dumps are accepted",
+        "kind": "ux",
+        "severity": "low",
+        "area": "safe_restore",
+        "rule_item": "3",
+        "evidence": "safe_restore.rs:186-190 refuses only a payload `tables` filter. A partial-export manifest is indistinguishable from a full one (adapters.rs:242-266), so every other target table becomes target_only and the status becomes ready_for_review (303-305). Overwrite therefore never swaps automatically for partial dumps (db_import_dialog.py:1915-1925).",
+        "scenario": "A user restores a partial dump with 덮어쓰기, sees '자동 교체 불가', and must review a list where all unrelated tables appear as target-only."
+      },
+      {
+        "title": "Table-detail fidelity gaps in replace (index comments, table options, view security)",
+        "kind": "rule_gap",
+        "severity": "low",
+        "area": "normalized schema / DDL",
+        "rule_item": "1",
+        "evidence": "NormalizedIndex/NormalizedTable have no index comment, ROW_FORMAT or KEY_BLOCK_SIZE (adapters.rs:72-139), and no inspector captures them (no INDEX_COMMENT/ROW_FORMAT queries). Views are rewritten without DEFINER and as SQL SECURITY INVOKER (schema.rs:839-850). PG identity uses MAX+1 (documented).",
+        "scenario": "A COMPRESSED table with commented indexes comes back DYNAMIC without index comments, and a DEFINER view now runs with the caller's privileges. None of this is reported."
+      },
+      {
+        "title": "replace/recreate on MySQL follows rules 1-3 for tables, including surviving target-only FKs",
+        "kind": "ok",
+        "severity": "low",
+        "area": "migration_core import replace",
+        "rule_item": "1",
+        "evidence": "Per-table DROP then CREATE then load (import.rs:419-431). A missing table is created (609-611). Target-only tables are never dropped. FK checks=0 (1499) plus the surviving-FK compatibility preflight (560-594, dump_format.rs:645-689). In-set child FKs are dropped before the parent and rebuilt (600-636). Covered by live tests (live_import_policy.rs:390-557).",
+        "scenario": "Re-importing a full or partial MySQL dump overwrites the dump tables, creates the missing ones and leaves the rest alone, as mysqldump does (apart from the post-load and trigger gaps above)."
+      },
+      {
+        "title": "merge/safe leave target-only tables untouched; safe into a missing namespace creates it",
+        "kind": "ok",
+        "severity": "low",
+        "area": "merge / safe",
+        "rule_item": "3",
+        "evidence": "merge only creates or appends to dump tables (import.rs:427-431). Safe never writes to the original (safe_restore.rs:358-384 targets the candidate only). When the namespace is missing, the requested name is created directly (330-334, 421-422).",
+        "scenario": "Target-only tables keep their data. Restoring into a new DB name gives exactly the dump's tables."
+      }
+    ],
+    "verdicts": [
+      {
+        "title": "merge creates missing tables without secondary indexes/FKs (PG: also no UNIQUE/comments)",
+        "verdict": {
+          "real": true,
+          "reasoning": "I tried to refute this and couldn't. The code path is reachable, and the policy doc says it is intended: docs/export_import_policy.md:38 says merge \"Appends dump rows to compatible existing tables (creates missing tables)\". The UI's \"데이터 추가 Import\" radio sends mode \"merge\" (db_import_dialog.py:1157), and rust_dump_exporter.py:617 passes it on to dump.import.\n\n1) Merge creates missing tables with partial DDL. For any mode other than replace/recreate, import.rs:427-431 calls adapter.create_table(table, ddl), where ddl comes from table_ddls (built by generate_table_ddl). LiveAdapter::create_table (adapters.rs:591-617) runs the DDL and treats \"already exists\" as OK, so a missing table really is created. Nothing before that stops it. prepare_import_target (import.rs:568-581) checks only that an existing MySQL target table is InnoDB, and a missing table (engine None) passes. probe_import_ddl only test-creates and drops a probe table.\n\n2) What generate_table_ddl (ddl.rs:1271-1303) emits:\n- Both engines: columns and the PRIMARY KEY.\n- MySQL only: UNIQUE KEYs (1279-1287), CHECKs (1288-1290), the AUTO_INCREMENT counter, the table COMMENT (1293-1296) and column COMMENTs (column_ddl_lines, ddl.rs:1351).\n- Not emitted: non-unique and SPATIAL secondary indexes and all FKs on MySQL. On PostgreSQL also the UNIQUE indexes and the COMMENT ON statements. All of these are only produced by generate_post_data_ddl (ddl.rs:145-231), which skips MySQL unique indexes (ddl.rs:157).\n\n3) Merge skips post-load DDL entirely. should_apply_post_load_ddl returns true only for replace/recreate (ddl.rs:255-257), and the unit test at ddl.rs:2234-2238 asserts merge is false. finalize (import.rs:875-892) then emits \"skipping post-load DDL for merge import; existing objects must already match\" and returns success after verify_imported_row_counts. That message is false for a table merge just created.\n\n4) No test covers merge into a missing table. Every merge live test in tests/live_import_policy.rs (lines 105, 172, 188-205, 234-247, 269) pre-creates the target table.\n\nAdditional consequence the original claim did not mention: apply_post_load_ddl is also where generate_sequence_reset_ddl (the PostgreSQL setval) runs (ddl.rs:268-273). On a PostgreSQL target, an identity column in a merge-created table can be left at its starting value after rows with explicit ids are loaded. That is likely whenever table.auto_increment is None, which inspect_generic sets by default (schema.rs:245). The next INSERT that relies on the default would then fail with a duplicate key.\n\nOne part does not hold: CHECK constraints should not count against merge on PostgreSQL. No path emits PG CHECKs (the only CHECK emission is ddl.rs:1289, inside the MySQL branch), so replace loses them too.\n\nSeverity: this is a real bug, not only a rule_gap. It is reachable by design and the import still reports success. The user does not see the effect until queries get slow or a missing FK lets orphan rows in.",
+          "corrected_claim": "When the merge (\"데이터 추가\") mode meets a dump table that does not exist in the target, it creates the table, as the policy documents (docs/export_import_policy.md:38). The table is created through create_table with generate_table_ddl (import.rs:427-431, adapters.rs:591-617, ddl.rs:1271-1303). Post-load DDL then never runs, because should_apply_post_load_ddl(\"merge\") is false (ddl.rs:255-257), and finalize logs \"existing objects must already match\" and reports success (import.rs:875-892).\n\nWhat the created table is missing:\n- MySQL: non-unique and SPATIAL secondary indexes, and all FOREIGN KEYs. PK, UNIQUE KEYs, CHECKs, comments and the AUTO_INCREMENT counter are kept.\n- PostgreSQL: everything except the columns and the PK. That means UNIQUE indexes, secondary indexes, FKs, and table/column comments, and the identity sequence is not reset with setval (ddl.rs:268-273). After a merge into a missing PG table, the next INSERT that uses the default id can collide with the loaded ids.\n\nPostgreSQL CHECK constraints are not part of this bug: no path emits them, so replace drops them too. No test covers merge into a missing table; every merge live test pre-creates the target table."
+        }
+      },
+      {
+        "title": "PG merge never resets serial/identity sequences",
+        "verdict": {
+          "real": true,
+          "reasoning": "I tried to refute the claim and could not; the code supports it. (1) The only place sequences get reset is generate_sequence_reset_ddl (ddl.rs:233-253), which emits setval(...MAX+1) for PostgreSQL. It runs only inside apply_post_load_ddl (ddl.rs:263-273). (2) finalize_dump_import calls apply_post_load_ddl only when should_apply_post_load_ddl(mode) is true (import.rs:875-883). That function is matches!(mode, \"replace\" | \"recreate\") (ddl.rs:255-257), and the unit test at ddl.rs:2237 asserts that merge is excluded. So merge takes the \"existing_schema\" branch and never runs setval. (3) Merge on PostgreSQL loads rows through adapter.insert_rows (import.rs:828) into copy_rows_to_postgres (adapters.rs:735-741, ddl.rs:746-765). That is COPY with the dump's explicit id values, which does not call nextval. (4) Nothing else resets the sequence. dump.import accepts merge for either engine (import.rs:248). The Python side passes the mode straight through (rust_dump_exporter.py:617) and the UI offers 데이터 추가 for any engine (db_import_dialog.py:664). The only setval use in Python is in the cross-engine migration guide (cross_engine_migration.py:544), not in import. (5) No test checks sequences after a PG merge. The merge tests in live_import_policy.rs are MySQL-only. (6) docs/export_import_policy.md:215 says \"Ordinary identity restoration uses MAX(id)+1\" and does not say this applies only to replace/recreate. The scenario in the claim holds whenever the id column is PK/UNIQUE. One refinement: the gap is wider than stated, because it also covers tables that merge creates. On a target where the table is missing, merge runs create_table (import.rs:420-423) with GENERATED BY DEFAULT AS IDENTITY. START WITH is set only from table.auto_increment (ddl.rs:1343-1344), and only the MySQL inspector fills that value (schema.rs:245 sets None, schema.rs:271 sets it for MySQL only). So a PG-to-PG merge creates the table with its identity at 1, and the first app INSERT collides at id 1. MySQL targets are not affected, because InnoDB moves AUTO_INCREMENT past explicitly inserted ids.",
+          "corrected_claim": "BUG (confirmed, PostgreSQL targets only): dump.import mode=merge never resets serial or identity sequences. The sequence reset (generate_sequence_reset_ddl, ddl.rs:233-253) is part of apply_post_load_ddl (ddl.rs:263-273). That step is gated by should_apply_post_load_ddl, which returns true only for replace/recreate (ddl.rs:255-257, called at import.rs:875; the test at ddl.rs:2237 confirms merge is excluded). Merge loads rows with COPY using explicit ids (import.rs:828 -> adapters.rs:735-741 -> ddl.rs:746), and COPY does not advance the sequence. Two cases are affected. (a) Existing table: the sequence stays where it was (for example 100), so after merging ids up to 500 the app's next INSERTs fail with duplicate keys on 101..500. (b) Table that merge creates because it is missing: for a PostgreSQL source the identity starts at 1, because auto_increment is filled only for MySQL sources (schema.rs:245/271, ddl.rs:1343-1344), so the very first INSERT collides at id 1. No test covers PostgreSQL merge sequences. The policy doc (export_import_policy.md:215) says identity restoration uses MAX(id)+1 without saying this applies only to replace/recreate. MySQL merge is unaffected because InnoDB advances AUTO_INCREMENT on explicit ids."
+        }
+      },
+      {
+        "title": "MySQL merge reports failure when the target already has the dump's views",
+        "verdict": {
+          "real": true,
+          "reasoning": "I could not refute the claim. I checked each step against the code at bb3c53b:\n- **Views reach a normal merge.** A normal (non-retry) import from the UI sends no `tables` key; it is only set from `retry_tables` (rust_dump_exporter.py:614-625). So `selected` is empty (import.rs:267-268), and a full export carries views in the manifest (dump.rs:741-742). `import_views` therefore runs for merge (import.rs:903-912).\n- **Nothing makes CREATE safe on MySQL.** MySQL definitions are the raw `SHOW CREATE VIEW` text, which is plain `CREATE ... VIEW` (schema.rs:792-800). `sanitize_view_definition` (schema.rs:839-855) only strips DEFINER, forces SQL SECURITY INVOKER and strips the schema prefix. It never adds `OR REPLACE`.\n- **Views are dropped only for replace/recreate** (import.rs:1036-1042). Merge executes `CREATE VIEW` against the existing view (import.rs:1047-1065). MySQL rejects it as \"already exists\" (ER 1050). The fixpoint loop stops with no progress, and every such view lands in `outcome.failed` (import.rs:1074-1080).\n- **The result is reported as failure.** `views_failed` is non-empty, so status is \"partial\" and success is false (import.rs:913-916). The Python layer returns `not bool(views_failed)` (rust_dump_exporter.py:685) and the worker passes that through (rust_dump_worker.py:178-196). The dialog then takes the failure branch (db_import_dialog.py:1748-1777): label \"Import 실패: 0/N 테이블 오류\", a warning box titled \"Import 실패\", and an anonymous error report.\n- **The re-run conflict is real.** The policy says never to blindly repeat merge against a partially loaded target (export_import_policy.md:155-158).\n- **No test covers this.** No Rust or Python test covers merge with existing views. The only view-failure test (tests/test_rust_dump_exporter.py:1022-1057) uses replace with a fake facade.\n\nCorrections to the claim:\n1. It is MySQL-only. PostgreSQL definitions are wrapped as `CREATE OR REPLACE VIEW` (schema.rs:823-826), so PG merge succeeds unless the view's column list changed.\n2. The message box is not entirely silent. Its body includes the exporter message \"Rust DB Core import 완료: N개 테이블, X rows (View K개 생성 실패: names)\". But the title, the status label and the error report all say failure. The actual reason (\"already exists\") is not shown, only the view names.\n3. A second effect: even when nothing fails, merge never updates an existing view whose definition differs.",
+          "corrected_claim": "Confirmed bug, MySQL only. A full merge sends no table list, so views are imported (import.rs:903-912). MySQL view definitions stay plain CREATE VIEW after sanitization (schema.rs:792-800, 839-855). Views are dropped only for replace/recreate (import.rs:1036-1042). So every view that already exists in the target fails with \"already exists\" and goes into views_failed (import.rs:1074-1080). The result is status \"partial\" with success false (import.rs:913-916; rust_dump_exporter.py:685). The dialog shows label \"Import 실패: 0/N 테이블 오류\" and a box titled \"Import 실패\", and sends an anonymous error report (db_import_dialog.py:1748-1779). All table rows are already appended, and the policy forbids re-running merge (export_import_policy.md:155-158). The box body does say \"import 완료 ... (View K개 생성 실패: names)\", but it does not give the \"already exists\" reason. PostgreSQL is not affected because its definitions are CREATE OR REPLACE VIEW (schema.rs:823-826). No test covers merge with existing views."
+        }
+      }
+    ]
+  },
+  {
+    "lens": "failure-retry",
+    "summary": "실패/재시도 관점에서 보면, replace/recreate는 '첫 오류에서 멈춤'과 '덤프 밖 테이블 무접촉'은 지킵니다(DROP 전에 사전검증하고, 덤프 밖 테이블은 DROP하지 않음). 하지만 '피해는 그 테이블 하나'는 지키지 못합니다. 보조 인덱스와 FK(PostgreSQL은 UNIQUE와 identity 재설정까지)를 마지막 post-load에서 한꺼번에 만들기 때문에, 중간에 실패하면 이미 교체된 테이블들이 인덱스·FK 없이 남습니다. 그런데 UI는 이 테이블들을 '성공(✅)'으로 표시하고, 안내문과 정책 문서에도 이 내용이 빠져 있습니다. merge는 실패 뒤 UI가 권하는 '같은 설정으로 다시 Import'를 누르면 이미 추가된 행이 또 추가돼 중복이 생깁니다. 대상에 없어서 merge가 새로 만든 테이블에는 인덱스·FK가 영구히 생기지 않습니다(설계상 post-load 생략). 안전 복원과 덮어쓰기는 원본을 지키지만, 실패한 후보 DB(tf_restore_*)가 계속 쌓이고 도구로 지울 수 없습니다. 존재하지 않는 대상 이름으로 복원하다 실패하면 그 이름으로 부분 DB가 남고, UI는 '원본 미변경'이라고만 표시합니다. 또 최종 대화상자는 실제 실패 원인 대신 일반 문구만 보여 줍니다. 모든 모드에서 Dump 폴더의 보고서 파일(_tunnelforge_import_report.json) 하나를 계속 덮어써서, 재실행하면 이전 시도의 손상 기록(삭제 후 복원되지 않은 테이블 등)과 승격 저널이 사라지거나 숨겨집니다. 작업 목록의 보고서 링크도 모두 같은 파일을 가리킵니다. MySQL 덮어쓰기 승격은 대상에만 있는 테이블까지 복제해서 교체하므로 규칙 3을 어깁니다(TF-STATUS-173 관련).",
+    "findings": [
+      {
+        "title": "replace/recreate 중간 실패 시 이미 교체된 테이블에 보조 인덱스·FK가 없음 (피해가 한 테이블로 한정되지 않음)",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "replace/recreate - create/data load/post-load",
+        "rule_item": "baseline",
+        "evidence": "migration_core/src/import.rs:419-431 각 테이블을 기본 DDL로 DROP 후 CREATE하고, :486-490 루프 오류 시 finalize 전에 return, :492-514 post-load는 전체 루프가 끝난 뒤에만 실행. ddl.rs:1271-1291 기본 DDL은 컬럼, PK, (MySQL) UNIQUE, CHECK만 포함. ddl.rs:145-220 및 :157 MySQL의 비고유 인덱스와 모든 FK, PostgreSQL의 UNIQUE 인덱스·FK·코멘트·identity setval(:233-252)이 post-load로 미뤄짐. 반면 UI db_import_dialog.py:677 안내문, :1220 확인창, docs/export_import_policy.md:36은 '진행 중이던 테이블만 없거나 일부 적재'라고만 설명. db_import_dialog.py:95-114 실패 상세는 원본 테이블에서 떼어 낸 FK만 나열하고, 교체된 테이블은 FK 목록에서 제외(:110).",
+        "scenario": "테이블 10개 덤프를 replace하다가 7번째 테이블 적재가 strict 오류(예: 1406)로 실패하면 1~6번은 데이터만 있고 비고유 인덱스와 FK가 없습니다(PostgreSQL은 UNIQUE와 identity 재설정도 없음). UI는 1~6번을 ✅로 표시하고 '성공: 6개 테이블'이라고 하며, 실패 대화상자도 이 상태를 알리지 않습니다. mysqldump였다면 1~6번은 인덱스·FK까지 완전한 상태로 남았을 것입니다. 복구는 전체 replace를 다시 실행하는 것뿐입니다."
+      },
+      {
+        "title": "merge 부분 실패 후 '같은 설정으로 다시 Import'를 누르면 행이 중복 추가됨",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "merge - rerun",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:790-793 btn_rerun이 do_import()를 호출함. :1642-1650 오류 상태 테이블이 있으면 모드와 관계없이 버튼 표시. :1774 실패 대화상자가 '원래 범위로 전체 Import를 다시 시작하세요'라고 안내. :1217-1234 merge에는 별도 확인창이 없음. import.rs:1114-1116 merge 재시작은 막혀 있지만, 실패 전 테이블 1..k-1과 k의 일부 청크는 이미 커밋된 상태. docs/export_import_policy.md:155-157 'Never blindly repeat merge' 경고와 UI 안내가 서로 맞지 않음.",
+        "scenario": "merge가 k번째 테이블에서 실패한 뒤 UI 안내대로 다시 Import하면, PK/UNIQUE가 없는 테이블에는 같은 행이 소리 없이 한 번 더 들어갑니다. 키가 있는 테이블은 첫 1062 오류에서 다시 멈춥니다."
+      },
+      {
+        "title": "재시도할 때마다 Dump 폴더의 단일 보고서를 덮어써서 이전 시도의 손상 기록과 승격 저널이 사라짐",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "all modes - report/journal",
+        "rule_item": "baseline",
+        "evidence": "dump_format.rs:852-856 보고서 경로는 Dump 폴더의 _tunnelforge_import_report.json 하나로 고정. import.rs:199-200, safe_restore.rs:168 모든 시도가 시작하자마자 이 파일을 덮어씀. job_recording.py:97,119-120 작업 목록 기록도 모두 같은 경로를 가리킴. safe_backups.rs:83-98 현재 보고서가 safe(candidate_created) 보고서이면 그 restore_id 하나만 등록하고 return하므로, 다른 .tunnelforge_promotion_plan_* 디렉터리는 조회되지 않음. safe_promotion.rs:206-212 승격은 이 공유 보고서로만 검증 계획을 불러옴.",
+        "scenario": "replace 실패 보고서에 dropped_not_restored_tables=[orders]가 기록된 상태에서 다시 실행했는데, 두 번째 시도가 검증 단계에서 실패하면 보고서에는 dropped_tables=[]만 남아 orders가 비어 있다는 증거가 사라집니다. 작업 목록에서 첫 기록의 '보고서 열기'를 눌러도 두 번째 보고서가 열립니다. 덮어쓰기를 같은 Dump 폴더로 두 번 하면 첫 번째 tf_backup_*은 '증명 안 됨'으로만 표시되고 정리도 되돌리기도 할 수 없습니다."
+      },
+      {
+        "title": "안전 복원/덮어쓰기 실패 시 최종 대화상자가 실제 원인 대신 일반 문구를 표시",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "safe/overwrite - all failure phases",
+        "rule_item": "n/a",
+        "evidence": "safe_restore.rs:441-457,477-480 실패해도 success:false와 message('Safe restore failed; ... {error}')를 담아 result로 반환. rust_dump_exporter.py:641-653은 이 message를 버리고 '안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다...'를 반환. rust_dump_worker.py:192 error_code는 예외 경로(rust_dump_exporter.py:686-694)에서만 설정되므로 None. db_import_dialog.py:1754-1766 이 일반 문구로 경고창을 띄움.",
+        "scenario": "후보 적재 중 1406 오류나 권한 부족으로 실패해도 사용자에게는 '안전 복원 실패 · 원본 미변경 / 검증된 새 대상 정보를 확인할 수 없습니다'만 보입니다. 실제 원인은 로그의 JSON 덩어리나 보고서를 열어야 알 수 있고, 익명 오류 보고에도 오류 코드가 빠집니다."
+      },
+      {
+        "title": "실패한 안전 복원 후보(tf_restore_*)가 계속 쌓이고 TunnelForge로 지울 수 없음",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "safe/overwrite - data load/verify/cancel",
+        "rule_item": "n/a",
+        "evidence": "safe_restore.rs:1-2,349 실패할 때마다 후보를 남김. safe_backups.rs:406-422 데이터가 있는 미승격 후보를 정리하려면 load_verified_plan과 reverify가 필요한데, safe_restore.rs:40-50은 검증되지 않은 보고서를 거부. 다음 시도가 보고서를 덮어쓰면 목록에서도 사라짐(safe_backups.rs:83-98). safe_promote_mysql.rs:1737-1740 이름 기반 조회는 tf_backup_ 접두사만 대상.",
+        "scenario": "덤프 전체 크기만큼의 후보 DB가 실패하거나 중지할 때마다 하나씩 남고, '다시 Import'를 누를 때마다 또 하나 생깁니다. '복원 백업 관리'에서는 삭제가 막히거나 아예 보이지 않아 사용자가 DROP DATABASE로 직접 지워야 합니다."
+      },
+      {
+        "title": "존재하지 않는 대상 이름으로 안전 복원하다 실패하면 그 이름으로 부분 DB가 남고, 재실행 때 이것이 '원본'으로 취급됨",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "safe/overwrite - new target",
+        "rule_item": "2",
+        "evidence": "safe_restore.rs:330-334 namespace가 없으면 후보 이름이 곧 요청한 이름이 됨. :346-352 그 이름으로 생성. :441-451 실패해도 original_unchanged=true. db_import_dialog.py:1754-1758 '안전 복원 실패 · 원본 미변경' 표시. safe_backups.rs:239-242,389-391 이 DB는 '복원 대상 자체'라서 정리 대상에서 제외됨.",
+        "scenario": "새 DB 'app'으로 복원하다 테이블 5번째에서 실패하면 'app'에 테이블 4개짜리 부분 DB가 남습니다. 다시 실행하면 이것을 기존 원본으로 보고 tf_restore_*에 복원하며, 덮어쓰기라면 부분 DB를 tf_backup_*으로 옮기며 교체합니다. 처음의 부분 DB는 도구로 지울 수 없습니다."
+      },
+      {
+        "title": "replace의 post-load 실패 시 모든 테이블이 ✅로 표시되고, 어떤 인덱스/FK가 빠졌는지 알려 주지 않음",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "replace/recreate - post-load",
+        "rule_item": "baseline",
+        "evidence": "ddl.rs:263-298 post-load DDL은 첫 실패 문장에서 중단. import.rs:226-230 요약 이벤트에 post_load_completed가 있지만 db_import_dialog.py:64-70은 이 값을 저장하지 않음. :1642-1650 오류 상태 테이블이 0개라 다시 Import 버튼이 숨겨짐. :1769-1777 'post_load_validation_failed: ...' 원문만 표시하고 상세는 비어 있음.",
+        "scenario": "FK 추가가 타입 불일치로 실패하거나 CREATE INDEX가 ERROR 1114로 실패하면, 데이터는 모두 들어갔지만 그 뒤의 인덱스와 FK가 전부 빠집니다. 화면에는 '❌ Import 실패: 0/N 테이블 오류'만 나와 무엇이 빠졌는지 알 수 없습니다."
+      },
+      {
+        "title": "replace를 중지(취소)하면 삭제된 테이블이 화면에 표시되지 않고 보고서가 'running' 상태로 남음",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "replace/recreate - cancel",
+        "rule_item": "baseline",
+        "evidence": "rust_dump_worker.py:43-59 Rust 프로세스를 terminate하므로 import.rs:205-230의 최종 보고서와 요약 이벤트가 나오지 않고, 마지막 checkpoint(import.rs:172-174, status 'running')만 남음. db_import_dialog.py:1762-1763 취소 시에는 _replace_failure_details를 호출하지 않음. confirmed_drops(:60-63)는 로그 저장 파일(:2072-2076)에만 기록. 취소 확인창(:2167)은 '일부 데이터가 반영'이라고만 하고 테이블 삭제 가능성은 언급하지 않음.",
+        "scenario": "교체 도중 '중지'를 누르면 '⏹ Import 취소됨: 3/10 테이블 완료'만 표시됩니다. 4번째 테이블이 DROP된 뒤 비어 있다는 사실은 로그를 저장하거나 status=running인 보고서를 직접 읽어야 알 수 있습니다."
+      },
+      {
+        "title": "접속 전 검증에서 실패해도 UI가 테이블 실패와 '다시 Import'를 표시함 (대상은 손대지 않았음)",
+        "kind": "ux",
+        "severity": "low",
+        "area": "replace/merge - validation",
+        "rule_item": "n/a",
+        "evidence": "import.rs:325 청크 검증이 :348 접속보다 먼저 실행됨. dump_format.rs:713,923 오류 메시지가 'export_invalid: <table>: ...' 형식이라 rust_dump_exporter.py:500의 f\": {table}:\" 매칭에 걸려 해당 테이블은 error, 나머지는 blocked로 표시(:491-505). 사전 거부로 인정되는 코드는 4개뿐(:509-514). replace/merge에는 '대상 무변경'을 알려 주는 문구가 없음(safe만 db_import_dialog.py:1755-1757에 있음).",
+        "scenario": "Dump 청크 체크섬이 맞지 않으면 대상은 전혀 바뀌지 않았는데도 '실패 1, 미실행 N, 대상 데이터를 확인한 후 다시 시작하세요'와 다시 Import 버튼이 나옵니다. 같은 손상 덤프로 다시 실행하면 같은 이유로 또 실패합니다."
+      },
+      {
+        "title": "DROP 결과 불명(drop_outcome_unknown/pending_drop_table)이 UI에 표시되지 않음",
+        "kind": "bug",
+        "severity": "low",
+        "area": "replace/recreate - prepare/drop",
+        "rule_item": "baseline",
+        "evidence": "import.rs:625-632 DROP 직전에 pending_drop을 기록하고, :153-154에서 보고서에 drop_outcome_unknown을 남기며, :227 요약 이벤트에 포함. db_import_dialog.py:68 저장하는 키 목록에 이 항목이 없고, _replace_failure_details(:95-114)에도 나오지 않음.",
+        "scenario": "DROP TABLE 도중 연결이 끊기면 그 테이블이 삭제됐는지 알 수 없는데, 실패 대화상자에는 '삭제 후 복원되지 않은 테이블'에도 '원본 유지'에도 나타나지 않습니다."
+      },
+      {
+        "title": "DDL 사전검증 probe 테이블(tf_probe_*)이 대상에 남을 수 있음 (덤프 밖 객체 생성)",
+        "kind": "bug",
+        "severity": "low",
+        "area": "replace/merge - DDL preflight",
+        "rule_item": "3",
+        "evidence": "import.rs:517-550 대상 스키마에 tf_probe_<pid>_<nonce>_<i>를 CREATE한 뒤 DROP. 그 사이에 취소(프로세스 kill)되거나 DROP이 실패하면 남음. ddl_probe_cleanup_failed는 rust_dump_exporter.py:509-514 사전 거부 목록에 없어서, :500 매칭으로 원래 테이블이 실패로 표시됨.",
+        "scenario": "사전검증 중 중지하거나 DROP 권한이 없으면 사용자 DB에 tf_probe_* 테이블이 남고, 어디에도 정리 안내가 나오지 않습니다."
+      },
+      {
+        "title": "덤프 테이블과 이름이 같은 VIEW가 대상에 있으면 사전검증을 통과한 뒤 중간에 실패함",
+        "kind": "bug",
+        "severity": "low",
+        "area": "replace/recreate - create",
+        "rule_item": "1",
+        "evidence": "import.rs:609-611,670-680 존재 확인을 BASE TABLE(PostgreSQL은 relkind r,p)로만 해서 DROP을 건너뜀. :525-526 probe는 다른 이름으로 만들기 때문에 이름 충돌을 잡지 못함. 그 결과 :424-426 create_new_table이 already exists로 실패하는데, 이미 앞 테이블들은 교체된 뒤임.",
+        "scenario": "대상에 'report'라는 VIEW가 있고 덤프에 report 테이블이 있으면, 앞선 테이블들을 교체한 다음 report에서 실패합니다. 이때 앞 테이블들은 인덱스/FK가 없는 상태로 남습니다."
+      },
+      {
+        "title": "merge가 새로 만든 테이블(대상에 없던 테이블)에는 인덱스/FK가 영구히 생기지 않음",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "merge - create/post-load",
+        "rule_item": "2",
+        "evidence": "ddl.rs:255-257 post-load는 replace/recreate에서만 실행. import.rs:427-431 merge는 기본 DDL로 create_table 하고, :875-892 post-load를 건너뜀(existing_schema). TF-STATUS-009의 의도된 정책. 기본 DDL에 들어가는 항목은 ddl.rs:1271-1291 참조.",
+        "scenario": "merge 대상 DB에 없던 테이블은 생성되고 데이터도 들어가지만, MySQL은 비고유 인덱스와 FK가, PostgreSQL은 UNIQUE·FK·identity 재설정이 끝까지 없습니다. 규칙 2('없으면 생성 후 적재', mysqldump 수준의 구조)에 미치지 못합니다."
+      },
+      {
+        "title": "MySQL 덮어쓰기 승격이 대상에만 있는 테이블을 복제·교체함 (규칙 3 위반)",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "overwrite - promotion (MySQL)",
+        "rule_item": "3",
+        "evidence": "safe_promote_mysql.rs:1307-1318 대상 전용 테이블을 기록된 정의로 tf_promote_ clone에 다시 만들고, :1416-1456 WRITE 잠금 아래에서 DELETE+INSERT로 복사한 뒤, :1127-1140 RENAME으로 원본을 tf_backup_*으로 옮기고 복제본으로 바꿈. safe_restore.rs:303-305는 blocker로 자동 교체만 막고, db_import_dialog.py:1944 '기존 이름으로 교체' 버튼은 여전히 활성. PostgreSQL은 선택 테이블만 SET SCHEMA로 옮겨 대상 전용 테이블을 보존(safe_promote_postgres.rs:142,417-426). TF-STATUS-173 관련.",
+        "scenario": "덤프에 없는 audit_log 테이블이 대상에 있는 상태에서 검토 대화상자의 '기존 이름으로 교체'를 누르면, audit_log는 새 테이블 ID를 가진 복제본으로 바뀌고 원본은 백업 DB로 이동합니다. 교체하는 동안에는 쓰기도 막힙니다."
+      },
+      {
+        "title": "'같은 설정으로 다시 Import'가 실제로는 현재 화면 설정을 다시 읽고, 일부 실패 경로에서만 보이며, 부분 재시도 코드는 쓰이지 않음",
+        "kind": "ux",
+        "severity": "low",
+        "area": "all modes - rerun/do_retry",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:793 do_import()가 현재 위젯 값을 다시 읽음. :1648 버튼은 오류 상태 테이블이 있을 때만 보이므로 post-load 실패, 취소, 사전 거부, safe 실패에서는 숨겨짐. :1186-1193,1988-1993 do_retry는 경고만 띄우고, retry_tables 경로(rust_dump_worker.py:189, rust_dump_exporter.py:597-599,624-625)는 UI에서 호출되지 않는 죽은 코드.",
+        "scenario": "실패 후 다시 활성화된 화면에서 모드를 바꾸고 '같은 설정으로 다시 Import'를 누르면, 실제로는 바꾼 모드로 실행됩니다."
+      },
+      {
+        "title": "replace는 첫 오류에서 멈추고, 끊김 재시작은 새로 만든 테이블만 TRUNCATE함",
+        "kind": "ok",
+        "severity": "low",
+        "area": "replace/recreate/merge - data load",
+        "rule_item": "baseline",
+        "evidence": "import.rs:399-475 테이블 루프가 ? 로 즉시 중단. :1690,1757-1759 병렬 적재는 첫 워커 오류 뒤 새 청크를 배정하지 않음. :1114-1116,1144-1233 연결 끊김 재시작은 replace에서만, 막 만든 테이블을 TRUNCATE한 뒤 수행. merge는 재시작하지 않음.",
+        "scenario": "k번째 테이블에서 실패하면 k+1번 이후 테이블은 원본 데이터 그대로 남습니다(unattempted로 보고)."
+      },
+      {
+        "title": "replace는 첫 DROP 전에 사전검증하고 덤프 밖 테이블은 DROP하지 않으며, 실패 시 손상 범위를 보고함",
+        "kind": "ok",
+        "severity": "low",
+        "area": "replace/recreate - validation/preflight/report",
+        "rule_item": "3",
+        "evidence": "import.rs:279-325 접속 전 메타데이터와 청크 검증, :379-383 PostgreSQL 의존성 확인·CHECK 이름·DDL probe, :581-591 MySQL에 남는 FK 호환성 거부, :640-667 FK 해제는 import 대상 자식 테이블로만 한정, :143-170,226-230 dropped_not_restored/unattempted/dropped_foreign_keys 기록. rust_dump_exporter.py:509-518,688 사전 거부 시 테이블을 실패로 표시하지 않음. db_import_dialog.py:95-114 실패 상세 표시.",
+        "scenario": "사전검증에서 거부되면 대상은 바뀌지 않고, 실패 대화상자에 '삭제 후 복원되지 않은 테이블'과 '원본 유지 테이블'이 구분되어 나옵니다."
+      },
+      {
+        "title": "안전 복원은 모든 실패 단계에서 원본을 보존하고, 승격 실패도 상태를 구분해 처리함",
+        "kind": "ok",
+        "severity": "low",
+        "area": "safe/overwrite - promotion",
+        "rule_item": "n/a",
+        "evidence": "safe_restore.rs:441-457 failed_original_untouched. safe_promote_mysql.rs:1483-1536 RENAME 전 실패는 만든 clone/backup DB와 숨긴 뷰를 정리, RENAME 시도 뒤에는 classify로 판정하고 불명이면 reconcile 대상. safe_promote_postgres.rs:373,527 트랜잭션. db_import_dialog.py:1897-1911 원본 미변경이면 재검토 가능, 불명이면 재검토 비활성.",
+        "scenario": "교체 중 잠금 획득에 실패하면 '전환 차단 · 원본 미변경'이 표시되고 검토를 다시 할 수 있습니다. 결과가 불명이면 '복원 백업 관리'에서 reconcile해야 합니다."
+      },
+      {
+        "title": "부분 테이블 재시도가 막혀 있고, safe는 테이블 필터를 거부함",
+        "kind": "ok",
+        "severity": "low",
+        "area": "all modes - retry_tables",
+        "rule_item": "3",
+        "evidence": "db_import_dialog.py:1988-1993 경고만 표시. safe_restore.rs:186-191 tables 필터 거부. import.rs:267-285 replace/merge 실행 범위는 덤프 전체(UI가 tables를 보내지 않음).",
+        "scenario": "실패한 테이블만 다시 넣다가 지연 생성되는 인덱스/FK가 빠지는 상황은 생기지 않습니다."
+      }
+    ],
+    "matrix": "| 실패 단계 | replace/recreate | merge | 안전 복원(safe) | 덮어쓰기(overwrite) |\n|---|---|---|---|---|\n| 검증(접속 전) | 대상 무변경, 단 UI가 테이블 실패와 다시 Import를 표시 | 동일 | 원본 무변경, 후보 미생성, 대화상자는 일반 문구 | 동일 |\n| DDL 사전검증 | 대상 무변경(사전 거부, 테이블은 pending). 취소하면 tf_probe_* 잔존 가능 | 동일 | 후보 안에서 실행되어 후보만 남음 | 동일 |\n| prepare/DROP | 진행 중 테이블만 비고, 차례가 안 온 import 대상 자식은 FK만 잃음(보고됨). DROP 결과 불명은 UI에 안 나옴 | 해당 없음 | 후보만 영향 | 후보만 영향 |\n| CREATE/적재 | 진행 중 테이블 없음/부분 적재. 이미 교체된 테이블은 인덱스·FK 없음(✅로 표시되고 보고 안 됨) | 앞 테이블은 행 추가 완료, 진행 중 테이블은 일부 커밋. 다시 Import하면 중복 | 후보 남음(도구로 삭제 불가). 새 이름으로 복원했다면 그 이름에 부분 DB가 남음 | 동일, 교체 안 함 |\n| post-load(인덱스/FK) | 실패한 문장 이후의 인덱스·FK 누락, 모든 테이블 ✅, 다시 Import 버튼 숨김 | post-load 없음(새로 만든 테이블은 영구히 인덱스·FK 없음) | 후보만 영향 | 후보만 영향 |\n| 뷰 | 같은 이름 뷰를 DROP한 뒤 재생성에 실패하면 사라짐(실패로 보고) | 기존 뷰 유지 | 후보만 영향 | 후보만 영향 |\n| 승격 | 해당 없음 | 해당 없음 | 사용자가 직접 선택 | MySQL: RENAME 전 실패면 만든 객체 정리, 원본 무변경. RENAME 결과 불명이면 reconcile. 대상 전용 테이블은 복제본으로 교체(규칙 3 위반). PostgreSQL: 트랜잭션, 대상 전용 테이블 보존 |\n| 중지(취소) | 프로세스 종료, 보고서는 running 상태로 남고 화면에 삭제된 테이블이 안 나옴 | 동일 | 후보 남음 | 승격 중 취소하면 결과 불명 |\n| 다시 실행 | 원인을 고친 뒤 전체를 다시 교체하면 복구됨. 이전 보고서는 덮어씀 | 중복 위험 | 후보 DB가 하나 더 생김 | 후보가 하나 더 생기고, 이전 승격 저널은 조회되지 않음 |",
+    "verdicts": [
+      {
+        "title": "merge 부분 실패 후 '같은 설정으로 다시 Import'를 누르면 행이 중복 추가됨",
+        "verdict": {
+          "real": true,
+          "reasoning": "I tried to refute the claim and could not. The core of it holds, but the reported severity and wording are too strong.\n\nConfirmed:\n- db_import_dialog.py:790-793: btn_rerun calls do_import() with no arguments.\n- db_import_dialog.py:1638-1650 (on_import_finished): the button and its hint appear whenever any table has status 'error'. Mode is never checked.\n- rust_dump_exporter.py:500-501: when an import fails, the table that was loading is marked 'error' in every mode. So a failed merge does show the rerun button.\n- do_import (db_import_dialog.py:1215-1234): only replace/recreate and overwrite get a confirmation dialog. For merge there is only _confirm_production_guard. Per production_guard.py:320-325 it asks nothing in Development, and elsewhere it asks the generic \"데이터 Import\" question, not anything about rerunning a merge.\n- On failure in a non-safe mode, the dialog says \"대상 데이터를 확인한 후 원래 범위로 전체 Import를 다시 시작하세요\" (db_import_dialog.py:1774).\n- Merge cannot restart internally (import.rs:1114-1116, the may_restart_import_table check). Earlier work is not undone: each INSERT/LOAD statement commits in its own transaction (import.rs:1933-1964), and tables run one after another (import.rs:401-475). So tables 1..k-1 and any finished chunks of table k stay committed.\n- docs/export_import_policy.md:153-157 promises \"with explicit confirmation\" and \"Never blindly repeat merge\". The UI has no merge-specific confirmation, so the UI does not match the documented contract.\n- The existing test (tests/test_db_import_dialog.py:1737-1750) only checks that rerun calls do_import(). No test covers merge.\n\nWhat needs correcting:\n(1) The UI does not tell the user to rerun blindly. Both the hint (:794) and the failure text say to check the target data first, and the merge mode description (:665) warns about duplicates and constraint errors. The fault is that the button offers merge a one-click rerun without warning that a merge rerun adds the same rows again. The UI does not instruct a duplicating action.\n(2) The scope of the duplication is narrower than claimed. The rerun processes the same tables in the same dependency order. For keyed MySQL tables, LOAD DATA LOCAL turns duplicate keys into 1062 warnings. execute_mysql_import_statement rejects any warning that is not allowlisted, rolls back the statement and fails (import.rs:1946-1955). So the rerun stops at the first already-loaded table that has a PK or UNIQUE key. Only keyless tables that come before that table in the import order are silently duplicated. If the first table is keyed, nothing is duplicated and the rerun fails right away.\n\nClassification: ux / contract gap (UI vs policy doc). It can cause silent data duplication in keyless tables, but it is not a wrong-data bug in the core.",
+          "corrected_claim": "After a merge Import fails, the dialog still shows '같은 설정으로 다시 Import' (db_import_dialog.py:1638-1650; rust_dump_exporter.py:500-501 marks the failed table 'error' in every mode). That button calls do_import() with merge still selected (:790-793). do_import has no merge-specific confirmation (:1217-1234 only covers replace/recreate/overwrite), and ProductionGuard asks nothing in Development. This breaks the policy doc's promise of 'explicit confirmation' and 'Never blindly repeat merge' (docs/export_import_policy.md:153-157). The UI text only says to check the target first and never warns that a merge rerun adds the same rows again. Merge commits per statement (import.rs:1933-1964), so a rerun replays the same tables in the same order. Keyless tables before the first already-loaded keyed table get duplicate rows silently. The rerun then stops at that keyed table, because the 1062 duplicate-key warning is rejected and that statement is rolled back (import.rs:1946-1955). If the first table in the import order has a PK or UNIQUE key, nothing is duplicated. Severity: ux / contract gap that can silently duplicate data in keyless tables, not a core logic bug."
+        }
+      },
+      {
+        "title": "재시도할 때마다 Dump 폴더의 단일 보고서를 덮어써서 이전 시도의 손상 기록과 승격 저널이 사라짐",
+        "verdict": {
+          "real": true,
+          "reasoning": "I read the code and the claim holds, with one wording fix.\n\n1) One fixed report path. `dump_format.rs:852-857` always returns `<input_dir>/_tunnelforge_import_report.json`. On a direct import (replace/merge/recreate), `import.rs:199-200` rewrites it before anything else runs; the comment there says \"Replacing a prior success report is a prerequisite for starting a new attempt\", so the overwrite is deliberate. On safe restore (안전 복원/덮어쓰기), `safe_restore.rs:168` rewrites it as the first step. Before either rewrite there is no check that keeps or archives an earlier failure report. `ImportJournal` starts with empty `dropped` and `loaded` lists (`import.rs:189-197`), so if a retry fails in validation, the new report has `dropped_tables=[]` and `dropped_not_restored_tables=[]`. Nothing else keeps a copy:\n- The import log is written only when the user saves it through a file dialog (`db_import_dialog.py:2026-2035`).\n- The job record stores only counts (`job_recording.py:119-121`).\n\n2) Every job record points at the same file. `job_recording.py:97` and `:119-120` use the same `<dir>/_tunnelforge_import_report.json`. The job list (`job_list_dialog.py:247-274`) and backup management (`main_window.py:703-724`) open that path, so opening an older record shows the newest report.\n\n3) Earlier backups disappear from the list. `safe_backups.rs` `discover_dir` (82-98) returns at line 97 after registering only the current report's `restore_id`, but only when that report has `mode==\"safe\"` and `candidate_created==true`. The scan of `.tunnelforge_promotion_plan_*` directories (100-112) is skipped. `list()` (`safe_backups.rs:256-267`) then marks every `tf_backup_*` not in `known` as `ownership: unproven`. `find()` (`safe_backups.rs:134-140`) cannot resolve the older `restore_id`, so `cleanup_plan`/`cleanup_apply` and rollback fail with \"no journal for this restore_id\". The second safe restore gets a new nonce-based `restore_id` (`safe_restore.rs:328`), so the two plan directories never collide. No test covers two restores in one Dump folder: each fixture in `migration_core/tests/live_backup_lifecycle.rs` uses its own dir.\n\n4) Promotion reads only the report it is given. `safe_promotion.rs:199-212` loads the plan from the `report_path` in the request, which is the shared file the UI passes.\n\nWhat needs correcting: the promotion journals are not deleted. `.tunnelforge_promotion_plan_<id>/` with its stored plan and `attempt/` journal is never overwritten. Only the top-level restore report is replaced, and the early return then hides the old journals. The hiding happens only when the newest report is a safe report with `candidate_created=true`. If the latest run was replace/merge/recreate, or a safe restore that failed before creating its candidate, the fallback scan still finds all earlier plan directories.",
+          "corrected_claim": "Bug (medium), all import modes. Every run writes the same file, `<Dump folder>/_tunnelforge_import_report.json` (`dump_format.rs:852-857`). It is replaced at the start of every attempt: `import.rs:199-200` for replace, merge and recreate, and `safe_restore.rs:168` for safe restore and 덮어쓰기. Nothing archives the previous report. So when a replace retry fails before its first DROP, the earlier failure record (`dropped_not_restored_tables=[orders]`) is gone, and all job-list records open the newest report (`job_recording.py:97`, `:119-120`).\n\nSeparately, when two safe restores or 덮어쓰기 runs use the same Dump folder and the newer one reaches candidate creation, `safe_backups.rs:82-98` lists only the newest report's `restore_id` and returns before scanning the other `.tunnelforge_promotion_plan_*` directories. The earlier promotion journals are still on disk, but `restore.backups` cannot see them. The first `tf_backup_*` is shown as `unproven` (`safe_backups.rs:256-267`), and cleanup and rollback for it fail because `find()` cannot resolve its `restore_id`. If the latest run was not a safe restore with a created candidate, the fallback scan at lines 100-112 still finds the old journals."
+        }
+      }
+    ]
+  },
+  {
+    "lens": "export-coverage",
+    "summary": "Export 쪽을 rule 기반 Import(replace)의 입력으로 보고 점검했습니다. 코드만 읽었고 live DB는 돌리지 않았습니다. Export는 안전 쪽으로 닫혀 있습니다. 보존할 수 없는 객체가 있으면 파일을 쓰기 전에 거부하고, 스냅샷 모드도 명시적으로 고르게 되어 있습니다. 문제는 그 결과가 \"이 테이블들만 덮어쓰고 나머지는 그대로\"라는 사용자 규칙과 여러 곳에서 어긋난다는 점입니다.\n(1) FULLTEXT·generated column·functional/DESC 인덱스 등 lossy 정의가 있는 테이블은 waive할 수도 없어서, 그 테이블은 아예 복사할 방법이 없습니다(mysqldump는 됨).\n(2) FK 부모 자동 포함이 기본 ON이고 추가된 테이블을 어디에도 표시하지 않습니다. 그래서 replace를 하면 사용자가 고르지 않은 부모 테이블까지 DROP 후 재생성됩니다. 끄면 덤프 밖 부모를 가리키는 FK를 사전 검사하지 않아서, MySQL은 고아/댕글링 FK를 조용히 허용하고 PG는 전 테이블 교체 후 post-load에서 실패합니다.\n(3) trigger는 export가 빼고(불완전 선택), replace의 DROP TABLE은 대상 trigger를 아무 보고 없이 지웁니다. 게다가 trigger·routine·event 탐지가 권한으로 필터링되는 information_schema에 의존합니다. 그래서 SELECT 전용/DB 범위 계정으로는 trigger를 보지 못한 채 \"완전한(strict)\" 덤프가 나올 가능성이 있습니다(live 미검증).\n(4) MyISAM/MEMORY 테이블은 waive하면 테이블 전체가 빠지고, 대상 쪽 테이블은 옛 데이터로 남습니다.\n(5) PG replace는 대상에 view나 대상 전용 FK 자식이 있으면 통째로 거부합니다. 같은 view를 담은 full dump를 다시 import하는 경우도 거부됩니다.\n(6) Import 화면은 manifest 경고, strict_export, 스냅샷 정책, 부분 덤프 여부, FK 자동 추가 목록을 파괴적 확인 전에 하나도 보여주지 않습니다.\nroutine/event를 건드리지 않는 점, MySQL에서 대상 view가 살아남는 점, 대상 전용 FK 자식 preflight, strict/table_lock/single 스냅샷은 규칙에 맞습니다.",
+    "findings": [
+      {
+        "title": "lossy 정의(FULLTEXT, generated column, functional/DESC 인덱스, 표현식 default, unsafe CHECK, cross-schema FK)가 있는 테이블은 export 자체가 불가능하고 waive도 안 됨",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "export refusal (dump.run)",
+        "rule_item": "1",
+        "evidence": "migration_core/src/dump.rs:813 LOSSY_SCHEMA_KINDS, dump.rs:838-855 dump_scope_refusal: lossy가 하나라도 있으면 bypassable=false이고 allow_incomplete로도 넘어가지 않음. migration_core/src/schema.rs:495: INDEX_TYPE NOT IN ('BTREE','HASH','SPATIAL') 조건 때문에 FULLTEXT, COLUMN_NAME IS NULL(functional), COLLATION='D'(DESC)는 unsupported_index가 됨. schema.rs:478-485는 generated/expression default. db_export_dialog.py:1338-1346: bypassable이 false면 불완전 선택지 없이 'Export 실패' 경고만 띄움. docs/export_import_policy.md:234 'not waivable'",
+        "scenario": "검색용 FULLTEXT 인덱스가 있는 posts를 운영에서 스테이징으로 복사하려고 함. full export는 DB 어디든 FULLTEXT가 하나라도 있으면 전체가 거부됨. 부분 export에서 posts를 고르면 posts 때문에 거부되고, 테이블 단위로 빼는 것 외에는 방법이 없음. 결국 posts는 대상에서 옛 상태로 남음(규칙 1 미충족). mysqldump는 같은 테이블을 그대로 옮김. 거부 메시지도 원시 코드(unsupported_index:posts:ft_body)뿐이고, 어떤 테이블을 빼야 하는지 안내하지 않음"
+      },
+      {
+        "title": "FK 부모 자동 포함이 기본 ON이고 추가된 테이블을 어디에도 표시하지 않음. replace 시 사용자가 고르지 않은 부모 테이블이 DROP 후 재생성됨",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "partial export FK auto-include",
+        "rule_item": "3",
+        "evidence": "db_export_dialog.py:526-528: chk_include_fk 기본값이 checked. rust_dump_exporter.py:228-264: 부모를 추이적으로 추가함. 432-440에서는 'FK 의존성 분석 중...' 진행 메시지만 남기고 added_tables를 사용자에게 보여주지 않음. 469-488: added_fk_tables는 _export_metadata.json에만 기록되고 src/ 어디서도 읽지 않음(grep 결과 0건). db_export_dialog.py:1442-1452: dump_plan은 테이블 개수만 갱신. import 쪽: rust_dump_exporter.py:582-586이 manifest의 모든 테이블을 import하고, db_import_dialog.py:771은 table_list가 NoSelection. 1218-1221의 확인 문구는 '선택한 기존 테이블'이라고만 하고 목록이 없음. 자동 추가된 부모에 trigger나 lossy 객체가 있으면 dump.rs:824-831 / 815-819의 refusal이 사용자가 고르지 않은 테이블 이름으로 뜸",
+        "scenario": "orders(→users FK)만 골라 export한 뒤 대상에 replace import. users가 몰래 덤프에 포함되어 있어서, 대상의 users가 DROP되고 소스 데이터로 재생성됨. 대상에만 있던 users 행은 사라짐. 사용자는 users를 고른 적이 없고, 확인창에도 users가 나오지 않음. 오늘 겪은 '제외한 테이블이 다시 들어감' 사례의 원인 경로이기도 함"
+      },
+      {
+        "title": "FK 자동 포함을 끄면 덤프 밖 부모를 가리키는 FK를 사전 검사하지 않음. MySQL은 고아/댕글링 FK를 조용히 허용하고, PG(또는 타입 불일치)는 전 테이블 교체 후 post-load에서 실패",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "import post-load FK / partial export",
+        "rule_item": "baseline",
+        "evidence": "dump_format.rs:511-529 incompatible_surviving_fk_offenders: 대상 전용 자식이 import set 부모를 가리키는 incoming FK만 검사함. import set 자식이 덤프 밖 부모를 가리키는 outgoing FK는 continue로 건너뜀. dump_format.rs:763-775 validate_foreign_key_column_compatibility: 부모가 덤프 schema에 없으면 continue. ddl.rs:186-214: post-load에서 ALTER TABLE ADD CONSTRAINT ... REFERENCES <덤프 밖 테이블>. ddl.rs:276-290: MySQL은 foreign_key_checks=0으로 실행. import.rs:327-466: 모든 테이블을 DROP→CREATE→load한 뒤에 finalize_dump_import(post-load)가 돎. export 시점에도 'FK가 덤프 밖을 가리킴' 경고가 없음",
+        "scenario": "FK 자동 포함을 끄고 orders만 export한 뒤 대상에 replace. (a) MySQL에서 대상 users에 없는 user_id 행은 checks=0이라 고아로 들어감. users가 아예 없으면 MySQL이 댕글링 FK를 허용하고(foreign_key_checks=0일 때 문서화된 동작, live 미검증), 이후 orders INSERT가 실패함. (b) 대상 users.id가 INT이고 소스는 BIGINT면 ERROR 3780이 post-load에서 남. (c) PG는 기존 행 검증 때문에 ADD FK가 실패함. (b)와 (c)는 모든 테이블이 이미 교체된 뒤에 실패하므로, 'damage는 한 테이블로 한정'이라는 기준선을 넘음"
+      },
+      {
+        "title": "trigger: export는 빼고(불완전 선택), replace의 DROP TABLE은 대상 trigger를 조용히 삭제함. 탐지도 보고도 없음",
+        "kind": "bug",
+        "severity": "high",
+        "area": "triggers (export omit to replace drop)",
+        "rule_item": "1",
+        "evidence": "dump.rs:829: 선택 테이블의 trigger는 waivable로 분류되고 allow_incomplete면 제외됨. import.rs:600-638 replace_target_table이 DROP TABLE IF EXISTS(ddl.rs:1943)를 실행하는데, MySQL·PG 모두 이때 테이블의 trigger도 함께 삭제됨. import.rs 전체에서 trigger를 조회하거나 보고하는 코드가 없음(grep 결과 테스트 문자열 1건뿐). 불완전 export 안내(db_export_dialog.py:1262-1269)는 '완전한 백업이 아닙니다'라고만 하고, import 시 대상 trigger가 지워진다는 말이 없음",
+        "scenario": "orders에 감사용 trigger(trg_orders_audit)가 있는 운영 DB에서 export가 거부됨. 사용자가 '이 객체 없이 내보내기(불완전)'를 고름. 같은 trigger가 있는 스테이징에 replace하면 orders는 재생성되고 trg_orders_audit는 사라짐. import 결과에는 trigger 이야기가 없고 manifest 경고 텍스트만 남음. mysqldump라면 trigger를 덤프해서 다시 만듦"
+      },
+      {
+        "title": "trigger/routine/event 탐지가 권한으로 필터링되는 information_schema에 의존함. SELECT 전용/DB 범위 계정으로는 이들이 보이지 않아 refusal 없이 strict 덤프가 생성됨",
+        "kind": "bug",
+        "severity": "high",
+        "area": "export inspection / privilege",
+        "rule_item": "1",
+        "evidence": "schema.rs:449-470(MySQL): information_schema.triggers는 테이블 TRIGGER 권한이 있어야 보이고, routines는 SHOW_ROUTINE/global SELECT/EXECUTE 등, events는 EVENT 권한이 필요함. schema.rs:676-683(PG): information_schema.triggers는 SELECT 외 권한이 있는 테이블의 trigger만 보여줌. dump.rs 쪽에는 메타데이터 가시성 검증이 없음(grep 결과 visibility/SHOW GRANTS 0건). 반면 safe restore 컷오버는 'proven complete metadata visibility'를 요구함(docs/export_import_policy.md:91-93). snapshot 폴백 single_connection/parallel_table_lock은 'none beyond SELECT'(LOCK TABLES) 계정을 정식 지원함(policy.md 표)",
+        "scenario": "오늘처럼 DB 범위로만 SELECT/LOCK TABLES 권한을 가진 계정으로 export함. trigger·event가 0개로 보여 refusal이 없고, manifest는 strict_export=true(경고 없음)로 나올 수 있음. 이 덤프로 대상에 replace하면 대상 trigger는 DROP TABLE로 사라지고 아무 경고도 없음. 권한별 가시성은 MySQL/PG 문서 기준이며 live 재현은 하지 않음(PLAUSIBLE)"
+      },
+      {
+        "title": "MyISAM/MEMORY 테이블은 waive하면 구조와 데이터가 통째로 빠지는데, 안내창은 이를 '객체'로만 표시함. 대상 쪽 테이블은 옛 데이터로 남음",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "non-InnoDB tables",
+        "rule_item": "1",
+        "evidence": "dump.rs:829, 860-875: 선택 범위의 deprecated_engine/non_transactional_table은 waivable. dump.rs:1022-1055: allow_incomplete면 non_innodb_table_names(dump.rs:270-278, InnoDB가 아닌 모든 엔진)를 schema.tables에서 제거함. db_export_dialog.py:1262-1269 안내: '아래 객체만 빼고 나머지 테이블의 구조와 데이터는 모두 내보냅니다' 아래에 'deprecated_engine:t:MyISAM' 같은 원시 코드만 나열함. import는 새 테이블을 어차피 InnoDB로 만듦(policy.md 'New MySQL import tables use InnoDB')",
+        "scenario": "MyISAM인 legacy_codes를 포함해 export하고 불완전을 선택함. 덤프에는 legacy_codes가 없으므로 replace는 대상 legacy_codes를 건드리지 않음(규칙 3). 사용자는 복사했다고 생각하지만 대상은 옛 데이터 그대로임. mysqldump는 MyISAM도 복사하고, import 경로도 InnoDB로 만들 수 있으므로 기술적으로 막을 이유가 약함"
+      },
+      {
+        "title": "PG replace는 대상에 view나 대상 전용 FK 자식이 있으면 전체를 거부함. 같은 view를 담은 full dump의 재import도 거부됨",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "PostgreSQL replace preflight / views",
+        "rule_item": "1",
+        "evidence": "import.rs:683-694 validate_postgres_drop_dependencies: import set 테이블에 의존하는 v/m view가 하나라도 있으면 'Use safe restore'로 실패함. 덤프 manifest.views에 같은 이름의 view가 있어도 예외가 없음. import.rs:697-708: 대상 전용 자식 FK가 있어도 거부. 의도된 동작이며 테스트로 고정되어 있음: tests/test_dump_python_live_contract.py:91-96(full export에 v_samples가 있고 대상에도 v_samples가 있으면 replace 실패), migration_core/tests/live_import_policy.rs:643-665. 반면 MySQL은 view를 남기고(DROP TABLE이 view를 지우지 않음), 대상 전용 FK 자식은 preflight로 허용함(import.rs:581-595)",
+        "scenario": "PG 스키마를 full export해서 매일 스테이징에 replace로 새로 고침함. 첫 import에서 view가 만들어지면, 두 번째부터는 항상 target_dependency_preflight_failed가 남. 대상에만 있는 audit_log(→orders FK)가 있어도 orders를 덮어쓸 수 없음. 남는 선택지는 safe/overwrite뿐인데, 둘 다 '이 테이블들만 덮어쓰기'가 아님"
+      },
+      {
+        "title": "Import 화면이 manifest 경고, strict_export, 스냅샷 정책, 불완전/부분 여부를 파괴적 확인 전에 보여주지 않음. unsynchronized 덤프의 고아 행도 MySQL에서 조용히 수용됨",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "import pre-confirm / manifest flags",
+        "rule_item": "baseline",
+        "evidence": "src/ 전체에서 manifest_warnings/strict_export/snapshot_policy를 읽는 곳은 rust_dump_exporter.py의 export 결과 처리뿐임(grep 결과). import 사전 분석인 rust_dump_exporter.py:524-565 _analyze_dump_metadata는 테이블/행/크기만 보고, db_import_dialog.py:988-1000은 MySQL 8.4 호환성 검사만 함. replace 확인(db_import_dialog.py:1217-1225)에는 덤프 품질 정보가 없음. 경고는 import.rs:345-352에서 실행 도중 이벤트로만 나감. import.rs:107-121 source_dump_warnings. ddl.rs:276-290: post-load FK를 foreign_key_checks=0으로 만들어 스냅샷 불일치로 생긴 고아 행을 거부하지 않음",
+        "scenario": "권한 부족 때문에 '병렬로 계속(시점 일관성 보장 안 함)'으로 만든 덤프, 또는 trigger를 뺀 불완전 덤프를 다른 사람이 받아 replace함. 확인창에는 '선택한 기존 테이블을 삭제'만 보이고, 덤프가 불완전하거나 시점 불일치라는 사실은 로그와 결과 메시지에서 사후에 알게 됨. 테이블 간 불일치로 생긴 고아 행은 MySQL에서 에러 없이 들어감"
+      },
+      {
+        "title": "부분 덤프를 표시하는 구조적 flag가 manifest에 없음. safe/overwrite는 부분 덤프를 full로 취급해 대상 전용 테이블을 blocker로 만듦. 'mysqldump처럼' 설명과 어긋남",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "manifest flags / safe+overwrite with partial dump",
+        "rule_item": "3",
+        "evidence": "adapters.rs:242-267 DumpManifest에는 export 범위(full/partial), 생략 객체 목록, FK 자동 추가 목록 필드가 없음. 생략 객체는 manifest_warnings 자유 텍스트로만 남고, _export_metadata.json은 import가 읽지 않음. safe_restore.rs:287-304: 덤프에 없는 대상 테이블/view를 blocker로 만들고, 312-314에서는 대상의 trigger/routine/event('unrepresented')도 blocker. db_import_dialog.py:655: 덮어쓰기 설명이 'mysqldump처럼 Dump로 기존 대상을 덮어씁니다'",
+        "scenario": "orders·users 2개만 담은 부분 덤프로 '덮어쓰기'를 고름. 대상에 다른 48개 테이블이 있으니 ready_for_review로 떨어져 자동 교체가 일어나지 않음. 사용자가 기대한 '두 테이블만 덮어쓰기'는 replace에서만 가능함. full 덤프라도 대상에 routine/trigger/event가 하나라도 있으면 같은 이유로 자동 교체가 막힘"
+      },
+      {
+        "title": "MySQL 파티셔닝을 탐지하지 않음. 파티션 테이블이 일반 테이블로 export되고, replace하면 대상 파티션이 조용히 사라짐",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "export inspection coverage",
+        "rule_item": "1",
+        "evidence": "schema.rs, ddl.rs, dump.rs에 'partition' 처리가 없음(grep 결과 0건). docs/export_import_policy.md:251-252: 'Objects this inspection does not detect (for example MySQL partitioning ...) are not reported'. 그래서 refusal도, 경고도, strict_export=false도 없음",
+        "scenario": "월별 RANGE 파티션 테이블 events_log를 export하면 strict 덤프로 성공함. 파티션된 대상에 replace하면 DROP 후 일반 테이블로 재생성되어 파티션 구조를 잃음. mysqldump는 SHOW CREATE TABLE로 파티션까지 재현함"
+      },
+      {
+        "title": "export 경고가 범위 밖 객체까지 'Object not exported'로 기록하고 strict_export를 false로 만듦",
+        "kind": "ux",
+        "severity": "low",
+        "area": "manifest_warnings",
+        "rule_item": "n/a",
+        "evidence": "dump.rs:897-900: export_warnings를 inspection.unsupported_objects 전체(DB 전역, view만 제외)로 만듦. 선택하지 않은 테이블의 trigger:other:x, generated_column:other:g, unsupported_index:other:ft도 포함됨. dump.rs:768-771: 하나라도 있으면 strict_export=false. import.rs:107-110이 'source dump: Object not exported ...'로 다시 내보냄",
+        "scenario": "깨끗한 codes 테이블 하나만 export해도, DB 다른 곳에 trigger나 FULLTEXT가 있으면 덤프가 'not strict'가 되고 'Object not exported: unsupported_index:posts:ft' 같은 경고가 붙음. 사용자는 codes에서 뭔가 빠졌다고 오해하게 되고, 진짜 경고(범위 내 생략)를 구분하기 어려워짐"
+      },
+      {
+        "title": "정책 문서는 SPATIAL 인덱스를 거부 대상으로 적었지만 코드는 지원함",
+        "kind": "ux",
+        "severity": "low",
+        "area": "docs",
+        "rule_item": "n/a",
+        "evidence": "docs/export_import_policy.md:234: 'advanced indexes (functional/descending/FULLTEXT/SPATIAL/...) Refused'. 반면 schema.rs:495는 INDEX_TYPE NOT IN ('BTREE','HASH','SPATIAL')이라 SPATIAL을 허용하고, ddl.rs:158은 SPATIAL INDEX를 생성함(manifest v5)",
+        "scenario": "사용자나 운영자가 문서를 보고 SPATIAL이 있는 테이블은 안 된다고 판단해 불필요하게 제외함"
+      },
+      {
+        "title": "routine/event는 replace가 대상 쪽을 건드리지 않음",
+        "kind": "ok",
+        "severity": "low",
+        "area": "routines/events",
+        "rule_item": "3",
+        "evidence": "dump.rs:830: routine/event/matview는 full export에서만 범위에 들어감(waivable). 부분 export는 경고만 남김. import.rs의 replace는 테이블 단위 DROP/CREATE(import.rs:600-638)만 함",
+        "scenario": "대상의 routine과 event는 그대로 남음. 단 소스의 routine은 옮겨지지 않음(문서화됨)"
+      },
+      {
+        "title": "MySQL replace 후에도 대상 view는 살아남음. full dump의 view는 같은 이름 기준으로 교체됨",
+        "kind": "ok",
+        "severity": "low",
+        "area": "views (MySQL)",
+        "rule_item": "3",
+        "evidence": "dump.rs:741: view는 full export에서만 수집. MySQL DROP TABLE은 의존 view를 지우지 않음. import.rs:903과 1036-1042: replace에서는 덤프 view만 이름 기준으로 DROP VIEW 후 다시 만듦. 대상 전용 view는 건드리지 않음",
+        "scenario": "규칙에 맞음. 단 새 구조에서 컬럼이 빠지면 대상 view가 invalid가 되는데, 이를 보고하지 않음(mysqldump와 동일)"
+      },
+      {
+        "title": "MySQL 대상 전용 FK 자식은 교체 전 preflight로 호환성을 확인한 뒤 유지됨",
+        "kind": "ok",
+        "severity": "low",
+        "area": "surviving FK (MySQL)",
+        "rule_item": "3",
+        "evidence": "import.rs:581-595 prepare_import_target가 detect_incompatible_surviving_fks(dump_format.rs:645-688)로, 아무것도 DROP하기 전에 비호환을 거부함. import set 안의 자식 FK만 replace_target_table(import.rs:612-623)에서 떼고 보고함",
+        "scenario": "orders만 덮어써도 대상 전용 audit_log(→orders) FK가 유지되거나, 맞지 않으면 아무것도 바꾸기 전에 멈춤"
+      },
+      {
+        "title": "스냅샷 모드 strict/table_lock/single은 시점 일관성을 보장하고, unsynchronized는 명시적 opt-in에 경고가 영속됨",
+        "kind": "ok",
+        "severity": "low",
+        "area": "snapshot modes / privilege fallback",
+        "rule_item": "n/a",
+        "evidence": "dump.rs:135-200 MysqlSharedSnapshot::acquire(FTWRL 또는 LOCK TABLES READ로 2초 내 획득 후 즉시 해제), dump.rs:1114-1131 DDL drift 검사, db_export_dialog.py:1349-1362 권한 질문 최대 2회(기본값은 table_lock), import.rs:107-114 unsynchronized 경고 재표시",
+        "scenario": "권한 폴백이 시점 일관성을 조용히 깨지 않음. 남는 문제는 import 확인창에 그 정보가 보이지 않는다는 것(별도 ux 항목)"
+      },
+      {
+        "title": "보존할 수 없는 객체는 파일을 쓰기 전에 거부되고, 불완전 export는 명시적으로 선택해야 함",
+        "kind": "ok",
+        "severity": "low",
+        "area": "incomplete-export choice",
+        "rule_item": "n/a",
+        "evidence": "dump.rs:919-927: refusal이 prepare_dump_output_dir(dump.rs:928)보다 먼저 일어남. db_export_dialog.py:1251-1283: 기본 버튼이 취소이고 DestructiveRole 버튼으로만 진행됨. 예약 백업은 프롬프트 없이 실패함(policy.md)",
+        "scenario": "사용자 모르게 불완전 덤프가 생기지는 않음. 다만 trigger 탐지가 권한에 좌우되는 문제는 별도 bug 항목 참조"
+      }
+    ],
+    "matrix": "| Export 동작 | 덤프에 남는 것 | 대상에 같은 객체가 있을 때 replace 결과 | 판정 |\n|---|---|---|---|\n| lossy 정의(FULLTEXT/generated/functional·DESC idx/expr default/unsafe CHECK/cross-schema FK) | 거부, waive 불가 | 해당 테이블을 복사할 수 없음. 대상은 옛 상태로 남음 | rule_gap (high) |\n| 선택 테이블의 trigger | 거부 후 불완전 선택 시 제외 | DROP TABLE이 대상 trigger를 조용히 삭제하고, 재생성도 보고도 없음 | bug (high) |\n| 권한 때문에 안 보이는 trigger/routine/event | 아예 탐지되지 않음(strict) | 위와 같고 경고조차 없음 | bug (high, PLAUSIBLE) |\n| routine/event (full=거부·waive, 부분=경고) | 제외 | 대상 routine/event는 그대로 | ok |\n| MyISAM/MEMORY 테이블 | 거부 후 불완전 선택 시 테이블 통째로 제외 | 대상 테이블은 옛 데이터로 남음 | rule_gap (medium) |\n| view, 부분 export | 수집 안 함 | MySQL: 대상 view 유지(ok). PG: replace 전체 거부 | ok / rule_gap |\n| view, full export | 별도 수집(strict=false) | MySQL: 같은 이름 view만 교체(ok). PG: 대상에 이미 있으면 거부 | ok / rule_gap |\n| FK 부모 자동 포함(기본 ON) | 고르지 않은 부모가 표시 없이 포함됨 | 고르지 않은 부모를 DROP 후 소스 데이터로 재생성 | rule_gap (high) |\n| FK 자동 포함 OFF | 덤프 밖 부모를 가리키는 FK가 그대로 남음 | MySQL: 고아/댕글링 FK를 조용히 허용. 타입이 다르거나 PG면 전 테이블 교체 후 post-load 실패 | bug (medium) |\n| 대상 전용 FK 자식 | n/a | MySQL: preflight 후 유지(ok). PG: 거부 | ok / rule_gap |\n| MySQL 파티셔닝 | 탐지 안 됨, 일반 테이블로 export | 대상 파티션이 사라짐 | rule_gap (medium) |\n| strict/table_lock/single 스냅샷 | 일관성 있음, strict=true | 정상 | ok |\n| unsynchronized 스냅샷 | strict=false, 경고 | MySQL: FKC=0이라 고아 행을 조용히 수용. 확인창에 표시 안 됨 | ux (medium) |\n| manifest 플래그 | full/partial, 생략 목록 필드 없음 | safe/overwrite가 부분 덤프를 full로 보고 blocker 생성. Import 확인 전 경고 미표시 | rule_gap / ux |",
+    "verdicts": [
+      {
+        "title": "FK 자동 포함을 끄면 덤프 밖 부모를 가리키는 FK를 사전 검사하지 않음. MySQL은 고아/댕글링 FK를 조용히 허용하고, PG(또는 타입 불일치)는 전 테이블 교체 후 post-load에서 실패",
+        "verdict": {
+          "real": true,
+          "reasoning": "I read the code at bb3c53b and could not refute the core gap. The claim's damage framing is overstated, and part (a) is not a bug when measured against the user's mysqldump baseline.\n\nHow it is reached:\n- The \"FK 의존성 테이블 자동 포함\" checkbox is on by default (db_export_dialog.py:526-527). When the user turns it off, rust_dump_exporter.py:432-441 skips parent resolution.\n- dump.rs:909 removes unselected tables from the dump but keeps their FKs, so a dumped child can still point at a parent that is not in the dump.\n- Cross-schema FKs are refused at export (schema.rs:503). Same-schema FKs to an unselected parent get no refusal and no warning.\n- The import dialog has no table-subset selection, so this export option is the only way in.\n\nEvery preflight misses the outgoing FK:\n- incompatible_surviving_fk_offenders (dump_format.rs:524-528 and 587-591) skips any row whose child is in the import set, so it checks only target-only children that point into the import set.\n- validate_foreign_key_column_compatibility (dump_format.rs:772-775) skips when the parent is not in the dump schema.\n- generate_table_ddl writes no inline FKs, so probe_import_ddl (import.rs:517-537) cannot catch an FK problem either.\n- On PostgreSQL, validate_postgres_drop_dependencies (import.rs:694-708) checks only incoming FKs.\n\nThe FK is first created after every selected table has already gone through DROP, CREATE and load (loop at import.rs:400-466). Then finalize_dump_import calls apply_post_load_ddl (import.rs:495 and 883), which emits ALTER TABLE ... ADD CONSTRAINT ... REFERENCES <table not in the dump> (ddl.rs:186-214). On MySQL this runs with foreign_key_checks=0 (ddl.rs:284-298). PostgreSQL has no NOT VALID path, so it validates existing rows.\n\nPart by part:\n- (a) MySQL accepting orphan rows (and a dangling parent) under checks=0: true. But the code comment at ddl.rs:276-283 says this deliberately copies mysqldump, which wraps the whole restore in FOREIGN_KEY_CHECKS=0, and mysqldump --tables would do the same thing. So this is ux (it happens silently), not a bug. I did not run the dangling-parent case live.\n- (b) MySQL type mismatch: true. MySQL still checks FK column types when checks=0, so ADD CONSTRAINT fails with error 3780 after all tables are replaced. The incoming-FK version of this check already runs before any DROP (prepare_import_target, import.rs:579-591), but no outgoing version exists.\n- (c) PostgreSQL: true. ADD CONSTRAINT fails with 23503 on orphan rows, or 42P01 if the parent table is missing, and only after all tables are replaced.\n\nWhere \"damage is not limited to one table\" is overstated:\n- No table loses data beyond the replacement the user asked for. Every replaced table holds the dump's rows.\n- generate_post_data_ddl creates all indexes before any FK, so indexes are complete.\n- What is actually left behind: the failing FK and every FK after it in table order are missing, row-count verification and views never run, and the import is reported as failed.\n- mysqldump would instead fail at the child's CREATE TABLE.\n- docs/export_import_policy.md:36 and 151 already say FKs are finalized only after loading, but nothing says an outgoing FK is left without a preflight.",
+          "corrected_claim": "bug (medium) + ux. When FK auto-include is turned off at export (db_export_dialog.py:526, default on; rust_dump_exporter.py:432), the dumped tables keep FKs that point to tables outside the dump (dump.rs:909). No preflight in replace/recreate checks these outgoing FKs:\n- incompatible_surviving_fk_offenders checks only target-only children that point into the import set (dump_format.rs:524-528).\n- validate_foreign_key_column_compatibility skips any parent that is not in the dump (dump_format.rs:772-775).\n- probe_import_ddl creates tables without FKs.\n- On PostgreSQL, validate_postgres_drop_dependencies checks only incoming FKs (import.rs:694-708).\n\nAs a result, a MySQL column type, charset or collation mismatch with the target's existing parent (error 3780, raised even with foreign_key_checks=0), or a PostgreSQL ADD CONSTRAINT failure (23503 orphan rows, 42P01 missing parent), shows up only in post-load (import.rs:495 → ddl.rs:186-214). By then every selected table has already been dropped, recreated and loaded. The import ends as failed. The failing FK and every FK after it are missing, and row-count verification and views are never reached. The same check for incoming FKs already runs before any DROP (import.rs:579-591), and mysqldump would have failed at the child's CREATE TABLE.\n\nData is not lost beyond the replacement the user asked for: every replaced table holds the dump's rows and all indexes are created. What is left incomplete is the constraint state across several tables, not the data of several tables.\n\nPart (a), MySQL silently accepting orphan or dangling FKs under checks=0, behaves the same as mysqldump and is intentional (ddl.rs:276-283), so it is ux, not a bug. Export gives no warning that an FK points outside the dump."
+        }
+      },
+      {
+        "title": "trigger: export는 빼고(불완전 선택), replace의 DROP TABLE은 대상 trigger를 조용히 삭제함. 탐지도 보고도 없음",
+        "verdict": {
+          "real": true,
+          "reasoning": "The mechanics hold up. Two details are overstated, and I would class this as a rule_gap/ux item, not a code bug.\n\nConfirmed:\n- dump.rs:824-833 (scoped_omitted_objects) puts `trigger:<table>:<name>` for a selected table into the omittable list.\n- dump.rs:838-853 (dump_scope_refusal) waives that list when allow_incomplete is set and no lossy objects are present.\n- The dump format never carries triggers. docs/export_import_policy.md:221 says \"the format is not being extended to triggers\", so any such dump of a table that has a trigger comes from the incomplete opt-in.\n- import.rs:600-637 (replace_target_table) runs drop_table_sql, which is a plain `DROP TABLE IF EXISTS` (ddl.rs:1943-1945). On both MySQL and PostgreSQL this removes the table's triggers with it.\n- import.rs has no code that looks up or reports target triggers. The only \"trigger\" string is a test fixture at import.rs:2090.\n- Before the destructive replace confirm (db_import_dialog.py:1217-1220), the import dialog never shows that the dump is incomplete. _analyze_dump_metadata (rust_dump_exporter.py:553-563) ignores manifest_warnings and strict_export.\n- The export notice (db_export_dialog.py:1262-1266) says only \"완전한 백업이 아닙니다\". It does not say that importing into a target will remove that target's trigger.\n- Nothing in the policy doc covers what happens to target triggers. It says \"Import behavior is unchanged\" (export_import_policy.md:250-251) and gives only a general backup advisory (line 259).\n\nOverstated:\n1. \"보고도 없음\" is not fully true. import.rs:107-109 turns each manifest warning into \"source dump: Object not exported: trigger:orders:trg_orders_audit\". import.rs:326-334 emits these as warning events before any target change. They are returned in verification.warnings (import.rs:935), and rust_dump_exporter.py:680-684 appends them to the final import message as \"Import warning: ...\". So the trigger's name does appear in the result. What is missing is any statement that the target's copy was dropped.\n2. Calling it a \"bug\" mislabels it. The code does what the documented design says. Against the user's rule 1 (\"overwrite with the dump's structure\"), dropping the trigger is literally consistent, since the dump has no trigger. The gap is against the mysqldump baseline, where the dump carries the trigger and recreates it. So this is a rule_gap/ux item.\n\nThe gap is also broader than the scenario. replace drops any trigger that exists only on the target table, even when the dump has no warnings at all, and nothing reports it. That case does match rule 1 and mysqldump behaviour, though, so it is consistent with the rule.",
+          "corrected_claim": "RULE_GAP/UX, not a code bug. A table exported with \"이 객체 없이 내보내기 (불완전)\" is dumped without its triggers (dump.rs:824-853). The dump format never carries triggers (export_import_policy.md:221). replace/recreate then runs a plain DROP TABLE IF EXISTS (import.rs:600-637, ddl.rs:1943), which also removes the target table's triggers, such as trg_orders_audit. The import never checks the target's triggers. It says nothing about them in the destructive-confirm dialog (db_import_dialog.py:1217-1220), and _analyze_dump_metadata does not surface manifest_warnings or strict_export=false before import (rust_dump_exporter.py:553-563). The export notice (db_export_dialog.py:1262-1266) does not warn that importing will remove the target's trigger. It is not fully silent: the source warning \"source dump: Object not exported: trigger:orders:trg_orders_audit\" is emitted before any target change (import.rs:326-334) and appended to the final import message (import.rs:935, rust_dump_exporter.py:680-684). But nothing says the target trigger was dropped. This matches the literal rule 1 (the dump's structure has no trigger) and documented policy, but differs from the mysqldump baseline, where the dump would carry the trigger and recreate it. The table's data and structure are restored; only the trigger definition is lost."
+        }
+      },
+      {
+        "title": "trigger/routine/event 탐지가 권한으로 필터링되는 information_schema에 의존함. SELECT 전용/DB 범위 계정으로는 이들이 보이지 않아 refusal 없이 strict 덤프가 생성됨",
+        "verdict": {
+          "real": true,
+          "reasoning": "I could not refute the code path. I did not reproduce it live; the privilege rules below come from the MySQL and PostgreSQL documentation.\n\n1. Detection depends on information_schema views that filter by privilege.\n   - MySQL: migration_core/src/schema.rs:449-470 reads information_schema.triggers, routines and events with no other check.\n   - PostgreSQL: schema.rs:676-683 reads information_schema.triggers, and schema.rs:697-701 reads routines.\n   - No other source is used. I found no SHOW GRANTS or visibility check anywhere in dump.rs; the only visibility proof is safe_promote_mysql.rs:121 (prove_metadata_visibility), which is used for safe-restore cutover and backup cleanup, not export.\n\n2. The refusal gate only knows about objects it can see.\n   - dump.rs:824-834 (scoped_omitted_objects) turns trigger:, routine: and event: entries into a refusal.\n   - dump.rs:838-855 (dump_scope_refusal) refuses only when that list is non-empty.\n   - dump.rs:897-900 builds the \"Object not exported\" warnings from the same list.\n   - dump.rs:764-775 sets strict_export=false only when those warnings exist.\n   - adapters.rs:929-948 returns strict=true for the single_connection, table_lock and shared snapshot modes.\n   - So objects the account cannot see produce no refusal, no warning, and a dump marked strict and complete.\n\n3. The scenario is supported and tested.\n   - live_export_contract.rs:349-353 creates an account with only `GRANT SELECT, LOCK TABLES ON db.*`.\n   - live_export_contract.rs:394 asserts strict_export == true for that account.\n   - Under the MySQL documentation, that account cannot see:\n     - triggers, which need TRIGGER on the table\n     - routines, which need DEFINER, SHOW_ROUTINE, global SELECT, or CREATE ROUTINE / ALTER ROUTINE / EXECUTE at a covering scope\n     - events, which need EVENT on the schema\n   - The test schema has no triggers, routines or events, so no test checks this case.\n\n4. Import does not catch it either. import.rs has no trigger, routine or event handling; the only trigger mention is test data at line 2090.\n\nWhat the claim overstates:\n- An account with `ALL ON db.*` is not affected, because that grant includes TRIGGER, EVENT and EXECUTE.\n- PostgreSQL routines are usually visible, because EXECUTE is granted to PUBLIC by default. The PostgreSQL gap is mostly triggers: information_schema.triggers hides triggers on tables where the role has only SELECT.\n- \"Replace drops the target's triggers with no warning\" is a separate import-side fact. It happens with any replace, whatever account did the export. The harm specific to this bug is that a dump that should have been refused, or marked incomplete, is labeled strict and complete.\n- mysqldump also leaves out triggers it cannot see, so against the mysqldump baseline this is no worse. It does break TunnelForge's own guarantee that an export refuses, or warns, when objects are left out.\n\nSeverity: medium, bug.",
+          "corrected_claim": "Bug, medium severity; confirmed in code, not reproduced live. dump.run finds triggers, routines and events only through privilege-filtered information_schema views. MySQL: schema.rs:449-470. PostgreSQL: schema.rs:676-683 for triggers, 697-701 for routines. Export has no metadata-visibility check; prove_metadata_visibility is used only for safe-restore cutover and backup cleanup.\n\nAs a result, an account with only `SELECT, LOCK TABLES ON db.*` sees none of these objects, and the dump goes ahead with no refusal and no warning:\n- MySQL hides triggers without TRIGGER, routines without EXECUTE/CREATE ROUTINE/ALTER ROUTINE/SHOW_ROUTINE/global SELECT, and events without EVENT.\n- PostgreSQL hides triggers from a SELECT-only role.\nThe project supports this account and tests it: live_export_contract.rs:349-353 creates it and :394 asserts strict_export=true.\n\nFor that account, scoped_omitted_objects and dump_scope_refusal (dump.rs:824-855) get no trigger, routine or event entries. The \"Object not exported\" warnings (dump.rs:897) stay empty and strict_export stays true (dump.rs:764-775). The manifest therefore claims a strict, complete export while triggers, routines and events were silently left out.\n\nLimits on the claim:\n- Accounts with ALL ON db.* are unaffected.\n- PostgreSQL routines are normally visible (EXECUTE is granted to PUBLIC), so the PostgreSQL impact is mainly triggers.\n- Target triggers being dropped by replace is a separate import behaviour, with no trigger checks in import.rs. It happens regardless of export privileges.\n- mysqldump also leaves out triggers it cannot see, so this breaks TunnelForge's own strict-refusal guarantee more than the mysqldump baseline.\n\nFix direction: before setting strict_export, prove metadata visibility (SHOW GRANTS or privilege probes, as safe_promote_mysql.rs:121 does). Use pg_trigger instead of information_schema.triggers. If visibility cannot be proven, mark the dump non-strict with a warning."
+        }
+      }
+    ]
+  },
+  {
+    "lens": "ux-clarity",
+    "summary": "Export/Import 다이얼로그 UX를 사용자 Import 규칙(①덮어쓰기 ②없으면 생성 ③덤프에 없으면 손대지 않음, mysqldump 기준)에 대 보았다. 5개 모드 가운데 규칙을 지키는 건 '고급: 전체 교체'(replace)와 그 중복인 '완전 재생성'(recreate) 둘뿐이다. 이 둘은 '고급' 접두어와 주황 경고색이 붙고, 확인창도 \"안전 복원 대신 기존 대상을 직접 변경하시겠습니까?\"로 묻는다. 규칙대로 동작하는 모드가 오히려 예외처럼 보이게 되어 있다.\n\n기본값인 안전 복원은 대상 DB가 이미 있으면 tf_restore_* 새 DB에 복원하고 비교/전환 검토창을 자동으로 띄운다. '덮어쓰기'는 설명에 \"mysqldump처럼\"이라고 적혀 있지만 실제 동작은 네임스페이스 전체를 RENAME으로 바꿔치기하는 것이다. 대상에만 있는 테이블도 백업 DB로 옮기고 SHOW CREATE TABLE 텍스트로 다시 만든다(TF-STATUS-173). 그래서 규칙 ③을 어긴다. 부분 Export 덤프를 쓰면 대상에만 있는 테이블 때문에 항상 ready_for_review가 되어 자동 교체가 일어나지 않는다.\n\n안전 복원과 덮어쓰기는 CREATE DATABASE 권한과 전역 SELECT/SHOW VIEW/PROCESS 권한이 있어야 한다. 오늘 확인된 사용자 로컬 계정 같은 DB 한정 계정에서는 기본 모드가 실패한다. 실패 원인(권한 거부)도 Python 래퍼가 버리고 \"검증된 새 대상 정보를 확인할 수 없습니다\"라는 일반 문구로 바꿔 보여 준다.\n\nExport 쪽에서는 'FK 의존성 테이블 자동 포함'이 기본으로 켜져 있다. 사용자가 뺀 부모 테이블이 조용히 덤프에 다시 들어가는데, 추가된 목록은 _export_metadata.json에만 남고 화면에는 나오지 않는다. 이 덤프를 replace로 Import하면 그 테이블까지 덮어쓴다.\n\n원문 노출도 여러 곳이다. Core 오류 영문 원문이 Export 실패, Import 실패, 전환 차단 사유에 그대로 나오고, 전환 완료 창은 결과 JSON을 그대로 보여 준다. Import 실패 창은 실패 테이블이 있으면 원인을 아예 빼고 개수만 보여 준다.\n\n흔한 경우인 'staging 테이블을 로컬에 덮기'를 Import 쪽에서 규칙대로 끝내려면 결정이 5~6번 필요하다. 연결, 모드를 고급 replace로 바꾸기, 시작, 환경 미분류 시 Yes/No, 삭제 확인, 완료가 그 단계다. 기본값을 그대로 쓰면 5~7번을 거치고도 규칙 ③을 어기거나, DB 한정 계정에서는 실패한다.\n\n최소 변경안은 다음과 같다.\n- replace 라디오를 '덮어쓰기 (mysqldump 방식)'로 이름을 바꾸고 기본값으로 둔다. '고급' 접두어와 경고색은 뺀다.\n- recreate와 지금의 overwrite 라디오는 화면에서 숨긴다. 교체 기능은 안전 복원 뒤 검토창의 '기존 이름으로 교체' 버튼에 이미 있다.\n- safe와 merge 설명을 실제 동작에 맞게 고친다.\n- 확인창에 덮어쓸 테이블, 새로 만들 테이블, 건드리지 않을 테이블 목록을 보여 준다.\n- Core 오류 문구를 그대로 전달하고, 전환 완료 창은 JSON 대신 사람이 읽을 문장으로 바꾼다.\n- FK 자동 포함을 기본 해제하거나, 자동으로 추가된 테이블을 화면에 보여 준다.\n- Export 테이블 목록은 체크박스로만 선택되게 한다.\n\n단 replace를 '덮어쓰기'라는 이름으로 기본값에 두는 안은 2026-10-02에 정한 C안(덮어쓰기 = 안전 복원 + 자동 교체)을 뒤집는다. 따라서 사용자 결정이 필요하다.",
+    "findings": [
+      {
+        "title": "기본 모드(안전 복원)가 규칙 ①②를 따르지 않음: 기존 DB가 있으면 tf_restore_* 새 DB에 복원하고 검토 다이얼로그로 넘김",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "Import dialog / mode default",
+        "rule_item": "1",
+        "evidence": "src/ui/dialogs/db_import_dialog.py:646-648 radio_safe.setChecked(True), 설명 '기존 대상은 변경하지 않고 새 데이터베이스/스키마에 복원'; migration_core/src/safe_restore.rs:330-334 namespace_exists면 name=tf_restore_{restore_id}; db_import_dialog.py:1738-1740 검증 후 '안전 복원 검증 완료' 창 + QTimer로 review_restore_target 자동 실행; 1936-1946 검토창 4버튼(기존 대상 유지/검증된 새 대상 사용/기존 이름으로 교체/Cancel, 기본=Cancel)",
+        "scenario": "사용자가 staging dump를 로컬 app DB(이미 존재)에 기본 설정으로 Import -> app은 그대로이고 tf_restore_1728..._1234 DB가 새로 생김. 이어 비교 다이얼로그가 뜨고, 기본 버튼 Cancel을 누르면 아무것도 바뀌지 않은 채 끝난다. 로컬 app 테이블은 덮어써지지 않는다."
+      },
+      {
+        "title": "'덮어쓰기'는 'mysqldump처럼'이라고 쓰여 있지만 실제로는 네임스페이스 전체를 RENAME으로 교체해 대상에만 있는 테이블까지 백업으로 옮기고 재생성",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "Import dialog / overwrite mode wording vs core promote",
+        "rule_item": "3",
+        "evidence": "db_import_dialog.py:655-656 'mysqldump처럼 Dump로 기존 대상을 덮어씁니다... 기존 이름으로 한 번에 교체'; migration_core/src/safe_promote_mysql.rs:1125-1133 rename_sql이 plan.original_tables 전부(대상 전용 포함)를 backup_database로 RENAME; 1414-1440 refreshing_target_only_rows: clone DB에 대상 전용 테이블을 만들고 INSERT ... SELECT; 199 SHOW CREATE TABLE 기반 재구성(TF-STATUS-173 lossy); 859 summary 키 이름이 'target_only_tables_preserved'",
+        "scenario": "로컬 app에 로컬 전용 테이블 local_notes가 있는 상태에서 '덮어쓰기'를 실행 -> local_notes 원본은 tf_backup_<nonce>로 이동하고, app.local_notes는 SHOW CREATE TABLE 텍스트로 다시 만든 복제본이 된다. MySQL 8.4에서 4바이트 CHECK 리터럴은 ????로 바뀐다. mysqldump라면 local_notes는 손대지 않는다."
+      },
+      {
+        "title": "부분 Export 덤프로 '덮어쓰기'를 하면 자동 교체가 일어나지 않고 항상 검토 다이얼로그로 떨어짐",
+        "kind": "ux",
+        "severity": "high",
+        "area": "Import dialog / overwrite auto-swap",
+        "rule_item": "3",
+        "evidence": "migration_core/src/safe_restore.rs:287-305 대상 전용 테이블이 있으면 blocker 'The original namespace contains tables absent from this dump...' 추가; 420-427 blocker가 있으면 status=ready_for_review; db_import_dialog.py:1915-1925 _take_auto_overwrite는 restore_status=='ready_for_switch'일 때만 자동 교체하고, 아니면 로그 '자동 교체 불가'만 남기고 _review_promotion_plan 실행",
+        "scenario": "Export에서 '선택 테이블 Export'로 3개만 내보낸 뒤 로컬 DB(테이블 50개)에 '덮어쓰기' -> 전체 복원과 검증을 기다린 뒤 다시 4버튼 검토창이 뜬다. 처음에 이미 '덮어쓰기 확인'에 Yes를 눌렀는데도 '기존 이름으로 교체'를 다시 누르고 Yes를 한 번 더, 환경 가드까지 거쳐야 한다."
+      },
+      {
+        "title": "기본/덮어쓰기 모드는 CREATE DATABASE 및 전역 SELECT/SHOW VIEW/PROCESS 권한이 필요해 DB 한정 로컬 계정에서는 실패",
+        "kind": "rule_gap",
+        "severity": "high",
+        "area": "Import dialog / mode vs privileges",
+        "rule_item": "1",
+        "evidence": "migration_core/src/safe_restore.rs:497-505 CREATE DATABASE tf_restore_* 실행, 실패 시 'safe candidate creation failed (existing namespaces are never reused)'; migration_core/src/safe_promote_mysql.rs:121-127, 623 plan 단계에서 prove_metadata_visibility 실패 시 'guarded promotion requires proven direct global SELECT, SHOW VIEW and PROCESS...'; safe_promotion.rs:262-268 blocked면 can_promote=false; db_import_dialog.py:1944 그 경우 '기존 이름으로 교체' 버튼 비활성. 안전 복원/덮어쓰기 라디오 설명(646-660)에는 권한 요구가 없음",
+        "scenario": "TF-STATUS-175와 같은 DB 한정 계정(dataflare)으로 기본 Import -> CREATE DATABASE 권한이 없어 안전 복원이 실패한다. '덮어쓰기'를 골라도 같은 단계에서 실패하고, CREATE 권한만 있으면 검토창에서 교체 버튼이 회색이 된다. 이 계정에서 실제로 동작하는 건 '고급: 전체 교체'뿐인데, 화면 어디에도 그런 안내가 없다."
+      },
+      {
+        "title": "안전 복원 실패 원인이 Python 래퍼에서 버려지고 일반 문구로 대체됨",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "Import result dialog",
+        "rule_item": "n/a",
+        "evidence": "migration_core/src/safe_restore.rs:441-456 실패 시 Ok(state)를 돌려주고 success=false, message='Safe restore failed; original database was not changed. <원인>'; 478-480 result 이벤트로 반환(예외 아님); src/exporters/rust_dump_exporter.py:645-653 import_mode=='safe'이고 상태가 ready가 아니면 result['message']를 무시하고 '안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다. 원본과 복원 대상의 상태를 보고서에서 확인하세요.' 반환; db_import_dialog.py:1765-1766 이 문구를 '안전 복원 실패' 창에 표시",
+        "scenario": "권한 부족(ERROR 1044)으로 tf_restore_* 생성에 실패 -> 창에는 '안전 복원 실패 · 원본 미변경 / 안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다'만 보인다. 실제 원인(Access denied)은 로그 목록의 JSON 덩어리 안에만 있어서, 사용자는 검증 문제로 오해하고 다른 모드를 고를 단서를 얻지 못한다."
+      },
+      {
+        "title": "규칙을 지키는 유일한 모드가 '고급'·경고색으로 표시되고 확인창도 이를 위험한 일탈로 묘사",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "Import dialog / replace labeling",
+        "rule_item": "1",
+        "evidence": "db_import_dialog.py:673 '고급: 전체 교체 Import (선택 테이블 삭제 후 재생성)'; 680 색상 #b45309(주황), 677-678 경고 문구; 1218-1221 확인창 '... 안전 복원 대신 기존 대상을 직접 변경하시겠습니까?'; legacy_translate.py:183,190 영어 동일",
+        "scenario": "mysqldump 방식으로 덮어쓰고 싶은 사용자가 맨 아래 주황색 '고급' 옵션을 찾아 골라야 하고, 확인창은 그 선택을 '안전 복원을 버리는 것'처럼 묻는다. '전체 교체'라는 이름은 DB 전체를 지우는 것처럼 읽히지만 실제로는 덤프에 있는 테이블만 교체한다."
+      },
+      {
+        "title": "'고급: 완전 재생성'은 '전체 교체'와 완전히 같은 동작인데 별도 라디오로 노출됨",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "Import dialog / duplicate option",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:687-693 라벨 '(이전 모드 · 교체와 동일)', 설명 '전체 교체와 동일한 동작입니다'; migration_core/src/import.rs:379,419,567,1038 replace|recreate를 같은 분기로 처리; docs/export_import_policy.md 'recreate: Legacy alias of replace'",
+        "scenario": "사용자는 5개 모드 가운데 둘이 같다는 걸 설명을 끝까지 읽어야 안다. 호환 목적이라면 UI에 띄울 필요가 없다(Core 프로토콜 별칭만 유지하면 된다)."
+      },
+      {
+        "title": "Import에는 테이블 선택 UI가 없는데 문구가 '선택 테이블', '선택한 기존 테이블'이라고 함",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "Import dialog / wording",
+        "rule_item": "3",
+        "evidence": "db_import_dialog.py:673-676 '선택 테이블 삭제 후 재생성', '선택한 테이블을 하나씩 삭제'; 1220 '선택한 기존 테이블을 하나씩 삭제'; 다이얼로그에는 테이블 체크 목록이 없음(init_ui 485-494). retry_tables는 항상 None(793, 841 do_import()) -> 덤프 전체 테이블이 대상",
+        "scenario": "사용자는 어딘가에서 테이블을 골라야 하거나 이미 골랐다고 생각하지만, 실제로는 덤프에 들어 있는 모든 테이블(FK 자동 포함분 포함)이 삭제 후 재생성된다."
+      },
+      {
+        "title": "교체 전 확인창에 어떤 테이블을 덮어쓰고, 새로 만들고, 건드리지 않는지 목록이 없음",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "Import dialog / confirmation",
+        "rule_item": "1",
+        "evidence": "db_import_dialog.py:1217-1225 확인 문구에 테이블 목록·개수가 없음; 덤프 테이블 목록은 시작 후에야 표시됨(on_metadata_analyzed 1599-1636은 50MB 이상만 미리 표시, pending 표시는 rust_dump_exporter.py:603-606 실행 중); 대상 테이블 목록은 이미 connector.get_tables로 얻을 수 있음(db_export_dialog.py:958)",
+        "scenario": "FK 자동 포함으로 users 테이블이 덤프에 섞여 있어도 Import 확인창에서는 알 수 없다. Yes를 누르면 로컬 users가 삭제되고 다시 만들어진다."
+      },
+      {
+        "title": "Export 'FK 의존성 테이블 자동 포함'이 기본 ON이고, 추가된 테이블이 화면에 안 나온 채 Import 때 덮어써짐",
+        "kind": "ux",
+        "severity": "high",
+        "area": "Export dialog / partial export",
+        "rule_item": "3",
+        "evidence": "db_export_dialog.py:526-527 chk_include_fk.setChecked(True); src/exporters/rust_dump_exporter.py:432-438 부모 테이블을 추이적으로 추가; 455-457 성공 시 added_tables를 _write_metadata로 _export_metadata.json에만 기록(483); src/ui/workers/rust_dump_worker.py:155-171 반환 tables를 버리고 finished(success,msg)만 emit; 완료창(db_export_dialog.py:1411-1415)은 폴더 경로만 표시; grep 결과 added_fk_tables를 읽는 UI 코드 없음",
+        "scenario": "orders만 체크하고 users는 체크를 푼 채 Export -> users가 자동으로 덤프에 들어간다. 로컬에 replace Import하면 로컬 users까지 DROP 후 staging 데이터로 바뀐다. 사용자가 '건드리지 말라'고 뺀 테이블이 덮어써지는 셈이다(오늘 실제로 겪은 문제)."
+      },
+      {
+        "title": "'데이터 추가' 모드는 기존 테이블 구조를 유지하고 행만 추가함(규칙 ① 위반), 라벨에 없는 테이블 생성 언급도 없음",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "Import dialog / merge",
+        "rule_item": "1",
+        "evidence": "db_import_dialog.py:664-665 '기존 행을 유지하고 Dump의 행을 추가합니다'; migration_core/src/import.rs:426-430 merge는 adapter.create_table(기존 테이블은 그대로 인정)을 사용; docs/export_import_policy.md merge '(creates missing tables)'",
+        "scenario": "staging에서 컬럼이 추가된 테이블을 merge로 Import하면 대상 구조는 바뀌지 않고, 행 적재가 실패하거나 중복키로 거부된다. 덤프에 없던 대상 테이블은 그대로 둔다(규칙 ③은 지킨다)."
+      },
+      {
+        "title": "replace를 존재하지 않는 MySQL DB 이름으로 실행하면 DB를 만들지 않고 원문 'Unknown database' 오류로 실패",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "Import dialog / target schema",
+        "rule_item": "2",
+        "evidence": "db_import_dialog.py:586-588 편집 가능한 콤보 + 툴팁 '새 이름을 입력하세요. 안전 복원은 ... 새 대상을 만듭니다'; migration_core/src/import.rs:348 LiveAdapter::connect(&endpoint); migration_core/src/adapters.rs:811 .db_name(endpoint.database)로 접속하므로 DB가 없으면 접속 오류; CREATE DATABASE는 safe_restore.rs:498에만 있음",
+        "scenario": "'원본 스키마명 사용'을 끄고 local_copy를 입력한 뒤 '고급: 전체 교체'를 실행 -> 'Import 실패: Rust DB Core import 오류: mysql connection error: ... Unknown database'. mysqldump --databases라면 CREATE DATABASE IF NOT EXISTS로 만들어 준다."
+      },
+      {
+        "title": "사용자 다이얼로그에 Core 원문(영문)과 결과 JSON이 그대로 노출됨",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "Export/Import result dialogs",
+        "rule_item": "n/a",
+        "evidence": "db_export_dialog.py:1434 QMessageBox.warning('Export 실패', f'❌ {message}') -> 'Rust DB Core export 오류: dump.run refused: the selected scope contains objects the dump cannot preserve (table definitions would be lossy): ...'(migration_core/src/dump.rs:920-924); db_import_dialog.py:1776 f'❌ {message}'(예: 'incompatible_surviving_fk: target-only foreign keys are incompatible...'); rust_dump_exporter.py:667-669 영문 blocker를 한국어 메시지에 붙여 1738 정보창에 표시; 154-157 검토창 '전환 차단 사유'에 영문 blocker; 1892 '전환 완료' 창 본문이 sanitize_local_diagnostic_json(result) 즉 결과 JSON 전체; 1911 전환 실패 원문",
+        "scenario": "전환이 성공하면 사용자는 {\"success\":true,\"status\":\"promoted\",\"backup_namespace\":\"tf_backup_...\",...} 같은 JSON 창을 받는다. Export가 거부되면 영문 한 줄 안에서 어떤 테이블을 빼야 하는지 직접 찾아야 하고, '이 테이블 빼고 내보내기' 같은 선택지는 없다."
+      },
+      {
+        "title": "Import 실패 창에 실패 테이블이 있으면 실패 원인 문구를 아예 빼고 개수만 보여 줌",
+        "kind": "ux",
+        "severity": "medium",
+        "area": "Import failure dialog",
+        "rule_item": "baseline",
+        "evidence": "db_import_dialog.py:1769-1777 error_count>0이면 text='성공/실패/미실행 개수 + 대상 데이터를 확인한 후...'이고 message는 넣지 않음; 원인은 테이블 목록 항목에 50자로 잘려 표시(1483-1484)되거나 로그에만 있음",
+        "scenario": "replace 중 orders 적재가 제약 위반으로 실패 -> 창에는 '실패: 1개 테이블'과 삭제 후 복원되지 않은 테이블 목록만 있고, 왜 실패했는지는 잘린 목록 항목이나 로그 저장 파일에서 찾아야 한다."
+      },
+      {
+        "title": "replace 실패 시 이미 교체된 테이블에 보조 인덱스/FK가 없다는 사실을 다이얼로그가 알리지 않음(피해가 한 테이블로 한정되지 않음)",
+        "kind": "rule_gap",
+        "severity": "medium",
+        "area": "Import failure dialog / replace",
+        "rule_item": "baseline",
+        "evidence": "migration_core/src/import.rs:491-511 모든 테이블 적재 후 finalize_dump_import에서 post-load DDL; migration_core/src/ddl.rs:263-288 인덱스/FK를 post-load에서 생성; db_import_dialog.py:1691-1692 '후처리가 완료되지 않았습니다' 문구는 로그(_add_log)에만 기록; 1769-1777 실패 창과 _replace_failure_details(95-114)에는 해당 항목 없음",
+        "scenario": "10개 테이블 중 7번째에서 실패 -> 1~6번은 데이터는 바뀌었지만 보조 인덱스/FK가 없는 상태로 남는다. 창에는 '성공: 6개 테이블'로 보여 정상 교체로 오해하기 쉽다. mysqldump는 테이블마다 CREATE에 인덱스가 들어 있어 피해가 실패한 1개 테이블에 그친다."
+      },
+      {
+        "title": "'원본 스키마명 사용'을 켜면 비활성 콤보가 실제 대상과 무관한 첫 스키마를 보여 줌",
+        "kind": "ux",
+        "severity": "low",
+        "area": "Import dialog / target schema",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:579-591 체크 기본 ON, 콤보 setEnabled(False); 899-905 load_schemas가 서버 스키마 전부를 넣어 index 0이 표시됨; 1138-1146 _update_original_schema_option은 콤보 텍스트를 덤프 스키마로 바꾸지 않음; 실제 대상은 _get_dump_schema_name(1309)",
+        "scenario": "덤프 원본이 app_stg인데 회색 콤보에는 'information_schema'나 다른 DB가 보인다. 사용자는 어느 DB에 들어갈지 확인할 수 없다(체크박스 라벨에도 이름이 없음)."
+      },
+      {
+        "title": "Import 모드 선택이 저장되지 않아 매번 안전 복원으로 초기화됨",
+        "kind": "ux",
+        "severity": "low",
+        "area": "Import dialog / defaults",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:647 radio_safe.setChecked(True); 폴더는 set_app_setting('rust_dump_import_dir')로 기억하지만(1246-1248) 모드는 저장하는 코드가 없음",
+        "scenario": "매일 staging->로컬로 replace를 쓰는 사용자도 다이얼로그를 열 때마다 맨 아래 '고급: 전체 교체'를 다시 골라야 하고, 깜빡하면 tf_restore_* DB가 하나씩 쌓인다."
+      },
+      {
+        "title": "환경 미분류(수동 연결) 시 변경이 없는 안전 복원에도 '위험 작업' Yes/No 확인을 받음",
+        "kind": "ux",
+        "severity": "low",
+        "area": "Import dialog / production guard",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:1215 모든 모드에서 _confirm_production_guard 호출; src/ui/dialogs/db_dialogs.py:146-151 tunnel_config=self.preselected_tunnel(수동 연결이면 None); src/core/production_guard.py:36-37 None->UNKNOWN, 366-383 UNKNOWN은 Yes/No(기본 No)",
+        "scenario": "로컬 DB를 연결 다이얼로그로 열고 replace를 실행 -> '⚪ 미분류 환경' Yes, 이어 '기존 대상 삭제 확인' Yes까지 같은 질문을 두 번 받는다. 원본을 바꾸지 않는 안전 복원도 같은 경고를 받는다."
+      },
+      {
+        "title": "Export 테이블 목록이 체크박스와 MultiSelection 하이라이트를 동시에 가짐",
+        "kind": "ux",
+        "severity": "low",
+        "area": "Export dialog / table list",
+        "rule_item": "3",
+        "evidence": "db_export_dialog.py:520 setSelectionMode(MultiSelection); 961 item.setCheckState(Checked); 993-999 get_selected_tables는 checkState만 사용",
+        "scenario": "행 텍스트를 클릭해 파랗게 '선택'해도 체크는 바뀌지 않는다. 사용자는 뺐다고 생각한 테이블이 체크 상태로 남아 Export되고, 이후 Import에서 덮어쓰기된다."
+      },
+      {
+        "title": "Export에는 중지 버튼이 없음(창 닫기로만 취소), Import에는 있음",
+        "kind": "ux",
+        "severity": "low",
+        "area": "Export dialog / buttons",
+        "rule_item": "n/a",
+        "evidence": "db_export_dialog.py:728-769 버튼은 로그 저장/Export 시작/닫기뿐, 취소는 closeEvent 1760-1781; db_import_dialog.py:867-877 btn_stop",
+        "scenario": "Export를 멈추려면 창 닫기를 눌러 '취소하시겠습니까'에 Yes를 해야 하고, 그러면 창도 닫혀 결과 로그를 볼 수 없다."
+      },
+      {
+        "title": "'MySQL 8.4 호환성 검사' 패널이 대상 엔진/버전과 무관하게 항상 표시되고 빨간 오류 개수를 보여 주지만 Import를 막지 않음",
+        "kind": "ux",
+        "severity": "low",
+        "area": "Import dialog / compatibility panel",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:490, 547-573 무조건 추가; 989-1024 엔진 확인 없이 DumpFileAnalyzer 실행, 1004-1009 error면 빨간 굵은 글씨",
+        "scenario": "MySQL 8.0 staging에서 MySQL 8.0 로컬로 복사하는데도 '⚠️ 호환성 이슈: 3개 오류'가 빨갛게 떠서, 진행해도 되는지 판단할 결정이 하나 더 생긴다."
+      },
+      {
+        "title": "덮어쓰기 실행 로그에 모드가 '안전 복원'으로 기록됨",
+        "kind": "ux",
+        "severity": "low",
+        "area": "Import log",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:1244 import_mode='safe'; 1292 로그 'Import 모드: '+_get_import_mode_text(import_mode); 2095 저장 로그도 last_import_mode(safe) 기준(바로 다음 줄에 Overwrite requested가 붙긴 함)",
+        "scenario": "덮어쓰기로 실행한 기록을 나중에 보면 'Import 모드: 안전 복원: 새 대상에 복원·검증'으로 적혀 있다."
+      },
+      {
+        "title": "replace/recreate는 테이블별 DROP->CREATE->적재로 규칙 ①②③과 기준(첫 오류 중단)을 따름",
+        "kind": "ok",
+        "severity": "low",
+        "area": "Core replace path",
+        "rule_item": "1",
+        "evidence": "migration_core/src/import.rs:419-430 테이블마다 replace_target_table 후 create_new_table; 581-591 대상 전용 자식 FK 비호환이면 DROP 전에 거부; 오류는 ?로 즉시 중단; db_import_dialog.py:95-114 실패 창에 삭제 후 미복원/미실행/제거된 FK 목록 표시",
+        "scenario": "덤프에 있는 테이블은 교체되고, 없던 테이블은 생성되며, 대상 전용 테이블은 그대로 남는다. 실패하면 그 테이블에서 멈추고, 아직 차례가 안 된 테이블은 원본을 유지한다(인덱스/FK 후처리 한계는 별도 항목)."
+      },
+      {
+        "title": "안전 복원은 대상 DB가 없으면 요청한 이름으로 만들어 복원(DB 단위 규칙 ②)",
+        "kind": "ok",
+        "severity": "low",
+        "area": "Core safe restore",
+        "rule_item": "2",
+        "evidence": "migration_core/src/safe_restore.rs:330-334 namespace가 없으면 name=원래 이름; db_import_dialog.py:1726-1727 '요청한 새 대상 복원·검증 완료'",
+        "scenario": "로컬에 app_stg가 없으면 바로 app_stg로 만들어 적재하고 추가 검토창은 띄우지 않는다."
+      },
+      {
+        "title": "Export 권한 다이얼로그는 v2.17.0 이후 서로 다른 선택지와 권장 기본값을 가짐",
+        "kind": "ok",
+        "severity": "low",
+        "area": "Export dialog / privilege prompt",
+        "rule_item": "n/a",
+        "evidence": "db_export_dialog.py:46-52, 1183-1228 테이블 락(권장, 기본)/비동기 병렬/단일 연결/취소, 2차 질문은 LOCK TABLES 거부 시에만",
+        "scenario": "RELOAD가 없는 staging 계정이면 한 번 묻고 기본 버튼으로 병렬 일관 Export가 진행된다."
+      },
+      {
+        "title": "불완전 Export 다이얼로그는 제외 객체를 나열하고 기본값이 취소",
+        "kind": "ok",
+        "severity": "low",
+        "area": "Export dialog / incomplete prompt",
+        "rule_item": "n/a",
+        "evidence": "db_export_dialog.py:1251-1283 최대 10개 나열, setDefaultButton(cancel)",
+        "scenario": "트리거가 있으면 목록을 보여 주고, 명시적으로 고를 때만 불완전 Export를 진행한다."
+      },
+      {
+        "title": "Import 덤프 폴더는 마지막 Export 폴더로 자동 채워짐",
+        "kind": "ok",
+        "severity": "low",
+        "area": "Import dialog / defaults",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:950-956 _load_default_input_dir가 rust_dump_last_dump_dir 등에서 유효한 덤프를 선택; db_export_dialog.py:1051-1053 Export 시 저장",
+        "scenario": "Export 직후 Import를 열면 폴더를 다시 고를 필요가 없다."
+      },
+      {
+        "title": "[제안] 규칙을 기본 경로로 만드는 최소 UI 변경안(안전장치 유지)",
+        "kind": "ux",
+        "severity": "high",
+        "area": "Proposal",
+        "rule_item": "n/a",
+        "evidence": "db_import_dialog.py:640-699(모드 그룹), 1217-1234(확인창), 579-591(대상 스키마), 1765-1777/1892(결과 창); rust_dump_exporter.py:645-653; db_export_dialog.py:520,526-527; rust_dump_worker.py:155-171",
+        "scenario": "(1) radio_replace 라벨을 '덮어쓰기 (mysqldump 방식, 권장)'으로 바꾸고 설명을 'Dump에 있는 테이블만 하나씩 삭제->생성->적재, 없던 테이블은 생성, Dump에 없는 대상 테이블은 건드리지 않음, 실패 시 그 테이블에서 멈추고 자동 복구 없음'으로 고친다. '고급:' 접두어와 주황색을 빼고 setChecked(True)로 기본값을 옮긴다. (2) radio_recreate는 UI에서 숨긴다(Core 별칭 유지). (3) radio_overwrite도 숨긴다. 검증 후 교체는 안전 복원 뒤 검토창의 '기존 이름으로 교체'가 이미 맡고 있다. 남긴다면 'mysqldump처럼' 문구를 빼고 'DB 전체 교체·대상 전용 테이블도 백업으로 이동·CREATE DATABASE+전역 권한 필요'로 고친다. (4) radio_safe를 '안전 복원 (새 DB에 먼저 복원·검증, DB 생성 권한 필요)'로 두 번째에 둔다. radio_merge는 '데이터 추가 (기존 구조 유지·행만 추가, 없는 테이블은 생성)'으로 바꾼다. 결과적으로 라디오는 3개다. (5) 덮어쓰기 확인창 제목을 '덮어쓰기 확인'으로 하고, 덤프 manifest 테이블과 connector.get_tables(대상)로 '덮어쓸 N개/새로 만들 M개/건드리지 않는 K개'와 이름 미리보기를 보여 준다. '안전 복원 대신...' 문구는 뺀다. (6) '원본 스키마명 사용 (app_stg)'처럼 이름을 라벨에 넣는다. (7) rust_dump_exporter.py:653에서 일반 문구 대신 result['message']를 돌려주고, 1776/1892는 사람이 읽을 문장으로 바꾼다(실패 테이블 첫 원인 포함, 전환 완료는 '백업: tf_backup_xxx'). (8) Export chk_include_fk를 기본 해제하거나 '(Import 시 이 테이블도 덮어씀)'을 명시한다. worker가 added_tables를 넘겨 완료창에 '자동 추가된 테이블: ...'을 보여 준다. (9) list_tables를 NoSelection으로 바꾼다. 이렇게 하면 일반 경로는 연결->Import 시작->확인 1회->완료로 줄고, 안전 복원·가드·백업 기능은 그대로 남는다. 주의: (1)~(3)은 2026-10-02에 확정한 C안(덮어쓰기=안전복원+자동교체)을 뒤집으므로 사용자 결정이 필요하다."
+      }
+    ],
+    "matrix": "| 상황 \\ 모드 | 안전 복원 (기본) | 덮어쓰기 (UI 전용) | 데이터 추가 (merge) | 고급: 전체 교체 (replace) | 고급: 완전 재생성 (recreate) |\n|---|---|---|---|---|---|\n| ① 덤프O·대상O 테이블 | 원본 그대로, tf_restore_* 사본에만 적재 -> 검토창 (위반) | 검증 후 DB 전체 RENAME 교체 (준수, 단 경로가 다름) | 구조 유지·행 추가 (위반) | 테이블별 DROP->CREATE->적재 (준수) | replace와 동일 (준수) |\n| ② 덤프O·대상X 테이블 | 사본에만 생성 (전환 전엔 미반영) | 교체 후 생성됨 (준수) | 생성·적재 (준수) | 생성·적재 (준수) | 동일 |\n| ③ 덤프X·대상O 테이블 | 그대로 (전환하지 않으면) | tf_backup_*로 RENAME + SHOW CREATE 텍스트로 재생성·행 복사 (위반, TF-173) | 그대로 (준수) | 그대로 (준수) | 동일 |\n| 대상 DB 자체가 없음 | 요청 이름으로 생성 (준수) | 생성, 교체 불필요 (준수) | 'Unknown database' 원문 오류 | 'Unknown database' 원문 오류 (갭) | 동일 |\n| 부분 Export 덤프(대상 전용 테이블 존재) | ready_for_review -> 검토창 | 자동 교체 안 됨 -> 검토창 + 추가 확인 2회 | 정상 | 정상 | 정상 |\n| DB 한정 로컬 계정 | CREATE DATABASE 실패 -> 일반 문구 'verified 대상 정보 확인 불가' | 같은 실패 / 전역 권한 없으면 교체 버튼 비활성 | 동작 | 동작 (v2.17.1) | 동작 |\n| 실패 시 피해 | 원본 무변경, 사본 잔존 | 원본 무변경(교체 전), 사본 잔존 | 부분 행 잔존 | 진행 중 1개 테이블 손실 + 이미 교체된 테이블은 인덱스/FK 없음 | 동일 |\n| 사용자 결정 수 (staging->로컬, 같은 이름 DB 존재) | 시작+가드(0-1)+완료창+검토창 선택+교체 확인+가드(0-1)+JSON 창 = 5-7, 그래도 ③ 위반 | 모드+시작+가드(0-1)+덮어쓰기 확인 (+부분 덤프면 검토창 선택+교체 확인+가드) = 3-7 | 모드+시작+가드(0-1)+완료 = 3-4 | 모드+시작+가드(0-1)+삭제 확인+완료 = 4-5 | 동일 |\n\nExport 쪽 결정 수(부분 Export): 연결 1 + '선택 테이블' 1 + 스키마 1 + 체크(전체 해제+N) + Export 시작 1 + 권한창 1(RELOAD 없는 staging) + 완료 1 = 6+N개. 'FK 자동 포함'은 기본 ON이라 사용자가 의식하지 않으면 뺀 부모 테이블이 다시 들어간다.\n\n다이얼로그 목록. Import: 경고 4종(폴더 미선택, 폴더 없음, 대상 선택 필요, 스키마 미선택), 환경 가드(Prod는 이름 입력, Staging/Unknown은 Yes/No, Dev는 생략), 기존 대상 삭제 확인, 덮어쓰기 확인, 안전 복원 검증 완료, Import 완료, 안전 복원 실패, Import 실패, 복원 대상 비교 및 전환 선택(4버튼), 기존 이름으로 교체 확인 + 가드, 전환 완료(JSON), 전환 작업 확인 필요, 전환 검토 불가, 재시도 불가(도달 불가 경로), 실행 중 취소 3종, 호환성 이슈 상세, 백업 관리, 로그 저장 4종. Export: 경고 4종, 권한 2종, 불완전 Export, Export 완료(폴더 열기), Export 실패(원문), 실행 중 닫기 확인, 설치 가이드, 로그 저장.",
+    "verdicts": [
+      {
+        "title": "안전 복원 실패 원인이 Python 래퍼에서 버려지고 일반 문구로 대체됨",
+        "verdict": {
+          "real": true,
+          "reasoning": "I tried to refute this and couldn't. The code confirms the claim.\n\n1. In Rust, migration_core/src/safe_restore.rs:185 runs the whole safe restore inside a closure. The `?` on create_candidate at :346 (the CREATE DATABASE at :498) is inside that closure, so a failure there is caught at :441-456. The handler sets success=false, status=\"failed_original_untouched\", message=\"Safe restore failed; original database was not changed. <cause>\" and error=<cause>. It emits a safe_restore_failed event (:467-473) and then returns Ok(state) as the \"result\" (:475-478). The failure is not raised as an error.\n\n2. The JSONL client does not turn success=false into an exception. src/core/db_core_client.py:303-305 returns the result dict, and only an \"error\" event raises. src/core/db_core_facade.py:310-315 passes the dict straight through. So the DbCoreServiceError branch at rust_dump_exporter.py:690, which would have kept the cause, is never reached.\n\n3. In src/exporters/rust_dump_exporter.py:640-653, when import_mode==\"safe\" and the status is not completed_new_target, ready_for_switch or ready_for_review, the code returns a fixed string: \"안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다. 원본과 복원 대상의 상태를 보고서에서 확인하세요.\" It never reads result[\"message\"] or result[\"error\"]. Before that, the wrapper writes its own raw JSON line (:642-646). That line copies only status, verified and similar keys, leaves out message and error, and is labeled event=\"safe_restore_ready\" even when the restore failed.\n\n4. src/ui/dialogs/db_import_dialog.py:1754-1758 sets the label to \"안전 복원 실패 · 원본 미변경\", and :1765-1766 shows QMessageBox.warning(\"안전 복원 실패\", label + \"\\n\\n\" + message), where message is the generic text.\n\n5. The cause still reaches the UI in two places. First, the Rust safe_restore_failed event passes through emit_core_event (src/exporters/dump_progress.py:186-187). on_raw_output (db_import_dialog.py:1551-1597) does not treat it as known telemetry, so it is added to txt_log as one sanitized compact JSON line. Second, the report file contains it, since write_dump_import_report(path, &state) runs at :458 after message and error are set, and _show_report_link displays a link to that file.\n\n6. The scenario can happen. There is no CREATE-privilege preflight for safe mode in the dialog or in safe_restore.rs (grep found nothing). Safe restore is the default mode. When the target namespace already exists, it runs CREATE DATABASE tf_restore_<id> (:330-346). An account scoped to one database, like the one in today's v2.17.1 incident, would get ERROR 1044 there. No test covers the generic message path; grep finds the string only at rust_dump_exporter.py:653.\n\nThe claim is right but overstates one point. The cause is not only in the log JSON: it is also in the Import report, which the dialog links to and which the generic text tells the user to check. It is still a real diagnostics defect: the popup drops a cause the wrapper has in hand, and the wrapper's own extra log line wrongly says \"safe_restore_ready\". I would classify it as ux/diagnostics rather than a data-safety bug, because the original database really is unchanged and the popup says so correctly.",
+          "corrected_claim": "In safe-restore mode, the wrapper discards the actual failure cause and the popup shows only generic text. Rust (safe_restore.rs:441-456, 475-478) returns the failure as a normal \"result\" with success=false, status=failed_original_untouched, message=\"Safe restore failed; original database was not changed. <cause>\" and error=<cause>. The JSONL client does not raise on this (db_core_client.py:303-305), so the cause is never wrapped as a DbCoreServiceError. rust_dump_exporter.py:640-653 then ignores result['message'] and result['error'] and returns the fixed text \"안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다. 원본과 복원 대상의 상태를 보고서에서 확인하세요.\" db_import_dialog.py:1765-1766 shows that text in the \"안전 복원 실패 · 원본 미변경\" warning. One reachable case: safe is the default mode, and there is no CREATE-privilege preflight. A database-scoped account importing into an existing database fails at CREATE DATABASE tf_restore_* (safe_restore.rs:346/498) with ERROR 1044, and the popup does not mention Access denied. The cause is not lost entirely. It is in the sanitized raw safe_restore_failed JSON line in the log list (dump_progress.py:186-187 -> db_import_dialog.py:1551-1597), and in the Import report file, which _show_report_link links to and which the generic text tells the user to check. A smaller related problem: the wrapper's own raw state line (rust_dump_exporter.py:642-646) is labeled event=\"safe_restore_ready\" even on failure and leaves out message and error. Severity: ux/diagnostics, not data safety. The original database is untouched, as the popup correctly says. Fix: in the safe failure branch, put result.get('message') or result.get('error') into the returned message."
+        }
+      }
+    ]
+  },
+  {
+    "lens": "privileges-live",
+    "summary": "권한 렌즈를 실제 코어 바이너리로 검증했다. bb3c53b(v2.17.1)를 별도 target 디렉터리에서 빌드했고, JSONL로 tf-test-my84(8.4.11)와 tf-test-my80(8.0.46)에 직접 요청을 보냈다. 계정은 7종(DB 범위 ALL, SELECT+LOCK TABLES, RELOAD 추가, tf_restore_% 와일드카드, 전역 SELECT/SHOW VIEW/PROCESS, REFERENCES 없는 앱 계정, 테이블 단위 SELECT)을 만들어 썼고, 테스트 DB·계정·tf_restore/backup/promote 네임스페이스·빌드 디렉터리는 끝난 뒤 모두 지웠다(tf_test 하나만 남아 있음).\n\n핵심 결과:\n(1) 권한이 좁은 Export 계정에서는 트리거·루틴·이벤트가 information_schema에 보이지 않는다. 그래서 거부 없이 strict_export=true(완전한 덤프)로 표시된 채 해당 객체가 조용히 빠진다. 테이블 단위 권한 계정은 테이블까지 빠진다. 정책 문서와도 다르다.\n(2) 기본값인 안전 복원과 덮어쓰기는 DB 범위 계정에서 항상 실패한다. 안전 복원은 CREATE DATABASE tf_restore_* 단계에서 ERROR 1044가 나고 원본은 그대로다. 덮어쓰기는 여기에 더해 전역 SELECT/SHOW VIEW/PROCESS와 tf_backup_/tf_promote_ 생성 권한이 필요하다. 결국 DB 범위 계정으로 실제 동작하는 모드는 사용자 규칙을 따르는 '고급' 교체/재생성과 데이터 추가뿐이다.\n(3) REFERENCES 권한이 없는 흔한 앱 계정은 DDL 사전 검증을 통과한다. 그 뒤 모든 테이블을 DROP→재적재하고 나서야 post-load FK 단계에서 실패해, 대상 전체에 FK와 뷰가 없는 상태가 남는다. 피해를 한 테이블로 제한한다는 기준을 위반한다.\n(4) v2.17.1의 max_error_count 1227 허용 이후에도 배치 크기는 65535 경고를 전제로 잡혀 있다. 그래서 DB 범위 계정은 legacy ENUM '' 값이 많은 테이블에서 하드 실패하고, 교체된 테이블은 빈 채로 남는다(root는 성공).\n나머지 세션 변수, local_infile temporary_global(SET GLOBAL 1227 시 INSERT로 폴백), 스냅샷 모드별 권한 마커, 뷰 DEFINER 제거는 안전하게 동작한다.",
+    "matrix": "| 동작 \\ 계정 | A: SELECT+LOCK TABLES (db) | F: A+RELOAD(전역) | B: ALL ON db.* | C: B+ALL ON `tf\\_restore\\_%` | D: C+전역 SELECT,SHOW VIEW,PROCESS+ALL ON tf\\_backup\\_%/tf\\_promote\\_% | E: 앱계정(REFERENCES/CREATE VIEW 없음) |\n|---|---|---|---|---|---|---|\n| Export parallel_strict | 실패 1227 RELOAD/FLUSH_TABLES → 마커→대화상자 (ok) | FTWRL 획득 후 BACKUP_ADMIN 1227 (전역 락 낭비) | 실패 1227 (ok) | - | - | - |\n| Export parallel_table_lock | 성공 (뷰: SHOW VIEW 1142→경고, strict=false) | - | 성공 | - | - | - |\n| Export unsynchronized / no_backup_lock / single | 성공 (SELECT만 필요) | - | - | - | - | - |\n| Export 트리거/루틴/이벤트 감지 | 안 보임 → 거부 없이 strict_export=true (BUG) | - | 정상 거부(waivable) | - | - | - |\n| Export max_user_connections=3, threads=4 | 1226 원시 오류, 폴백 안내 없음 / single은 성공 | - | - | - | - | - |\n| Import merge | - | - | 성공 (기존 뷰 있으면 1050→partial) | - | - | - |\n| Import replace / recreate | - | - | 성공, 규칙 1·2·3 준수 (keep_me 미변경) | - | - | 전 테이블 교체 후 FK 단계 1142 REFERENCES 실패 (BUG) |\n| Import replace + legacy ENUM '' (3열×500행) | - | - | 1500 warnings 거부, 테이블 0행 (BUG) / root 성공 | - | - | - |\n| Import local_infile temporary_global | - | - | SET GLOBAL 1227 → INSERT 폴백 (ok) | - | - | - |\n| Import 안전 복원(기본) | - | - | 1044 CREATE DATABASE tf_restore_* 실패, 원본 미변경 | 성공 (ready_for_review) | 성공 | - |\n| Import 덮어쓰기(=safe+promote) | - | - | 1044 (위와 동일) | promote plan blocked: 전역 SELECT/SHOW VIEW/PROCESS 필요 | promoted 성공 | - |\n| 세션 SET (sql_mode, fk/unique_checks, net/wait_timeout, lc_messages, information_schema_stats_expiry, lock_wait_timeout) | ok | ok | ok (8.0/8.4) | ok | ok | ok |\n| SET SESSION max_error_count=65535 | - | - | 1227 → 무시하고 1024 유지 (ok, 단 ENUM 배치 BUG) | - | - | - |",
+    "findings": [
+      {
+        "title": "권한이 좁은 Export 계정은 트리거/루틴/이벤트(와 권한 없는 테이블)를 조용히 빼고 strict_export=true(완전한 덤프)로 표시한다",
+        "kind": "bug",
+        "severity": "high",
+        "area": "export / schema inspection",
+        "rule_item": "baseline",
+        "evidence": "migration_core/src/schema.rs:448-471: 트리거·루틴·이벤트 감지가 information_schema.triggers/routines/events에만 의존하는데, MySQL은 이 결과를 계정 권한으로 거른다(TRIGGER / SHOW_ROUTINE·CREATE ROUTINE·EXECUTE / EVENT 권한이 필요). migration_core/src/dump.rs:919의 dump_scope_refusal은 이 목록으로만 거부 여부를 정한다. docs/export_import_policy.md:235 'Triggers on an exported table: Refused before export'와 다르다. 실측(8.4·8.0 동일): GRANT SELECT, LOCK TABLES ON tfpriv_obj.* 계정으로 information_schema를 조회하면 triggers 0 / routines 0 / events 0, root는 1/1/1. dump.run 결과: root와 DB 범위 ALL 계정은 'dump.run refused: ... trigger:t1:trg_t1_ai, routine:p_noop, event:ev_noop'. SELECT+LOCK TABLES 계정은 {\"success\":true,\"strict_export\":true} 이고 manifest_warnings=[] 이다. 테이블 단위 GRANT SELECT ON tfpriv_src.parent 계정으로 전체 export하면 tables=['parent']만 담기고(child·view 누락) 여전히 strict_export=True, 경고 없음.",
+        "scenario": "운영 DB에서 읽기 전용 계정(SELECT[, LOCK TABLES])으로 전체 Export를 하면 트리거·프로시저·이벤트가 있어도 거부 대화상자가 뜨지 않는다. 덤프는 '완전'으로 표시되고, Import 쪽도 이 덤프를 strict로 받아들인다. 사용자는 백업이 완전하다고 믿지만 트리거·루틴·이벤트(테이블 단위 권한이면 테이블까지)가 없다. 해결 방향: 해당 권한이 있는지 확인하고(SHOW GRANTS 또는 SHOW_ROUTINE/TRIGGER/EVENT 보유 여부), 없으면 strict_export=false와 '이 계정 권한으로는 트리거/루틴/이벤트를 확인할 수 없음' 경고를 남기거나 allow_incomplete 없이는 거부한다."
+      },
+      {
+        "title": "기본 Import 모드(안전 복원)와 덮어쓰기는 DB 범위 계정에서 항상 실패하는데, UI는 필요 권한을 알려주지 않는다",
+        "kind": "ux",
+        "severity": "high",
+        "area": "import safe restore / overwrite promote",
+        "rule_item": "1",
+        "evidence": "migration_core/src/safe_restore.rs:330-346과 483-503: 대상 DB가 이미 있으면 CREATE DATABASE `tf_restore_<nanos>_<pid>`가 필수다. migration_core/src/safe_promote_mysql.rs:121-127(prove_metadata_visibility: 전역 SELECT/SHOW VIEW/PROCESS 필요), :768과 :1036-1045(tf_backup_/tf_promote_ DB 생성). src/ui/dialogs/db_import_dialog.py:646-660의 모드 설명에는 권한 언급이 없고, :1765는 원시 메시지를 그대로 보여준다. 권한 검사는 전체 청크 검증(safe_restore.rs:233) 뒤에야 일어난다. 실측(8.0·8.4): GRANT ALL ON tfpriv_tgt.* 계정의 safe 결과는 'safe candidate creation failed (existing namespaces are never reused): MySqlError { ERROR 1044 (42000): Access denied for user 'tfpriv_dbonly'@'%' to database 'tf_restore_1791866871207938321_1' }', status=failed_original_untouched. ALL ON `tf\\_restore\\_%`.*를 추가하면 safe는 성공하지만 promote plan은 blocked이고 'guarded promotion requires proven direct global SELECT, SHOW VIEW and PROCESS visibility ...'가 나온다. SELECT,SHOW VIEW,PROCESS ON *.*와 ALL ON tf\\_backup\\_%/tf\\_promote\\_%까지 주면 status=promoted.",
+        "scenario": "오늘 max_error_count 사고와 같은 종류의 DB 범위 로컬/스테이징 계정으로 기본값(안전 복원) 그대로 Import하면, 덤프 전체 검증을 기다린 뒤 'Access denied ... tf_restore_...' 원시 오류로 실패한다(원본은 안전함). 덮어쓰기도 같다. 이런 계정으로 실제 동작하는 모드는 사용자 규칙(1·2·3)을 따르는 '고급: 전체 교체/완전 재생성'과 '데이터 추가'뿐이다. 해결 방향: 시작 전에 권한을 확인해 필요 권한(CREATE on tf_restore_%, 덮어쓰기는 전역 SELECT/SHOW VIEW/PROCESS와 tf_backup_/tf_promote_)을 안내하거나 교체 모드를 제안한다."
+      },
+      {
+        "title": "REFERENCES 권한 없는 계정: DDL 사전 검증을 통과한 뒤 모든 테이블을 교체하고 나서 FK 단계에서 실패한다",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "import replace/recreate preflight",
+        "rule_item": "baseline",
+        "evidence": "migration_core/src/import.rs:517-537 probe_import_ddl는 FK 없는 CREATE TABLE만 시험한다. :419-430은 테이블마다 DROP 후 CREATE하고 적재한다. migration_core/src/ddl.rs:263-303 apply_post_load_ddl은 모든 적재가 끝난 뒤에 ALTER TABLE ... ADD CONSTRAINT FOREIGN KEY를 실행한다. 실측(8.4): GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX ON tfpriv_tgt.* 계정으로 replace하면 'post_load_validation_failed: post-load DDL failed while executing ALTER TABLE `child` ADD CONSTRAINT `fk_child_parent` ... ERROR 1142 (42000): REFERENCES command denied to user 'tfpriv_app'@'[ip-address]' for table 'tfpriv_tgt.parent''. 이후 대상 상태: parent 2행, child 2행이 교체됐고 REFERENTIAL_CONSTRAINTS 0건, 뷰 v_parent 없음.",
+        "scenario": "흔한 앱 계정(REFERENCES·CREATE VIEW 없음)으로 '전체 교체'를 실행하면 사전 검증이 통과하고, 선택한 모든 테이블이 DROP→재생성→적재된다. 그다음에야 FK 생성이 거부되어 대상 전체에 FK가 없고 뷰도 없는 상태로 '실패'한다. 'mysqldump 기준: 첫 오류에서 멈추고 피해는 그 테이블 하나'를 위반한다. 해결 방향: preflight probe에 FK(부모+자식 probe 쌍)와 CREATE VIEW를 포함하거나 REFERENCES/CREATE VIEW 권한을 미리 확인한다."
+      },
+      {
+        "title": "SESSION_VARIABLES_ADMIN 없는 계정은 legacy ENUM '' 데이터를 Import하지 못하고, 교체된 테이블이 빈 채로 남는다",
+        "kind": "bug",
+        "severity": "medium",
+        "area": "import warning cap (v2.17.1 후속)",
+        "rule_item": "baseline",
+        "evidence": "migration_core/src/adapters.rs:789-799 raise_mysql_max_error_count는 1227을 무시해 max_error_count가 1024로 남는다(ponytail 주석이 이 상한을 인지하고 있음). 그런데 migration_core/src/import.rs:1878-1881 enum_warning_batch_rows와 :1825의 LOAD DATA 분할 기준은 MYSQL_IMPORT_MAX_WARNINGS=65535(import.rs:24)를 전제로 한다. :1917-1921은 SHOW COUNT(*) WARNINGS 값과 SHOW WARNINGS 행 수가 다르면 거부한다. 실측(8.4): ENUM('x','y') 3열에 '' 값 600행. DB 범위 ALL 계정의 replace 결과는 'mysql insert fallback error for table e3 chunk 1: import data validation failed: 1500 MySQL warnings: 1265: Data truncated for column 'a' at row 1; ...'이고 SELECT COUNT(*) FROM tfpriv_tgt.e3 = 0. 같은 덤프를 root로 넣으면 Import completed, 600행.",
+        "scenario": "오래된 비strict 운영 데이터(ENUM 빈값)를 DB 범위 계정으로 교체 Import하면, INSERT 폴백에서는 ENUM 3열 이상, LOAD DATA 경로에서는 청크당 1024셀 초과일 때 하드 실패한다. 해당 테이블은 DROP 후 빈 상태로 남는다. v2.17.1은 SET 문 실패만 고쳤고 상한 자체는 남아 있다. 해결 방향: raise 시도 뒤 @@max_error_count를 읽어 배치 행 수와 분할 기준을 계산한다."
+      },
+      {
+        "title": "max_user_connections가 제한된 계정에서 병렬 Export가 원시 1226 오류로 실패하고 대안 안내가 없다",
+        "kind": "ux",
+        "severity": "low",
+        "area": "export connection count",
+        "rule_item": "n/a",
+        "evidence": "migration_core/src/dump.rs:138-142는 coordinator·control·워커 N개 연결을 연다. dump.rs:113-121 mysql_parallel_privilege_error는 1044/1045/1142/1227만 권한 마커로 바꾼다. 실측(8.4, MAX_USER_CONNECTIONS 3, threads 4): 'mysql connection error: MySqlError { ERROR 1226 (42000): User 'tfpriv_ro' has exceeded the 'max_user_connections' resource (current value: 3) }'. 같은 계정으로 single_connection은 성공.",
+        "scenario": "연결 수가 제한된 공유/매니지드 계정으로 기본 병렬 Export를 하면 바로 실패하고, Export 대화상자의 권한 질문(단일 연결로 계속)도 뜨지 않는다. 사용자가 스레드 수를 낮추거나 단일 연결을 직접 골라야 한다는 걸 알 수 없다."
+      },
+      {
+        "title": "parallel_strict: RELOAD만 있는 계정은 서버 전체 FTWRL을 잡은 뒤에야 BACKUP_ADMIN 부족으로 실패한다",
+        "kind": "bug",
+        "severity": "low",
+        "area": "export snapshot",
+        "rule_item": "n/a",
+        "evidence": "migration_core/src/dump.rs:160-191: FLUSH TABLES WITH READ LOCK을 먼저 잡고, 워커 스냅샷을 연 다음 LOCK INSTANCE FOR BACKUP을 시도한다. 실측(8.0·8.4, GRANT RELOAD ON *.*와 SELECT, LOCK TABLES ON db.*): 'MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:BACKUP_ADMIN:ERROR 1227 (42000): Access denied; you need (at least one of) the BACKUP_ADMIN privilege(s) for this operation'. 실패 전에 FTWRL이 실제로 획득됐다.",
+        "scenario": "RELOAD는 있고 BACKUP_ADMIN은 없는 계정으로 Export를 시작할 때마다 서버 전체 쓰기가 짧게(최대 2초 대기 + 워커 스냅샷 시간) 막혔다가 실패한다. 이후 대화상자에서 테이블 락으로 재시도하는 흐름은 정상이다. BACKUP_ADMIN을 먼저 확인하거나 LOCK INSTANCE FOR BACKUP을 먼저 실행하면 피할 수 있다."
+      },
+      {
+        "title": "데이터 추가(merge): 대상에 같은 뷰가 이미 있으면 1050으로 'partial/실패' 처리된다",
+        "kind": "ux",
+        "severity": "low",
+        "area": "import merge views",
+        "rule_item": "n/a",
+        "evidence": "migration_core/src/import.rs:1038-1042: 기존 뷰 DROP은 replace/recreate일 때만 한다. 실측(8.4, DB 범위 계정): merge 결과는 status=partial, success=false, views_failed=[{'name':'v_parent','error':'... ERROR 1050 (42S01): Table 'v_parent' already exists'}]. 테이블 데이터는 커밋됨.",
+        "scenario": "같은 덤프로 교체 Import를 한 대상에 데이터 추가 Import를 하면, 행은 모두 들어갔는데 결과는 '실패'로 표시된다. 권한 문제는 아니지만 모드 혼란을 키운다."
+      },
+      {
+        "title": "Export 스냅샷 모드별 권한 요구와 강등은 문서대로 동작한다",
+        "kind": "ok",
+        "severity": "low",
+        "area": "export snapshot modes",
+        "rule_item": "n/a",
+        "evidence": "실측(8.0·8.4): SELECT+LOCK TABLES 계정의 parallel_strict는 'MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:FLUSH_TABLES_OR_RELOAD:ERROR 1227 ... RELOAD or FLUSH_TABLES' 마커를 낸다(dump.rs:166-176, 대화상자 db_export_dialog.py:1348-1356). parallel_table_lock은 같은 계정으로 성공하고(dump.rs:79-87), unsynchronized·no_backup_lock·single_connection은 SELECT만 있으면 성공한다. SHOW VIEW가 없으면 'View definitions could not be collected: ... ERROR 1142 SHOW VIEW command denied' 경고와 strict_export=false로 강등된다(dump.rs:735-750). 다른 세션이 WRITE 락을 잡은 상태에서 table_lock 모드는 'could not acquire table read locks within 2 seconds: ERROR 1205'로 안전하게 실패한다. KILL QUERY는 자기 연결 대상이라 추가 권한이 필요 없다.",
+        "scenario": "권한이 없을 때 원시 오류 대신 마커와 대화상자로 다음 모드를 안내하고, 실패하더라도 덤프 파일이 '완전'으로 잘못 기록되지 않는다(위 트리거·루틴·이벤트 가시성 문제는 예외)."
+      },
+      {
+        "title": "DB 범위 계정의 교체/재생성/추가 Import는 세션 권한 요구 없이 동작하고 규칙 1·2·3을 지킨다",
+        "kind": "ok",
+        "severity": "low",
+        "area": "import session statements",
+        "rule_item": "1",
+        "evidence": "migration_core/src/import.rs:1495-1523의 세션 SET(sql_mode, foreign_key_checks, unique_checks, default_storage_engine, lc_messages, net_read/write_timeout, wait_timeout)은 DB 범위 계정에서 모두 통과한다. max_error_count 1227은 adapters.rs:795-799가 무시한다. local_infile temporary_global은 'MySQL local_infile temporary enable failed: ... ERROR 1227 ... SUPER or SYSTEM_VARIABLES_ADMIN ...; using safe Rust INSERT fallback'으로 처리된다(import.rs:1314-1330; UI는 기본값 fallback만 사용). 뷰는 DEFINER를 제거해 생성하므로 DEFINER=tfpriv_dbonly@%, SQL SECURITY INVOKER가 유지되고 SET_USER_ID가 필요 없다. replace/recreate 결과: parent·child는 덤프 구조와 데이터로 교체되고 덤프에 없는 keep_me는 미변경. 8.0·8.4 동일.",
+        "scenario": "DB 범위 권한만 있는 계정에서 사용자 규칙(1 덮어씀, 2 생성, 3 덤프 밖 테이블 미변경)을 지키는 모드는 '고급: 전체 교체/완전 재생성'뿐이고 실제로 동작한다. 단 REFERENCES 누락과 legacy ENUM 상한은 위 bug 항목 참고. PostgreSQL 경로는 이번 렌즈에서 라이브 검증하지 않았다."
+      }
+    ],
+    "verdicts": [
+      {
+        "title": "권한이 좁은 Export 계정은 트리거/루틴/이벤트(와 권한 없는 테이블)를 조용히 빼고 strict_export=true(완전한 덤프)로 표시한다",
+        "verdict": {
+          "real": true,
+          "reasoning": "I read the code and the claim holds. I did not repeat the live test; the auditor's numbers match what the code does with MySQL's documented information_schema filtering.\n\n1. Detection uses filtered views only (migration_core/src/schema.rs:449-471). Triggers, routines and events come only from information_schema.triggers, routines and events. MySQL filters these by privilege: TRIGGER on the table; DEFINER, SHOW_ROUTINE, global SELECT, or CREATE/ALTER ROUTINE/EXECUTE; EVENT. The table list is also filtered: it comes from information_schema.tables (ddl.rs:1150, via inspect_generic). There is no SHOW GRANTS check or visibility check anywhere on the export path. A grep of dump.rs, schema.rs and src/*.py finds none.\n\n2. The refusal only sees what was detected (dump.rs:913-927). Its object list is inspection.unsupported_objects plus non-transactional tables. A full export means selected_tables is empty (dump.rs:891), and that runs on whatever tables were visible. Hidden tables, triggers, routines and events produce no entries, so nothing is refused.\n\n3. strict_export stays true (dump.rs:764-775). It is set false only when export_warnings (from detected objects) or a view-collection error exists. A restricted account produces neither.\n\n4. Import also stays quiet (import.rs:106-122). source_dump_warnings warns only when !manifest.strict_export.\n\n5. The project knows about this risk elsewhere. safe_promote_mysql.rs:121-128 (prove_metadata_visibility) runs SHOW GRANTS FOR CURRENT_USER and refuses cutover without global SELECT, SHOW VIEW and PROCESS. Its error says: \"database-scoped permissions cannot certify external dependencies\". docs/export_import_policy.md:75-76 says the same for promotion. Export has no such guard.\n\n6. The docs do not cover this case. Policy line 235 says triggers are \"Refused before export\". The disclaimer at line 252 is about object types the inspection does not detect at all (partitioning, extensions), not objects that privileges hide.\n\n7. No test covers it. The live tests that create restricted accounts (live_export_contract.rs:116, 352-354) never combine one with triggers, routines or events.\n\nThere is no handling to refute the claim, so it is real. It is a bug, not a rule_gap: a dump marked complete can be silently missing objects. PostgreSQL probably has the same gap, though I did not verify it live. schema.rs:678 also reads information_schema.triggers, which in PostgreSQL shows only triggers on tables the user owns or holds a non-SELECT privilege on.",
+          "corrected_claim": "Confirmed bug, with the scope stated precisely. In MySQL, dump.run decides what to refuse using only information_schema (triggers, routines, events, tables, views; schema.rs:449-471, ddl.rs:1150), and the account's privileges filter all of these. It never checks whether the account can see all metadata. The only such check, prove_metadata_visibility in safe_promote_mysql.rs:121-128, runs only on promote. So a SELECT[+LOCK TABLES] account (DB-scoped or table-scoped) gets no refusal (dump.rs:919). A full export then silently leaves out triggers, routines and events it cannot see; with a table-level grant it also leaves out tables and views. The manifest still says strict_export=true with no manifest_warnings (dump.rs:764-775), and import adds no 'not strict' warning (import.rs:116). This contradicts docs/export_import_policy.md:235. Global SELECT or SHOW_ROUTINE reveals routines, and TRIGGER reveals triggers, so only accounts without those privileges are affected. PostgreSQL triggers (schema.rs:678) are probably affected the same way for SELECT-only roles; not live-verified. Suggested fix, mirroring the promote guard: before refusing, confirm metadata visibility through SHOW GRANTS (or the specific TRIGGER/EVENT/SHOW_ROUTINE privileges). If it cannot be confirmed, refuse without allow_incomplete, or set strict_export=false and add a persistent 'metadata visibility not proven for this account' warning."
+        }
+      },
+      {
+        "title": "REFERENCES 권한 없는 계정: DDL 사전 검증을 통과한 뒤 모든 테이블을 교체하고 나서 FK 단계에서 실패한다",
+        "verdict": {
+          "real": true,
+          "reasoning": "I read the code to check the claim, and it holds. probe_import_ddl (migration_core/src/import.rs:517-537) creates and drops a probe copy of each table using generate_table_ddl. That DDL has no FK clauses: FKs are emitted only by generate_post_data_ddl as `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... REFERENCES` (ddl.rs:187-214). So the preflight never uses the REFERENCES privilege.\n\nIn replace/recreate mode the loop at import.rs:419-430 runs replace_target_table (DROP), then create_new_table, then loads rows, one table at a time. Only after every table is loaded does finalize_dump_import call apply_post_load_ddl (import.rs:875-883, ddl.rs:263-303), and that is where the FK ALTERs run. Neither import.rs nor the Python import path (rust_dump_exporter.py, db_import_dialog.py, rust_dump_worker.py) checks privileges first. The only privilege handling I found is the export parallel-snapshot marker. docs/current_status.md does not track a REFERENCES-denied case.\n\nThe result is what the auditor measured. An account without REFERENCES passes the preflight, every selected table is dropped, recreated and loaded, and then ADD FOREIGN KEY fails as post_load_validation_failed. This breaks the mysqldump baseline. mysqldump puts FKs inline in CREATE TABLE, so it would stop at the first child table.\n\nSome details are overstated or wrong:\n(a) The missing view is not a separate CREATE VIEW failure. apply_post_load_ddl returns early through `?` (import.rs:883), so import_views (import.rs:903-913) never runs.\n(b) View failures are non-fatal by design (a partial result with data committed, import.rs:900-901). A CREATE VIEW privilege check is a lower-priority UX addition, not part of this bug.\n(c) Data and secondary indexes are restored correctly. Indexes run before FKs in post-data DDL. The damage is FK constraints missing on every replaced table, views not restored, and a failed status. No rows are lost.\n(d) The same gap covers other post-load DDL that is never probed: non-unique CREATE INDEX on MySQL (INDEX privilege; ddl.rs:156 skips only unique keys) and PostgreSQL FK/COMMENT statements.",
+          "corrected_claim": "This is a real bug in replace/recreate mode. The DDL preflight (import.rs:517-537) only probes CREATE TABLE without FKs. FKs and non-unique MySQL indexes are added only after every table has been dropped, recreated and loaded (import.rs:419-430, then finalize_dump_import at import.rs:883, which calls apply_post_load_ddl at ddl.rs:263-303). Nothing checks REFERENCES or INDEX privileges beforehand. So an account without REFERENCES passes the preflight and gets all selected tables replaced, data and indexes included. It then fails with post_load_validation_failed and leaves every replaced table without FK constraints. This breaks the \"stop at the first error, only that table is damaged\" baseline.\n\nCorrections to the claim:\n- Views are missing because the post-load error returns before import_views runs (import.rs:883 vs 903). It is not a separate CREATE VIEW denial.\n- View failures are non-fatal by design, so a CREATE VIEW check is optional UX hardening.\n- No rows are lost; the damage is missing FKs and views plus a failed status.\n- The fix: add FK probes (a parent and child probe pair) and a post-load index probe to probe_import_ddl, or check REFERENCES and INDEX privileges before the first DROP. The same gap applies to PostgreSQL REFERENCES."
+        }
+      },
+      {
+        "title": "SESSION_VARIABLES_ADMIN 없는 계정은 legacy ENUM '' 데이터를 Import하지 못하고, 교체된 테이블이 빈 채로 남는다",
+        "verdict": {
+          "real": true,
+          "reasoning": "I could not refute it. The code shows the mechanism, and the 1500-warning error in the report is exactly what the code produces for 600 rows with 3 ENUM columns.\n\n1. migration_core/src/adapters.rs:795-799: `raise_mysql_max_error_count` ignores ERROR 1227, so the session stays at the server default of 1024 SHOW WARNINGS rows. Lines 793-794 carry a ponytail comment that already admits the gap: \"a restricted account refuses a chunk with more than 1024 expected legacy ENUM-zero warnings\". So this is a deferred known limit, not something that is handled.\n2. The batch and split sizes still assume 65535 warnings:\n   - import.rs:24 sets `MYSQL_IMPORT_MAX_WARNINGS=65_535`.\n   - import.rs:1878-1881: `enum_warning_batch_rows` = min(500, 65535/legacy_enum_cols). With 3 columns that is 500 rows, which can mean 1500 warnings.\n   - The TSV INSERT fallback batches at that size (import.rs:1611-1625).\n   - LOAD DATA only splits a chunk when it has more than 65535 cells (import.rs:1825).\n   - The JSONL / binary-column INSERT path at import.rs:821-829 also runs the whole chunk as one INSERT unless it has more than 65535 cells.\n3. import.rs:1919-1921: `only_expected_enum_zero_warnings` returns false when SHOW COUNT(*) WARNINGS differs from the number of SHOW WARNINGS rows. execute_mysql_import_statement (import.rs:1949-1956) then returns \"import data validation failed: {warnings} MySQL warnings: ...\" and rolls back that statement. For 600 rows with 3 '' ENUM columns, the first 500-row batch gives 1500 warnings, which matches the reported text.\n4. In replace/recreate, replace_target_table runs DROP TABLE (import.rs:419-424, 628) before the load, and the load error ends the import (import.rs:432 `?`). The table is left without its data.\n5. Nothing reads @@max_error_count anywhere (grep). The repo's evidence that the SET fails for a database-scoped account is the live test at live_import_policy.rs:230 and the TF-STATUS-175 row. The legacy ENUM-zero live test (live_import_policy.rs:118-150) runs only as root, so no test covers this case.\n\nReachability: the code deliberately supports legacy ENUM-zero data, TF-STATUS-175 came from a real database-scoped local account, and MySQL 8 has local_infile OFF by default, so the default policy takes the INSERT-fallback path (import.rs:1126-1135, 1270).\n\nParts of the claim that are inexact:\n- \"ENUM 3열 이상\" is necessary but not sufficient. The real condition is more than 1024 '' cells in one statement.\n- The JSONL / binary-column path is missing from the claim.\n- \"빈 상태\" should say \"empty, or partly loaded\".",
+          "corrected_claim": "The claim is real; the details below are corrected. On MySQL 8.0/8.4, an account without SESSION_VARIABLES_ADMIN keeps max_error_count=1024. raise_mysql_max_error_count ignores ERROR 1227 (adapters.rs:795-799, and its ponytail comment admits the limit). The import code still sizes its batches for 65535 warnings (import.rs:24). Any single import statement with more than 1024 legacy ENUM '' cells is therefore refused with \"import data validation failed: N MySQL warnings\", because SHOW COUNT(*) WARNINGS no longer matches the SHOW WARNINGS rows (import.rs:1919-1921, 1949-1956). The same dump imports fine as root. The threshold is cells per statement, not a column count:\n(a) TSV INSERT fallback, the default when local_infile is OFF: per 500-row batch (or smaller under the 4 MB cap). This needs at least 3 legacy ENUM columns with '' in the same batch, e.g. 3 columns x 342 rows or more (import.rs:1611-1625, 1878-1881).\n(b) LOAD DATA with local_infile ON: more than 1024 '' cells in one dump chunk, even with one ENUM column. The split happens only above 65535 cells (import.rs:1825).\n(c) JSONL or binary-column tables: the whole chunk is one INSERT, so the same per-chunk limit applies (import.rs:819-829).\n\nIn replace/recreate the target table is dropped before loading (import.rs:419-424, 628). The failing statement rolls back and the import stops, so that table is left empty, or holding only the batches/chunks already committed. Tables not yet reached keep their data, which is the same damage scope as mysqldump. Merge mode keeps the table but stops partway. The error text does not mention max_error_count or privileges.\n\nFix direction stands: after the raise attempt, read @@max_error_count and use it in enum_warning_batch_rows and in the LOAD DATA / JSONL split threshold. Add a live test that imports more than 1024 ENUM-zero cells with a database-scoped account."
+        }
+      }
+    ]
+  }
+]
